@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 
 import pytest
 
+from virtual_context.core.compaction_pipeline import CompactionPipeline
 from virtual_context.storage.sqlite import SQLiteStore
 from virtual_context.types import (
     CARD_KIND_ACTIVE_GOAL,
@@ -20,6 +21,8 @@ from virtual_context.types import (
     CARD_SENSITIVITY_HIGH,
     ActorCardEntry,
     ActorCardEntrySource,
+    SegmentMetadata,
+    StoredSegment,
 )
 
 OPTICS = "actor:discord:optics"
@@ -157,6 +160,155 @@ def test_list_actor_facts_derives_audience_from_canonical_rows(store):
     }
 
 
+def test_segment_source_mapping_survives_store_round_trip(store):
+    _conversation(store, "c1")
+    now = datetime.now(timezone.utc)
+    stored = StoredSegment(
+        ref="seg-round-trip", conversation_id="c1", primary_tag="tag",
+        tags=["tag"], summary="summary", full_text="full",
+        messages=[{
+            "role": "user", "content": "hello",
+            "metadata": {"_vc_source_canonical_turn_ids": ["ct1"]},
+        }],
+        metadata=SegmentMetadata(
+            canonical_turn_ids=["ct1"], source_mapping_complete=True,
+        ),
+        created_at=now, start_timestamp=now, end_timestamp=now,
+    )
+
+    store.store_segment(stored)
+    loaded = store.get_segment("seg-round-trip", conversation_id="c1")
+
+    assert loaded is not None
+    assert loaded.metadata.canonical_turn_ids == ["ct1"]
+    assert loaded.metadata.source_mapping_complete is True
+    assert loaded.messages[0]["metadata"] == {
+        "_vc_source_canonical_turn_ids": ["ct1"],
+    }
+
+
+def test_compaction_card_builder_curates_and_skips_unchanged_input(store):
+    from types import SimpleNamespace
+
+    _dm_and_guild(store)
+
+    class LLM:
+        def __init__(self):
+            self.calls = 0
+
+        def complete(self, **_kwargs):
+            self.calls += 1
+            return json.dumps({"entries": [{
+                "kind": CARD_KIND_ACTIVE_GOAL,
+                "body": "finish the migration",
+                "confidence": 0.8,
+                "sensitivity": "normal",
+                "fact_ids": ["f-dm"],
+            }]}), {}
+
+    llm = LLM()
+    pipeline = object.__new__(CompactionPipeline)
+    pipeline._store = store
+    pipeline._config = SimpleNamespace(
+        tenant_id="t1",
+        assembler=SimpleNamespace(
+            actor_card_enabled=True,
+            actor_card_fact_limit=60,
+            actor_card_entries_per_kind=3,
+        ),
+        compactor=SimpleNamespace(max_summary_tokens=500),
+    )
+    pipeline._compactor = SimpleNamespace(
+        llm=llm,
+        _parse_response=lambda text: json.loads(text),
+    )
+
+    assert pipeline._rebuild_actor_card(OPTICS) == 1
+    card = store.get_actor_card(
+        "t1", OPTICS, owner_conversation_id="dm",
+        audience_conversation_id="dm", audience_channel_id="chan-dm",
+    )
+    assert _bodies(card) == ["finish the migration"]
+
+    assert pipeline._rebuild_actor_card(OPTICS) == 0
+    assert llm.calls == 1
+
+
+def test_compaction_card_builder_rejects_any_unknown_fact_citation(store):
+    from types import SimpleNamespace
+
+    _dm_and_guild(store)
+
+    class LLM:
+        def complete(self, **_kwargs):
+            return json.dumps({"entries": [{
+                "kind": CARD_KIND_ACTIVE_GOAL,
+                "body": "unsupported synthesis",
+                "confidence": 0.8,
+                "sensitivity": "normal",
+                "fact_ids": ["f-dm", "invented-fact"],
+            }]}), {}
+
+    pipeline = object.__new__(CompactionPipeline)
+    pipeline._store = store
+    pipeline._config = SimpleNamespace(
+        tenant_id="t1",
+        assembler=SimpleNamespace(
+            actor_card_enabled=True,
+            actor_card_fact_limit=60,
+            actor_card_entries_per_kind=3,
+        ),
+        compactor=SimpleNamespace(max_summary_tokens=500),
+    )
+    pipeline._compactor = SimpleNamespace(
+        llm=LLM(),
+        _parse_response=lambda text: json.loads(text),
+    )
+
+    assert pipeline._rebuild_actor_card(OPTICS) == 0
+    assert store.get_actor_card(
+        "t1", OPTICS, owner_conversation_id="dm",
+        audience_conversation_id="dm", audience_channel_id="chan-dm",
+    ) is None
+
+
+def test_compaction_card_builder_rejects_boolean_confidence(store):
+    from types import SimpleNamespace
+
+    _dm_and_guild(store)
+
+    class LLM:
+        def complete(self, **_kwargs):
+            return json.dumps({"entries": [{
+                "kind": CARD_KIND_ACTIVE_GOAL,
+                "body": "not numeric confidence",
+                "confidence": True,
+                "sensitivity": "normal",
+                "fact_ids": ["f-dm"],
+            }]}), {}
+
+    pipeline = object.__new__(CompactionPipeline)
+    pipeline._store = store
+    pipeline._config = SimpleNamespace(
+        tenant_id="t1",
+        assembler=SimpleNamespace(
+            actor_card_enabled=True,
+            actor_card_fact_limit=60,
+            actor_card_entries_per_kind=3,
+        ),
+        compactor=SimpleNamespace(max_summary_tokens=500),
+    )
+    pipeline._compactor = SimpleNamespace(
+        llm=LLM(), _parse_response=lambda text: json.loads(text),
+    )
+
+    assert pipeline._rebuild_actor_card(OPTICS) == 0
+    assert store.get_actor_card(
+        "t1", OPTICS, owner_conversation_id="dm",
+        audience_conversation_id="dm", audience_channel_id="chan-dm",
+    ) is None
+
+
 def test_list_actor_facts_is_tenant_scoped(store):
     """An actor id shared by two tenants must never cross the fact query."""
     _dm_and_guild(store)
@@ -169,6 +321,17 @@ def test_incomplete_source_mapping_is_card_ineligible(store):
     _segment(store, "seg1", "c1", ["ct1"], complete=False)
     _fact(store, "f1", "c1", "seg1", OPTICS)
     store.upsert_actor_profile_from_turn("c1", OPTICS, "Optics", seen_at=_now())
+    assert store.list_actor_facts("t1", OPTICS, limit=10) == []
+
+
+def test_segment_mapping_cannot_borrow_a_row_from_another_owner(store):
+    _conversation(store, "c1")
+    _conversation(store, "c2")
+    _turn(store, "ct-other", "c2", OPTICS, "c2", "chan")
+    _segment(store, "seg1", "c1", ["ct-other"], complete=True)
+    _fact(store, "f1", "c1", "seg1", OPTICS)
+    store.upsert_actor_profile_from_turn("c1", OPTICS, "Optics", seen_at=_now())
+
     assert store.list_actor_facts("t1", OPTICS, limit=10) == []
 
 
@@ -383,6 +546,24 @@ def test_delete_conversation_removes_its_contribution_to_every_card(store):
     ) is None
 
 
+def test_delete_does_not_prune_an_unrelated_tenant_profile(store):
+    _conversation(store, "doomed", tenant="t1")
+    _conversation(store, "other", tenant="t2")
+    _turn(store, "doomed-ct", "doomed", BIGTEX, "doomed")
+    assert store.upsert_actor_profile_from_turn(
+        "doomed", BIGTEX, "BigTex one", seen_at=_now(),
+    )
+    assert store.upsert_actor_profile_from_turn(
+        "other", BIGTEX, "BigTex", seen_at=_now(),
+    )
+
+    store.delete_conversation("doomed")
+
+    profile = store.get_actor_profile("t2", BIGTEX)
+    assert profile is not None
+    assert profile.display_name == "BigTex"
+
+
 def test_stale_builder_cannot_resurrect_after_epoch_change(store):
     """A builder that enumerated at epoch 1 cannot write after a resurrect."""
     _dm_and_guild(store)
@@ -402,6 +583,86 @@ def test_stale_builder_cannot_resurrect_after_epoch_change(store):
         "t1", OPTICS, owner_conversation_id="dm",
         audience_conversation_id="dm", audience_channel_id="chan-dm",
     ) is None
+
+
+def test_fact_redistillation_epoch_fence_preserves_existing_facts(store):
+    _dm_and_guild(store)
+
+    deleted, inserted = store.replace_facts_for_segment(
+        "dm", "seg-dm", [], expected_lifecycle_epoch=99,
+    )
+
+    assert (deleted, inserted) == (0, 0)
+    assert [fact.id for fact in store.get_facts_by_segment("seg-dm")] == ["f-dm"]
+
+
+def test_card_replacement_rejects_forged_source_provenance(store):
+    _dm_and_guild(store)
+    written = store.replace_actor_card(
+        "t1", OPTICS,
+        [(_entry("e-forged", CARD_KIND_COMMUNICATION_PREF, "forged"),
+          [_source(
+              "e-forged", "guild", "guild", "f-dm", "chan-guild",
+          )])],
+        input_hash="forged",
+        expected_source_epochs={"dm": 1, "guild": 1},
+    )
+
+    assert written == 0
+    assert store._get_conn().execute(
+        "SELECT 1 FROM actor_card_entries WHERE id = 'e-forged'",
+    ).fetchone() is None
+
+
+def test_card_replacement_rejects_source_free_cross_context_entry(store):
+    _dm_and_guild(store)
+    written = store.replace_actor_card(
+        "t1", OPTICS,
+        [(_entry(
+            "e-unproven", CARD_KIND_COMMUNICATION_PREF, "unproven",
+            scope=CARD_SCOPE_CROSS_CONTEXT,
+        ), [])],
+        input_hash="unproven", expected_source_epochs={},
+    )
+
+    assert written == 0
+    assert store.get_actor_card(
+        "t1", OPTICS, owner_conversation_id="guild",
+        audience_conversation_id="guild", audience_channel_id="chan-guild",
+    ) is None
+
+
+def test_card_entry_id_collision_cannot_cross_tenant_or_actor(store):
+    _dm_and_guild(store)
+    first = _entry("shared-entry", CARD_KIND_ACTIVE_GOAL, "tenant one")
+    assert store.replace_actor_card(
+        "t1", OPTICS,
+        [(first, [_source("shared-entry", "dm", "dm", "f-dm", "chan-dm")])],
+        input_hash="one", expected_source_epochs={"dm": 1},
+    ) == 1
+
+    _conversation(store, "other-c", tenant="t2")
+    _turn(store, "other-ct", "other-c", BIGTEX, "other-c", "other-chan")
+    _segment(store, "other-seg", "other-c", ["other-ct"])
+    _fact(store, "other-fact", "other-c", "other-seg", BIGTEX)
+    store.upsert_actor_profile_from_turn(
+        "other-c", BIGTEX, "BigTex", seen_at=_now(),
+    )
+    second = _entry("shared-entry", CARD_KIND_ACTIVE_GOAL, "tenant two")
+
+    assert store.replace_actor_card(
+        "t2", BIGTEX,
+        [(second, [_source(
+            "shared-entry", "other-c", "other-c", "other-fact", "other-chan",
+            tenant="t2",
+        )])],
+        input_hash="two", expected_source_epochs={"other-c": 1},
+    ) == 0
+    row = store._get_conn().execute(
+        "SELECT tenant_id, actor_id, body FROM actor_card_entries WHERE id = ?",
+        ("shared-entry",),
+    ).fetchone()
+    assert tuple(row) == ("t1", OPTICS, "tenant one")
 
 
 def test_replace_facts_for_segment_dirties_the_author_card(store):
@@ -432,4 +693,31 @@ def test_card_read_requires_route_to_resolve_to_the_owner(store):
         "t1", OPTICS, owner_conversation_id="guild",
         audience_conversation_id="dm",   # unrelated route, not an alias of guild
         audience_channel_id="chan-guild",
+    ) is None
+
+
+def test_request_audience_resolver_preserves_a_validated_alias_origin(store):
+    _conversation(store, "dm", phase="merged")
+    _conversation(store, "guild")
+    store.save_conversation_alias("dm", "guild")
+
+    assert store.resolve_request_audience("t1", "dm", "guild") == "dm"
+    assert store.resolve_request_audience("t1", "guild", "guild") == "guild"
+    assert store.resolve_request_audience("other", "dm", "guild") == ""
+
+
+def test_deleted_audience_route_cannot_read_cross_context_entries(store):
+    _dm_and_guild(store)
+    _build_dm_goal_and_cross_pref(store)
+    conn = store._get_conn()
+    conn.execute(
+        "UPDATE conversations SET phase = 'deleted', deleted_at = ? "
+        "WHERE conversation_id = 'dm'",
+        (_now(),),
+    )
+    conn.commit()
+
+    assert store.get_actor_card(
+        "t1", OPTICS, owner_conversation_id="dm",
+        audience_conversation_id="dm", audience_channel_id="chan-dm",
     ) is None

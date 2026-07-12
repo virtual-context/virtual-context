@@ -46,6 +46,7 @@ from ..types import (
     ActorCardEntry,
     ActorCardEntrySource,
     ActorFactSource,
+    ActorProfile,
 )
 from .helpers import dt_to_str as _dt_to_str, str_to_dt as _str_to_dt, extract_excerpt as _extract_excerpt
 
@@ -589,6 +590,9 @@ def _row_to_segment(row: sqlite3.Row, tags: list[str]) -> StoredSegment:
             end_turn_number=metadata_raw.get("end_turn_number", -1),
             generated_by_turn_id=metadata_raw.get("generated_by_turn_id", ""),
             session_date=metadata_raw.get("session_date", ""),
+            source_mapping_complete=bool(
+                metadata_raw.get("source_mapping_complete", False)
+            ),
         ),
         created_at=_str_to_dt(row["created_at"]),
         start_timestamp=_str_to_dt(row["start_timestamp"]),
@@ -619,6 +623,9 @@ def _row_to_summary(row: sqlite3.Row, tags: list[str]) -> StoredSummary:
             end_turn_number=metadata_raw.get("end_turn_number", -1),
             generated_by_turn_id=metadata_raw.get("generated_by_turn_id", ""),
             session_date=metadata_raw.get("session_date", ""),
+            source_mapping_complete=bool(
+                metadata_raw.get("source_mapping_complete", False)
+            ),
         ),
         created_at=_str_to_dt(row["created_at"]),
         start_timestamp=_str_to_dt(row["start_timestamp"]),
@@ -2598,6 +2605,9 @@ CREATE TABLE IF NOT EXISTS request_captures (
             "start_turn_number": getattr(segment.metadata, "start_turn_number", -1),
             "end_turn_number": getattr(segment.metadata, "end_turn_number", -1),
             "generated_by_turn_id": getattr(segment.metadata, "generated_by_turn_id", ""),
+            "source_mapping_complete": bool(
+                getattr(segment.metadata, "source_mapping_complete", False)
+            ),
         }
         if segment.metadata.session_date:
             metadata_dict["session_date"] = segment.metadata.session_date
@@ -5721,6 +5731,23 @@ CREATE TABLE IF NOT EXISTS request_captures (
         # has to observe state that the very same delete is about to destroy.
         conn.execute("BEGIN IMMEDIATE")
         try:
+            tenant_row = conn.execute(
+                "SELECT tenant_id FROM conversations WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()
+            deleted_tenant = (tenant_row[0] or "") if tenant_row else ""
+            profile_actor_ids = {
+                (row[0] or "").strip()
+                for row in conn.execute(
+                    """SELECT sender_actor_id FROM canonical_turns
+                        WHERE conversation_id = ? AND sender_actor_id <> ''
+                        UNION
+                        SELECT author_actor_id FROM facts
+                        WHERE conversation_id = ? AND author_actor_id <> ''""",
+                    (conversation_id, conversation_id),
+                ).fetchall()
+                if (row[0] or "").strip()
+            }
             # Capture and dirty affected cards BEFORE any fact is deleted:
             # actor_card_entry_sources.fact_id cascades on fact delete, so
             # deleting facts first would erase the rows needed to discover which
@@ -5759,7 +5786,9 @@ CREATE TABLE IF NOT EXISTS request_captures (
 
             # A profile with no surviving actor rows and no surviving facts is
             # not a person we know anything about any more.
-            self._prune_orphan_actor_profiles(conn)
+            self._prune_orphan_actor_profiles(
+                conn, deleted_tenant, profile_actor_ids,
+            )
             conn.execute("COMMIT")
         except Exception:
             conn.execute("ROLLBACK")
@@ -6604,6 +6633,36 @@ CREATE TABLE IF NOT EXISTS request_captures (
         ).fetchone()
         return row[0] if row else None
 
+    def resolve_request_audience(
+        self,
+        tenant_id: str,
+        audience_conversation_id: str,
+        owner_conversation_id: str,
+    ) -> str:
+        """Prove that a raw route belongs to this tenant and resolves to owner."""
+        audience = (audience_conversation_id or "").strip()
+        owner_id = (owner_conversation_id or "").strip()
+        if not audience or not owner_id:
+            return ""
+        conn = self._get_conn()
+        owner = self._resolve_owner(conn, owner_id)
+        if not owner or self._resolve_owner(conn, audience) != owner:
+            return ""
+        owner_row = conn.execute(
+            """SELECT 1 FROM conversations
+                WHERE conversation_id = ? AND tenant_id = ?
+                  AND phase NOT IN ('deleted', 'merged')
+                  AND deleted_at IS NULL""",
+            (owner, tenant_id),
+        ).fetchone()
+        audience_row = conn.execute(
+            """SELECT 1 FROM conversations
+                WHERE conversation_id = ? AND tenant_id = ?
+                  AND phase <> 'deleted' AND deleted_at IS NULL""",
+            (audience, tenant_id),
+        ).fetchone()
+        return audience if owner_row is not None and audience_row is not None else ""
+
     def delete_conversation_alias(
         self,
         alias_id: str,
@@ -7104,6 +7163,8 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 continue
             sets: list[str] = []
             params: list[object] = []
+            conflict_clauses: list[str] = []
+            conflict_params: list[object] = []
             for field_name in fields:
                 value = (edge.get(field_name) or "").strip()
                 if not value:
@@ -7115,6 +7176,11 @@ CREATE TABLE IF NOT EXISTS request_captures (
                     f"THEN ? ELSE {field_name} END"
                 )
                 params.append(value)
+                conflict_clauses.append(
+                    f" AND (COALESCE(TRIM({field_name}), '') = '' "
+                    f"OR TRIM({field_name}) = ?)"
+                )
+                conflict_params.append(value)
             for version_field in (
                 "reply_attribution_version",
                 "audience_attribution_version",
@@ -7136,6 +7202,8 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 + ", updated_at = ? WHERE conversation_id = ? AND canonical_turn_id = ?"
             )
             params.extend([now, conversation_id, canonical_turn_id])
+            sql += "".join(conflict_clauses)
+            params.extend(conflict_params)
             if expected_lifecycle_epoch is not None:
                 sql += (
                     " AND EXISTS (SELECT 1 FROM conversations c"
@@ -8043,6 +8111,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
         operation_id: str | None = None,
         owner_worker_id: str | None = None,
         lifecycle_epoch: int | None = None,
+        expected_lifecycle_epoch: int | None = None,
     ) -> tuple[int, int]:
         """Atomically replace all facts for a segment.
 
@@ -8084,6 +8153,16 @@ CREATE TABLE IF NOT EXISTS request_captures (
         conn = self._get_conn()
         conn.execute("BEGIN IMMEDIATE")
         try:
+            if expected_lifecycle_epoch is not None:
+                live = conn.execute(
+                    """SELECT 1 FROM conversations
+                        WHERE conversation_id = ? AND lifecycle_epoch = ?
+                          AND phase <> 'deleted'""",
+                    (conversation_id, expected_lifecycle_epoch),
+                ).fetchone()
+                if live is None:
+                    conn.execute("ROLLBACK")
+                    return (0, 0)
             if guard_all:
                 # Probe ownership BEFORE the DELETE so we never commit a
                 # DELETE without a matching INSERT.
@@ -8281,12 +8360,21 @@ CREATE TABLE IF NOT EXISTS request_captures (
     # ------------------------------------------------------------------
 
     def _resolve_owner(self, conn: sqlite3.Connection, conversation_id: str) -> str:
-        """Follow an alias to its target, if the id is an alias."""
-        row = conn.execute(
-            "SELECT target_id FROM conversation_aliases WHERE alias_id = ?",
-            (conversation_id,),
-        ).fetchone()
-        return (row[0] if row else conversation_id) or conversation_id
+        """Follow a bounded alias chain to its terminal, failing on cycles."""
+        current = (conversation_id or "").strip()
+        seen: set[str] = set()
+        for _ in range(8):
+            if not current or current in seen:
+                return ""
+            seen.add(current)
+            row = conn.execute(
+                "SELECT target_id FROM conversation_aliases WHERE alias_id = ?",
+                (current,),
+            ).fetchone()
+            if row is None or not (row[0] or "").strip():
+                return current
+            current = (row[0] or "").strip()
+        return ""
 
     def upsert_actor_profile_from_turn(
         self,
@@ -8312,43 +8400,43 @@ CREATE TABLE IF NOT EXISTS request_captures (
         if not actor_id:
             return False
         conn = self._get_conn()
-        row = conn.execute(
-            """SELECT tenant_id, lifecycle_epoch FROM conversations
-                WHERE conversation_id = ? AND phase <> 'deleted'""",
-            (conversation_id,),
-        ).fetchone()
-        if row is None:
-            return False
-        tenant_id = row[0] or ""
-        if (
-            expected_lifecycle_epoch is not None
-            and int(row[1] or 0) != int(expected_lifecycle_epoch)
-        ):
-            return False
-
-        platform = ""
-        parts = actor_id.split(":")
-        if len(parts) >= 3 and parts[0] == "actor":
-            platform = parts[1]
-        display_name = (display_name or "").strip()
-
-        conn.execute(
-            """INSERT INTO actor_profiles
-                   (tenant_id, actor_id, platform, display_name,
-                    first_seen_at, last_seen_at)
-               VALUES (?, ?, ?, ?, ?, ?)
-               ON CONFLICT (tenant_id, actor_id) DO UPDATE SET
-                   last_seen_at = excluded.last_seen_at,
-                   display_name = CASE
-                       WHEN excluded.display_name <> '' THEN excluded.display_name
-                       ELSE actor_profiles.display_name END,
-                   platform = CASE
-                       WHEN excluded.platform <> '' THEN excluded.platform
-                       ELSE actor_profiles.platform END""",
-            (tenant_id, actor_id, platform, display_name, seen_at, seen_at),
-        )
-        conn.commit()
-        return True
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                """SELECT tenant_id, lifecycle_epoch FROM conversations
+                    WHERE conversation_id = ? AND phase <> 'deleted'""",
+                (conversation_id,),
+            ).fetchone()
+            if row is None or (
+                expected_lifecycle_epoch is not None
+                and int(row[1] or 0) != int(expected_lifecycle_epoch)
+            ):
+                conn.execute("ROLLBACK")
+                return False
+            tenant_id = row[0] or ""
+            parts = actor_id.split(":")
+            platform = parts[1] if len(parts) >= 3 and parts[0] == "actor" else ""
+            display_name = (display_name or "").strip()
+            conn.execute(
+                """INSERT INTO actor_profiles
+                       (tenant_id, actor_id, platform, display_name,
+                        first_seen_at, last_seen_at)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT (tenant_id, actor_id) DO UPDATE SET
+                       last_seen_at = excluded.last_seen_at,
+                       display_name = CASE
+                           WHEN excluded.display_name <> '' THEN excluded.display_name
+                           ELSE actor_profiles.display_name END,
+                       platform = CASE
+                           WHEN excluded.platform <> '' THEN excluded.platform
+                           ELSE actor_profiles.platform END""",
+                (tenant_id, actor_id, platform, display_name, seen_at, seen_at),
+            )
+            conn.execute("COMMIT")
+            return True
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
 
     def _fact_audience(
         self,
@@ -8392,8 +8480,9 @@ CREATE TABLE IF NOT EXISTS request_captures (
             f"""SELECT canonical_turn_id, user_content, audience_conversation_id,
                        audience_attribution_version, origin_channel_id
                   FROM canonical_turns
-                 WHERE canonical_turn_id IN ({placeholders})""",
-            tuple(ids),
+                 WHERE conversation_id = ?
+                   AND canonical_turn_id IN ({placeholders})""",
+            (fact.conversation_id, *ids),
         ).fetchall()
         if len(rows) != len(set(ids)):
             # A source id that no longer resolves makes the mapping incomplete.
@@ -8446,8 +8535,8 @@ CREATE TABLE IF NOT EXISTS request_captures (
                   AND c.phase NOT IN ('deleted', 'merged')
                   AND f.superseded_by IS NULL
                   AND f.author_attribution_version > 0
-                ORDER BY f.mentioned_at DESC""",
-            (actor_id, tenant_id),
+                ORDER BY f.mentioned_at DESC, f.id""",
+                (actor_id, tenant_id),
         ).fetchall()
 
         out: list[ActorFactSource] = []
@@ -8480,6 +8569,32 @@ CREATE TABLE IF NOT EXISTS request_captures (
             if len(out) >= max(0, int(limit)):
                 break
         return out
+
+    def get_actor_profile(self, tenant_id: str, actor_id: str) -> ActorProfile | None:
+        row = self._get_conn().execute(
+            """SELECT * FROM actor_profiles
+                WHERE tenant_id = ? AND actor_id = ?""",
+            (tenant_id, actor_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return ActorProfile(
+            tenant_id=row["tenant_id"], actor_id=row["actor_id"],
+            platform=row["platform"] or "", display_name=row["display_name"] or "",
+            first_seen_at=row["first_seen_at"], last_seen_at=row["last_seen_at"],
+            card_built_at=row["card_built_at"], card_dirty=bool(row["card_dirty"]),
+            card_input_hash=row["card_input_hash"] or "",
+        )
+
+    def mark_actor_card_dirty(self, tenant_id: str, actor_id: str) -> bool:
+        conn = self._get_conn()
+        cur = conn.execute(
+            """UPDATE actor_profiles SET card_dirty = 1
+                WHERE tenant_id = ? AND actor_id = ?""",
+            (tenant_id, actor_id),
+        )
+        conn.commit()
+        return int(cur.rowcount or 0) == 1
 
     def replace_actor_card(
         self,
@@ -8531,15 +8646,81 @@ CREATE TABLE IF NOT EXISTS request_captures (
                     conn.execute("ROLLBACK")
                     return 0
 
-            # Every source fact must still exist.
-            for _entry, sources in entries_with_sources:
+            normalized_entries: list[
+                tuple[ActorCardEntry, list[ActorCardEntrySource]]
+            ] = []
+            for entry, sources in entries_with_sources:
+                collision = conn.execute(
+                    """SELECT tenant_id, actor_id FROM actor_card_entries
+                        WHERE id = ?""",
+                    (entry.id,),
+                ).fetchone()
+                if collision is not None and (
+                    collision["tenant_id"] != tenant_id
+                    or collision["actor_id"] != actor_id
+                ):
+                    conn.execute("ROLLBACK")
+                    return 0
+                # A source-free cross-context entry would be globally visible
+                # with no fact or audience provenance at all.
+                if not sources:
+                    conn.execute("ROLLBACK")
+                    return 0
+                normalized_sources: list[ActorCardEntrySource] = []
                 for src in sources:
-                    hit = conn.execute(
-                        "SELECT 1 FROM facts WHERE id = ?", (src.fact_id,),
+                    fact_row = conn.execute(
+                        """SELECT f.*, c.lifecycle_epoch AS _owner_epoch
+                             FROM facts f
+                             JOIN conversations c
+                               ON c.conversation_id = f.conversation_id
+                            WHERE f.id = ? AND f.author_actor_id = ?
+                              AND f.superseded_by IS NULL
+                              AND c.tenant_id = ?
+                              AND c.phase NOT IN ('deleted', 'merged')""",
+                        (src.fact_id, actor_id, tenant_id),
                     ).fetchone()
-                    if hit is None:
+                    if fact_row is None:
                         conn.execute("ROLLBACK")
                         return 0
+                    fact = Fact.from_dict(dict(fact_row), dt_parser=_str_to_dt)
+                    derived = self._fact_audience(conn, fact)
+                    if derived is None:
+                        conn.execute("ROLLBACK")
+                        return 0
+                    audience_id, channel_id = derived
+                    audience_row = conn.execute(
+                        """SELECT lifecycle_epoch FROM conversations
+                            WHERE conversation_id = ? AND tenant_id = ?
+                              AND phase <> 'deleted'""",
+                        (audience_id, tenant_id),
+                    ).fetchone()
+                    owner_id = fact.conversation_id
+                    owner_epoch = int(fact_row["_owner_epoch"] or 0)
+                    audience_epoch = (
+                        int(audience_row[0] or 0) if audience_row is not None else -1
+                    )
+                    if (
+                        audience_row is None
+                        or expected.get(owner_id) != owner_epoch
+                        or expected.get(audience_id) != audience_epoch
+                        or (src.entry_id or "") != entry.id
+                        or (src.tenant_id or "") != tenant_id
+                        or (src.owner_conversation_id or "") != owner_id
+                        or (src.audience_conversation_id or "") != audience_id
+                        or (src.audience_channel_id or "") != channel_id
+                    ):
+                        conn.execute("ROLLBACK")
+                        return 0
+                    normalized_sources.append(ActorCardEntrySource(
+                        entry_id=entry.id,
+                        tenant_id=tenant_id,
+                        owner_conversation_id=owner_id,
+                        audience_conversation_id=audience_id,
+                        audience_channel_id=channel_id,
+                        fact_id=fact.id,
+                    ))
+                normalized_entries.append((entry, normalized_sources))
+            entries_with_sources = normalized_entries
 
             # Supersede the currently-active entries. A same-kind replacement
             # is the natural successor; otherwise the hash records the rebuild
@@ -8567,11 +8748,17 @@ CREATE TABLE IF NOT EXISTS request_captures (
             written = 0
             for entry, sources in entries_with_sources:
                 conn.execute(
-                    """INSERT OR REPLACE INTO actor_card_entries
+                    """INSERT INTO actor_card_entries
                            (id, tenant_id, actor_id, kind, body, confidence,
                             sensitivity, audience_scope, superseded_by,
                             created_at, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)""",
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+                       ON CONFLICT(id) DO UPDATE SET
+                           kind=excluded.kind, body=excluded.body,
+                           confidence=excluded.confidence,
+                           sensitivity=excluded.sensitivity,
+                           audience_scope=excluded.audience_scope,
+                           superseded_by=NULL, updated_at=excluded.updated_at""",
                     (
                         entry.id, tenant_id, actor_id, entry.kind, entry.body,
                         float(entry.confidence or 0.0), entry.sensitivity,
@@ -8579,8 +8766,9 @@ CREATE TABLE IF NOT EXISTS request_captures (
                     ),
                 )
                 conn.execute(
-                    "DELETE FROM actor_card_entry_sources WHERE entry_id = ?",
-                    (entry.id,),
+                    """DELETE FROM actor_card_entry_sources
+                        WHERE entry_id = ? AND tenant_id = ?""",
+                    (entry.id, tenant_id),
                 )
                 for src in sources:
                     # Provenance is set from the authoritative fact row by the
@@ -8644,10 +8832,20 @@ CREATE TABLE IF NOT EXISTS request_captures (
             return None
         orow = conn.execute(
             """SELECT 1 FROM conversations
-                WHERE conversation_id = ? AND tenant_id = ?""",
+                WHERE conversation_id = ? AND tenant_id = ?
+                  AND phase NOT IN ('deleted', 'merged')
+                  AND deleted_at IS NULL""",
             (owner, tenant_id),
         ).fetchone()
         if orow is None:
+            return None
+        arow = conn.execute(
+            """SELECT 1 FROM conversations
+                WHERE conversation_id = ? AND tenant_id = ?
+                  AND phase <> 'deleted' AND deleted_at IS NULL""",
+            (audience_conversation_id, tenant_id),
+        ).fetchone()
+        if arow is None:
             return None
 
         prof = conn.execute(
@@ -8788,18 +8986,40 @@ CREATE TABLE IF NOT EXISTS request_captures (
             )
         return len(entry_ids)
 
-    def _prune_orphan_actor_profiles(self, conn: sqlite3.Connection) -> int:
-        """Drop profiles with no surviving actor rows and no surviving facts."""
-        if not self._table_exists(conn, "actor_profiles"):
+    def _prune_orphan_actor_profiles(
+        self,
+        conn: sqlite3.Connection,
+        tenant_id: str,
+        actor_ids,
+    ) -> int:
+        """Drop only deleted-conversation actors that now have no sources."""
+        actor_ids = sorted({actor for actor in actor_ids if actor})
+        if (
+            not tenant_id
+            or not actor_ids
+            or not self._table_exists(conn, "actor_profiles")
+        ):
             return 0
+        placeholders = ",".join("?" for _ in actor_ids)
         cur = conn.execute(
-            """DELETE FROM actor_profiles
-                WHERE NOT EXISTS (
-                        SELECT 1 FROM canonical_turns ct
-                         WHERE ct.sender_actor_id = actor_profiles.actor_id)
+            f"""DELETE FROM actor_profiles
+                WHERE tenant_id = ?
+                  AND actor_id IN ({placeholders})
                   AND NOT EXISTS (
-                        SELECT 1 FROM facts f
-                         WHERE f.author_actor_id = actor_profiles.actor_id)"""
+                        SELECT 1
+                          FROM canonical_turns ct
+                          JOIN conversations c
+                            ON c.conversation_id = ct.conversation_id
+                         WHERE ct.sender_actor_id = actor_profiles.actor_id
+                           AND c.tenant_id = actor_profiles.tenant_id)
+                  AND NOT EXISTS (
+                        SELECT 1
+                          FROM facts f
+                          JOIN conversations c
+                            ON c.conversation_id = f.conversation_id
+                         WHERE f.author_actor_id = actor_profiles.actor_id
+                           AND c.tenant_id = actor_profiles.tenant_id)""",
+            (tenant_id, *actor_ids),
         )
         return int(cur.rowcount or 0)
 

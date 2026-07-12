@@ -6,7 +6,10 @@ manual compaction (compact_manual), and the shared compaction core (_run_compact
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
+import math
 import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING
@@ -159,6 +162,191 @@ class CompactionPipeline:
             except Exception as e:
                 logger.warning("Failed to embed fact %s: %s", fact.id, e)
 
+    def _rebuild_actor_card(self, actor_id: str, *, force: bool = False) -> int:
+        """Curate and atomically replace one actor's rebuildable card cache."""
+        if (
+            not force
+            and not getattr(self._config.assembler, "actor_card_enabled", False)
+        ):
+            return 0
+        if self._compactor is None or not actor_id:
+            return 0
+        from datetime import datetime, timezone
+
+        from ..types import (
+            CARD_CROSS_CONTEXT_KINDS,
+            CARD_ENTRY_BODY_MAX_CHARS,
+            CARD_KINDS,
+            CARD_SCOPE_CROSS_CONTEXT,
+            CARD_SCOPE_SAME_CONVERSATION,
+            CARD_SENSITIVITIES,
+            CARD_SENSITIVITY_NORMAL,
+            ActorCardEntry,
+            ActorCardEntrySource,
+        )
+
+        tenant_id = self._config.tenant_id
+        sources = list(self._store.list_actor_facts(
+            tenant_id,
+            actor_id,
+            limit=int(self._config.assembler.actor_card_fact_limit),
+        ))
+        hash_payload = [
+            {
+                "id": source.fact.id,
+                "subject": source.fact.subject,
+                "verb": source.fact.verb,
+                "object": source.fact.object,
+                "what": source.fact.what,
+                "status": source.fact.status,
+                "superseded_by": source.fact.superseded_by,
+                "author_version": source.fact.author_attribution_version,
+                "author_role": source.fact.author_source_role,
+            }
+            for source in sources
+        ]
+        input_hash = hashlib.sha256(json.dumps(
+            {"policy": 1, "facts": hash_payload},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        profile = self._store.get_actor_profile(tenant_id, actor_id)
+        if profile is None:
+            return 0
+        if profile.card_input_hash == input_hash and not profile.card_dirty:
+            return 0
+        if not self._store.mark_actor_card_dirty(tenant_id, actor_id):
+            return 0
+
+        source_by_id = {source.fact.id: source for source in sources}
+        raw_entries: list = []
+        if sources:
+            prompt_facts = [
+                {
+                    "id": source.fact.id,
+                    "fact": source.fact.format_for_prompt(),
+                    "author_role": source.fact.author_source_role,
+                }
+                for source in sources
+            ]
+            system = (
+                "Curate durable interaction patterns, not a fact scrapbook. "
+                "Return JSON only with an entries array. Each entry needs kind, "
+                "body, confidence, sensitivity, and fact_ids. Kinds are "
+                "communication_pref, active_goal, relevant_history, interaction_style."
+            )
+            user = json.dumps({
+                "facts": prompt_facts,
+                "limits": {
+                    "entries_per_kind": int(
+                        self._config.assembler.actor_card_entries_per_kind
+                    ),
+                    "body_chars": CARD_ENTRY_BODY_MAX_CHARS,
+                },
+            }, separators=(",", ":"))
+            response_text, _usage = self._compactor.llm.complete(
+                system=system,
+                user=user,
+                max_tokens=self._config.compactor.max_summary_tokens,
+            )
+            parsed = self._compactor._parse_response(response_text)
+            if isinstance(parsed.get("entries"), list):
+                raw_entries = parsed["entries"]
+
+        now = datetime.now(timezone.utc).isoformat()
+        per_kind: dict[str, int] = {}
+        normalized: list[tuple[ActorCardEntry, list[ActorCardEntrySource]]] = []
+        for item in raw_entries:
+            if not isinstance(item, dict):
+                continue
+            kind = item.get("kind")
+            body = item.get("body")
+            sensitivity = item.get("sensitivity", CARD_SENSITIVITY_NORMAL)
+            confidence = item.get("confidence")
+            fact_ids = item.get("fact_ids")
+            if kind not in CARD_KINDS or sensitivity not in CARD_SENSITIVITIES:
+                continue
+            if per_kind.get(kind, 0) >= int(
+                self._config.assembler.actor_card_entries_per_kind
+            ):
+                continue
+            if not isinstance(body, str) or not body.strip():
+                continue
+            body = body.strip()
+            if (
+                len(body) > CARD_ENTRY_BODY_MAX_CHARS
+                or any(ord(ch) < 32 or ord(ch) == 127 for ch in body)
+            ):
+                continue
+            if isinstance(confidence, bool) or not isinstance(
+                confidence, (int, float)
+            ):
+                continue
+            confidence = float(confidence)
+            if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+                continue
+            if not isinstance(fact_ids, list) or not fact_ids:
+                continue
+            if any(
+                not isinstance(fid, str) or fid not in source_by_id
+                for fid in fact_ids
+            ):
+                continue
+            fact_ids = list(dict.fromkeys(fact_ids))
+
+            scope = (
+                CARD_SCOPE_CROSS_CONTEXT
+                if sensitivity == CARD_SENSITIVITY_NORMAL
+                and kind in CARD_CROSS_CONTEXT_KINDS
+                else CARD_SCOPE_SAME_CONVERSATION
+            )
+            digest = hashlib.sha256(json.dumps(
+                [actor_id, kind, body, fact_ids], separators=(",", ":"),
+            ).encode("utf-8")).hexdigest()[:32]
+            entry = ActorCardEntry(
+                id=f"card-{digest}", tenant_id=tenant_id, actor_id=actor_id,
+                kind=kind, body=body, confidence=confidence,
+                sensitivity=sensitivity, audience_scope=scope,
+                created_at=now, updated_at=now,
+            )
+            entry_sources = [
+                ActorCardEntrySource(
+                    entry_id=entry.id,
+                    tenant_id=tenant_id,
+                    owner_conversation_id=source_by_id[fid].owner_conversation_id,
+                    audience_conversation_id=(
+                        source_by_id[fid].audience_conversation_id
+                    ),
+                    audience_channel_id=source_by_id[fid].audience_channel_id,
+                    fact_id=fid,
+                )
+                for fid in fact_ids
+            ]
+            normalized.append((entry, entry_sources))
+            per_kind[kind] = per_kind.get(kind, 0) + 1
+
+        expected_epochs: dict[str, int] = {}
+        for source in sources:
+            expected_epochs[source.owner_conversation_id] = (
+                source.owner_lifecycle_epoch
+            )
+            expected_epochs[source.audience_conversation_id] = (
+                source.audience_lifecycle_epoch
+            )
+        written = self._store.replace_actor_card(
+            tenant_id,
+            actor_id,
+            normalized,
+            input_hash=input_hash,
+            expected_source_epochs=expected_epochs,
+        )
+        refreshed = self._store.get_actor_profile(tenant_id, actor_id)
+        if refreshed is None or refreshed.card_dirty or (
+            refreshed.card_input_hash != input_hash
+        ):
+            return 0
+        return written
+
     def _physical_rows_by_group(self) -> dict[int, list["CanonicalTurnRow"]]:
         """Physical canonical rows of this conversation, grouped by turn group.
 
@@ -177,7 +365,9 @@ class CompactionPipeline:
             return {}
         grouped: dict[int, list["CanonicalTurnRow"]] = {}
         for row in getter(self._config.conversation_id) or ():
-            grouped.setdefault(int(getattr(row, "turn_group_number", -1) or -1), []).append(row)
+            raw_group = getattr(row, "turn_group_number", -1)
+            group = int(raw_group if raw_group is not None else -1)
+            grouped.setdefault(group, []).append(row)
         return grouped
 
     @staticmethod
@@ -272,12 +462,27 @@ class CompactionPipeline:
                     # the source of truth and will produce (or already produced)
                     # its facts. The quote is current-request context, not a
                     # second disclosure.
-                    target_present = any(
-                        (getattr(physical_by_id.get(c), "source_message_id", "") or "")
+                    audience = (
+                        getattr(row, "audience_conversation_id", "") or ""
+                    ).strip()
+                    channel = (getattr(row, "origin_channel_id", "") or "").strip()
+                    target_candidates = [
+                        candidate for candidate in physical_by_id.values()
+                        if target_id
+                        and (getattr(candidate, "source_message_id", "") or "").strip()
                         == target_id
-                        for c in ids
-                        if target_id and physical_by_id.get(c) is not None
-                    )
+                        and audience
+                        and (
+                            getattr(candidate, "audience_conversation_id", "") or ""
+                        ).strip() == audience
+                        and (
+                            not channel
+                            or (getattr(candidate, "origin_channel_id", "") or "").strip()
+                            == channel
+                        )
+                        and (getattr(candidate, "user_content", "") or "").strip()
+                    ]
+                    target_present = len(target_candidates) == 1
                     if not target_present:
                         roster.lanes.append(FactLane(
                             role=AUTHOR_ROLE_SUBJECT,
@@ -315,7 +520,8 @@ class CompactionPipeline:
         by_group = self._physical_rows_by_group()
         messages: list[Message] = []
         for row in rows:
-            group = int(getattr(row, "turn_group_number", -1) or -1)
+            raw_group = getattr(row, "turn_group_number", -1)
+            group = int(raw_group if raw_group is not None else -1)
             backing = by_group.get(group, [])
             # Split the backing physical rows by which side actually carries
             # content. A legacy combined row carries both, and may therefore
@@ -1062,11 +1268,25 @@ class CompactionPipeline:
         """
         from datetime import datetime, timezone
 
-        from ..types import CompactionResult, FactSignal, Message, SegmentMetadata, StoredSegment
+        from ..types import (
+            SOURCE_CANONICAL_TURN_IDS_KEY,
+            CompactionResult,
+            FactSignal,
+            Message,
+            SegmentMetadata,
+            StoredSegment,
+        )
         from .tag_scoring import compute_relatedness
 
         _ensure_engine_imports()
         compact_rows = list(compact_rows or [])
+
+        physical_rows_by_group = self._physical_rows_by_group()
+        physical_by_id = {
+            row.canonical_turn_id: row
+            for rows_in_group in physical_rows_by_group.values()
+            for row in rows_in_group
+        }
 
         all_results: list[CompactionResult] = []
 
@@ -1153,6 +1373,7 @@ class CompactionPipeline:
         # Pass 1: Sequential pre-pass — stubs + merge check (no LLM calls)
         # ==================================================================
         compactable: list = []  # segments ready for LLM compaction
+        merged_mapping_prereqs: dict[str, bool] = {}
         now = datetime.now(timezone.utc)
 
         # P1: pre-load embeddings and embed_fn once (not per-segment)
@@ -1167,6 +1388,12 @@ class CompactionPipeline:
             if _is_stub_content_fn(text):
                 text = text.strip()
                 turn_range = segment_turn_ranges.get(seg.id)
+                exact_ids, mapping_complete = self._segment_source_ids(seg)
+                mapping_complete = bool(
+                    mapping_complete
+                    and exact_ids
+                    and all(cid in physical_by_id for cid in exact_ids)
+                )
                 logger.info(
                     "SEGMENT passthrough_stub ref=%s tokens=%d primary=%s",
                     seg.id[:8], seg.token_count, seg.primary_tag,
@@ -1179,15 +1406,27 @@ class CompactionPipeline:
                     summary_tokens=seg.token_count,
                     full_text=text,
                     original_tokens=seg.token_count,
-                    messages=[{"role": m.role, "content": m.content} for m in seg.messages],
+                    messages=[
+                        {
+                            "role": m.role,
+                            "content": m.content,
+                            **({"metadata": m.metadata} if m.metadata else {}),
+                        }
+                        for m in seg.messages
+                    ],
                     metadata=SegmentMetadata(
                         code_refs=segment_code_refs.get(seg.id, []),
                         turn_count=seg.turn_count,
-                        canonical_turn_ids=list(segment_canonical_turn_ids.get(seg.id, [])),
+                        canonical_turn_ids=(
+                            list(exact_ids)
+                            if exact_ids
+                            else list(segment_canonical_turn_ids.get(seg.id, []))
+                        ),
                         start_turn_number=turn_range[0] if turn_range else -1,
                         end_turn_number=(turn_range[1] - 1) if turn_range and turn_range[1] > turn_range[0] else -1,
                         generated_by_turn_id=generated_by_turn_id,
                         session_date=getattr(seg, "session_date", ""),
+                        source_mapping_complete=mapping_complete,
                     ),
                     compression_ratio=1.0,
                     timestamp=seg.start_timestamp,
@@ -1273,10 +1512,49 @@ class CompactionPipeline:
 
                 if best_candidate is not None:
                     # Combine turns: prepend existing segment's messages
-                    candidate_messages = [
-                        Message(role=m.get("role", "user"), content=m.get("content", ""))
-                        for m in best_candidate.messages
-                    ]
+                    old_meta = best_candidate.metadata
+                    old_ids = list(
+                        getattr(old_meta, "canonical_turn_ids", []) or []
+                    )
+                    old_complete = bool(
+                        old_meta
+                        and getattr(old_meta, "source_mapping_complete", False)
+                        and old_ids
+                        and all(cid in physical_by_id for cid in old_ids)
+                    )
+                    if old_complete:
+                        candidate_messages = []
+                        for cid in old_ids:
+                            old_row = physical_by_id[cid]
+                            if (old_row.user_content or "").strip():
+                                metadata = {
+                                    SOURCE_CANONICAL_TURN_IDS_KEY: [cid],
+                                }
+                                if (old_row.sender or "").strip():
+                                    metadata["sender"] = {"name": old_row.sender}
+                                candidate_messages.append(Message(
+                                    role="user",
+                                    content=old_row.user_content,
+                                    metadata=metadata,
+                                ))
+                            if (old_row.assistant_content or "").strip():
+                                candidate_messages.append(Message(
+                                    role="assistant",
+                                    content=old_row.assistant_content,
+                                    metadata={
+                                        SOURCE_CANONICAL_TURN_IDS_KEY: [cid],
+                                    },
+                                ))
+                    else:
+                        candidate_messages = [
+                            Message(
+                                role=m.get("role", "user"),
+                                content=m.get("content", ""),
+                                metadata=(m.get("metadata") or None),
+                            )
+                            for m in best_candidate.messages
+                        ]
+                    merged_mapping_prereqs[seg.id] = old_complete
                     seg.messages = candidate_messages + list(seg.messages)
                     seg.merge_ref = best_candidate.ref
                     seg.token_count += best_candidate.full_tokens
@@ -1347,11 +1625,6 @@ class CompactionPipeline:
         # not from the positional cursor above: the cursor walks logical merged
         # rows and cannot survive noncontiguous topic grouping or a session
         # split, so it is not a safe basis for deciding who authored a fact.
-        physical_by_id = {
-            row.canonical_turn_id: row
-            for rows_in_group in self._physical_rows_by_group().values()
-            for row in rows_in_group
-        }
         actor_rosters_by_segment = {
             seg.id: self._build_actor_roster(seg, physical_by_id)
             for seg in compactable
@@ -1392,6 +1665,15 @@ class CompactionPipeline:
             # or synthesized segment), and mark that mapping incomplete so no
             # fact author is derived from it.
             exact_ids, mapping_complete = exact_source_ids.get(seg.id, ([], False))
+            mapping_complete = bool(
+                mapping_complete
+                and exact_ids
+                and all(cid in physical_by_id for cid in exact_ids)
+                and (
+                    not seg.merge_ref
+                    or merged_mapping_prereqs.get(seg.id, False)
+                )
+            )
             if exact_ids:
                 result.metadata.canonical_turn_ids = list(exact_ids)
                 result.metadata.source_mapping_complete = bool(mapping_complete)
@@ -1496,7 +1778,13 @@ class CompactionPipeline:
             )
 
             _seg_ref = stored.ref
-            if result.facts:
+            _existing_facts_before = self._store.get_facts_by_segment(_seg_ref)
+            if result.facts or _existing_facts_before:
+                _actors_to_rebuild = {
+                    (fact.author_actor_id or "").strip()
+                    for fact in [*_existing_facts_before, *result.facts]
+                    if (fact.author_actor_id or "").strip()
+                }
                 for fact in result.facts:
                     fact.segment_ref = _seg_ref
                     fact.conversation_id = self._config.conversation_id
@@ -1540,6 +1828,18 @@ class CompactionPipeline:
                             operation_id=operation_id,
                             guard_kwargs=self._compaction_guard_kwargs(operation_id),
                         )
+                    for actor_id in sorted(_actors_to_rebuild):
+                        try:
+                            self._rebuild_actor_card(actor_id)
+                        except Exception:
+                            # replace_facts_for_segment already dirtied the
+                            # profile in the same transaction. A failed
+                            # curation therefore leaves the old entries
+                            # auditable but unreadable.
+                            logger.warning(
+                                "actor card rebuild failed actor=%s",
+                                actor_id[:24], exc_info=True,
+                            )
                 _superseded_count = 0
                 _links_count = 0
                 # C2R gate (fencing plan §7.2 #7/#8): backlog-sweeper

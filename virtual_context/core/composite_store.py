@@ -538,6 +538,19 @@ class CompositeStore:
             return []
         return list_by_target(target_id)
 
+    def resolve_request_audience(
+        self,
+        tenant_id: str,
+        audience_conversation_id: str,
+        owner_conversation_id: str,
+    ) -> str:
+        resolver = getattr(self._segments, "resolve_request_audience", None)
+        if not callable(resolver):
+            return ""
+        return str(resolver(
+            tenant_id, audience_conversation_id, owner_conversation_id,
+        ) or "")
+
     # ------------------------------------------------------------------
     # FactStore
     # ------------------------------------------------------------------
@@ -625,6 +638,7 @@ class CompositeStore:
         operation_id: str | None = None,
         owner_worker_id: str | None = None,
         lifecycle_epoch: int | None = None,
+        expected_lifecycle_epoch: int | None = None,
     ) -> tuple[int, int]:
         return self._facts.replace_facts_for_segment(
             conversation_id,
@@ -633,6 +647,7 @@ class CompositeStore:
             operation_id=operation_id,
             owner_worker_id=owner_worker_id,
             lifecycle_epoch=lifecycle_epoch,
+            expected_lifecycle_epoch=expected_lifecycle_epoch,
         )
 
     def search_facts(self, query: str, limit: int = 10, conversation_id: str | None = None) -> list[Fact]:
@@ -983,6 +998,14 @@ class CompositeStore:
         if callable(fn):
             return list(fn(tenant_id, actor_id, limit=limit))
         return []
+
+    def get_actor_profile(self, tenant_id: str, actor_id: str):
+        fn = getattr(self._facts, "get_actor_profile", None)
+        return fn(tenant_id, actor_id) if callable(fn) else None
+
+    def mark_actor_card_dirty(self, tenant_id: str, actor_id: str) -> bool:
+        fn = getattr(self._facts, "mark_actor_card_dirty", None)
+        return bool(fn(tenant_id, actor_id)) if callable(fn) else False
 
     def replace_actor_card(
         self,

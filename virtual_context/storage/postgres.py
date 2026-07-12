@@ -56,6 +56,7 @@ from ..types import (
     ActorCardEntry,
     ActorCardEntrySource,
     ActorFactSource,
+    ActorProfile,
 )
 from .helpers import dt_to_str as _dt_to_str, str_to_dt as _str_to_dt, extract_excerpt as _extract_excerpt
 
@@ -749,6 +750,9 @@ def _row_to_segment(row: dict, tags: list[str]) -> StoredSegment:
             end_turn_number=metadata_raw.get("end_turn_number", -1),
             generated_by_turn_id=metadata_raw.get("generated_by_turn_id", ""),
             session_date=metadata_raw.get("session_date", ""),
+            source_mapping_complete=bool(
+                metadata_raw.get("source_mapping_complete", False)
+            ),
         ),
         created_at=_str_to_dt(row["created_at"]),
         start_timestamp=_str_to_dt(row["start_timestamp"]),
@@ -779,6 +783,9 @@ def _row_to_summary(row: dict, tags: list[str]) -> StoredSummary:
             end_turn_number=metadata_raw.get("end_turn_number", -1),
             generated_by_turn_id=metadata_raw.get("generated_by_turn_id", ""),
             session_date=metadata_raw.get("session_date", ""),
+            source_mapping_complete=bool(
+                metadata_raw.get("source_mapping_complete", False)
+            ),
         ),
         created_at=_str_to_dt(row["created_at"]),
         start_timestamp=_str_to_dt(row["start_timestamp"]),
@@ -2382,6 +2389,9 @@ class PostgresStore(ContextStore):
                 "start_turn_number": getattr(segment.metadata, "start_turn_number", -1),
                 "end_turn_number": getattr(segment.metadata, "end_turn_number", -1),
                 "generated_by_turn_id": getattr(segment.metadata, "generated_by_turn_id", ""),
+                "source_mapping_complete": bool(
+                    getattr(segment.metadata, "source_mapping_complete", False)
+                ),
             }
             if segment.metadata.session_date:
                 metadata_dict["session_date"] = segment.metadata.session_date
@@ -3018,6 +3028,12 @@ class PostgresStore(ContextStore):
         """
         with self.pool.connection() as conn:
             with conn.transaction():
+                # Coordinate with delete/merge before observing the epoch.
+                conn.execute(
+                    """SELECT 1 FROM conversation_lifecycle
+                        WHERE conversation_id = %s FOR SHARE""",
+                    (conversation_id,),
+                ).fetchone()
                 row = conn.execute(
                     """
                     SELECT lifecycle_epoch, phase,
@@ -5494,6 +5510,30 @@ class PostgresStore(ContextStore):
                         WHERE conversation_id = %s FOR UPDATE""",
                     (conversation_id,),
                 ).fetchone()
+                tenant_row = conn.execute(
+                    """SELECT tenant_id FROM conversations
+                        WHERE conversation_id = %s""",
+                    (conversation_id,),
+                ).fetchone()
+                deleted_tenant = (
+                    (tenant_row["tenant_id"] or "") if tenant_row else ""
+                )
+                profile_actor_ids = {
+                    (row["actor_id"] or "").strip()
+                    for row in conn.execute(
+                        """SELECT sender_actor_id AS actor_id
+                             FROM canonical_turns
+                            WHERE conversation_id = %s
+                              AND sender_actor_id <> ''
+                            UNION
+                           SELECT author_actor_id AS actor_id
+                             FROM facts
+                            WHERE conversation_id = %s
+                              AND author_actor_id <> ''""",
+                        (conversation_id, conversation_id),
+                    ).fetchall()
+                    if (row["actor_id"] or "").strip()
+                }
 
                 # Capture and dirty affected cards BEFORE any fact is deleted:
                 # actor_card_entry_sources.fact_id cascades on fact delete, so
@@ -5531,7 +5571,9 @@ class PostgresStore(ContextStore):
 
                 # A profile with no surviving actor rows and no surviving facts
                 # is not a person we know anything about any more.
-                self._prune_orphan_actor_profiles(conn)
+                self._prune_orphan_actor_profiles(
+                    conn, deleted_tenant, profile_actor_ids,
+                )
 
             # Disk cleanup: remove media files for this conversation
             import os
@@ -6801,6 +6843,40 @@ class PostgresStore(ContextStore):
             ).fetchone()
             return row["target_id"] if row else None
 
+    def resolve_request_audience(
+        self,
+        tenant_id: str,
+        audience_conversation_id: str,
+        owner_conversation_id: str,
+    ) -> str:
+        """Prove that a raw route belongs to this tenant and resolves to owner."""
+        audience = (audience_conversation_id or "").strip()
+        owner_id = (owner_conversation_id or "").strip()
+        if not audience or not owner_id:
+            return ""
+        with self.pool.connection() as conn:
+            owner = self._resolve_owner(conn, owner_id)
+            if not owner or self._resolve_owner(conn, audience) != owner:
+                return ""
+            owner_row = conn.execute(
+                """SELECT 1 FROM conversations
+                    WHERE conversation_id = %s AND tenant_id = %s
+                      AND phase NOT IN ('deleted', 'merged')
+                      AND deleted_at IS NULL""",
+                (owner, tenant_id),
+            ).fetchone()
+            audience_row = conn.execute(
+                """SELECT 1 FROM conversations
+                    WHERE conversation_id = %s AND tenant_id = %s
+                      AND phase <> 'deleted' AND deleted_at IS NULL""",
+                (audience, tenant_id),
+            ).fetchone()
+            return (
+                audience
+                if owner_row is not None and audience_row is not None
+                else ""
+            )
+
     def delete_conversation_alias(
         self,
         alias_id: str,
@@ -7288,6 +7364,8 @@ class PostgresStore(ContextStore):
                     continue
                 sets: list[str] = []
                 params: list[object] = []
+                conflict_clauses: list[str] = []
+                conflict_params: list[object] = []
                 for field_name in fields:
                     value = (edge.get(field_name) or "").strip()
                     if not value:
@@ -7297,6 +7375,11 @@ class PostgresStore(ContextStore):
                         f"THEN %s ELSE {field_name} END"
                     )
                     params.append(value)
+                    conflict_clauses.append(
+                        f" AND (COALESCE(BTRIM({field_name}), '') = '' "
+                        f"OR BTRIM({field_name}) = %s)"
+                    )
+                    conflict_params.append(value)
                 for version_field in (
                     "reply_attribution_version",
                     "audience_attribution_version",
@@ -7317,6 +7400,8 @@ class PostgresStore(ContextStore):
                     " AND canonical_turn_id = %s"
                 )
                 params.extend([now, conversation_id, canonical_turn_id])
+                sql += "".join(conflict_clauses)
+                params.extend(conflict_params)
                 if expected_lifecycle_epoch is not None:
                     sql += (
                         " AND EXISTS (SELECT 1 FROM conversations c"
@@ -8418,6 +8503,7 @@ class PostgresStore(ContextStore):
         operation_id: str | None = None,
         owner_worker_id: str | None = None,
         lifecycle_epoch: int | None = None,
+        expected_lifecycle_epoch: int | None = None,
     ) -> tuple[int, int]:
         """Atomically replace all facts for a segment.
 
@@ -8457,6 +8543,19 @@ class PostgresStore(ContextStore):
 
         with self.pool.connection() as conn:
             with conn.transaction():
+                if expected_lifecycle_epoch is not None:
+                    # Lifecycle rows are created lazily, so a missing row is
+                    # not a liveness verdict; upsert-then-lock keeps the merge
+                    # coordination real without refusing legacy conversations.
+                    self._acquire_lifecycle_share_lock(conn, conversation_id)
+                    live = conn.execute(
+                        """SELECT 1 FROM conversations
+                            WHERE conversation_id = %s AND lifecycle_epoch = %s
+                              AND phase <> 'deleted'""",
+                        (conversation_id, expected_lifecycle_epoch),
+                    ).fetchone()
+                    if live is None:
+                        return (0, 0)
                 if guard_all:
                     # Probe ownership BEFORE the DELETE.
                     row = conn.execute(
@@ -8637,12 +8736,21 @@ class PostgresStore(ContextStore):
         return int(result.rowcount or 0)
 
     def _resolve_owner(self, conn, conversation_id: str) -> str:
-        """Follow an alias to its target, if the id is an alias."""
-        row = conn.execute(
-            "SELECT target_id FROM conversation_aliases WHERE alias_id = %s",
-            (conversation_id,),
-        ).fetchone()
-        return (row["target_id"] if row else conversation_id) or conversation_id
+        """Follow a bounded alias chain to its terminal, failing on cycles."""
+        current = (conversation_id or "").strip()
+        seen: set[str] = set()
+        for _ in range(8):
+            if not current or current in seen:
+                return ""
+            seen.add(current)
+            row = conn.execute(
+                "SELECT target_id FROM conversation_aliases WHERE alias_id = %s",
+                (current,),
+            ).fetchone()
+            if row is None or not (row["target_id"] or "").strip():
+                return current
+            current = (row["target_id"] or "").strip()
+        return ""
 
     def upsert_actor_profile_from_turn(
         self,
@@ -8665,6 +8773,11 @@ class PostgresStore(ContextStore):
             return False
         with self.pool.connection() as conn:
             with conn.transaction():
+                # Lifecycle rows are created lazily, so a missing row is not
+                # a liveness verdict; the conversations row below is. The
+                # upsert-then-lock keeps merge coordination real for legacy
+                # conversations that predate the lifecycle table.
+                self._acquire_lifecycle_share_lock(conn, conversation_id)
                 row = conn.execute(
                     """SELECT tenant_id, lifecycle_epoch FROM conversations
                         WHERE conversation_id = %s AND phase <> 'deleted'""",
@@ -8742,8 +8855,9 @@ class PostgresStore(ContextStore):
             """SELECT canonical_turn_id, user_content, audience_conversation_id,
                       audience_attribution_version, origin_channel_id
                  FROM canonical_turns
-                WHERE canonical_turn_id = ANY(%s)""",
-            (list(set(ids)),),
+                WHERE conversation_id = %s
+                  AND canonical_turn_id = ANY(%s)""",
+            (fact.conversation_id, list(set(ids))),
         ).fetchall()
         if len(rows) != len(set(ids)):
             return None
@@ -8792,7 +8906,7 @@ class PostgresStore(ContextStore):
                       AND c.phase NOT IN ('deleted', 'merged')
                       AND f.superseded_by IS NULL
                       AND f.author_attribution_version > 0
-                    ORDER BY f.mentioned_at DESC""",
+                    ORDER BY f.mentioned_at DESC, f.id""",
                 (actor_id, tenant_id),
             ).fetchall()
 
@@ -8826,6 +8940,36 @@ class PostgresStore(ContextStore):
                 if len(out) >= max(0, int(limit)):
                     break
             return out
+
+    def get_actor_profile(self, tenant_id: str, actor_id: str) -> ActorProfile | None:
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                """SELECT * FROM actor_profiles
+                    WHERE tenant_id = %s AND actor_id = %s""",
+                (tenant_id, actor_id),
+            ).fetchone()
+        if row is None:
+            return None
+        return ActorProfile(
+            tenant_id=row["tenant_id"], actor_id=row["actor_id"],
+            platform=row["platform"] or "", display_name=row["display_name"] or "",
+            first_seen_at=_dt_to_str(row["first_seen_at"]),
+            last_seen_at=_dt_to_str(row["last_seen_at"]),
+            card_built_at=(
+                _dt_to_str(row["card_built_at"]) if row["card_built_at"] else None
+            ),
+            card_dirty=bool(row["card_dirty"]),
+            card_input_hash=row["card_input_hash"] or "",
+        )
+
+    def mark_actor_card_dirty(self, tenant_id: str, actor_id: str) -> bool:
+        with self.pool.connection() as conn:
+            cur = conn.execute(
+                """UPDATE actor_profiles SET card_dirty = 1
+                    WHERE tenant_id = %s AND actor_id = %s""",
+                (tenant_id, actor_id),
+            )
+            return int(cur.rowcount or 0) == 1
 
     def replace_actor_card(
         self,
@@ -8861,11 +9005,24 @@ class PostgresStore(ContextStore):
                                 src.audience_conversation_id)
                     if cid
                 } | set(expected))
+                # Upsert-then-lock: FOR SHARE on a row that does not exist yet
+                # locks nothing, which would let a concurrent merge create the
+                # row and proceed unserialized against this write.
                 for cid in conv_ids:
+                    self._acquire_lifecycle_share_lock(conn, cid)
+
+                # The entry id is globally unique. Lock its key even when no
+                # row exists yet, otherwise two tenants can both pass the
+                # collision SELECT and the later ON CONFLICT path lets one
+                # rewrite the other's entry. Sorted advisory locks also make a
+                # multi-entry replacement deadlock-safe.
+                for entry_id in sorted({
+                    entry.id for entry, _sources in entries_with_sources
+                    if entry.id
+                }):
                     conn.execute(
-                        """SELECT 1 FROM conversation_lifecycle
-                            WHERE conversation_id = %s FOR SHARE""",
-                        (cid,),
+                        "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                        (entry_id,),
                     ).fetchone()
 
                 prof = conn.execute(
@@ -8889,13 +9046,75 @@ class PostgresStore(ContextStore):
                     if row is None or int(row["lifecycle_epoch"] or 0) != int(epoch):
                         return 0
 
-                for _entry, sources in entries_with_sources:
+                normalized_entries: list[
+                    tuple[ActorCardEntry, list[ActorCardEntrySource]]
+                ] = []
+                for entry, sources in entries_with_sources:
+                    collision = conn.execute(
+                        """SELECT tenant_id, actor_id FROM actor_card_entries
+                            WHERE id = %s""",
+                        (entry.id,),
+                    ).fetchone()
+                    if collision is not None and (
+                        collision["tenant_id"] != tenant_id
+                        or collision["actor_id"] != actor_id
+                    ):
+                        return 0
+                    if not sources:
+                        return 0
+                    normalized_sources: list[ActorCardEntrySource] = []
                     for src in sources:
-                        hit = conn.execute(
-                            "SELECT 1 FROM facts WHERE id = %s", (src.fact_id,),
+                        fact_row = conn.execute(
+                            """SELECT f.*, c.lifecycle_epoch AS _owner_epoch
+                                 FROM facts f
+                                 JOIN conversations c
+                                   ON c.conversation_id = f.conversation_id
+                                WHERE f.id = %s AND f.author_actor_id = %s
+                                  AND f.superseded_by IS NULL
+                                  AND c.tenant_id = %s
+                                  AND c.phase NOT IN ('deleted', 'merged')""",
+                            (src.fact_id, actor_id, tenant_id),
                         ).fetchone()
-                        if hit is None:
+                        if fact_row is None:
                             return 0
+                        fact = self._row_to_fact(fact_row)
+                        derived = self._fact_audience(conn, fact)
+                        if derived is None:
+                            return 0
+                        audience_id, channel_id = derived
+                        audience_row = conn.execute(
+                            """SELECT lifecycle_epoch FROM conversations
+                                WHERE conversation_id = %s AND tenant_id = %s
+                                  AND phase <> 'deleted'""",
+                            (audience_id, tenant_id),
+                        ).fetchone()
+                        owner_id = fact.conversation_id
+                        owner_epoch = int(fact_row["_owner_epoch"] or 0)
+                        audience_epoch = (
+                            int(audience_row["lifecycle_epoch"] or 0)
+                            if audience_row is not None else -1
+                        )
+                        if (
+                            audience_row is None
+                            or expected.get(owner_id) != owner_epoch
+                            or expected.get(audience_id) != audience_epoch
+                            or (src.entry_id or "") != entry.id
+                            or (src.tenant_id or "") != tenant_id
+                            or (src.owner_conversation_id or "") != owner_id
+                            or (src.audience_conversation_id or "") != audience_id
+                            or (src.audience_channel_id or "") != channel_id
+                        ):
+                            return 0
+                        normalized_sources.append(ActorCardEntrySource(
+                            entry_id=entry.id,
+                            tenant_id=tenant_id,
+                            owner_conversation_id=owner_id,
+                            audience_conversation_id=audience_id,
+                            audience_channel_id=channel_id,
+                            fact_id=fact.id,
+                        ))
+                    normalized_entries.append((entry, normalized_sources))
+                entries_with_sources = normalized_entries
 
                 # Supersede the currently-active entries rather than deleting,
                 # mirroring how facts already work.
@@ -8942,8 +9161,9 @@ class PostgresStore(ContextStore):
                         ),
                     )
                     conn.execute(
-                        "DELETE FROM actor_card_entry_sources WHERE entry_id = %s",
-                        (entry.id,),
+                        """DELETE FROM actor_card_entry_sources
+                            WHERE entry_id = %s AND tenant_id = %s""",
+                        (entry.id, tenant_id),
                     )
                     for src in sources:
                         # Provenance is set from the authoritative fact row by
@@ -9007,10 +9227,20 @@ class PostgresStore(ContextStore):
                 return None
             orow = conn.execute(
                 """SELECT 1 FROM conversations
-                    WHERE conversation_id = %s AND tenant_id = %s""",
+                    WHERE conversation_id = %s AND tenant_id = %s
+                      AND phase NOT IN ('deleted', 'merged')
+                      AND deleted_at IS NULL""",
                 (owner, tenant_id),
             ).fetchone()
             if orow is None:
+                return None
+            arow = conn.execute(
+                """SELECT 1 FROM conversations
+                    WHERE conversation_id = %s AND tenant_id = %s
+                      AND phase <> 'deleted' AND deleted_at IS NULL""",
+                (audience_conversation_id, tenant_id),
+            ).fetchone()
+            if arow is None:
                 return None
 
             prof = conn.execute(
@@ -9140,16 +9370,35 @@ class PostgresStore(ContextStore):
             )
         return len(entry_ids)
 
-    def _prune_orphan_actor_profiles(self, conn) -> int:
-        """Drop profiles with no surviving actor rows and no surviving facts."""
+    def _prune_orphan_actor_profiles(
+        self,
+        conn,
+        tenant_id: str,
+        actor_ids,
+    ) -> int:
+        """Drop only deleted-conversation actors that now have no sources."""
+        actor_ids = sorted({actor for actor in actor_ids if actor})
+        if not tenant_id or not actor_ids:
+            return 0
         result = conn.execute(
             """DELETE FROM actor_profiles p
-                WHERE NOT EXISTS (
-                        SELECT 1 FROM canonical_turns ct
-                         WHERE ct.sender_actor_id = p.actor_id)
+                WHERE p.tenant_id = %s
+                  AND p.actor_id = ANY(%s)
                   AND NOT EXISTS (
-                        SELECT 1 FROM facts f
-                         WHERE f.author_actor_id = p.actor_id)"""
+                        SELECT 1
+                          FROM canonical_turns ct
+                          JOIN conversations c
+                            ON c.conversation_id = ct.conversation_id
+                         WHERE ct.sender_actor_id = p.actor_id
+                           AND c.tenant_id = p.tenant_id)
+                  AND NOT EXISTS (
+                        SELECT 1
+                          FROM facts f
+                          JOIN conversations c
+                            ON c.conversation_id = f.conversation_id
+                         WHERE f.author_actor_id = p.actor_id
+                           AND c.tenant_id = p.tenant_id)""",
+            (tenant_id, actor_ids),
         )
         return int(result.rowcount or 0)
 
