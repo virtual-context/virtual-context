@@ -725,6 +725,7 @@ class DomainCompactor:
                 "role": m.role,
                 "content": m.content,
                 "timestamp": m.timestamp.isoformat() if m.timestamp else None,
+                **({"metadata": m.metadata} if m.metadata else {}),
             }
             for m in segment.messages
         ]
@@ -909,7 +910,9 @@ class DomainCompactor:
                     # empty — it never falls back to the other human in the
                     # exchange, which is precisely the contamination this
                     # partition exists to prevent.
-                    fact.author_actor_id = lane.actor_id or ""
+                    fact.author_actor_id = (
+                        (lane.actor_id or "") if roster.complete else ""
+                    )
                 out.extend([fact])
         return out
 
