@@ -453,7 +453,12 @@ def _normalize_actor_id(platform: str, user_id: str) -> str:
     return f"actor:{platform}:{user_id}"
 
 
-def get_actor_id(metadata: dict | None, conversation_key: str = "") -> str:
+def get_actor_id(
+    metadata: dict | None,
+    conversation_key: str = "",
+    *,
+    platform_override: str = "",
+) -> str:
     """Derive the durable actor id for one message, or ``""``.
 
     Two accepted sources: a normalized ``actor`` block carrying ``platform`` +
@@ -470,7 +475,12 @@ def get_actor_id(metadata: dict | None, conversation_key: str = "") -> str:
     fall back to actor-then-conversation-info on the merged dict.
 
     Never guesses a platform and never mints ``actor:unknown:<id>``: an id that
-    collides across platforms is worse than no id. Side-effect free.
+    collides across platforms is worse than no id. ``platform_override`` is an
+    explicit operator assertion of provenance (admin backfills over
+    conversations whose caller keys never named a platform); it substitutes
+    for key parsing in the conversation-info branch only and is still
+    validated by normalization. An ``actor`` block's own platform is
+    adapter-asserted and is never overridden. Side-effect free.
     """
     if not isinstance(metadata, dict):
         return ""
@@ -496,7 +506,10 @@ def get_actor_id(metadata: dict | None, conversation_key: str = "") -> str:
             value.get("platform", ""), value.get("user_id", ""),
         )
     if source == "conversation info":
-        platform = get_platform_from_conversation_key(conversation_key)
+        platform = (
+            (platform_override or "").strip()
+            or get_platform_from_conversation_key(conversation_key)
+        )
         if not platform:
             return ""
         sender_id = value.get("sender_id")

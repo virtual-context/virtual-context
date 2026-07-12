@@ -3102,8 +3102,15 @@ class VirtualContextEngine:
         *,
         dry_run: bool = False,
         limit: int | None = None,
+        platform: str = "",
     ) -> dict:
-        """Recover actor ids from the provider-effective retained user text."""
+        """Recover actor ids from the provider-effective retained user text.
+
+        ``platform`` is an explicit operator assertion of provenance for
+        conversations whose caller keys never named a platform (legacy or
+        opaque ids). It is never inferred; passing it means the operator is
+        signing where these rows came from.
+        """
         if not conversation_id:
             raise ValueError("backfill_actors requires a non-empty conversation_id")
         self._require_actor_sql_store()
@@ -3141,7 +3148,10 @@ class VirtualContextEngine:
                 _clean, metadata = _extract_envelope_metadata(text)
                 origin = (row.origin_conversation_id or "").strip()
                 provenance_key = origin or conversation_id
-                actor_id = get_actor_id(metadata, provenance_key)
+                actor_id = get_actor_id(
+                    metadata, provenance_key,
+                    platform_override=platform,
+                )
                 if not actor_id:
                     # Identity may be present but unusable because the winning
                     # snapshot and stable key together prove no platform.
