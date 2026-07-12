@@ -247,12 +247,17 @@ def get_sender_name(metadata: dict | None) -> str | None:
         name = sender.get("name") or sender.get("display_name") or sender.get("label")
         if name:
             return name
-    # Fallback: conversation info block often has a "sender" string field
+    # Fallback: conversation info block carries a "sender" field, either a
+    # plain string or a nested object with name/username fields
     conv_info = metadata.get("conversation info")
     if conv_info and isinstance(conv_info, dict):
         name = conv_info.get("sender")
         if name and isinstance(name, str):
             return name
+        if isinstance(name, dict):
+            nested = name.get("name") or name.get("display_name") or name.get("username")
+            if nested and isinstance(nested, str):
+                return nested
     return None
 
 
@@ -353,7 +358,7 @@ SOURCE_CANONICAL_TURN_IDS_KEY = "_vc_source_canonical_turn_ids"
 # ``_STABLE_CHANNEL_KEY_RE``: that one captures the trailing channel id and
 # rejects DM keys, but a DM still has an actor.
 _STABLE_ACTOR_PLATFORM_RE = re.compile(
-    r'^(?:sk:)?agent:[^:]+:([^:]+):(?:channel|group|direct|dm):[^:]+$'
+    r'^(?:sk:)?agent:[^:]+:([^:]+):(?:channel|group|guild|direct|dm):.+$'
 )
 
 _ACTOR_PLATFORM_CHARS_RE = re.compile(r'^[a-z0-9._-]+$')
@@ -389,12 +394,34 @@ def is_actor_identity_block(parsed: object) -> bool:
     )
 
 
+def _nested_sender_id(parsed: dict) -> str:
+    """Sender id from a dict-valued ``sender`` field, else ``""``.
+
+    Adapters ship the sender as a nested object (``"sender": {"id": ...,
+    "name": ...}``) rather than a flat ``sender_id``. Only a string id
+    counts; numbers are not coerced, matching the flat-field rule.
+    """
+    sender = parsed.get("sender")
+    if isinstance(sender, dict):
+        sender_id = sender.get("id")
+        if isinstance(sender_id, str):
+            return sender_id
+    return ""
+
+
 def is_conversation_info_identity_block(parsed: object) -> bool:
-    """Is a ``Conversation info`` block syntactically identity-bearing?"""
+    """Is a ``Conversation info`` block syntactically identity-bearing?
+
+    Accepts the flat ``sender_id`` field and the nested ``sender.id`` object
+    form. Syntax only: it claims the first-block slot even when normalization
+    later rejects it.
+    """
     if not isinstance(parsed, dict):
         return False
     sender_id = parsed.get("sender_id")
-    return isinstance(sender_id, str) and bool(sender_id.strip())
+    if isinstance(sender_id, str) and bool(sender_id.strip()):
+        return True
+    return bool(_nested_sender_id(parsed).strip())
 
 
 def get_platform_from_conversation_key(conversation_key: str) -> str:
@@ -472,7 +499,10 @@ def get_actor_id(metadata: dict | None, conversation_key: str = "") -> str:
         platform = get_platform_from_conversation_key(conversation_key)
         if not platform:
             return ""
-        return _normalize_actor_id(platform, value.get("sender_id", ""))
+        sender_id = value.get("sender_id")
+        if not (isinstance(sender_id, str) and sender_id.strip()):
+            sender_id = _nested_sender_id(value)
+        return _normalize_actor_id(platform, sender_id)
     return ""
 
 
