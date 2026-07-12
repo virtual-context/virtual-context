@@ -184,6 +184,7 @@ class VirtualContextEngine:
         from .core.exceptions import EngineConstructionError
 
         _raw_store = self._build_raw_store()
+        self._validate_actor_card_store(_raw_store)
         _raw_conv_id = self.config.conversation_id
         if _raw_conv_id:
             try:
@@ -881,6 +882,47 @@ class VirtualContextEngine:
             raise ValueError(f"Unsupported storage backend: {self.config.storage.backend}")
 
         return store
+
+    def _validate_actor_card_store(self, store) -> None:
+        """Fail closed unless cards share one transactional SQL delegate."""
+        if not getattr(self.config.assembler, "actor_card_enabled", False):
+            return
+        from .core.composite_store import CompositeStore
+        from .storage.sqlite import SQLiteStore
+
+        if not isinstance(store, CompositeStore):
+            raise ValueError(
+                "actor cards require a co-located SQLite or Postgres store"
+            )
+        segments = store._segments
+        facts = store._facts
+        is_sql = isinstance(facts, SQLiteStore) or (
+            facts.__class__.__name__ == "PostgresStore"
+            and facts.__class__.__module__ == "virtual_context.storage.postgres"
+        )
+        if facts is not segments or not is_sql:
+            raise ValueError(
+                "actor cards require segment, lifecycle, fact, and card writes "
+                "on the same SQLite or Postgres delegate"
+            )
+
+    def _require_actor_sql_store(self, *, cards: bool = False) -> None:
+        """Refuse actor migrations on stores without physical SQL rows."""
+        from .core.composite_store import CompositeStore
+
+        store = getattr(self._store, "_store", self._store)
+        if not isinstance(store, CompositeStore):
+            raise RuntimeError("actor administration requires SQLite or Postgres")
+        segments = store._segments
+        facts = store._facts
+        is_sql = isinstance(segments, SQLiteStore) or (
+            segments.__class__.__name__ == "PostgresStore"
+            and segments.__class__.__module__ == "virtual_context.storage.postgres"
+        )
+        if not is_sql or (cards and facts is not segments):
+            raise RuntimeError(
+                "actor administration requires co-located SQLite or Postgres storage"
+            )
 
     def _init_store_view(self, raw_store) -> None:
         """Activate the conversation generation and install the store view.
@@ -3024,6 +3066,418 @@ class VirtualContextEngine:
             return ""
         match = _STABLE_CHANNEL_KEY_RE.match(key.strip())
         return match.group(1) if match else ""
+
+    @staticmethod
+    def _effective_raw_text(raw_content: str | None) -> str:
+        """Select the one provider-effective text block retained on a row."""
+        if not isinstance(raw_content, str) or not raw_content.strip():
+            return ""
+        stripped = raw_content.strip()
+        if not stripped.startswith(("[", "{")):
+            return raw_content
+        try:
+            decoded = json.loads(stripped)
+        except (json.JSONDecodeError, ValueError):
+            return raw_content
+        if isinstance(decoded, dict):
+            return decoded.get("text", "") if isinstance(decoded.get("text"), str) else ""
+        if not isinstance(decoded, list):
+            return ""
+        typed = [block for block in decoded if isinstance(block, dict)]
+        if any(block.get("type") in {"input_text", "output_text"} for block in typed):
+            return "\n".join(
+                block["text"]
+                for block in typed
+                if block.get("type") in {"input_text", "output_text", "text"}
+                and isinstance(block.get("text"), str)
+            )
+        for block in reversed(typed):
+            if block.get("type") == "text" and isinstance(block.get("text"), str):
+                return block["text"]
+        return ""
+
+    def backfill_actors(
+        self,
+        conversation_id: str,
+        *,
+        dry_run: bool = False,
+        limit: int | None = None,
+    ) -> dict:
+        """Recover actor ids from the provider-effective retained user text."""
+        if not conversation_id:
+            raise ValueError("backfill_actors requires a non-empty conversation_id")
+        self._require_actor_sql_store()
+        cas = getattr(self._store, "update_canonical_turn_actors_if_empty", None)
+        if not callable(cas):
+            raise RuntimeError("the configured store has no physical actor CAS")
+
+        report = {
+            "eligible": 0, "updated": 0, "skipped_existing": 0,
+            "skipped_no_raw": 0, "skipped_no_identity": 0,
+            "skipped_no_platform": 0, "failed": 0, "dry_run": bool(dry_run),
+        }
+        from .proxy._envelope import _extract_envelope_metadata
+        from .types import get_actor_id, get_actor_display_name
+
+        upgrades: dict[str, str] = {}
+        names: dict[str, str] = {}
+        for row in self._store.get_all_canonical_turns(conversation_id):
+            if limit is not None and len(upgrades) >= limit:
+                break
+            if (row.sender_actor_id or "").strip():
+                report["skipped_existing"] += 1
+                continue
+            if not (row.user_content or "").strip():
+                continue
+            if not (row.user_raw_content or "").strip():
+                report["skipped_no_raw"] += 1
+                continue
+            report["eligible"] += 1
+            try:
+                text = self._effective_raw_text(row.user_raw_content)
+                if not text:
+                    report["skipped_no_identity"] += 1
+                    continue
+                _clean, metadata = _extract_envelope_metadata(text)
+                origin = (row.origin_conversation_id or "").strip()
+                provenance_key = origin or conversation_id
+                actor_id = get_actor_id(metadata, provenance_key)
+                if not actor_id:
+                    # Identity may be present but unusable because the winning
+                    # snapshot and stable key together prove no platform.
+                    if "sender_id" in text or '"id"' in text:
+                        report["skipped_no_platform"] += 1
+                    else:
+                        report["skipped_no_identity"] += 1
+                    continue
+                if row.canonical_turn_id:
+                    upgrades[row.canonical_turn_id] = actor_id
+                    names[row.canonical_turn_id] = get_actor_display_name(metadata)
+            except Exception:
+                report["failed"] += 1
+
+        if dry_run:
+            report["updated"] = len(upgrades)
+            return report
+        epoch = self._store.get_lifecycle_epoch(conversation_id)
+        report["updated"] = int(cas(
+            conversation_id, upgrades, expected_lifecycle_epoch=epoch,
+        ))
+        upsert = getattr(self._store, "upsert_actor_profile_from_turn", None)
+        if callable(upsert):
+            now = datetime.now(timezone.utc).isoformat()
+            accepted = {
+                row.canonical_turn_id: (row.sender_actor_id or "").strip()
+                for row in self._store.get_all_canonical_turns(conversation_id)
+                if row.canonical_turn_id
+            }
+            for ct_id, actor_id in upgrades.items():
+                if accepted.get(ct_id) != actor_id:
+                    continue
+                upsert(
+                    conversation_id, actor_id, names.get(ct_id, ""),
+                    seen_at=now, expected_lifecycle_epoch=epoch,
+                )
+        return report
+
+    def backfill_reply_roles(
+        self,
+        conversation_id: str,
+        *,
+        dry_run: bool = False,
+        limit: int | None = None,
+    ) -> dict:
+        """Recover reply edges and policy audience from retained user text."""
+        if not conversation_id:
+            raise ValueError(
+                "backfill_reply_roles requires a non-empty conversation_id"
+            )
+        self._require_actor_sql_store()
+        cas = getattr(
+            self._store, "update_canonical_turn_reply_roles_if_empty", None,
+        )
+        if not callable(cas):
+            raise RuntimeError("the configured store has no physical reply CAS")
+        report = {
+            "eligible": 0, "updated": 0, "skipped_existing": 0,
+            "skipped_no_raw": 0, "skipped_no_reply": 0,
+            "resolved_by_message_id": 0, "resolved_by_target_sender_id": 0,
+            "resolved_by_unique_label": 0, "unresolved_label": 0,
+            "conflicting_signals": 0, "failed": 0, "dry_run": bool(dry_run),
+        }
+        from .proxy._envelope import _extract_envelope_metadata
+        from .types import get_origin_channel
+
+        resolver = getattr(self._store, "resolve_request_audience", None)
+        tenant_id = self.config.tenant_id if isinstance(self.config.tenant_id, str) else ""
+        updates: dict[str, dict] = {}
+        rows = self._store.get_all_canonical_turns(conversation_id)
+        for row in rows:
+            if limit is not None and len(updates) >= limit:
+                break
+            if not (row.user_content or "").strip():
+                continue
+            if int(row.reply_attribution_version or 0) > 0 and int(
+                row.audience_attribution_version or 0
+            ) > 0:
+                report["skipped_existing"] += 1
+                continue
+            if not (row.user_raw_content or "").strip():
+                report["skipped_no_raw"] += 1
+                continue
+            report["eligible"] += 1
+            try:
+                text = self._effective_raw_text(row.user_raw_content)
+                if not text:
+                    report["skipped_no_reply"] += 1
+                    continue
+                clean, metadata = _extract_envelope_metadata(text)
+                origin = (row.origin_conversation_id or "").strip()
+                inbound = origin or conversation_id
+                audience = (
+                    resolver(tenant_id, inbound, conversation_id)
+                    if callable(resolver) else ""
+                )
+                channel_id, channel_label = get_origin_channel(metadata)
+                message = Message(role="user", content=clean, metadata=metadata)
+                edge = self._ingest_reconciler._derive_reply_edge(
+                    message, inbound, audience,
+                )
+                exact_actor = ""
+                target_id = (edge.get("reply_target_message_id") or "").strip()
+                if target_id and audience:
+                    exact = self._ingest_reconciler._find_row_by_source_message_id(
+                        conversation_id,
+                        target_id,
+                        audience_conversation_id=audience,
+                        origin_channel_id=channel_id,
+                    )
+                    exact_actor = (
+                        (exact.sender_actor_id or "").strip() if exact else ""
+                    )
+                direct_actor = (edge.get("reply_subject_actor_id") or "").strip()
+                probe = type(row)(
+                    conversation_id=conversation_id,
+                    canonical_turn_id=row.canonical_turn_id,
+                    user_content=clean,
+                    origin_channel_id=channel_id,
+                    origin_channel_label=channel_label,
+                    **edge,
+                )
+                self._ingest_reconciler._resolve_reply_subjects(
+                    conversation_id, [probe],
+                )
+                candidate = {
+                    **edge,
+                    "reply_subject_actor_id": probe.reply_subject_actor_id,
+                    "audience_conversation_id": audience,
+                    "audience_attribution_version": 1 if audience else 0,
+                }
+                has_reply = int(candidate.get("reply_attribution_version") or 0) > 0
+                if not has_reply and not audience:
+                    report["skipped_no_reply"] += 1
+                    continue
+                if has_reply:
+                    if exact_actor and direct_actor and exact_actor != direct_actor:
+                        report["conflicting_signals"] += 1
+                    elif probe.reply_subject_actor_id and exact_actor:
+                        report["resolved_by_message_id"] += 1
+                    elif probe.reply_subject_actor_id and direct_actor:
+                        report["resolved_by_target_sender_id"] += 1
+                    elif probe.reply_subject_actor_id and probe.reply_subject_label:
+                        report["resolved_by_unique_label"] += 1
+                    elif probe.reply_subject_label:
+                        report["unresolved_label"] += 1
+                    else:
+                        report["skipped_no_reply"] += 1
+                if row.canonical_turn_id:
+                    updates[row.canonical_turn_id] = candidate
+            except Exception:
+                report["failed"] += 1
+
+        if dry_run:
+            report["updated"] = len(updates)
+            return report
+        epoch = self._store.get_lifecycle_epoch(conversation_id)
+        report["updated"] = int(cas(
+            conversation_id, updates, expected_lifecycle_epoch=epoch,
+        ))
+        return report
+
+    def backfill_fact_authors(
+        self,
+        conversation_id: str,
+        *,
+        dry_run: bool = False,
+        limit: int | None = None,
+    ) -> dict:
+        """Re-distill eligible segments using canonical-row actor rosters."""
+        if not conversation_id:
+            raise ValueError(
+                "backfill_fact_authors requires a non-empty conversation_id"
+            )
+        self._require_actor_sql_store(cards=True)
+        if not dry_run and self._compactor is None:
+            raise RuntimeError("fact-author backfill requires a configured compactor")
+        from .types import (
+            SOURCE_CANONICAL_TURN_IDS_KEY,
+            TaggedSegment,
+        )
+
+        report = {
+            "eligible": 0, "updated": 0, "skipped_existing": 0,
+            "skipped_incomplete_source": 0, "skipped_multi_actor": 0,
+            "unattributed_subject": 0, "unattributed_speaker": 0,
+            "failed": 0, "dry_run": bool(dry_run),
+        }
+        physical = {
+            row.canonical_turn_id: row
+            for row in self._store.get_all_canonical_turns(conversation_id)
+            if row.canonical_turn_id
+        }
+        segments = self._store.get_all_segments(
+            conversation_id=conversation_id,
+            limit=limit,
+        )
+        for stored in segments:
+            old_facts = self._store.get_facts_by_segment(stored.ref)
+            if old_facts and all(
+                int(f.author_attribution_version or 0) > 0 for f in old_facts
+            ):
+                report["skipped_existing"] += 1
+                continue
+            ids = list(stored.metadata.canonical_turn_ids or [])
+            if (
+                not stored.metadata.source_mapping_complete
+                or not ids
+                or any(cid not in physical for cid in ids)
+            ):
+                report["skipped_incomplete_source"] += 1
+                continue
+
+            messages: list[Message] = []
+            for cid in ids:
+                row = physical[cid]
+                source_meta = {SOURCE_CANONICAL_TURN_IDS_KEY: [cid]}
+                if (row.user_content or "").strip():
+                    meta = dict(source_meta)
+                    if (row.sender or "").strip():
+                        meta["sender"] = {"name": row.sender}
+                    messages.append(Message(
+                        role="user", content=row.user_content,
+                        metadata=meta,
+                    ))
+                if (row.assistant_content or "").strip():
+                    messages.append(Message(
+                        role="assistant", content=row.assistant_content,
+                        metadata=dict(source_meta),
+                    ))
+            tagged = TaggedSegment(
+                id=stored.ref,
+                primary_tag=stored.primary_tag,
+                tags=list(stored.tags),
+                messages=messages,
+                start_timestamp=stored.start_timestamp,
+                end_timestamp=stored.end_timestamp,
+                turn_count=stored.metadata.turn_count,
+                session_date=stored.metadata.session_date,
+            )
+            roster = self._compaction._build_actor_roster(tagged, physical)
+            if not roster.complete:
+                report["skipped_incomplete_source"] += 1
+                continue
+            if not roster.reply_bearing and not roster.sole_actor_id:
+                report["skipped_multi_actor"] += 1
+                continue
+            report["eligible"] += 1
+            if dry_run:
+                continue
+            try:
+                epoch = self._store.get_lifecycle_epoch(conversation_id)
+                result = self._compactor._compact_one(tagged, roster=roster)
+                if self._store.get_lifecycle_epoch(conversation_id) != epoch:
+                    report["failed"] += 1
+                    continue
+                for fact in result.facts:
+                    fact.segment_ref = stored.ref
+                    fact.conversation_id = conversation_id
+                deleted, inserted = self._store.replace_facts_for_segment(
+                    conversation_id, stored.ref, result.facts,
+                    expected_lifecycle_epoch=epoch,
+                )
+                if old_facts and deleted == 0 and inserted == 0:
+                    report["failed"] += 1
+                    continue
+                report["updated"] += 1
+                for fact in result.facts:
+                    if not fact.author_actor_id:
+                        if fact.author_source_role == "subject":
+                            report["unattributed_subject"] += 1
+                        else:
+                            report["unattributed_speaker"] += 1
+                actors = {
+                    (fact.author_actor_id or "").strip()
+                    for fact in [*old_facts, *result.facts]
+                    if (fact.author_actor_id or "").strip()
+                }
+                for actor_id in actors:
+                    self._compaction._rebuild_actor_card(actor_id, force=True)
+            except Exception:
+                logger.warning(
+                    "fact-author backfill failed for segment %s",
+                    stored.ref, exc_info=True,
+                )
+                report["failed"] += 1
+        return report
+
+    def rebuild_actor_cards(
+        self,
+        conversation_id: str,
+        *,
+        dry_run: bool = False,
+        limit: int | None = None,
+    ) -> dict:
+        """Rebuild cards for actors observed by one conversation."""
+        if not conversation_id:
+            raise ValueError(
+                "rebuild_actor_cards requires a non-empty conversation_id"
+            )
+        self._require_actor_sql_store(cards=True)
+        if not dry_run and self._compactor is None:
+            raise RuntimeError("actor-card rebuild requires a configured compactor")
+        actors = {
+            (row.sender_actor_id or "").strip()
+            for row in self._store.get_all_canonical_turns(conversation_id)
+            if (row.sender_actor_id or "").strip()
+        }
+        for segment in self._store.get_all_segments(
+            conversation_id=conversation_id,
+        ):
+            actors.update(
+                (fact.author_actor_id or "").strip()
+                for fact in self._store.get_facts_by_segment(segment.ref)
+                if (fact.author_actor_id or "").strip()
+            )
+        ordered = sorted(actors)
+        if limit is not None:
+            ordered = ordered[:max(0, int(limit))]
+        report = {
+            "eligible": len(ordered), "rebuilt": 0, "failed": 0,
+            "dry_run": bool(dry_run),
+        }
+        if dry_run:
+            return report
+        for actor_id in ordered:
+            try:
+                self._compaction._rebuild_actor_card(actor_id, force=True)
+                report["rebuilt"] += 1
+            except Exception:
+                logger.warning(
+                    "actor-card rebuild failed for actor %s",
+                    actor_id[:24], exc_info=True,
+                )
+                report["failed"] += 1
+        return report
 
     def backfill_senders(
         self,
