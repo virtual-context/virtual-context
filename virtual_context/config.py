@@ -253,6 +253,19 @@ def _build_config(raw: dict[str, Any], *, validate: bool = True) -> VirtualConte
         context_hint_max_tokens=assembly_raw.get("context_hint_max_tokens", _asm_defaults.context_hint_max_tokens),
         pre_compaction_filtering=assembly_raw.get("pre_compaction_filtering", _asm_defaults.pre_compaction_filtering),
         context_injection_max_tokens=assembly_raw.get("context_injection_max_tokens", -1),
+        actor_card_enabled=assembly_raw.get(
+            "actor_card_enabled", _asm_defaults.actor_card_enabled,
+        ),
+        actor_card_max_tokens=assembly_raw.get(
+            "actor_card_max_tokens", _asm_defaults.actor_card_max_tokens,
+        ),
+        actor_card_fact_limit=assembly_raw.get(
+            "actor_card_fact_limit", _asm_defaults.actor_card_fact_limit,
+        ),
+        actor_card_entries_per_kind=assembly_raw.get(
+            "actor_card_entries_per_kind",
+            _asm_defaults.actor_card_entries_per_kind,
+        ),
         protected_window_db_source=assembly_raw.get(
             "protected_window_db_source",
             _asm_defaults.protected_window_db_source,
@@ -498,6 +511,12 @@ def validate_config(config: VirtualContextConfig) -> list[str]:
             f"assembly.protected_window_db_source must be one of {_valid_pwds}, "
             f"got '{config.assembler.protected_window_db_source}'"
         )
+    if config.assembler.actor_card_max_tokens < 0:
+        errors.append("assembly.actor_card_max_tokens must be >= 0")
+    if config.assembler.actor_card_fact_limit < 1:
+        errors.append("assembly.actor_card_fact_limit must be >= 1")
+    if config.assembler.actor_card_entries_per_kind < 1:
+        errors.append("assembly.actor_card_entries_per_kind must be >= 1")
 
     # Segmenter config
     if not (0.0 <= config.segmenter.tag_overlap_threshold <= 1.0):

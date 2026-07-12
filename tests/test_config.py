@@ -5,8 +5,10 @@ from pathlib import Path
 
 import pytest
 import yaml
+from types import SimpleNamespace
 
 from virtual_context.config import load_config, validate_config
+from virtual_context.engine import VirtualContextEngine
 
 
 def test_retrieval_fact_dense_config_defaults_false_20_and_parses_yaml():
@@ -20,6 +22,32 @@ def test_retrieval_fact_dense_config_defaults_false_20_and_parses_yaml():
     })
     assert parsed.retriever.fact_dense_retrieval is True
     assert parsed.retriever.fact_dense_top_n == 7
+
+
+def test_actor_card_assembly_config_parses_yaml_keys():
+    config = load_config(config_dict={
+        "assembly": {
+            "actor_card_enabled": True,
+            "actor_card_max_tokens": 321,
+            "actor_card_fact_limit": 17,
+            "actor_card_entries_per_kind": 2,
+        },
+    })
+
+    assert config.assembler.actor_card_enabled is True
+    assert config.assembler.actor_card_max_tokens == 321
+    assert config.assembler.actor_card_fact_limit == 17
+    assert config.assembler.actor_card_entries_per_kind == 2
+
+
+def test_actor_cards_refuse_a_non_sql_or_split_store():
+    engine = object.__new__(VirtualContextEngine)
+    engine.config = SimpleNamespace(
+        assembler=SimpleNamespace(actor_card_enabled=True),
+    )
+
+    with pytest.raises(ValueError, match="co-located SQLite or Postgres"):
+        engine._validate_actor_card_store(object())
 
 
 class TestLoadConfig:

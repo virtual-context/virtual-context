@@ -1867,6 +1867,115 @@ def cmd_admin_backfill_channels(args):
             pass
 
 
+def _cmd_admin_actor_operation(args, method_name: str, total_keys: tuple[str, ...]):
+    """Shared tenant/batch/storage shell for actor migration primitives."""
+    from virtual_context.engine import VirtualContextEngine
+
+    conversation_id = getattr(args, "conversation_id", None) or ""
+    tenant_id = getattr(args, "tenant_id", "") or ""
+    all_convs = bool(getattr(args, "all_convs_for_tenant", False))
+    dry_run = bool(getattr(args, "dry_run", False))
+    limit = getattr(args, "limit", None)
+    if not conversation_id and not all_convs:
+        print(json.dumps({
+            "status": "error", "stage": "args",
+            "error": "either <conversation_id> or --all-convs-for-tenant must be supplied",
+        }))
+        sys.exit(2)
+    try:
+        config = load_config(args.config)
+        if conversation_id:
+            config.conversation_id = conversation_id
+        if tenant_id:
+            config.tenant_id = tenant_id
+        _apply_storage_overrides(config, args)
+        if config.storage.backend not in {"sqlite", "postgres"}:
+            raise ValueError(
+                f"{method_name.replace('_', '-')} requires SQLite or Postgres"
+            )
+    except Exception as exc:  # noqa: BLE001
+        print(json.dumps({
+            "status": "error", "stage": "load_config", "error": repr(exc),
+        }))
+        sys.exit(1)
+
+    kwargs = {"config": config}
+    if method_name in {"backfill_actors", "backfill_reply_roles"}:
+        class _NoopEmbeddingProvider:
+            @staticmethod
+            def get_embed_fn():
+                return None
+        config.retriever.inbound_tagger_type = "disabled"
+        kwargs["embedding_provider"] = _NoopEmbeddingProvider()
+    try:
+        engine = VirtualContextEngine(**kwargs)
+    except Exception as exc:  # noqa: BLE001
+        print(json.dumps({
+            "status": "error", "stage": "engine_construct", "error": repr(exc),
+        }))
+        sys.exit(1)
+
+    try:
+        targets = (
+            engine._store.list_canonical_conversation_ids(
+                tenant_id=tenant_id or None, limit=limit,
+            )
+            if all_convs else [engine.config.conversation_id]
+        )
+        totals = {key: 0 for key in total_keys}
+        results = []
+        method = getattr(engine, method_name)
+        for target in targets:
+            counts = method(
+                target,
+                dry_run=dry_run,
+                limit=None if all_convs else limit,
+            )
+            for key in totals:
+                totals[key] += int(counts.get(key, 0))
+            results.append({"conversation_id": target, **counts})
+        print(json.dumps({
+            "status": "ok", "tenant_id": tenant_id, "dry_run": dry_run,
+            "storage_backend": config.storage.backend,
+            "conversations": len(targets), **totals, "results": results,
+        }))
+    finally:
+        try:
+            engine.close()
+        except Exception:
+            pass
+
+
+def cmd_admin_backfill_actors(args):
+    _cmd_admin_actor_operation(args, "backfill_actors", (
+        "eligible", "updated", "skipped_existing", "skipped_no_raw",
+        "skipped_no_identity", "skipped_no_platform", "failed",
+    ))
+
+
+def cmd_admin_backfill_reply_roles(args):
+    _cmd_admin_actor_operation(args, "backfill_reply_roles", (
+        "eligible", "updated", "skipped_existing", "skipped_no_raw",
+        "skipped_no_reply", "resolved_by_message_id",
+        "resolved_by_target_sender_id", "resolved_by_unique_label",
+        "unresolved_label", "conflicting_signals", "failed",
+    ))
+
+
+def cmd_admin_backfill_fact_authors(args):
+    _cmd_admin_actor_operation(args, "backfill_fact_authors", (
+        "eligible", "updated", "skipped_existing",
+        "skipped_incomplete_source", "skipped_multi_actor",
+        "unattributed_subject", "unattributed_speaker", "failed",
+    ))
+
+
+def cmd_admin_rebuild_actor_cards(args):
+    _cmd_admin_actor_operation(args, "rebuild_actor_cards", (
+        "eligible", "rebuilt", "failed",
+    ))
+
+
 def cmd_admin_retag_canonical_turns(args):
     """Re-tag canonical rows that carry degraded fallback tags.
 
@@ -2580,6 +2689,28 @@ def main():
         help="SQLite database path. Overrides storage.sqlite_path.",
     )
 
+    # Actor/reply/fact/card migrations share the same guarded batch shell.
+    for command_name, command_help in (
+        ("backfill-actors", "Recover durable actor ids from retained raw user text"),
+        ("backfill-reply-roles", "Recover reply roles and policy audience provenance"),
+        ("backfill-fact-authors", "Re-distill facts with canonical actor provenance"),
+        ("rebuild-actor-cards", "Rebuild tenant-scoped actor card caches"),
+    ):
+        actor_parser = admin_sub.add_parser(command_name, help=command_help)
+        actor_parser.add_argument(
+            "conversation_id", nargs="?", default=None,
+            help="Conversation id (omit with --all-convs-for-tenant)",
+        )
+        actor_parser.add_argument("--tenant-id", default="")
+        actor_parser.add_argument("--all-convs-for-tenant", action="store_true")
+        actor_parser.add_argument("--dry-run", action="store_true")
+        actor_parser.add_argument("--limit", type=int, default=None)
+        actor_parser.add_argument(
+            "--storage-backend", choices=("sqlite", "postgres", "filesystem"),
+        )
+        actor_parser.add_argument("--postgres-dsn")
+        actor_parser.add_argument("--sqlite-path")
+
     # ------------------------------------------------------------------
     # admin retag-canonical-turns
     # ------------------------------------------------------------------
@@ -2774,6 +2905,14 @@ def main():
             cmd_admin_backfill_senders(args)
         elif args.admin_command == "backfill-channels":
             cmd_admin_backfill_channels(args)
+        elif args.admin_command == "backfill-actors":
+            cmd_admin_backfill_actors(args)
+        elif args.admin_command == "backfill-reply-roles":
+            cmd_admin_backfill_reply_roles(args)
+        elif args.admin_command == "backfill-fact-authors":
+            cmd_admin_backfill_fact_authors(args)
+        elif args.admin_command == "rebuild-actor-cards":
+            cmd_admin_rebuild_actor_cards(args)
         elif args.admin_command == "backfill-session-state-markers":
             cmd_admin_backfill_session_state_markers(args)
         else:

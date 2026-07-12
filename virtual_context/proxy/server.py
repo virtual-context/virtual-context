@@ -37,7 +37,18 @@ from ..core.tool_loop import (
     is_vc_tool,
     execute_vc_tool,
 )
-from ..types import Fact, Message, PreparedPayload, SplitResult, StoredSummary  # noqa: F401 — re-exported
+from ..types import (  # noqa: F401 — re-exported
+    CanonicalTurnRow,
+    Fact,
+    Message,
+    PreparedPayload,
+    RequestRoles,
+    SplitResult,
+    StoredSummary,
+    get_actor_id,
+    get_current_conversation_info,
+    get_origin_channel,
+)
 from ..types import SOURCE_CONVERSATION_KEY as _SOURCE_CONVERSATION_KEY
 
 from .dashboard import register_dashboard_routes
@@ -327,6 +338,100 @@ def _serialize_recall_fact(
 # ---------------------------------------------------------------------------
 # prepare_payload — extracted from catch_all() for reuse by REST API
 # ---------------------------------------------------------------------------
+
+def _resolve_request_audience(
+    state: "ProxyState | None",
+    inbound_conversation_id: str,
+) -> str:
+    """Validate the raw pre-alias route against tenant and resolved owner."""
+    raw = (inbound_conversation_id or "").strip()
+    if state is None or not raw:
+        return ""
+    engine = state.engine
+    owner = (getattr(engine.config, "conversation_id", "") or "").strip()
+    tenant_raw = getattr(engine.config, "tenant_id", "")
+    tenant_id = tenant_raw if isinstance(tenant_raw, str) else ""
+    resolver = getattr(engine._store, "resolve_request_audience", None)
+    if not callable(resolver):
+        return ""
+    try:
+        resolved = resolver(tenant_id, raw, owner)
+    except Exception:
+        logger.warning(
+            "request audience resolution failed for route=%s owner=%s",
+            raw[:12], owner[:12], exc_info=True,
+        )
+        return ""
+    return resolved.strip() if isinstance(resolved, str) else ""
+
+
+def _roles_for_active_user(
+    state: "ProxyState | None",
+    active_user: Message | None,
+    user_message: str,
+    *,
+    inbound_conversation_id: str,
+    audience_conversation_id: str,
+) -> RequestRoles:
+    """Derive request roles from the selected inbound active user entry."""
+    owner = (
+        (getattr(state.engine.config, "conversation_id", "") or "").strip()
+        if state is not None
+        else ""
+    )
+    if (
+        active_user is None
+        or (active_user.content or "").strip() != (user_message or "").strip()
+    ):
+        logger.warning(
+            "active user metadata mismatch; disabling actor card selection",
+            extra={"owner_conversation_id": owner[:12]},
+        )
+        return RequestRoles(owner_conversation_id=owner)
+
+    metadata = active_user.metadata if isinstance(active_user.metadata, dict) else {}
+    actor_key = (inbound_conversation_id or "").strip() or owner
+    current = get_current_conversation_info(metadata)
+    channel_id, channel_label = (
+        get_origin_channel({"conversation info": current}) if current else ("", "")
+    )
+
+    from ..core.ingest_reconciler import IngestReconciler
+
+    edge = IngestReconciler._derive_reply_edge(
+        active_user, actor_key, audience_conversation_id,
+    )
+    probe = CanonicalTurnRow(
+        conversation_id=owner,
+        user_content=active_user.content,
+        origin_channel_id=channel_id,
+        origin_channel_label=channel_label,
+        **edge,
+    )
+    if state is not None:
+        reconciler = getattr(state.engine, "_ingest_reconciler", None)
+        if reconciler is None:
+            reconciler = IngestReconciler(state.engine._store, None)  # type: ignore[arg-type]
+        try:
+            reconciler._resolve_reply_subjects(owner, [probe])
+        except Exception:
+            logger.warning(
+                "request reply-role resolution failed for owner=%s",
+                owner[:12], exc_info=True,
+            )
+            probe.reply_subject_actor_id = ""
+
+    return RequestRoles(
+        requester_actor_id=get_actor_id(metadata, actor_key),
+        subject_actor_id=probe.reply_subject_actor_id,
+        subject_label=probe.reply_subject_label,
+        reply_target_message_id=probe.reply_target_message_id,
+        reply_target_body=probe.reply_target_body,
+        owner_conversation_id=owner,
+        audience_conversation_id=audience_conversation_id,
+        audience_channel_id=channel_id,
+        audience_channel_label=channel_label,
+    )
 
 async def prepare_payload(
     body: dict,
@@ -760,6 +865,20 @@ async def prepare_payload(
                     message.metadata[_SOURCE_CONVERSATION_KEY] = raw_key
         return messages
 
+    _request_messages = _extract_ingestible_messages(body)
+    _active_user = next(
+        (message for message in reversed(_request_messages) if message.role == "user"),
+        None,
+    )
+    _audience_conversation_id = _resolve_request_audience(
+        state, inbound_conversation_id,
+    )
+    _request_roles = RequestRoles(
+        owner_conversation_id=(
+            state.engine.config.conversation_id if state is not None else ""
+        ),
+    )
+
     _model_name = body.get("model", "")
     if state:
         state._last_model = _model_name
@@ -826,6 +945,7 @@ async def prepare_payload(
                 # be a UUID that names no platform — which would silently strip
                 # the platform segment out of every actor id.
                 source_conversation_key=inbound_conversation_id or "",
+                source_audience_conversation_id=_audience_conversation_id,
             )
         except _LE_MISMATCH:
             raise
@@ -842,6 +962,14 @@ async def prepare_payload(
                 phase="ingesting", started_tagger=False,
             )
         _note_prep("handle_prepare_payload", _hpp_stage)
+
+    _request_roles = _roles_for_active_user(
+        state,
+        _active_user,
+        user_message,
+        inbound_conversation_id=inbound_conversation_id,
+        audience_conversation_id=_audience_conversation_id,
+    )
 
     # ---------------------------------------------------------------
     # State-aware dispatch: PASSTHROUGH/INGESTING vs ACTIVE
@@ -976,7 +1104,13 @@ async def prepare_payload(
                 state.conversation_history.append(
                     Message(role="user", content=user_message,
                             timestamp=datetime.now(timezone.utc),
-                            raw_content=fmt.extract_user_raw_content(body))
+                            raw_content=fmt.extract_user_raw_content(body),
+                            metadata=(
+                                dict(_active_user.metadata)
+                                if _active_user is not None
+                                and isinstance(_active_user.metadata, dict)
+                                else None
+                            ))
                 )
 
             _conversation_id = state.engine.config.conversation_id
@@ -1231,7 +1365,13 @@ async def prepare_payload(
                 state.conversation_history.append(
                     Message(role="user", content=user_message,
                             timestamp=datetime.now(timezone.utc),
-                            raw_content=fmt.extract_user_raw_content(body))
+                            raw_content=fmt.extract_user_raw_content(body),
+                            metadata=(
+                                dict(_active_user.metadata)
+                                if _active_user is not None
+                                and isinstance(_active_user.metadata, dict)
+                                else None
+                            ))
                 )
 
                 t1 = time.monotonic()
@@ -1240,6 +1380,7 @@ async def prepare_payload(
                     user_message,
                     state.conversation_history,
                     body.get("model", ""),
+                    request_roles=_request_roles,
                 )
                 inbound_ms = _note_prep("on_message_inbound", t1)
 
