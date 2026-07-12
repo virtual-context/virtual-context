@@ -338,6 +338,42 @@ class FactStore(Protocol):
     def get_fact_count_by_tags(self, *, conversation_id: str | None = None) -> dict[str, int]: ...
     def get_superseded_facts(self, fact_ids: list[str]) -> list[dict]: ...
     def get_actionable_fact_tags(self, tags: list[str], conversation_id: str | None = None) -> set[str]: ...
+    # Person cards live on the FactStore side, colocated with the facts they
+    # are derived from. Enabling the card gate on a delegate that cannot back
+    # these must fail startup rather than silently serve an unscoped card.
+    def upsert_actor_profile_from_turn(
+        self,
+        conversation_id: str,
+        actor_id: str,
+        display_name: str = "",
+        *,
+        seen_at: str,
+        expected_lifecycle_epoch: int | None = None,
+    ) -> bool: ...
+    def list_actor_facts(
+        self, tenant_id: str, actor_id: str, *, limit: int = 60,
+    ) -> list: ...
+    def replace_actor_card(
+        self,
+        tenant_id: str,
+        actor_id: str,
+        entries_with_sources: list,
+        *,
+        input_hash: str = "",
+        expected_source_epochs: dict[str, int] | None = None,
+    ) -> int: ...
+    def get_actor_card(
+        self,
+        tenant_id: str,
+        actor_id: str,
+        *,
+        owner_conversation_id: str,
+        audience_conversation_id: str,
+        audience_channel_id: str = "",
+    ): ...
+    def invalidate_actor_cards_for_conversation(
+        self, conversation_id: str, *, reason: str = "",
+    ) -> int: ...
 
 
 @runtime_checkable

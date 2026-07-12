@@ -947,6 +947,91 @@ class CompositeStore:
             ))
         return 0
 
+    # ------------------------------------------------------------------
+    # Person cards — forwarded to the FACT delegate, where the card tables are
+    # colocated with the facts they derive from. When the card gate is on, the
+    # segment/lifecycle and fact/card delegates must be the same transactional
+    # SQL store; otherwise canonical actor acceptance, tenant/lifecycle state,
+    # fact replacement, and card dirtying span independent stores and cannot
+    # give the atomic delete / stale-writer guarantees the card depends on.
+    # ------------------------------------------------------------------
+
+    def upsert_actor_profile_from_turn(
+        self,
+        conversation_id: str,
+        actor_id: str,
+        display_name: str = "",
+        *,
+        seen_at: str,
+        expected_lifecycle_epoch: int | None = None,
+    ) -> bool:
+        fn = getattr(self._facts, "upsert_actor_profile_from_turn", None)
+        if callable(fn):
+            return bool(fn(
+                conversation_id,
+                actor_id,
+                display_name,
+                seen_at=seen_at,
+                expected_lifecycle_epoch=expected_lifecycle_epoch,
+            ))
+        return False
+
+    def list_actor_facts(
+        self, tenant_id: str, actor_id: str, *, limit: int = 60,
+    ) -> list:
+        fn = getattr(self._facts, "list_actor_facts", None)
+        if callable(fn):
+            return list(fn(tenant_id, actor_id, limit=limit))
+        return []
+
+    def replace_actor_card(
+        self,
+        tenant_id: str,
+        actor_id: str,
+        entries_with_sources: list,
+        *,
+        input_hash: str = "",
+        expected_source_epochs: dict[str, int] | None = None,
+    ) -> int:
+        fn = getattr(self._facts, "replace_actor_card", None)
+        if callable(fn):
+            return int(fn(
+                tenant_id,
+                actor_id,
+                entries_with_sources,
+                input_hash=input_hash,
+                expected_source_epochs=expected_source_epochs,
+            ))
+        return 0
+
+    def get_actor_card(
+        self,
+        tenant_id: str,
+        actor_id: str,
+        *,
+        owner_conversation_id: str,
+        audience_conversation_id: str,
+        audience_channel_id: str = "",
+    ):
+        fn = getattr(self._facts, "get_actor_card", None)
+        if callable(fn):
+            return fn(
+                tenant_id,
+                actor_id,
+                owner_conversation_id=owner_conversation_id,
+                audience_conversation_id=audience_conversation_id,
+                audience_channel_id=audience_channel_id,
+            )
+        return None
+
+    def invalidate_actor_cards_for_conversation(
+        self, conversation_id: str, *, reason: str = "",
+    ) -> int:
+        fn = getattr(self._facts, "invalidate_actor_cards_for_conversation", None)
+        if callable(fn):
+            return int(fn(conversation_id, reason=reason))
+        return 0
+
     def update_canonical_turn_reply_roles_if_empty(
         self,
         conversation_id: str,
