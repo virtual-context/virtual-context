@@ -243,6 +243,12 @@ class SegmentStore(Protocol):
         on_committed=None,
     ) -> None: ...
     def list_conversation_aliases_by_target(self, target_id: str) -> list[str]: ...
+    def resolve_request_audience(
+        self,
+        tenant_id: str,
+        audience_conversation_id: str,
+        owner_conversation_id: str,
+    ) -> str: ...
     def has_any_alias(self, conversation_id: str) -> bool: ...
     def get_recent_canonical_turns(
         self,
@@ -312,6 +318,7 @@ class FactStore(Protocol):
         operation_id: str | None = None,
         owner_worker_id: str | None = None,
         lifecycle_epoch: int | None = None,
+        expected_lifecycle_epoch: int | None = None,
     ) -> tuple[int, int]: ...
     def search_facts(self, query: str, limit: int = 10, conversation_id: str | None = None) -> list[Fact]: ...
     def set_fact_superseded(
@@ -353,6 +360,8 @@ class FactStore(Protocol):
     def list_actor_facts(
         self, tenant_id: str, actor_id: str, *, limit: int = 60,
     ) -> list: ...
+    def get_actor_profile(self, tenant_id: str, actor_id: str): ...
+    def mark_actor_card_dirty(self, tenant_id: str, actor_id: str) -> bool: ...
     def replace_actor_card(
         self,
         tenant_id: str,

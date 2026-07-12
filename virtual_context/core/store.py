@@ -705,6 +705,14 @@ class ContextStore(ABC):
         """
         return []
 
+    def get_actor_profile(self, tenant_id: str, actor_id: str):
+        """Return the tenant-scoped profile/cache state, or ``None``."""
+        return None
+
+    def mark_actor_card_dirty(self, tenant_id: str, actor_id: str) -> bool:
+        """Make a card unreadable before a changed-input curation call."""
+        return False
+
     def replace_actor_card(
         self,
         tenant_id: str,
@@ -1381,6 +1389,7 @@ class ContextStore(ABC):
         operation_id: str | None = None,
         owner_worker_id: str | None = None,
         lifecycle_epoch: int | None = None,
+        expected_lifecycle_epoch: int | None = None,
     ) -> tuple[int, int]:
         """Atomically replace all facts for a segment. Returns (deleted, inserted)."""
         return 0, self.store_facts(
@@ -1674,3 +1683,17 @@ class ContextStore(ABC):
         implementations.
         """
         return []
+
+    def resolve_request_audience(
+        self,
+        tenant_id: str,
+        audience_conversation_id: str,
+        owner_conversation_id: str,
+    ) -> str:
+        """Return the validated pre-alias route, or ``""``.
+
+        Backends without tenant-aware conversation and alias tables fail
+        closed. The raw route is never silently replaced with the resolved
+        owner because those ids separate disclosure policy from storage.
+        """
+        return ""
