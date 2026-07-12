@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -305,6 +306,351 @@ def channel_excerpt_prefix(origin_channel_id: str, origin_channel_label: str) ->
         return f"[{label}] "
     channel_id = (origin_channel_id or "").strip()
     return f"[{channel_id}] " if channel_id else ""
+
+
+# ---------------------------------------------------------------------------
+# Actor identity
+# ---------------------------------------------------------------------------
+
+# Reserved top-level metadata keys. An envelope label always begins with an
+# uppercase ASCII letter, so a labeled block can never mint an underscore-led
+# key and none of these fields can be forged from message text.
+ACTOR_IDENTITY_KEY = "_vc_actor_identity"
+SOURCE_CONVERSATION_KEY = "_vc_source_conversation_key"
+REPLY_SUBJECT_KEY = "_vc_reply_subject"
+CURRENT_CONVERSATION_KEY = "_vc_current_conversation"
+SOURCE_CANONICAL_TURN_IDS_KEY = "_vc_source_canonical_turn_ids"
+
+# The platform segment of a caller-asserted stable conversation key, e.g.
+# ``sk:agent:bast:discord:channel:152497...``. Deliberately distinct from
+# ``_STABLE_CHANNEL_KEY_RE``: that one captures the trailing channel id and
+# rejects DM keys, but a DM still has an actor.
+_STABLE_ACTOR_PLATFORM_RE = re.compile(
+    r'^(?:sk:)?agent:[^:]+:([^:]+):(?:channel|group|direct|dm):[^:]+$'
+)
+
+_ACTOR_PLATFORM_CHARS_RE = re.compile(r'^[a-z0-9._-]+$')
+
+_ACTOR_PLATFORM_MAX = 32
+_ACTOR_USER_ID_MAX = 256
+
+
+def _actor_clean_str(value: object) -> str:
+    """Trimmed string, or ``""`` for a non-string / control-bearing value."""
+    if not isinstance(value, str):
+        return ""
+    text = value.strip()
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in text):
+        return ""
+    return text
+
+
+def is_actor_identity_block(parsed: object) -> bool:
+    """Is an ``Actor`` block syntactically identity-bearing?
+
+    Syntax only: it claims the first-block slot even when normalization later
+    rejects it. Skipping a malformed first adapter block and accepting a
+    later user-authored one would restore the spoof this rule exists to stop.
+    """
+    if not isinstance(parsed, dict):
+        return False
+    platform = parsed.get("platform")
+    user_id = parsed.get("user_id")
+    return (
+        isinstance(platform, str) and bool(platform.strip())
+        and isinstance(user_id, str) and bool(user_id.strip())
+    )
+
+
+def is_conversation_info_identity_block(parsed: object) -> bool:
+    """Is a ``Conversation info`` block syntactically identity-bearing?"""
+    if not isinstance(parsed, dict):
+        return False
+    sender_id = parsed.get("sender_id")
+    return isinstance(sender_id, str) and bool(sender_id.strip())
+
+
+def get_platform_from_conversation_key(conversation_key: str) -> str:
+    """Platform segment of a stable conversation key, else ``""``.
+
+    Accepts ``direct``/``dm`` kinds as well as ``channel``/``group``: a DM has
+    an actor even though it has no channel. A UUID/hash conversation id yields
+    no platform, and therefore no actor id — never a guess.
+    """
+    match = _STABLE_ACTOR_PLATFORM_RE.match((conversation_key or "").strip())
+    return match.group(1) if match else ""
+
+
+def _normalize_actor_id(platform: str, user_id: str) -> str:
+    """Assemble ``actor:<platform>:<user_id>`` or ``""``.
+
+    Platform is lowercased and constrained; the user id is opaque and is never
+    coerced to an integer. Both components must resolve, so this is one column
+    and not two: half an identity is not an identity.
+    """
+    platform = _actor_clean_str(platform).lower()
+    user_id = _actor_clean_str(user_id)
+    if not platform or not user_id:
+        return ""
+    if len(platform) > _ACTOR_PLATFORM_MAX or len(user_id) > _ACTOR_USER_ID_MAX:
+        return ""
+    if not _ACTOR_PLATFORM_CHARS_RE.match(platform):
+        return ""
+    return f"actor:{platform}:{user_id}"
+
+
+def get_actor_id(metadata: dict | None, conversation_key: str = "") -> str:
+    """Derive the durable actor id for one message, or ``""``.
+
+    Two accepted sources: a normalized ``actor`` block carrying ``platform`` +
+    ``user_id``, or a ``conversation info`` block carrying ``sender_id`` whose
+    platform is parsed from *conversation_key*.
+
+    Identity is **first-block-wins**. ``_extract_envelope_metadata`` merges
+    labeled blocks last-wins, so a member whose message text begins with a
+    forged block could otherwise repoint attribution at someone else. When the
+    envelope parser recorded a first identity-bearing candidate under
+    ``ACTOR_IDENTITY_KEY`` this reads that snapshot and nothing else, even if
+    normalizing it yields ``""``. Direct structured-metadata callers that never
+    passed through the parser have no hidden block order to recover, so they
+    fall back to actor-then-conversation-info on the merged dict.
+
+    Never guesses a platform and never mints ``actor:unknown:<id>``: an id that
+    collides across platforms is worse than no id. Side-effect free.
+    """
+    if not isinstance(metadata, dict):
+        return ""
+
+    snapshot = metadata.get(ACTOR_IDENTITY_KEY)
+    if isinstance(snapshot, dict):
+        source = snapshot.get("source")
+        value = snapshot.get("value")
+        if not isinstance(value, dict):
+            return ""
+    else:
+        actor_block = metadata.get("actor")
+        conv_info = metadata.get("conversation info")
+        if is_actor_identity_block(actor_block):
+            source, value = "actor", actor_block
+        elif is_conversation_info_identity_block(conv_info):
+            source, value = "conversation info", conv_info
+        else:
+            return ""
+
+    if source == "actor":
+        return _normalize_actor_id(
+            value.get("platform", ""), value.get("user_id", ""),
+        )
+    if source == "conversation info":
+        platform = get_platform_from_conversation_key(conversation_key)
+        if not platform:
+            return ""
+        return _normalize_actor_id(platform, value.get("sender_id", ""))
+    return ""
+
+
+def get_actor_display_name(metadata: dict | None) -> str:
+    """Presentation name preferred from the winning identity block.
+
+    Presentation only: it never participates in the actor key. Falls back to
+    the shipped sender derivation so a plugin that sends no ``display_name``
+    keeps the name the rest of the system already shows.
+    """
+    if not isinstance(metadata, dict):
+        return ""
+    snapshot = metadata.get(ACTOR_IDENTITY_KEY)
+    if isinstance(snapshot, dict):
+        value = snapshot.get("value")
+        if isinstance(value, dict):
+            name = _actor_clean_str(value.get("display_name"))
+            if name:
+                return name
+    return (get_sender_name(metadata) or "").strip()
+
+
+# ---------------------------------------------------------------------------
+# Reply-graph roles: requester, subject, audience
+# ---------------------------------------------------------------------------
+
+# The only labels that may name a reply target, casefolded after the label
+# trim ``_METADATA_BLOCK_RE`` already performs. A block with any other label
+# is not a subject signal, and neither is a vocative in the prose.
+REPLY_SUBJECT_LABELS = frozenset({
+    "reply target of current user message",
+    "replied message",
+    "reply context",
+})
+
+# The quoted body is retained in its own lane and is bounded so a reply block
+# cannot become an unbounded ingestion channel.
+REPLY_BODY_MAX_BYTES = 16 * 1024
+
+REPLY_ATTRIBUTION_VERSION = 1
+AUDIENCE_ATTRIBUTION_VERSION = 1
+
+
+def is_reply_subject_block(parsed: object) -> bool:
+    """Is a reply-target block syntactically subject-bearing?
+
+    Syntax only, exactly like the identity blocks: a candidate claims the
+    reserved slot even when normalization later rejects it. Failing closed on
+    a malformed first candidate is the point — repairing it with a later,
+    attacker-controlled block is the contamination path this rule exists to
+    close.
+    """
+    if not isinstance(parsed, dict):
+        return False
+    for key in ("sender_id", "sender_label", "name"):
+        value = parsed.get(key)
+        if isinstance(value, str) and value.strip():
+            return True
+    return False
+
+
+@dataclass
+class ReplySubject:
+    """The normalized reply edge of one inbound user message.
+
+    Empty fields are honest. An unresolved subject never falls back to the
+    requester, never resolves a label by best effort, and never weakens the
+    audience boundary.
+    """
+    subject_actor_id: str = ""
+    subject_label: str = ""
+    target_message_id: str = ""
+    target_body: str = ""
+    # A candidate was seen and normalized, whether or not an actor resolved.
+    # Stamped even when empty so replay and backfill stay idempotent.
+    version: int = 0
+    # Set when a syntactically-valid candidate could not be normalized, or
+    # when two outer-edge candidates disagree. Callers must not attribute.
+    unresolved_reason: str = ""
+
+
+@dataclass
+class RequestRoles:
+    """Who is asking, whose statement is analyzed, and where it may surface.
+
+    Request-scoped and passed explicitly from the active user entry. The roles
+    are orthogonal: one actor may occupy two of them, but no role is ever
+    inferred from another. A reply target is never the requester, and a
+    display label is never an authorization boundary.
+    """
+    requester_actor_id: str = ""
+    subject_actor_id: str = ""
+    subject_label: str = ""
+    reply_target_message_id: str = ""
+    reply_target_body: str = ""
+    # The alias-resolved conversation that OWNS the canonical/fact rows.
+    owner_conversation_id: str = ""
+    # The validated pre-alias route the request actually arrived on. Equal to
+    # the owner for a native request; the retained source alias for a request
+    # routed through a VCMERGE alias. An unproved route stays empty and reads
+    # no card — silently substituting the owner is the DM-to-guild leak.
+    audience_conversation_id: str = ""
+    audience_channel_id: str = ""
+    audience_channel_label: str = ""
+
+
+def get_current_conversation_info(metadata: dict | None) -> dict:
+    """The FIRST ``conversation info`` block, not the last-wins merged dict.
+
+    ``_extract_envelope_metadata`` merges labeled blocks last-wins, so the
+    merged ``conversation info`` can be a block the member typed themselves.
+    That is tolerable for display, but it is not tolerable for the audience
+    channel, which is a privacy boundary. Policy reads this ordered snapshot;
+    only old/direct callers with no snapshot fall back to the merged dict, and
+    that provenance is not policy-eligible.
+    """
+    if not isinstance(metadata, dict):
+        return {}
+    snapshot = metadata.get(CURRENT_CONVERSATION_KEY)
+    if isinstance(snapshot, dict):
+        return snapshot
+    return {}
+
+
+def get_reply_subject(
+    metadata: dict | None,
+    conversation_key: str = "",
+) -> ReplySubject:
+    """Normalize the reply edge from the reserved first-candidate snapshot.
+
+    Consumes only ``metadata[REPLY_SUBJECT_KEY]``, which the envelope parser
+    fills outer-envelope-first. It never inspects ``sender``, the merged
+    current ``conversation info``, or prose mentions as a substitute: those
+    describe the *requester*, and copying them here is the cross-role
+    contamination path.
+
+    Resolves an actor only from an explicit target ``sender_id`` plus a valid
+    platform. The durable-row and unique-label fallbacks need store access and
+    therefore live in the reconciler; this helper leaves them for it. The
+    quoted body survives an unresolved actor, but it stays marked unattributed.
+    Side-effect free.
+    """
+    if not isinstance(metadata, dict):
+        return ReplySubject()
+    snapshot = metadata.get(REPLY_SUBJECT_KEY)
+    if not isinstance(snapshot, dict):
+        return ReplySubject()
+
+    if snapshot.get("conflict"):
+        # Two outer-edge candidates disagreed. Choosing one would be choosing
+        # an actor by coin flip; fail closed and keep the version stamp.
+        return ReplySubject(
+            version=REPLY_ATTRIBUTION_VERSION,
+            unresolved_reason="contradictory_edges",
+        )
+
+    value = snapshot.get("value")
+    if not isinstance(value, dict):
+        return ReplySubject(
+            version=REPLY_ATTRIBUTION_VERSION,
+            unresolved_reason="malformed_candidate",
+        )
+
+    label = _actor_clean_str(
+        value.get("sender_label") or value.get("name") or ""
+    )
+    target_message_id = _actor_clean_str(value.get("message_id"))
+
+    raw_body = value.get("body")
+    body = ""
+    if isinstance(raw_body, str):
+        candidate = raw_body.strip()
+        if len(candidate.encode("utf-8")) <= REPLY_BODY_MAX_BYTES:
+            body = candidate
+        else:
+            # An oversized body makes the candidate unresolved; it still
+            # claimed the slot, so a later block cannot repair it.
+            return ReplySubject(
+                version=REPLY_ATTRIBUTION_VERSION,
+                unresolved_reason="oversized_body",
+            )
+    elif raw_body is not None:
+        return ReplySubject(
+            version=REPLY_ATTRIBUTION_VERSION,
+            unresolved_reason="malformed_body",
+        )
+
+    # Never borrow the requester's user id: this id is the TARGET's.
+    subject_actor_id = ""
+    sender_id = _actor_clean_str(value.get("sender_id"))
+    if sender_id:
+        platform = _actor_clean_str(value.get("platform")).lower()
+        if not platform:
+            platform = get_platform_from_conversation_key(conversation_key)
+        if platform:
+            subject_actor_id = _normalize_actor_id(platform, sender_id)
+
+    return ReplySubject(
+        subject_actor_id=subject_actor_id,
+        subject_label=label,
+        target_message_id=target_message_id,
+        target_body=body,
+        version=REPLY_ATTRIBUTION_VERSION,
+        unresolved_reason="" if subject_actor_id else "unresolved_actor",
+    )
 
 
 @dataclass
@@ -723,6 +1069,41 @@ class CanonicalTurnRow:
     # carry both, because the derivation is per physical message.
     origin_channel_id: str = ""
     origin_channel_label: str = ""
+    # Durable speaker identity: ``actor:<platform>:<user_id>``. One column,
+    # not two, because platform and user id must BOTH resolve to form a key.
+    # Follows the ``sender`` role rule rather than the channel rule: an actor
+    # id is speaker attribution, so an assistant row is never newly labeled
+    # with a human actor (a stored value is still preserved).
+    sender_actor_id: str = ""
+    # The reply edge, role-local to the physical USER row. An assistant row
+    # never receives a human reply edge.
+    #
+    # ``reply_target_body`` is a SEPARATE LANE: it is deliberately absent from
+    # ``user_content``, the normalized text, the turn hash, the tag text, and
+    # the requester's fact input. A quoted claim belongs to the person quoted,
+    # so letting it into requester content is what turns a canonical row into
+    # a container a later distiller mistakes for the requester's own belief.
+    source_message_id: str = ""
+    reply_target_message_id: str = ""
+    reply_subject_actor_id: str = ""
+    reply_subject_label: str = ""
+    reply_target_body: str = ""
+    # Stamped even when the subject stays unresolved, so replay and backfill
+    # are idempotent and the unresolved state is auditable rather than
+    # indistinguishable from "never looked".
+    reply_attribution_version: int = 0
+    # The validated PRE-ALIAS route this row was observed on, which is NOT the
+    # same thing as the conversation that owns the row. They are equal for a
+    # native request and differ for one routed through a retained VCMERGE
+    # source alias: the row is written under the target owner, but it was still
+    # observed on the source's audience. Owner scopes storage; audience scopes
+    # disclosure. Collapsing them would let a DM request through a merged alias
+    # receive guild-origin influence.
+    #
+    # Empty means the route could not be proved, which makes the row ineligible
+    # for policy reads rather than defaulting to the owner.
+    audience_conversation_id: str = ""
+    audience_attribution_version: int = 0
     # Read-only provenance projected by the raw loaders. VCMERGE owns the
     # column; ``save_canonical_turn`` never writes it, so a default-empty
     # full-row rewrite cannot erase it.
