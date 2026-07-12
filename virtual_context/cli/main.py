@@ -1450,6 +1450,16 @@ def _apply_storage_overrides(config, args) -> None:
             storage_backend = "postgres"
             postgres_dsn = env_db_url
 
+    # A storage flag names its backend: --postgres-dsn alone must not leave
+    # the command running against the default sqlite store while looking
+    # like it targeted Postgres. Both flags together still require an
+    # explicit --storage-backend to disambiguate.
+    if storage_backend is None:
+        if postgres_dsn and not sqlite_path:
+            storage_backend = "postgres"
+        elif sqlite_path and not postgres_dsn:
+            storage_backend = "sqlite"
+
     if storage_backend:
         config.storage.backend = storage_backend
     if postgres_dsn:
