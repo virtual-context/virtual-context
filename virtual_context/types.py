@@ -1560,6 +1560,9 @@ class AssembledContext:
     total_tokens: int = 0
     budget_breakdown: dict[str, int] = field(default_factory=dict)
     prepend_text: str = ""
+    # Rendered requester person card, influence-only. Surfaced so its cost is
+    # measurable rather than inferred. Empty with the gate off.
+    actor_card_text: str = ""
     matched_tags: list[str] = field(default_factory=list)
     context_hint: str = ""  # Topic list injected post-compaction
     temporal: bool = False  # True when query references a time position

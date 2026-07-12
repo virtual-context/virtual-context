@@ -145,8 +145,17 @@ class RetrievalAssembler:
         conversation_history: list[Message],
         model_name: str = "",
         max_context_tokens: int | None = None,
+        *,
+        request_roles=None,
     ) -> AssembledContext:
-        """Before sending to LLM: tag, retrieve, assemble enriched context."""
+        """Before sending to LLM: tag, retrieve, assemble enriched context.
+
+        *request_roles* is the explicit request-scoped selector for the person
+        card. It is never recovered by sniffing ``conversation_history``:
+        making card selection depend on an incidental history append is a
+        silent-failure shape, and a "latest row" lookup is not request-stable
+        under overlap or concurrency.
+        """
         _started = time.monotonic()
         _breakdown: dict[str, float] = {}
 
@@ -388,6 +397,7 @@ class RetrievalAssembler:
             working_set=ws_param,
             full_segments=full_segments_param,
             max_context_tokens=max_context_tokens,
+            request_roles=request_roles,
         )
         _note("assemble_primary", _assemble_stage)
 
@@ -441,6 +451,9 @@ class RetrievalAssembler:
                         working_set=ws_param,
                         full_segments=full_segments_param,
                         max_context_tokens=max_context_tokens,
+                        # The retry must not lose requester, subject, or
+                        # audience.
+                        request_roles=request_roles,
                     )
                     _note("assemble_retry", _retry_assemble_stage)
 

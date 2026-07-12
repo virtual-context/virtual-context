@@ -1037,6 +1037,10 @@ class VirtualContextEngine:
             tag_rules=self.config.tag_rules,
             store=self._store,
             conversation_id=self.config.conversation_id,
+            # A card is read by (tenant_id, actor_id), never actor alone, so
+            # assembly needs the tenant explicitly: AssemblerConfig has no
+            # tenant field for it to reach for.
+            tenant_id=self.config.tenant_id,
         )
 
     def _init_retriever(self) -> None:
@@ -2401,8 +2405,21 @@ class VirtualContextEngine:
         conversation_history: list[Message],
         model_name: str = "",
         max_context_tokens: int | None = None,
+        *,
+        request_roles: "RequestRoles | None" = None,
     ) -> AssembledContext:
-        return self._retrieval.on_message_inbound(message, conversation_history, model_name, max_context_tokens)
+        """Assemble context for an inbound message.
+
+        *request_roles* carries who is asking, whose statement is referenced,
+        and where the answer may surface. It is derived once from the inbound
+        active user entry and passed explicitly; assembly never sniffs it back
+        out of ``conversation_history``, and a "latest row" lookup is never the
+        selector. Defaults empty, so every existing caller is unchanged.
+        """
+        return self._retrieval.on_message_inbound(
+            message, conversation_history, model_name, max_context_tokens,
+            request_roles=request_roles,
+        )
 
     def tag_turn(
         self,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fnmatch
+import json
 import logging
 import re
 import time
@@ -106,12 +107,118 @@ class ContextAssembler:
         tag_rules: list[TagPromptRule] | None = None,
         store: object | None = None,
         conversation_id: str = "",
+        tenant_id: str = "",
     ) -> None:
         self.config = config
         self.token_counter = token_counter or (lambda text: len(text) // 4)
         self.tag_rules = tag_rules or []
         self._store = store
         self._conversation_id = conversation_id
+        # A card is read by (tenant_id, actor_id), never by actor alone. The
+        # tenant is not on AssemblerConfig, so it is an explicit constructor
+        # input rather than something assembly can reach for.
+        self._tenant_id = tenant_id
+
+    # ------------------------------------------------------------------
+    # Requester person card
+    # ------------------------------------------------------------------
+
+    # Fixed wrapper. Entry bodies are untrusted derived memory, so they are
+    # emitted as JSON scalars by the standard encoder and cannot close the
+    # wrapper or open a new system section. Structural exclusion is the
+    # guarantee here; the wording is only orientation for the reader.
+    _CARD_OPEN = '<actor-card mode="influence-only" quote="forbidden">'
+    _CARD_CLOSE = "</actor-card>"
+
+    @staticmethod
+    def _card_sort_key(entry) -> tuple:
+        """Lowest-confidence first, stable on (updated_at, id)."""
+        return (float(entry.confidence or 0.0), entry.updated_at or "", entry.id or "")
+
+    def _render_actor_card(self, entries: list) -> str:
+        """Render entries into the fixed wrapper, or "" for no entries.
+
+        No display name and no actor id appear in the rendered body: the card
+        shapes tone and depth, it does not identify anyone to the reader.
+
+        JSON escaping alone is NOT enough to contain an entry body. The encoder
+        escapes quotes and backslashes but leaves ``<`` and ``>`` untouched, so a
+        body containing a literal ``</actor-card>`` would close the wrapper and
+        could open a new system section. Angle brackets are therefore emitted as
+        ``\\u003c`` / ``\\u003e`` escapes: a JSON parser decodes them back to the
+        original text, so the body round-trips exactly, while the rendered
+        characters can no longer terminate the wrapper. Structural exclusion is
+        the guarantee here; the ``quote="forbidden"`` wording is not.
+        """
+        if not entries:
+            return ""
+        ordered = sorted(entries, key=lambda e: (e.kind, -float(e.confidence or 0.0), e.id))
+        payload = json.dumps(
+            {"entries": [{"kind": e.kind, "body": e.body} for e in ordered]},
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+        payload = payload.replace("<", "\\u003c").replace(">", "\\u003e")
+        return f"{self._CARD_OPEN}\n{payload}\n{self._CARD_CLOSE}"
+
+    def _build_actor_card(
+        self,
+        request_roles,
+        base_pool: int,
+    ) -> tuple[str, int, list]:
+        """Read, cap, and render the requester's card.
+
+        Returns ``(text, tokens, surviving_entries)``. Every failure mode —
+        gate off, unknown requester, unproved audience, dirty card, no store —
+        returns ``("", 0, [])`` and is indistinguishable from today.
+        """
+        if not self.config.actor_card_enabled:
+            # Ships dark: no profile or card read, no budget key, and rendered
+            # output byte-identical to before the feature existed.
+            return "", 0, []
+        if request_roles is None:
+            return "", 0, []
+        actor_id = (request_roles.requester_actor_id or "").strip()
+        # An unknown requester injects nothing, so a new member gets a clean
+        # generic experience by construction.
+        if not actor_id:
+            return "", 0, []
+        getter = getattr(self._store, "get_actor_card", None)
+        if not callable(getter):
+            return "", 0, []
+
+        try:
+            card = getter(
+                self._tenant_id,
+                actor_id,
+                owner_conversation_id=(
+                    request_roles.owner_conversation_id or self._conversation_id
+                ),
+                audience_conversation_id=request_roles.audience_conversation_id,
+                audience_channel_id=request_roles.audience_channel_id or "",
+            )
+        except Exception:
+            logger.warning("actor card read failed", exc_info=True)
+            return "", 0, []
+        if card is None or not card.entries:
+            return "", 0, []
+
+        # The store already applied the sensitivity/audience/superseded
+        # predicates; this is only the token cap.
+        entries = list(card.entries)
+        cap = max(0, int(self.config.actor_card_max_tokens))
+        allowed = min(cap, max(0, int(base_pool)))
+        while entries:
+            text = self._render_actor_card(entries)
+            tokens = self.token_counter(text)
+            if tokens <= allowed:
+                return text, tokens, entries
+            # Drop whole lowest-confidence entries. Never truncate mid-entry:
+            # half a preference is worse than none of it.
+            entries.remove(min(entries, key=self._card_sort_key))
+        # With no surviving entry, or a wrapper that alone exceeds the cap,
+        # inject and charge zero.
+        return "", 0, []
 
     def assemble(
         self,
@@ -123,6 +230,7 @@ class ContextAssembler:
         working_set: dict[str, WorkingSetEntry] | None = None,
         full_segments: dict[str, list[StoredSegment]] | None = None,
         max_context_tokens: int | None = None,
+        request_roles=None,
     ) -> AssembledContext:
         """Build final context within token budget.
 
@@ -181,11 +289,22 @@ class ContextAssembler:
         _note("sort_tags", _stage)
 
         # --- Unified pool allocation ---
-        pool = self.config.context_injection_max_tokens
+        # The card is rendered and counted FIRST, then subtracted from the pool
+        # exactly once. Reducing max_context_tokens and then subtracting the
+        # card again would charge it twice.
+        base_pool = self.config.context_injection_max_tokens
         # Headroom cap (proxy mode)
         if max_context_tokens is not None:
             available = max(0, max_context_tokens - core_tokens - hint_tokens)
-            pool = min(pool, available)
+            base_pool = min(base_pool, available)
+
+        _stage = time.monotonic()
+        actor_card_text, card_tokens, card_entries = self._build_actor_card(
+            request_roles, base_pool,
+        )
+        _note("build_actor_card", _stage)
+
+        pool = max(0, base_pool - card_tokens)
         tag_cap = self.config.tag_context_max_tokens
         facts_cap = self.config.facts_max_tokens
 
@@ -396,7 +515,8 @@ class ContextAssembler:
 
         # Conversation budget = remaining tokens
         conversation_budget = (
-            token_budget - core_tokens - tag_tokens - hint_tokens - facts_tokens_actual
+            token_budget - core_tokens - tag_tokens - hint_tokens
+            - facts_tokens_actual - card_tokens
         )
 
         # Trim conversation to budget
@@ -407,20 +527,26 @@ class ContextAssembler:
         conv_tokens = sum(self.token_counter(m.content) for m in trimmed)
         _note("count_conversation_tokens", _stage)
 
-        # Build prepend text (core + context hint + tag sections + facts)
+        # Build prepend text (core + card + context hint + tag sections + facts).
+        # The card sits after core context and before tag context.
         _stage = time.monotonic()
-        prepend_parts: list[str] = []
-        if core:
-            prepend_parts.append(core)
-        if context_hint:
-            prepend_parts.append(context_hint)
-        for tag in sorted_tags:
-            if tag in tag_sections:
-                prepend_parts.append(tag_sections[tag])
-        if facts_text:
-            prepend_parts.append(facts_text)
 
-        prepend_text = "\n\n".join(prepend_parts)
+        def _build_prepend() -> str:
+            parts: list[str] = []
+            if core:
+                parts.append(core)
+            if actor_card_text:
+                parts.append(actor_card_text)
+            if context_hint:
+                parts.append(context_hint)
+            for tag in sorted_tags:
+                if tag in tag_sections:
+                    parts.append(tag_sections[tag])
+            if facts_text:
+                parts.append(facts_text)
+            return "\n\n".join(parts)
+
+        prepend_text = _build_prepend()
         _note("build_prepend", _stage)
 
         # Hard budget cap: if prepend_text exceeds token_budget,
@@ -446,24 +572,29 @@ class ContextAssembler:
                             drop_tag, prepend_tokens, token_budget, dropped_tokens)
                 del tag_sections[drop_tag]
                 tag_tokens -= dropped_tokens
-                # Rebuild prepend_text
-                prepend_parts = []
-                if core:
-                    prepend_parts.append(core)
-                if context_hint:
-                    prepend_parts.append(context_hint)
-                for tag in sorted_tags:
-                    if tag in tag_sections:
-                        prepend_parts.append(tag_sections[tag])
-                if facts_text:
-                    prepend_parts.append(facts_text)
-                prepend_text = "\n\n".join(prepend_parts)
+                prepend_text = _build_prepend()
                 prepend_tokens = self.token_counter(prepend_text)
                 if prepend_tokens <= token_budget:
                     break
+
+            # Still over after tag eviction: drop whole low-confidence card
+            # entries, in the same stable order, and rebuild. Never truncate an
+            # entry. The whole-prepend recount is authoritative because token
+            # counts need not be additive across the "\n\n" separators.
+            while prepend_tokens > token_budget and card_entries:
+                card_entries.remove(min(card_entries, key=self._card_sort_key))
+                actor_card_text = self._render_actor_card(card_entries)
+                card_tokens = (
+                    self.token_counter(actor_card_text) if actor_card_text else 0
+                )
+                prepend_text = _build_prepend()
+                prepend_tokens = self.token_counter(prepend_text)
         _note("hard_cap_trim", _stage)
 
-        total_tokens = core_tokens + tag_tokens + facts_tokens_actual + conv_tokens
+        total_tokens = (
+            core_tokens + hint_tokens + tag_tokens + facts_tokens_actual
+            + card_tokens + conv_tokens
+        )
 
         # Compute presented_tags from rendered <virtual-context tags="..."> headers
         _stage = time.monotonic()
@@ -496,19 +627,25 @@ class ContextAssembler:
                 " ".join(stage_bits) if stage_bits else "no-stages",
             )
 
+        _budget_breakdown = {
+            "core": core_tokens,
+            "context_hint": hint_tokens,
+            "tags": tag_tokens,
+            "facts": facts_tokens_actual,
+            "conversation": conv_tokens,
+        }
+        # With the gate off, no new budget key appears at all.
+        if self.config.actor_card_enabled:
+            _budget_breakdown["actor_card"] = card_tokens
+
         return AssembledContext(
             core_context=core,
             tag_sections=tag_sections,
             facts_text=facts_text,
             conversation_history=trimmed,
             total_tokens=total_tokens,
-            budget_breakdown={
-                "core": core_tokens,
-                "context_hint": hint_tokens,
-                "tags": tag_tokens,
-                "facts": facts_tokens_actual,
-                "conversation": conv_tokens,
-            },
+            budget_breakdown=_budget_breakdown,
+            actor_card_text=actor_card_text,
             prepend_text=prepend_text,
             presented_segment_refs=presented_refs,
             selected_facts=selected_facts,
