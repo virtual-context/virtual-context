@@ -38,6 +38,7 @@ from ..core.tool_loop import (
     execute_vc_tool,
 )
 from ..types import Fact, Message, PreparedPayload, SplitResult, StoredSummary  # noqa: F401 — re-exported
+from ..types import SOURCE_CONVERSATION_KEY as _SOURCE_CONVERSATION_KEY
 
 from .dashboard import register_dashboard_routes
 from .formats import (
@@ -731,11 +732,33 @@ async def prepare_payload(
 
     # Resolve upstream context window limit for this model
     from .helpers import (
-        _extract_ingestible_messages,
+        _extract_ingestible_messages as _extract_ingestible_messages_raw,
         _inject_context,
         _inject_vc_tools,
     )
     from ..model_limits import resolve_upstream_limit
+
+    def _extract_ingestible_messages(payload: dict) -> list:
+        """Parse the payload and stamp the RAW caller key on every message.
+
+        The tagger derives an actor id from ``Message.metadata``, but the
+        platform segment of that id lives only in the pre-alias caller key —
+        ``config.conversation_id`` is resolved by then and can be a UUID.
+
+        Every message is stamped, not just the active tail: the historical
+        tagger path re-derives identity from the completed-history messages, so
+        stamping only the tail would leave every alias-routed conversation's
+        history actor-blind.
+        """
+        messages = _extract_ingestible_messages_raw(payload)
+        raw_key = (inbound_conversation_id or "").strip()
+        if raw_key:
+            for message in messages:
+                if message.metadata is None:
+                    message.metadata = {}
+                if isinstance(message.metadata, dict):
+                    message.metadata[_SOURCE_CONVERSATION_KEY] = raw_key
+        return messages
 
     _model_name = body.get("model", "")
     if state:
@@ -798,6 +821,11 @@ async def prepare_payload(
             _phase_decision = state.handle_prepare_payload(
                 body=body,
                 payload_accounting=_payload_accounting,
+                # The pre-alias-resolution caller key. The engine's own
+                # conversation id is resolved by now and, after a VCATTACH, can
+                # be a UUID that names no platform — which would silently strip
+                # the platform segment out of every actor id.
+                source_conversation_key=inbound_conversation_id or "",
             )
         except _LE_MISMATCH:
             raise

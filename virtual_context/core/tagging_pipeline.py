@@ -288,6 +288,83 @@ class TaggingPipeline:
             derived_id, derived_label = get_origin_channel(message.metadata)
         return (derived_id or stored_id, derived_label or stored_label)
 
+    def _actor_source_key(self, message: "Message | None") -> str:
+        """Raw caller key to derive an actor platform from, for one message.
+
+        The proxy stamps the pre-alias-resolution caller key onto every
+        ``Message`` it parses from the inbound payload. Reading
+        ``config.conversation_id`` alone would lose the platform after a
+        VCATTACH, because the engine id is resolved to a UUID by then.
+        """
+        from ..types import SOURCE_CONVERSATION_KEY
+
+        metadata = getattr(message, "metadata", None) if message else None
+        if isinstance(metadata, dict):
+            raw_key = metadata.get(SOURCE_CONVERSATION_KEY)
+            if isinstance(raw_key, str) and raw_key.strip():
+                return raw_key.strip()
+        return self.config.conversation_id
+
+    @staticmethod
+    def _row_reply_edge(row: "CanonicalTurnRow | None") -> dict:
+        """Re-supply the stored reply edge on a direct canonical-row rewrite.
+
+        ``save_canonical_turn`` is a full-row upsert: every omitted column is
+        overwritten with its default. A tagger rewrite that does not pass these
+        back would therefore ERASE an edge the reconciler already resolved
+        correctly — silently moving a quoted claim out of attribution entirely.
+
+        The tagger never derives an edge; it only preserves one. Resolution
+        needs the whole batch and the store, and it already happened at ingest.
+
+        Every read carries the column default. Row doubles in the test suite
+        are permissive namespaces rather than real ``CanonicalTurnRow``s, and a
+        strict ``getattr`` would turn "this double predates the reply edge"
+        into an ``AttributeError`` on an unrelated tagging path.
+        """
+        defaults: dict[str, str | int] = {
+            "source_message_id": "",
+            "reply_target_message_id": "",
+            "reply_subject_actor_id": "",
+            "reply_subject_label": "",
+            "reply_target_body": "",
+            "reply_attribution_version": 0,
+            "audience_attribution_version": 0,
+        }
+        if row is None:
+            return dict(defaults)
+        return {
+            name: (getattr(row, name, default) if getattr(row, name, default) is not None else default)
+            for name, default in defaults.items()
+        }
+
+    def _merge_row_actor(
+        self,
+        message: "Message | None",
+        row: "CanonicalTurnRow | None",
+        *,
+        role: str,
+    ) -> str:
+        """Actor id to re-supply on a direct canonical-row rewrite.
+
+        Role-local by construction: only a user message may newly derive an
+        identity, so an assistant row passes its stored value straight through
+        and can never be labeled with a human actor. A stored value also wins
+        over an empty derivation, so a rewrite whose payload no longer carries
+        the identity envelope cannot blank it.
+        """
+        from ..types import get_actor_id
+
+        stored = (getattr(row, "sender_actor_id", "") or "") if row else ""
+        if role != "user":
+            return stored
+        derived = ""
+        if message is not None and getattr(message, "metadata", None):
+            derived = get_actor_id(
+                message.metadata, self._actor_source_key(message),
+            )
+        return derived or stored
+
     def _persist_canonical_turn(
         self,
         entry: "TurnTagEntry",
@@ -359,6 +436,10 @@ class TaggingPipeline:
             asst_channel_id, asst_channel_label = self._merge_row_channel(
                 asst_msg, assistant_row,
             )
+            user_actor_id = self._merge_row_actor(user_msg, user_row, role="user")
+            asst_actor_id = self._merge_row_actor(
+                asst_msg, assistant_row, role="assistant",
+            )
             self._store.save_canonical_turn(
                 self.config.conversation_id,
                 entry.turn_number,
@@ -391,6 +472,8 @@ class TaggingPipeline:
                 turn_group_number=entry.turn_number,
                 origin_channel_id=user_channel_id,
                 origin_channel_label=user_channel_label,
+                sender_actor_id=user_actor_id,
+                **self._row_reply_edge(user_row),
             )
             self._store.save_canonical_turn(
                 self.config.conversation_id,
@@ -423,15 +506,22 @@ class TaggingPipeline:
                 turn_group_number=entry.turn_number,
                 origin_channel_id=asst_channel_id,
                 origin_channel_label=asst_channel_label,
+                sender_actor_id=asst_actor_id,
+                **self._row_reply_edge(assistant_row),
             )
             entry.canonical_turn_id = user_row.canonical_turn_id or entry.canonical_turn_id
             # Fallback hash-search path: 0 rows consumed from
             # ``existing_rows`` (we bypassed it).
             return 0
-        from ..types import get_origin_channel
+        from ..types import get_actor_id, get_origin_channel
 
         user_channel_id, user_channel_label = get_origin_channel(user_msg.metadata)
         asst_channel_id, asst_channel_label = get_origin_channel(asst_msg.metadata)
+        # Only the user half may carry an actor id, and its platform comes from
+        # the raw caller key stamped on the message, not the resolved engine id.
+        user_actor_id = get_actor_id(
+            user_msg.metadata, self._actor_source_key(user_msg),
+        )
         result = IngestReconciler(self._store, self._semantic).ingest_single(
             conversation_id=self.config.conversation_id,
             user_content=user_msg.content,
@@ -446,6 +536,7 @@ class TaggingPipeline:
             user_origin_channel_label=user_channel_label,
             assistant_origin_channel_id=asst_channel_id,
             assistant_origin_channel_label=asst_channel_label,
+            user_sender_actor_id=user_actor_id,
             fact_signals=list(entry.fact_signals or []),
             code_refs=list(entry.code_refs or []),
             expected_lifecycle_epoch=self._engine_state.lifecycle_epoch,
@@ -509,6 +600,9 @@ class TaggingPipeline:
                 asst_id, asst_label = self._merge_row_channel(asst_msg, row)
                 combined_channel_id = combined_channel_id or asst_id
                 combined_channel_label = combined_channel_label or asst_label
+            # A legacy combined row carries both halves, so it IS a user row:
+            # derive from the user message only, never from the assistant one.
+            combined_actor_id = self._merge_row_actor(user_msg, row, role="user")
             self._store.save_canonical_turn(
                 self.config.conversation_id,
                 entry.turn_number,
@@ -541,6 +635,8 @@ class TaggingPipeline:
                 turn_group_number=row.turn_group_number,
                 origin_channel_id=combined_channel_id,
                 origin_channel_label=combined_channel_label,
+                sender_actor_id=combined_actor_id,
+                **self._row_reply_edge(row),
             )
             entry.canonical_turn_id = row.canonical_turn_id or entry.canonical_turn_id
             return 1
@@ -592,6 +688,7 @@ class TaggingPipeline:
             # Per-entry channel derivation: this physical message's own
             # metadata, else the row's stored value, per field.
             row_channel_id, row_channel_label = self._merge_row_channel(message, row)
+            row_actor_id = self._merge_row_actor(message, row, role=role)
             self._store.save_canonical_turn(
                 self.config.conversation_id,
                 entry.turn_number,
@@ -621,6 +718,8 @@ class TaggingPipeline:
                 turn_group_number=row.turn_group_number,
                 origin_channel_id=row_channel_id,
                 origin_channel_label=row_channel_label,
+                sender_actor_id=row_actor_id,
+                **self._row_reply_edge(row),
             )
         entry.canonical_turn_id = window[0].canonical_turn_id or entry.canonical_turn_id
         # Report rows consumed from the head of ``existing_rows``: the offset
@@ -1291,6 +1390,8 @@ class TaggingPipeline:
             # provenance straight back so the upsert cannot default it away.
             origin_channel_id=row.origin_channel_id,
             origin_channel_label=row.origin_channel_label,
+            sender_actor_id=row.sender_actor_id,
+            **self._row_reply_edge(row),
         )
 
     def retag_canonical_turns(
@@ -1494,6 +1595,8 @@ class TaggingPipeline:
                     turn_group_number=row.turn_group_number,
                     origin_channel_id=row.origin_channel_id,
                     origin_channel_label=row.origin_channel_label,
+                    sender_actor_id=row.sender_actor_id,
+                    **self._row_reply_edge(row),
                 )
             for tag in tag_result.tags:
                 if tag not in store_tags:

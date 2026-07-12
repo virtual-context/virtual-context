@@ -278,6 +278,15 @@ class CompositeStore:
         turn_group_number: int = -1,
         origin_channel_id: str = "",
         origin_channel_label: str = "",
+        sender_actor_id: str = "",
+        source_message_id: str = "",
+        reply_target_message_id: str = "",
+        reply_subject_actor_id: str = "",
+        reply_subject_label: str = "",
+        reply_target_body: str = "",
+        reply_attribution_version: int = 0,
+        audience_conversation_id: str = "",
+        audience_attribution_version: int = 0,
     ) -> None:
         return self._segments.save_canonical_turn(
             conversation_id,
@@ -308,6 +317,15 @@ class CompositeStore:
             turn_group_number=turn_group_number,
             origin_channel_id=origin_channel_id,
             origin_channel_label=origin_channel_label,
+            sender_actor_id=sender_actor_id,
+            source_message_id=source_message_id,
+            reply_target_message_id=reply_target_message_id,
+            reply_subject_actor_id=reply_subject_actor_id,
+            reply_subject_label=reply_subject_label,
+            reply_target_body=reply_target_body,
+            reply_attribution_version=reply_attribution_version,
+            audience_conversation_id=audience_conversation_id,
+            audience_attribution_version=audience_attribution_version,
         )
 
     def recompute_canonical_turn_groups(
@@ -912,6 +930,78 @@ class CompositeStore:
                 expected_lifecycle_epoch=expected_lifecycle_epoch,
             ))
         return 0
+
+    def update_canonical_turn_actors_if_empty(
+        self,
+        conversation_id: str,
+        updates: dict[str, str],
+        *,
+        expected_lifecycle_epoch: int | None = None,
+    ) -> int:
+        fn = getattr(self._segments, "update_canonical_turn_actors_if_empty", None)
+        if callable(fn):
+            return int(fn(
+                conversation_id,
+                updates,
+                expected_lifecycle_epoch=expected_lifecycle_epoch,
+            ))
+        return 0
+
+    def update_canonical_turn_reply_roles_if_empty(
+        self,
+        conversation_id: str,
+        updates: dict[str, dict],
+        *,
+        expected_lifecycle_epoch: int | None = None,
+    ) -> int:
+        fn = getattr(
+            self._segments, "update_canonical_turn_reply_roles_if_empty", None,
+        )
+        if callable(fn):
+            return int(fn(
+                conversation_id,
+                updates,
+                expected_lifecycle_epoch=expected_lifecycle_epoch,
+            ))
+        return 0
+
+    def find_canonical_turn_by_source_message_id(
+        self,
+        conversation_id: str,
+        source_message_id: str,
+        *,
+        audience_conversation_id: str = "",
+        origin_channel_id: str = "",
+    ) -> "CanonicalTurnRow | None":
+        fn = getattr(
+            self._segments, "find_canonical_turn_by_source_message_id", None,
+        )
+        if callable(fn):
+            return fn(
+                conversation_id,
+                source_message_id,
+                audience_conversation_id=audience_conversation_id,
+                origin_channel_id=origin_channel_id,
+            )
+        return None
+
+    def find_actor_ids_by_display_label(
+        self,
+        conversation_id: str,
+        label: str,
+        *,
+        audience_conversation_id: str = "",
+        origin_channel_id: str = "",
+    ) -> list[str]:
+        fn = getattr(self._segments, "find_actor_ids_by_display_label", None)
+        if callable(fn):
+            return list(fn(
+                conversation_id,
+                label,
+                audience_conversation_id=audience_conversation_id,
+                origin_channel_id=origin_channel_id,
+            ))
+        return []
 
     def list_canonical_conversation_ids(
         self,
