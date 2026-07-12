@@ -220,3 +220,50 @@ def test_rebuild_actor_cards_runs_while_read_gate_is_dark(tmp_path):
     assert card is not None
     assert [entry.body for entry in card.entries] == ["prefers terse answers"]
     engine.close()
+
+
+def test_batch_operation_continues_past_a_vanished_conversation(tmp_path, capsys, monkeypatch):
+    """A conversation deleted between enumeration and processing must not
+    abort the rest of the batch."""
+    import json as _json
+    import sys as _sys
+    from types import SimpleNamespace
+    from virtual_context.cli import main as cli_main
+
+    calls = []
+
+    class _FakeEngine:
+        def __init__(self, **kwargs):
+            self.config = kwargs["config"]
+            self._store = SimpleNamespace(
+                list_canonical_conversation_ids=lambda **kw: ["conv-a", "conv-gone", "conv-b"],
+            )
+
+        def backfill_reply_roles(self, target, *, dry_run, limit):
+            calls.append(target)
+            if target == "conv-gone":
+                raise KeyError(target)
+            return {"eligible": 1, "updated": 1, "failed": 0}
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        "virtual_context.engine.VirtualContextEngine", _FakeEngine,
+    )
+    args = SimpleNamespace(
+        conversation_id="", tenant_id="", all_convs_for_tenant=True,
+        dry_run=False, limit=None, config=None,
+        storage_backend="sqlite", postgres_dsn=None,
+        sqlite_path=str(tmp_path / "s.db"),
+    )
+    cli_main._cmd_admin_actor_operation(
+        args, "backfill_reply_roles", ("eligible", "updated", "failed"),
+    )
+    out = _json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert out["status"] == "ok"
+    assert out["errors"] == 1
+    assert out["updated"] == 2
+    assert calls == ["conv-a", "conv-gone", "conv-b"]
+    error_rows = [r for r in out["results"] if r.get("status") == "error"]
+    assert len(error_rows) == 1 and error_rows[0]["conversation_id"] == "conv-gone"
