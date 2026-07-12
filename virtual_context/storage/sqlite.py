@@ -35,7 +35,28 @@ from ..core.progress_snapshot import (
 )
 from ..core.store import ContextStore
 from ..types import ChunkEmbedding, ConversationStats, DepthLevel, EngineStateSnapshot, Fact, FactLink, FactSignal, CanonicalTurnChunkEmbedding, CanonicalTurnRow, LinkedFact, QuoteResult, SegmentMetadata, StoredSegment, StoredSummary, TagStats, TagSummary, TemporalStatus, TurnTagEntry, WorkingSetEntry, channel_excerpt_prefix, strip_channel_hash
+from ..types import (
+    CARD_CROSS_CONTEXT_KINDS,
+    CARD_KINDS,
+    CARD_SCOPES,
+    CARD_SCOPE_SAME_CONVERSATION,
+    CARD_SENSITIVITIES,
+    CARD_SENSITIVITY_NORMAL,
+    ActorCard,
+    ActorCardEntry,
+    ActorCardEntrySource,
+    ActorFactSource,
+)
 from .helpers import dt_to_str as _dt_to_str, str_to_dt as _str_to_dt, extract_excerpt as _extract_excerpt
+
+
+def _sql_in_list(values: tuple[str, ...]) -> str:
+    """Render an enum tuple as a SQL literal list for a CHECK constraint.
+
+    The values are module constants, never user or model input; this exists so
+    the CHECK constraint and the Python enum cannot drift apart.
+    """
+    return ", ".join("'" + v.replace("'", "''") + "'" for v in values)
 
 SCHEMA_SQL = """\
 CREATE TABLE IF NOT EXISTS segments (
@@ -1799,6 +1820,10 @@ CREATE TABLE IF NOT EXISTS request_captures (
             self._ensure_fact_author_schema(conn)
         except Exception:
             logger.warning("fact author bootstrap failed", exc_info=True)
+        try:
+            self._ensure_actor_card_schema(conn)
+        except Exception:
+            logger.warning("actor card bootstrap failed", exc_info=True)
         # The bootstrap above swallows broad failures, so a half-migrated
         # schema would otherwise run silently and drop identity on every
         # write. Assert the actor column on both the base table and the
@@ -1914,6 +1939,17 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 "cross-conversation actor lookup would fall back to a full scan"
             )
 
+        # Card tables. A missing card table is not a degraded read, it is a
+        # silent privacy failure: delete/merge invalidation would have nothing
+        # to invalidate.
+        for table in ("actor_profiles", "actor_card_entries",
+                      "actor_card_entry_sources"):
+            if not self._table_exists(conn, table):
+                raise RuntimeError(
+                    f"{table} is missing; refusing to run person cards on a "
+                    f"half-migrated schema"
+                )
+
     def _ensure_fact_author_schema(self, conn: sqlite3.Connection) -> None:
         """Forward-migrate fact authorship onto an existing database."""
         for column, definition in FACT_AUTHOR_COLUMN_DEFS.items():
@@ -1923,6 +1959,77 @@ CREATE TABLE IF NOT EXISTS request_captures (
                    ON facts(author_actor_id, conversation_id)
                    WHERE author_actor_id <> ''"""
         )
+
+    def _ensure_actor_card_schema(self, conn: sqlite3.Connection) -> None:
+        """Create the person-card tables.
+
+        Cards are keyed ``(tenant_id, actor_id)`` so a person is one person
+        across conversations rather than a scrapbook re-learned per room. That
+        key does NOT include ``conversation_id``, so ``delete_conversation``
+        cannot reach a card by name: ``actor_card_entry_sources`` is what makes
+        deletion and audience policy possible at all, carrying both the owner
+        conversation and the validated pre-alias audience origin of every
+        contributing fact.
+        """
+        conn.executescript(f"""
+            CREATE TABLE IF NOT EXISTS actor_profiles (
+                tenant_id TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                platform TEXT NOT NULL DEFAULT '',
+                display_name TEXT NOT NULL DEFAULT '',
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                card_built_at TEXT NULL,
+                card_dirty INTEGER NOT NULL DEFAULT 0,
+                card_input_hash TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (tenant_id, actor_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS actor_card_entries (
+                id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                kind TEXT NOT NULL
+                    CHECK (kind IN ({_sql_in_list(CARD_KINDS)})),
+                body TEXT NOT NULL,
+                confidence REAL NOT NULL DEFAULT 0.0,
+                sensitivity TEXT NOT NULL DEFAULT 'normal'
+                    CHECK (sensitivity IN ({_sql_in_list(CARD_SENSITIVITIES)})),
+                audience_scope TEXT NOT NULL DEFAULT 'same_conversation'
+                    CHECK (audience_scope IN ({_sql_in_list(CARD_SCOPES)})),
+                superseded_by TEXT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE (id, tenant_id),
+                FOREIGN KEY (tenant_id, actor_id)
+                    REFERENCES actor_profiles(tenant_id, actor_id)
+                    ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_actor_card_entries_actor
+                ON actor_card_entries(tenant_id, actor_id, superseded_by);
+
+            CREATE TABLE IF NOT EXISTS actor_card_entry_sources (
+                entry_id TEXT NOT NULL,
+                tenant_id TEXT NOT NULL,
+                owner_conversation_id TEXT NOT NULL,
+                audience_conversation_id TEXT NOT NULL,
+                audience_channel_id TEXT NOT NULL DEFAULT '',
+                fact_id TEXT NOT NULL,
+                PRIMARY KEY (entry_id, fact_id),
+                FOREIGN KEY (entry_id, tenant_id)
+                    REFERENCES actor_card_entries(id, tenant_id)
+                    ON DELETE CASCADE,
+                FOREIGN KEY (fact_id) REFERENCES facts(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_actor_card_sources_owner
+                ON actor_card_entry_sources(tenant_id, owner_conversation_id);
+            CREATE INDEX IF NOT EXISTS idx_actor_card_sources_audience
+                ON actor_card_entry_sources(tenant_id, audience_conversation_id);
+            CREATE INDEX IF NOT EXISTS idx_actor_card_sources_fact
+                ON actor_card_entry_sources(fact_id);
+        """)
 
     def _ensure_canonical_turn_views(self, conn: sqlite3.Connection) -> None:
         conn.execute("DROP VIEW IF EXISTS canonical_turns_ordinal")
@@ -4619,6 +4726,15 @@ CREATE TABLE IF NOT EXISTS request_captures (
                      completed_at.isoformat()),
                 )
 
+            # Invalidate every card entry naming either side, inside the merge
+            # transaction. Facts move to the target while an entry can still
+            # hold the source's owner id, and a rebuild that ran against the
+            # moved facts would erase the original audience boundary. Dirtied
+            # cards are unreadable, so the next compaction touching those actors
+            # (or an explicit rebuild) is enough to restore them safely.
+            for cid in sorted({source_conversation_id, target_conversation_id}):
+                self._invalidate_actor_cards(conn, cid)
+
             conn.execute("COMMIT")
         except Exception:
             conn.execute("ROLLBACK")
@@ -5600,35 +5716,54 @@ CREATE TABLE IF NOT EXISTS request_captures (
 
     def delete_conversation(self, conversation_id: str) -> int:
         conn = self._get_conn()
-        deleted = self._delete_conversation_rows(conn, "segments", conversation_id)
-        # Also clear persisted state and diagnostics so restarts do not
-        # resurrect a partially deleted conversation.
-        for table in (
-            "engine_state",
-            "fact_embeddings",
-            "facts",
-            "canonical_turns",
-            "canonical_turn_chunks",
-            "canonical_turn_anchors",
-            "ingest_batches",
-            "tag_summaries",
-            "tag_aliases",
-            "request_captures",
-            "tool_outputs",
-            "tool_calls",
-            "request_context",
-            "request_turn_counters",
-            "tag_summary_embeddings",
-            "turn_tool_outputs",
-            "segment_tool_outputs",
-            "chain_snapshots",
-            "media_outputs",
-            "ingestion_episode",
-            "compaction_operation",
-            "conversations",
-        ):
-            self._delete_conversation_rows(conn, table, conversation_id)
-        conn.commit()
+        # One explicit write transaction. The shipped implementation relied on
+        # an implicit one, which is not sufficient once the card capture below
+        # has to observe state that the very same delete is about to destroy.
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            # Capture and dirty affected cards BEFORE any fact is deleted:
+            # actor_card_entry_sources.fact_id cascades on fact delete, so
+            # deleting facts first would erase the rows needed to discover which
+            # cards this conversation contributed to, and its content would
+            # survive inside them.
+            self._invalidate_actor_cards(conn, conversation_id)
+
+            deleted = self._delete_conversation_rows(conn, "segments", conversation_id)
+            # Also clear persisted state and diagnostics so restarts do not
+            # resurrect a partially deleted conversation.
+            for table in (
+                "engine_state",
+                "fact_embeddings",
+                "facts",
+                "canonical_turns",
+                "canonical_turn_chunks",
+                "canonical_turn_anchors",
+                "ingest_batches",
+                "tag_summaries",
+                "tag_aliases",
+                "request_captures",
+                "tool_outputs",
+                "tool_calls",
+                "request_context",
+                "request_turn_counters",
+                "tag_summary_embeddings",
+                "turn_tool_outputs",
+                "segment_tool_outputs",
+                "chain_snapshots",
+                "media_outputs",
+                "ingestion_episode",
+                "compaction_operation",
+                "conversations",
+            ):
+                self._delete_conversation_rows(conn, table, conversation_id)
+
+            # A profile with no surviving actor rows and no surviving facts is
+            # not a person we know anything about any more.
+            self._prune_orphan_actor_profiles(conn)
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
 
         # Disk cleanup: remove media files for this conversation
         import os
@@ -7975,6 +8110,18 @@ CREATE TABLE IF NOT EXISTS request_captures (
                     )
                     return (0, 0)
 
+            # Capture the OUTGOING authors before the DELETE. Their cards are
+            # about to lose a source, so they must be dirtied even though the
+            # replacement facts may name a different actor entirely.
+            outgoing_authors = {
+                r[0] for r in conn.execute(
+                    """SELECT DISTINCT author_actor_id FROM facts
+                        WHERE conversation_id = ? AND segment_ref = ?
+                          AND COALESCE(TRIM(author_actor_id), '') <> ''""",
+                    (conversation_id, segment_ref),
+                ).fetchall()
+            }
+
             # DELETE existing facts (and their tag links) for this segment.
             conn.execute(
                 "DELETE FROM fact_tags WHERE fact_id IN "
@@ -8072,6 +8219,19 @@ CREATE TABLE IF NOT EXISTS request_captures (
                     )
                 count += 1
 
+            # Dirty the union of outgoing and incoming authors, in the SAME
+            # transaction as the replacement. Marking cards dirty only after
+            # the facts were replaced would leave a crash window in which
+            # stale card content stays readable; readers serve no dirty card.
+            incoming_authors = {
+                (f.author_actor_id or "").strip()
+                for f in facts
+                if (f.author_actor_id or "").strip()
+            }
+            self._mark_actor_profiles_dirty(
+                conn, conversation_id, outgoing_authors | incoming_authors,
+            )
+
             conn.execute("COMMIT")
             return deleted, count
         except CompactionLeaseLost:
@@ -8080,6 +8240,568 @@ CREATE TABLE IF NOT EXISTS request_captures (
         except Exception:
             conn.execute("ROLLBACK")
             raise
+
+    def _mark_actor_profiles_dirty(
+        self,
+        conn: sqlite3.Connection,
+        conversation_id: str,
+        actor_ids,
+    ) -> int:
+        """Mark the given actors' cards dirty, scoped to the owning tenant.
+
+        The tenant comes from the authoritative ``conversations`` row, never
+        from a caller-supplied string: a card read filters on both tenant and
+        actor, so a wrong tenant here would dirty the wrong person's card and
+        leave the real one stale-but-readable.
+        """
+        actor_ids = {a for a in (actor_ids or ()) if a}
+        if not actor_ids:
+            return 0
+        if not self._table_exists(conn, "actor_profiles"):
+            return 0
+        row = conn.execute(
+            "SELECT tenant_id FROM conversations WHERE conversation_id = ?",
+            (conversation_id,),
+        ).fetchone()
+        if row is None:
+            return 0
+        tenant_id = row[0] or ""
+        updated = 0
+        for actor_id in sorted(actor_ids):
+            cur = conn.execute(
+                """UPDATE actor_profiles SET card_dirty = 1
+                    WHERE tenant_id = ? AND actor_id = ?""",
+                (tenant_id, actor_id),
+            )
+            updated += int(cur.rowcount or 0)
+        return updated
+
+    # ------------------------------------------------------------------
+    # Person cards
+    # ------------------------------------------------------------------
+
+    def _resolve_owner(self, conn: sqlite3.Connection, conversation_id: str) -> str:
+        """Follow an alias to its target, if the id is an alias."""
+        row = conn.execute(
+            "SELECT target_id FROM conversation_aliases WHERE alias_id = ?",
+            (conversation_id,),
+        ).fetchone()
+        return (row[0] if row else conversation_id) or conversation_id
+
+    def upsert_actor_profile_from_turn(
+        self,
+        conversation_id: str,
+        actor_id: str,
+        display_name: str = "",
+        *,
+        seen_at: str,
+        expected_lifecycle_epoch: int | None = None,
+    ) -> bool:
+        """Record that this actor was observed on an accepted user turn.
+
+        Tenant is derived from the authoritative ``conversations`` row, never
+        from a separately supplied string, and the lifecycle epoch is checked
+        in the same statement so a stale writer cannot resurrect a profile for
+        a conversation that was deleted underneath it.
+
+        A repeat observation still advances ``last_seen_at`` and may refresh the
+        presentation name even when the canonical actor column was already set.
+        The display name never participates in the key.
+        """
+        actor_id = (actor_id or "").strip()
+        if not actor_id:
+            return False
+        conn = self._get_conn()
+        row = conn.execute(
+            """SELECT tenant_id, lifecycle_epoch FROM conversations
+                WHERE conversation_id = ? AND phase <> 'deleted'""",
+            (conversation_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        tenant_id = row[0] or ""
+        if (
+            expected_lifecycle_epoch is not None
+            and int(row[1] or 0) != int(expected_lifecycle_epoch)
+        ):
+            return False
+
+        platform = ""
+        parts = actor_id.split(":")
+        if len(parts) >= 3 and parts[0] == "actor":
+            platform = parts[1]
+        display_name = (display_name or "").strip()
+
+        conn.execute(
+            """INSERT INTO actor_profiles
+                   (tenant_id, actor_id, platform, display_name,
+                    first_seen_at, last_seen_at)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT (tenant_id, actor_id) DO UPDATE SET
+                   last_seen_at = excluded.last_seen_at,
+                   display_name = CASE
+                       WHEN excluded.display_name <> '' THEN excluded.display_name
+                       ELSE actor_profiles.display_name END,
+                   platform = CASE
+                       WHEN excluded.platform <> '' THEN excluded.platform
+                       ELSE actor_profiles.platform END""",
+            (tenant_id, actor_id, platform, display_name, seen_at, seen_at),
+        )
+        conn.commit()
+        return True
+
+    def _fact_audience(
+        self,
+        conn: sqlite3.Connection,
+        fact: Fact,
+    ) -> tuple[str, str] | None:
+        """Derive one fact's audience origin from its canonical source rows.
+
+        This canonical mapping is authoritative for policy.
+        ``facts.origin_conversation_id`` is NOT a safe fallback: a fact first
+        distilled after its canonical row was moved is born under the target
+        owner with an empty fact-origin column even though the row still came
+        from the source audience, so treating empty-origin as owner would leak
+        the source into the target.
+
+        Returns ``(audience_conversation_id, audience_channel_id)``, or None
+        when the mapping is incomplete, legacy, or spans more than one audience
+        — all of which make the fact card-ineligible rather than defaulting to
+        the owner.
+        """
+        if not fact.segment_ref:
+            return None
+        seg = conn.execute(
+            "SELECT metadata_json FROM segments WHERE ref = ?",
+            (fact.segment_ref,),
+        ).fetchone()
+        if seg is None:
+            return None
+        try:
+            meta = json.loads(seg[0] or "{}")
+        except Exception:
+            return None
+        if not meta.get("source_mapping_complete"):
+            return None
+        ids = [c for c in (meta.get("canonical_turn_ids") or []) if c]
+        if not ids:
+            return None
+
+        placeholders = ",".join("?" for _ in ids)
+        rows = conn.execute(
+            f"""SELECT canonical_turn_id, user_content, audience_conversation_id,
+                       audience_attribution_version, origin_channel_id
+                  FROM canonical_turns
+                 WHERE canonical_turn_id IN ({placeholders})""",
+            tuple(ids),
+        ).fetchall()
+        if len(rows) != len(set(ids)):
+            # A source id that no longer resolves makes the mapping incomplete.
+            return None
+
+        audiences: set[str] = set()
+        channels: set[str] = set()
+        for r in rows:
+            if not (r["user_content"] or "").strip():
+                continue  # assistant-only row carries no human audience
+            if int(r["audience_attribution_version"] or 0) != 1:
+                return None
+            audience = (r["audience_conversation_id"] or "").strip()
+            if not audience:
+                return None
+            audiences.add(audience)
+            channels.add((r["origin_channel_id"] or "").strip())
+        if len(audiences) != 1:
+            # No audience at all, or a fact spanning several: fail closed.
+            return None
+        # A single agreed non-empty channel, else unknown (which fails closed
+        # for a channel-bound read rather than acting as a wildcard).
+        channel = next(iter(channels)) if len(channels) == 1 else ""
+        return next(iter(audiences)), channel
+
+    def list_actor_facts(
+        self,
+        tenant_id: str,
+        actor_id: str,
+        *,
+        limit: int = 60,
+    ) -> list[ActorFactSource]:
+        """Enumerate an actor's card-eligible facts, tenant-scoped.
+
+        Querying by ``author_actor_id`` alone would be a cross-tenant leak, so
+        the tenant filter is applied in SQL through ``conversations`` before any
+        limit. Facts whose canonical audience cannot be proven are dropped, not
+        defaulted.
+        """
+        actor_id = (actor_id or "").strip()
+        if not actor_id:
+            return []
+        conn = self._get_conn()
+        rows = conn.execute(
+            """SELECT f.*, c.lifecycle_epoch AS _owner_epoch
+                 FROM facts f
+                 JOIN conversations c ON c.conversation_id = f.conversation_id
+                WHERE f.author_actor_id = ?
+                  AND c.tenant_id = ?
+                  AND c.phase NOT IN ('deleted', 'merged')
+                  AND f.superseded_by IS NULL
+                  AND f.author_attribution_version > 0
+                ORDER BY f.mentioned_at DESC""",
+            (actor_id, tenant_id),
+        ).fetchall()
+
+        out: list[ActorFactSource] = []
+        for row in rows:
+            fact = Fact.from_dict(dict(row), dt_parser=_str_to_dt)
+            derived = self._fact_audience(conn, fact)
+            if derived is None:
+                continue
+            audience_id, channel_id = derived
+            # The audience row must still exist under the same tenant. 'merged'
+            # is allowed here: a merge deliberately retains the source as an
+            # alias, and that alias is exactly the audience we must preserve.
+            arow = conn.execute(
+                """SELECT lifecycle_epoch FROM conversations
+                    WHERE conversation_id = ? AND tenant_id = ?
+                      AND phase <> 'deleted'""",
+                (audience_id, tenant_id),
+            ).fetchone()
+            if arow is None:
+                continue
+            out.append(ActorFactSource(
+                fact=fact,
+                tenant_id=tenant_id,
+                owner_conversation_id=fact.conversation_id,
+                audience_conversation_id=audience_id,
+                audience_channel_id=channel_id,
+                owner_lifecycle_epoch=int(row["_owner_epoch"] or 0),
+                audience_lifecycle_epoch=int(arow[0] or 0),
+            ))
+            if len(out) >= max(0, int(limit)):
+                break
+        return out
+
+    def replace_actor_card(
+        self,
+        tenant_id: str,
+        actor_id: str,
+        entries_with_sources: list[tuple[ActorCardEntry, list[ActorCardEntrySource]]],
+        *,
+        input_hash: str = "",
+        expected_source_epochs: dict[str, int] | None = None,
+    ) -> int:
+        """Atomically replace an actor's card and clear its dirty flag.
+
+        Every source conversation named by the new entries is re-verified inside
+        the write transaction against the epoch observed during enumeration, so
+        a stale builder cannot resurrect a card whose source was deleted (and
+        recreated under a new epoch) while it was curating.
+
+        Old entries are superseded rather than deleted so the supersession chain
+        stays auditable, mirroring how facts already work.
+        """
+        actor_id = (actor_id or "").strip()
+        if not actor_id:
+            return 0
+        expected = expected_source_epochs or {}
+        now = _dt_to_str(datetime.now(timezone.utc))
+
+        conn = self._get_conn()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            prof = conn.execute(
+                """SELECT 1 FROM actor_profiles
+                    WHERE tenant_id = ? AND actor_id = ?""",
+                (tenant_id, actor_id),
+            ).fetchone()
+            if prof is None:
+                conn.execute("ROLLBACK")
+                return 0
+
+            # Stale-writer fence: every conversation this card is about to cite
+            # must still be live, in this tenant, at the epoch we enumerated.
+            for conv_id, epoch in sorted(expected.items()):
+                row = conn.execute(
+                    """SELECT lifecycle_epoch FROM conversations
+                        WHERE conversation_id = ? AND tenant_id = ?
+                          AND phase <> 'deleted'""",
+                    (conv_id, tenant_id),
+                ).fetchone()
+                if row is None or int(row[0] or 0) != int(epoch):
+                    conn.execute("ROLLBACK")
+                    return 0
+
+            # Every source fact must still exist.
+            for _entry, sources in entries_with_sources:
+                for src in sources:
+                    hit = conn.execute(
+                        "SELECT 1 FROM facts WHERE id = ?", (src.fact_id,),
+                    ).fetchone()
+                    if hit is None:
+                        conn.execute("ROLLBACK")
+                        return 0
+
+            # Supersede the currently-active entries. A same-kind replacement
+            # is the natural successor; otherwise the hash records the rebuild
+            # that retired the entry.
+            successor_by_kind: dict[str, str] = {}
+            for entry, _sources in entries_with_sources:
+                successor_by_kind.setdefault(entry.kind, entry.id)
+            active = conn.execute(
+                """SELECT id, kind FROM actor_card_entries
+                    WHERE tenant_id = ? AND actor_id = ?
+                      AND superseded_by IS NULL""",
+                (tenant_id, actor_id),
+            ).fetchall()
+            for old in active:
+                conn.execute(
+                    """UPDATE actor_card_entries
+                          SET superseded_by = ?, updated_at = ?
+                        WHERE id = ? AND tenant_id = ?""",
+                    (
+                        successor_by_kind.get(old["kind"]) or (input_hash or "rebuilt"),
+                        now, old["id"], tenant_id,
+                    ),
+                )
+
+            written = 0
+            for entry, sources in entries_with_sources:
+                conn.execute(
+                    """INSERT OR REPLACE INTO actor_card_entries
+                           (id, tenant_id, actor_id, kind, body, confidence,
+                            sensitivity, audience_scope, superseded_by,
+                            created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)""",
+                    (
+                        entry.id, tenant_id, actor_id, entry.kind, entry.body,
+                        float(entry.confidence or 0.0), entry.sensitivity,
+                        entry.audience_scope, entry.created_at or now, now,
+                    ),
+                )
+                conn.execute(
+                    "DELETE FROM actor_card_entry_sources WHERE entry_id = ?",
+                    (entry.id,),
+                )
+                for src in sources:
+                    # Provenance is set from the authoritative fact row by the
+                    # caller; a model- or caller-supplied conversation id is
+                    # never accepted here.
+                    conn.execute(
+                        """INSERT OR REPLACE INTO actor_card_entry_sources
+                               (entry_id, tenant_id, owner_conversation_id,
+                                audience_conversation_id, audience_channel_id,
+                                fact_id)
+                           VALUES (?, ?, ?, ?, ?, ?)""",
+                        (
+                            entry.id, tenant_id, src.owner_conversation_id,
+                            src.audience_conversation_id,
+                            src.audience_channel_id or "", src.fact_id,
+                        ),
+                    )
+                written += 1
+
+            conn.execute(
+                """UPDATE actor_profiles
+                      SET card_built_at = ?, card_dirty = 0, card_input_hash = ?
+                    WHERE tenant_id = ? AND actor_id = ?""",
+                (now, input_hash or "", tenant_id, actor_id),
+            )
+            conn.execute("COMMIT")
+            return written
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+    def get_actor_card(
+        self,
+        tenant_id: str,
+        actor_id: str,
+        *,
+        owner_conversation_id: str,
+        audience_conversation_id: str,
+        audience_channel_id: str = "",
+    ) -> ActorCard | None:
+        """Read one clean, policy-filtered card.
+
+        This method owns the clean/superseded/privacy/audience predicates so no
+        caller can fetch an unsafe superset and filter it afterwards.
+
+        The audience is the validated PRE-ALIAS route, not the resolved owner:
+        after a merge a DM source alias and a guild target share one owner, so
+        comparing owners would serve guild influence to a request that arrived
+        through the DM. An unproved or empty audience reads no card at all.
+        """
+        actor_id = (actor_id or "").strip()
+        audience_conversation_id = (audience_conversation_id or "").strip()
+        if not actor_id or not audience_conversation_id:
+            return None
+
+        conn = self._get_conn()
+        # The route must be provably the owner, or a retained alias to it.
+        owner = self._resolve_owner(conn, owner_conversation_id)
+        audience_owner = self._resolve_owner(conn, audience_conversation_id)
+        if audience_owner != owner:
+            return None
+        orow = conn.execute(
+            """SELECT 1 FROM conversations
+                WHERE conversation_id = ? AND tenant_id = ?""",
+            (owner, tenant_id),
+        ).fetchone()
+        if orow is None:
+            return None
+
+        prof = conn.execute(
+            """SELECT display_name, card_built_at, card_dirty, card_input_hash
+                 FROM actor_profiles
+                WHERE tenant_id = ? AND actor_id = ?""",
+            (tenant_id, actor_id),
+        ).fetchone()
+        if prof is None or int(prof["card_dirty"] or 0):
+            # A dirty card is unreadable. That is what makes delete and merge
+            # invalidation safe without any post-commit callback.
+            return None
+
+        cross_kinds = _sql_in_list(CARD_CROSS_CONTEXT_KINDS)
+        # The audience predicate runs in SQL, before the return:
+        #   * cross_context is allowed only for the policy-granted kinds;
+        #   * same_conversation requires EVERY source to carry this exact
+        #     audience id, and — when the request has a durable channel — this
+        #     exact channel. An empty source channel is unknown, not wildcard,
+        #     so it fails closed.
+        rows = conn.execute(
+            f"""SELECT e.* FROM actor_card_entries e
+                 WHERE e.tenant_id = ?
+                   AND e.actor_id = ?
+                   AND e.superseded_by IS NULL
+                   AND e.sensitivity = ?
+                   AND (
+                     (e.audience_scope = 'cross_context'
+                      AND e.kind IN ({cross_kinds}))
+                     OR (
+                       e.audience_scope = 'same_conversation'
+                       AND EXISTS (SELECT 1 FROM actor_card_entry_sources s
+                                    WHERE s.entry_id = e.id)
+                       AND NOT EXISTS (
+                         SELECT 1 FROM actor_card_entry_sources s
+                          WHERE s.entry_id = e.id
+                            AND (
+                              s.audience_conversation_id <> ?
+                              OR (? <> '' AND s.audience_channel_id <> ?)
+                            )
+                       )
+                     )
+                   )
+                 ORDER BY e.kind, e.confidence DESC, e.updated_at, e.id""",
+            (
+                tenant_id, actor_id, CARD_SENSITIVITY_NORMAL,
+                audience_conversation_id,
+                audience_channel_id or "", audience_channel_id or "",
+            ),
+        ).fetchall()
+        if not rows:
+            return None
+
+        return ActorCard(
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+            display_name=prof["display_name"] or "",
+            entries=[
+                ActorCardEntry(
+                    id=r["id"], tenant_id=tenant_id, actor_id=actor_id,
+                    kind=r["kind"], body=r["body"],
+                    confidence=float(r["confidence"] or 0.0),
+                    sensitivity=r["sensitivity"],
+                    audience_scope=r["audience_scope"],
+                    superseded_by=r["superseded_by"],
+                    created_at=r["created_at"], updated_at=r["updated_at"],
+                )
+                for r in rows
+            ],
+            card_built_at=prof["card_built_at"],
+            card_input_hash=prof["card_input_hash"] or "",
+        )
+
+    def invalidate_actor_cards_for_conversation(
+        self,
+        conversation_id: str,
+        *,
+        reason: str = "",
+    ) -> int:
+        """Remove every card entry this conversation contributed to.
+
+        A card is keyed by tenant+actor, so it is NOT reachable by
+        ``conversation_id`` and a plain delete cascade would leave content from
+        a deleted conversation alive inside it. Both the owner and the audience
+        origin are matched, because one curated entry may synthesize facts from
+        several conversations and either role is enough to taint it.
+
+        Callers already inside a write transaction get the same behaviour; this
+        method is safe to invoke from ``delete_conversation`` and from a merge.
+        """
+        conn = self._get_conn()
+        if not self._table_exists(conn, "actor_card_entry_sources"):
+            return 0
+        return self._invalidate_actor_cards(conn, conversation_id)
+
+    def _invalidate_actor_cards(
+        self,
+        conn: sqlite3.Connection,
+        conversation_id: str,
+    ) -> int:
+        """Capture, dirty, then delete. Order is load-bearing.
+
+        ``actor_card_entry_sources.fact_id`` is ``ON DELETE CASCADE``, so once
+        the facts are gone the source rows needed to *discover* the affected
+        entries are gone too. Discovery therefore has to happen before any fact
+        is deleted.
+        """
+        if not self._table_exists(conn, "actor_card_entry_sources"):
+            return 0
+        affected = conn.execute(
+            """SELECT DISTINCT s.tenant_id, e.actor_id, s.entry_id
+                 FROM actor_card_entry_sources s
+                 JOIN actor_card_entries e
+                   ON e.id = s.entry_id AND e.tenant_id = s.tenant_id
+                WHERE s.owner_conversation_id = ?
+                   OR s.audience_conversation_id = ?""",
+            (conversation_id, conversation_id),
+        ).fetchall()
+        if not affected:
+            return 0
+
+        entry_ids = {r["entry_id"] for r in affected}
+        profiles = {(r["tenant_id"], r["actor_id"]) for r in affected}
+        for entry_id in sorted(entry_ids):
+            conn.execute(
+                "DELETE FROM actor_card_entry_sources WHERE entry_id = ?",
+                (entry_id,),
+            )
+            conn.execute(
+                "DELETE FROM actor_card_entries WHERE id = ?", (entry_id,),
+            )
+        for tenant_id, actor_id in sorted(profiles):
+            conn.execute(
+                """UPDATE actor_profiles
+                      SET card_dirty = 1, card_input_hash = ''
+                    WHERE tenant_id = ? AND actor_id = ?""",
+                (tenant_id, actor_id),
+            )
+        return len(entry_ids)
+
+    def _prune_orphan_actor_profiles(self, conn: sqlite3.Connection) -> int:
+        """Drop profiles with no surviving actor rows and no surviving facts."""
+        if not self._table_exists(conn, "actor_profiles"):
+            return 0
+        cur = conn.execute(
+            """DELETE FROM actor_profiles
+                WHERE NOT EXISTS (
+                        SELECT 1 FROM canonical_turns ct
+                         WHERE ct.sender_actor_id = actor_profiles.actor_id)
+                  AND NOT EXISTS (
+                        SELECT 1 FROM facts f
+                         WHERE f.author_actor_id = actor_profiles.actor_id)"""
+        )
+        return int(cur.rowcount or 0)
 
     def search_facts(self, query: str, limit: int = 10, conversation_id: str | None = None) -> list[Fact]:
         """FTS search across fact subject, verb, object, what fields.

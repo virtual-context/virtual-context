@@ -1059,6 +1059,137 @@ class ActorRoster:
 
 
 # ---------------------------------------------------------------------------
+# Person cards
+# ---------------------------------------------------------------------------
+
+CARD_KIND_COMMUNICATION_PREF = "communication_pref"
+CARD_KIND_ACTIVE_GOAL = "active_goal"
+CARD_KIND_RELEVANT_HISTORY = "relevant_history"
+CARD_KIND_INTERACTION_STYLE = "interaction_style"
+CARD_KINDS: tuple[str, ...] = (
+    CARD_KIND_COMMUNICATION_PREF,
+    CARD_KIND_ACTIVE_GOAL,
+    CARD_KIND_RELEVANT_HISTORY,
+    CARD_KIND_INTERACTION_STYLE,
+)
+
+CARD_SENSITIVITY_NORMAL = "normal"
+CARD_SENSITIVITY_HIGH = "high"
+CARD_SENSITIVITIES: tuple[str, ...] = (
+    CARD_SENSITIVITY_NORMAL,
+    CARD_SENSITIVITY_HIGH,
+)
+
+# ``same_conversation`` is the default and the safe one. ``cross_context`` is
+# granted by POLICY CODE, never by the model: a private-DM goal can leak by
+# shaping a public answer without ever being quoted, so influence-only use is
+# not an audience boundary.
+CARD_SCOPE_SAME_CONVERSATION = "same_conversation"
+CARD_SCOPE_CROSS_CONTEXT = "cross_context"
+CARD_SCOPES: tuple[str, ...] = (
+    CARD_SCOPE_SAME_CONVERSATION,
+    CARD_SCOPE_CROSS_CONTEXT,
+)
+
+# Only these kinds may ever be widened to cross_context, and only at normal
+# sensitivity. A goal or a piece of history never crosses contexts.
+CARD_CROSS_CONTEXT_KINDS: tuple[str, ...] = (
+    CARD_KIND_COMMUNICATION_PREF,
+    CARD_KIND_INTERACTION_STYLE,
+)
+
+# Longest single-line entry body accepted from the curation model.
+CARD_ENTRY_BODY_MAX_CHARS = 500
+
+
+@dataclass
+class ActorProfile:
+    """One person, keyed by ``(tenant_id, actor_id)``.
+
+    Never keyed by ``actor_id`` alone: an actor id shared across two tenants
+    must never let one tenant's card be served to the other.
+    """
+    tenant_id: str = ""
+    actor_id: str = ""
+    platform: str = ""
+    display_name: str = ""      # presentation only, last seen, never a key
+    first_seen_at: str = ""
+    last_seen_at: str = ""
+    card_built_at: str | None = None
+    card_dirty: bool = False
+    card_input_hash: str = ""
+
+
+@dataclass
+class ActorCardEntry:
+    """One curated line of a person card.
+
+    The card is a CACHE, not a second source of truth: every entry is derived
+    from facts carrying that actor's ``author_actor_id`` and is fully
+    rebuildable. ``superseded_by`` mirrors the fact supersession chain.
+    """
+    id: str = ""
+    tenant_id: str = ""
+    actor_id: str = ""
+    kind: str = CARD_KIND_COMMUNICATION_PREF
+    body: str = ""
+    confidence: float = 0.0
+    sensitivity: str = CARD_SENSITIVITY_NORMAL
+    audience_scope: str = CARD_SCOPE_SAME_CONVERSATION
+    superseded_by: str | None = None
+    created_at: str = ""
+    updated_at: str = ""
+
+
+@dataclass
+class ActorCardEntrySource:
+    """Normalized per-fact provenance for one card entry.
+
+    Both ids are load-bearing and distinct. ``owner_conversation_id`` is where
+    the fact is stored; ``audience_conversation_id`` is the validated pre-alias
+    route the source message actually arrived on. After a merge they differ, and
+    only the audience id may decide disclosure: comparing owners would serve
+    guild influence to a request arriving through a retained DM alias.
+    """
+    entry_id: str = ""
+    tenant_id: str = ""
+    owner_conversation_id: str = ""
+    audience_conversation_id: str = ""
+    audience_channel_id: str = ""   # "" means unknown, which fails closed
+    fact_id: str = ""
+
+
+@dataclass
+class ActorCard:
+    """A person card as served to assembly: clean, scoped, non-superseded."""
+    tenant_id: str = ""
+    actor_id: str = ""
+    display_name: str = ""
+    entries: list[ActorCardEntry] = field(default_factory=list)
+    card_built_at: str | None = None
+    card_input_hash: str = ""
+
+
+@dataclass
+class ActorFactSource:
+    """One of an actor's facts, with the provenance needed to curate it safely.
+
+    Carries BOTH lifecycle epochs. The audience epoch is required even when the
+    audience row is a retained ``merged`` alias: without the epoch observed at
+    enumeration, a delete-and-resurrect of that source id could pass a
+    replacement-time existence check and let a stale builder recreate influence
+    that was deleted.
+    """
+    fact: "Fact" = None  # type: ignore[assignment]
+    tenant_id: str = ""
+    owner_conversation_id: str = ""
+    audience_conversation_id: str = ""
+    audience_channel_id: str = ""
+    owner_lifecycle_epoch: int = 0
+    audience_lifecycle_epoch: int = 0
+
+
+# ---------------------------------------------------------------------------
 # Compaction
 # ---------------------------------------------------------------------------
 
@@ -1615,6 +1746,16 @@ class AssemblerConfig:
     # "merge" -> three-tier gate fires per the cross-channel-mirror spec.
     # YAML key: assembly.protected_window_db_source.
     protected_window_db_source: str = "off"
+    # Person cards. SHIPS DARK: with the gate off, no profile or card read is
+    # performed, no budget key is added, and rendered output is byte-identical.
+    # YAML keys: assembly.actor_card_enabled, assembly.actor_card_max_tokens,
+    # assembly.actor_card_fact_limit, assembly.actor_card_entries_per_kind.
+    actor_card_enabled: bool = False
+    actor_card_max_tokens: int = 400
+    # Bounds on the curation pass: how many of an actor's facts it may read,
+    # and how many entries it may emit per kind.
+    actor_card_fact_limit: int = 60
+    actor_card_entries_per_kind: int = 3
 
     def __post_init__(self):
         if self.context_injection_max_tokens < 0:

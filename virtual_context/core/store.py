@@ -667,6 +667,81 @@ class ContextStore(ABC):
         """
         return 0
 
+    # ------------------------------------------------------------------
+    # Person cards
+    #
+    # Cards are keyed ``(tenant_id, actor_id)``. A backend that cannot store
+    # them keeps these no-op defaults; the card gate refuses to enable on such
+    # a backend rather than silently degrading to an unscoped store.
+    # ------------------------------------------------------------------
+
+    def upsert_actor_profile_from_turn(
+        self,
+        conversation_id: str,
+        actor_id: str,
+        display_name: str = "",
+        *,
+        seen_at: str,
+        expected_lifecycle_epoch: int | None = None,
+    ) -> bool:
+        """Record an actor observed on an accepted user turn.
+
+        Tenant is derived from the authoritative ``conversations`` row, never
+        from a separately supplied string.
+        """
+        return False
+
+    def list_actor_facts(
+        self,
+        tenant_id: str,
+        actor_id: str,
+        *,
+        limit: int = 60,
+    ) -> list:
+        """Enumerate an actor's card-eligible facts, tenant-scoped.
+
+        Never query by ``actor_id`` alone: that is a cross-tenant leak. The
+        tenant filter is applied through ``conversations`` before any limit.
+        """
+        return []
+
+    def replace_actor_card(
+        self,
+        tenant_id: str,
+        actor_id: str,
+        entries_with_sources: list,
+        *,
+        input_hash: str = "",
+        expected_source_epochs: dict[str, int] | None = None,
+    ) -> int:
+        """Atomically replace an actor's card and clear its dirty flag."""
+        return 0
+
+    def get_actor_card(
+        self,
+        tenant_id: str,
+        actor_id: str,
+        *,
+        owner_conversation_id: str,
+        audience_conversation_id: str,
+        audience_channel_id: str = "",
+    ):
+        """Read one clean, policy-filtered card, or ``None``.
+
+        Owns the clean/superseded/privacy/audience predicates so no caller can
+        fetch an unsafe superset and filter it after a limit.
+        """
+        return None
+
+    def invalidate_actor_cards_for_conversation(
+        self,
+        conversation_id: str,
+        *,
+        reason: str = "",
+    ) -> int:
+        """Remove every card entry this conversation contributed to."""
+        return 0
+
     def update_canonical_turn_reply_roles_if_empty(
         self,
         conversation_id: str,
