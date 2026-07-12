@@ -329,6 +329,7 @@ class TaggingPipeline:
             "reply_subject_label": "",
             "reply_target_body": "",
             "reply_attribution_version": 0,
+            "audience_conversation_id": "",
             "audience_attribution_version": 0,
         }
         if row is None:

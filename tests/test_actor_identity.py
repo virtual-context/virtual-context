@@ -354,6 +354,37 @@ def test_contradictory_leading_and_trailing_edges_fail_closed():
     assert subject.version == 1  # versioned-unresolved, not "never looked"
 
 
+def test_contradictory_reply_platforms_fail_closed():
+    payload = f'{{"sender_id": "{BIGTEX_ID}", "sender_label": "BigTex"'
+    text = (
+        _block("Replied message", payload + ', "platform": "discord"}')
+        + "thoughts?\n\n"
+        + _block(
+            "Reply target of current user message",
+            payload + ', "platform": "slack"}',
+        )
+    )
+    _, meta = _extract_envelope_metadata(text)
+
+    subject = get_reply_subject(meta, GUILD_KEY)
+    assert subject.subject_actor_id == ""
+    assert subject.unresolved_reason == "contradictory_edges"
+
+
+def test_reply_candidate_with_malformed_identity_component_is_unresolved():
+    text = _block(
+        "Reply Context",
+        f'{{"sender_id": "{BIGTEX_ID}", "sender_label": "BigTex\\u0001", '
+        '"platform": "discord"}',
+    ) + "thoughts?"
+    _, meta = _extract_envelope_metadata(text)
+
+    subject = get_reply_subject(meta, GUILD_KEY)
+    assert subject.subject_actor_id == ""
+    assert subject.subject_label == ""
+    assert subject.unresolved_reason == "malformed_identity"
+
+
 def test_agreeing_leading_and_trailing_edges_resolve():
     payload = f'{{"sender_id": "{BIGTEX_ID}", "sender_label": "BigTex"}}'
     text = _block("Replied message", payload) + "thoughts?\n\n" + _block(

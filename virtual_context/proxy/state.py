@@ -1128,6 +1128,7 @@ class ProxyState:
         body: dict,
         payload_accounting: dict,
         source_conversation_key: str = "",
+        source_audience_conversation_id: str = "",
     ) -> PhaseDecision:
         """Run the ingestion flow (, steps 1-8) for one inbound request.
 
@@ -1204,6 +1205,9 @@ class ProxyState:
                     # already resolved and after a VCATTACH it can be a UUID
                     # that names no platform at all.
                     source_conversation_key=source_conversation_key,
+                    source_audience_conversation_id=(
+                        source_audience_conversation_id
+                    ),
                 )
             except AttributeError:
                 # No reconciler configured on engine — acceptable for

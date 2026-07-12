@@ -143,6 +143,7 @@ def _reply_identity_tuple(value: dict) -> tuple:
         _clean("sender_label") or _clean("name"),
         _clean("body"),
         _clean("message_id"),
+        _clean("platform").lower(),
     )
 
 

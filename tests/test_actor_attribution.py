@@ -25,12 +25,17 @@ import os
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from virtual_context.core.ingest_reconciler import IngestReconciler
 from virtual_context.core.semantic_search import SemanticSearchManager
+from virtual_context.core.tagging_pipeline import TaggingPipeline
+from virtual_context.proxy._envelope import _extract_envelope_metadata
+from virtual_context.proxy.server import _roles_for_active_user
 from virtual_context.storage.sqlite import SQLiteStore
+from virtual_context.types import CanonicalTurnRow, Message
 
 GUILD_KEY = "sk:agent:bast:discord:channel:15249"
 OPTICS = "1111111111111111111"
@@ -113,6 +118,7 @@ def test_ingest_batch_populates_actor_on_user_rows(tmp_path):
         fmt=_anthropic(),
         expected_lifecycle_epoch=1,
         source_conversation_key=GUILD_KEY,
+        source_audience_conversation_id="c",
     )
     rows = _rows(store)
     user = [r for r in rows if r.user_content]
@@ -121,6 +127,12 @@ def test_ingest_batch_populates_actor_on_user_rows(tmp_path):
     assert user and user[0].sender_actor_id == BIGTEX_ACTOR
     # An assistant row is never newly labeled with a human actor.
     assert all(r.sender_actor_id == "" for r in assistant)
+
+    profile = store._get_conn().execute(
+        "SELECT tenant_id, actor_id FROM actor_profiles WHERE actor_id = ?",
+        (BIGTEX_ACTOR,),
+    ).fetchone()
+    assert tuple(profile) == ("t", BIGTEX_ACTOR)
 
 
 def test_actor_platform_comes_from_the_raw_key_not_the_resolved_id(tmp_path):
@@ -359,6 +371,7 @@ def test_subject_resolves_from_the_referenced_row_in_the_same_batch(tmp_path):
         fmt=_anthropic(),
         expected_lifecycle_epoch=1,
         source_conversation_key=GUILD_KEY,
+        source_audience_conversation_id="c",
     )
     users = [r for r in _rows(store) if r.user_content]
     bigtex_row = next(r for r in users if r.source_message_id == "m1")
@@ -450,6 +463,7 @@ def test_unique_label_resolves_the_subject(tmp_path):
     rec.ingest_batch(
         "c", body=_body(first), fmt=_anthropic(),
         expected_lifecycle_epoch=1, source_conversation_key=GUILD_KEY,
+        source_audience_conversation_id="c",
     )
     rec.ingest_batch(
         "c",
@@ -461,6 +475,7 @@ def test_unique_label_resolves_the_subject(tmp_path):
         fmt=_anthropic(),
         expected_lifecycle_epoch=1,
         source_conversation_key=GUILD_KEY,
+        source_audience_conversation_id="c",
     )
     row = next(r for r in _rows(store) if r.source_message_id == "m9")
     assert row.reply_subject_actor_id == BIGTEX_ACTOR
@@ -480,9 +495,147 @@ def test_contradictory_row_and_block_ids_fail_closed(tmp_path):
         fmt=_anthropic(),
         expected_lifecycle_epoch=1,
         source_conversation_key=GUILD_KEY,
+        source_audience_conversation_id="c",
     )
     row = next(r for r in _rows(store) if r.source_message_id == "m2")
     assert row.reply_subject_actor_id == ""
+
+
+def test_same_batch_duplicate_message_ids_fail_closed(tmp_path):
+    store = _store(tmp_path)
+    rec = _reconciler(store)
+    prepared = [
+        CanonicalTurnRow(
+            conversation_id="c", canonical_turn_id="a", user_content="one",
+            source_message_id="m1", sender_actor_id=BIGTEX_ACTOR,
+            audience_conversation_id="c",
+        ),
+        CanonicalTurnRow(
+            conversation_id="c", canonical_turn_id="b", user_content="two",
+            source_message_id="m1", sender_actor_id=OPTICS_ACTOR,
+            audience_conversation_id="c",
+        ),
+        CanonicalTurnRow(
+            conversation_id="c", canonical_turn_id="reply", user_content="thoughts?",
+            reply_target_message_id="m1", reply_attribution_version=1,
+            audience_conversation_id="c",
+        ),
+    ]
+
+    rec._resolve_reply_subjects("c", prepared)
+
+    assert prepared[-1].reply_subject_actor_id == ""
+
+
+def test_full_row_rewrite_preserves_a_conflicting_stored_actor_and_edge():
+    stored = CanonicalTurnRow(
+        conversation_id="c", canonical_turn_id="ct1", sender_actor_id=BIGTEX_ACTOR,
+        source_message_id="m1", reply_target_message_id="m0",
+        reply_subject_actor_id=BIGTEX_ACTOR,
+        reply_target_body="original claim", audience_conversation_id="dm",
+        reply_attribution_version=1, audience_attribution_version=1,
+    )
+    incoming = CanonicalTurnRow(
+        conversation_id="c", canonical_turn_id="ct1", sender_actor_id=OPTICS_ACTOR,
+        source_message_id="m2", reply_target_message_id="other",
+        reply_subject_actor_id=OPTICS_ACTOR,
+        reply_target_body="different claim", audience_conversation_id="guild",
+        reply_attribution_version=1, audience_attribution_version=1,
+    )
+
+    IngestReconciler._preserve_existing_enrichment(incoming, stored)
+
+    assert incoming.sender_actor_id == BIGTEX_ACTOR
+    assert incoming.source_message_id == "m1"
+    assert incoming.reply_target_message_id == "m0"
+    assert incoming.reply_subject_actor_id == BIGTEX_ACTOR
+    assert incoming.reply_target_body == "original claim"
+    assert incoming.audience_conversation_id == "dm"
+
+
+def test_full_row_conflict_does_not_fill_gaps_from_the_other_edge():
+    stored = CanonicalTurnRow(
+        conversation_id="c", canonical_turn_id="ct1",
+        reply_subject_actor_id=BIGTEX_ACTOR,
+    )
+    incoming = CanonicalTurnRow(
+        conversation_id="c", canonical_turn_id="ct1",
+        reply_subject_actor_id=OPTICS_ACTOR,
+        reply_target_body="Optics's claim", reply_attribution_version=1,
+    )
+
+    IngestReconciler._preserve_existing_enrichment(incoming, stored)
+
+    assert incoming.reply_subject_actor_id == BIGTEX_ACTOR
+    assert incoming.reply_target_body == ""
+    assert incoming.reply_attribution_version == 0
+
+
+def test_tagger_full_row_rewrites_resupply_audience_origin():
+    row = CanonicalTurnRow(
+        conversation_id="c",
+        audience_conversation_id="dm", audience_attribution_version=1,
+    )
+
+    edge = TaggingPipeline._row_reply_edge(row)
+
+    assert edge["audience_conversation_id"] == "dm"
+    assert edge["audience_attribution_version"] == 1
+
+
+def test_proxy_roles_come_from_the_active_entry_and_validated_audience(tmp_path):
+    store = SQLiteStore(tmp_path / "roles.db")
+    store.upsert_conversation(tenant_id="t1", conversation_id=GUILD_KEY)
+    store.save_canonical_turn(
+        GUILD_KEY, 0, "claim", "", canonical_turn_id="target",
+        turn_hash="target-hash", sort_key=1.0, sender="BigTex",
+        sender_actor_id=BIGTEX_ACTOR, source_message_id="m1",
+        audience_conversation_id=GUILD_KEY, audience_attribution_version=1,
+        origin_channel_id="15249",
+    )
+    raw = (
+        _conv_info(OPTICS, message_id="m2", reply_to_id="m1")
+        + "thoughts?"
+        + _reply_block(sender_label="BigTex", body="claim")
+    )
+    text, metadata = _extract_envelope_metadata(raw)
+    active = Message(role="user", content=text, metadata=metadata)
+    engine = SimpleNamespace(
+        config=SimpleNamespace(conversation_id=GUILD_KEY, tenant_id="t1"),
+        _store=store,
+    )
+    engine._ingest_reconciler = _reconciler(store)
+    state = SimpleNamespace(engine=engine)
+
+    roles = _roles_for_active_user(
+        state, active, "thoughts?",
+        inbound_conversation_id=GUILD_KEY,
+        audience_conversation_id=GUILD_KEY,
+    )
+
+    assert roles.requester_actor_id == OPTICS_ACTOR
+    assert roles.subject_actor_id == BIGTEX_ACTOR
+    assert roles.reply_target_message_id == "m1"
+    assert roles.audience_conversation_id == GUILD_KEY
+    assert roles.audience_channel_id == "15249"
+
+
+def test_proxy_role_selection_mismatch_fails_closed(tmp_path):
+    store = SQLiteStore(tmp_path / "roles-mismatch.db")
+    store.upsert_conversation(tenant_id="t1", conversation_id="owner")
+    state = SimpleNamespace(engine=SimpleNamespace(
+        config=SimpleNamespace(conversation_id="owner", tenant_id="t1"),
+        _store=store,
+    ))
+
+    roles = _roles_for_active_user(
+        state, Message(role="user", content="other", metadata={}), "active",
+        inbound_conversation_id="owner", audience_conversation_id="owner",
+    )
+
+    assert roles.requester_actor_id == ""
+    assert roles.subject_actor_id == ""
+    assert roles.audience_conversation_id == ""
 
 
 def test_reply_edge_preserved_across_a_resend_without_the_block(tmp_path):
@@ -532,6 +685,29 @@ def test_reply_cas_never_rewrites_a_contradictory_stored_edge(tmp_path):
     # The stored edge wins. Rewriting it would move a claim between members.
     assert after.reply_subject_actor_id == BIGTEX_ACTOR
     assert after.reply_target_body == "a claim"
+
+
+def test_reply_cas_rejects_whole_partial_edge_on_one_conflict(tmp_path):
+    store = _store(tmp_path)
+    store.save_canonical_turn(
+        "c", -1, "thoughts?", "", canonical_turn_id="partial",
+        sort_key=1, turn_hash="partial", reply_subject_actor_id=BIGTEX_ACTOR,
+    )
+
+    updated = store.update_canonical_turn_reply_roles_if_empty(
+        "c",
+        {"partial": {
+            "reply_subject_actor_id": OPTICS_ACTOR,
+            "reply_target_body": "Optics's claim",
+            "reply_attribution_version": 1,
+        }},
+    )
+    row = store.get_all_canonical_turns("c")[0]
+
+    assert updated == 0
+    assert row.reply_subject_actor_id == BIGTEX_ACTOR
+    assert row.reply_target_body == ""
+    assert row.reply_attribution_version == 0
 
 
 def test_vcmerge_may_move_a_duplicate_source_id_and_lookup_fails_closed(tmp_path):
