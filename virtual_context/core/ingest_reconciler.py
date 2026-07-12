@@ -410,12 +410,40 @@ class IngestReconciler:
         # so a reply to a message that arrived in the SAME payload can still
         # link by its source id.
         self._resolve_reply_subjects(conversation_id, prepared)
-        return self.ingest_prepared_turns(
+        result = self.ingest_prepared_turns(
             conversation_id,
             prepared_turns=prepared,
             raw_turn_count=len(prepared),
             expected_lifecycle_epoch=expected_lifecycle_epoch,
         )
+        # A profile is an observation cache, not a side effect of filling an
+        # empty canonical column. Repeat sightings must still advance
+        # last_seen_at and may refresh the presentation name, including exact
+        # resends and overlap fast-skips whose actor was already durable.
+        upsert_profile = getattr(
+            self._store, "upsert_actor_profile_from_turn", None,
+        )
+        if callable(upsert_profile):
+            from ..types import get_actor_display_name
+
+            for message, row in zip(entries, prepared, strict=False):
+                actor_id = (row.sender_actor_id or "").strip()
+                if message.role != "user" or not actor_id:
+                    continue
+                try:
+                    upsert_profile(
+                        conversation_id,
+                        actor_id,
+                        get_actor_display_name(message.metadata) or row.sender,
+                        seen_at=row.last_seen_at or utcnow_iso(),
+                        expected_lifecycle_epoch=expected_lifecycle_epoch,
+                    )
+                except Exception:
+                    logger.warning(
+                        "ACTOR_PROFILE_UPSERT_FAILED: conv=%s actor=%s",
+                        conversation_id[:12], actor_id[:24], exc_info=True,
+                    )
+        return result
 
     @staticmethod
     def _derive_reply_edge(
@@ -493,11 +521,10 @@ class IngestReconciler:
         conflict: the subject goes unresolved rather than picking one of two
         actors. Zero, multiple, or fuzzy label matches also stay unresolved.
         """
-        in_batch = {
-            row.source_message_id: row
-            for row in prepared
-            if row.source_message_id and (row.user_content or "").strip()
-        }
+        in_batch: dict[str, list[CanonicalTurnRow]] = {}
+        for candidate in prepared:
+            if candidate.source_message_id and (candidate.user_content or "").strip():
+                in_batch.setdefault(candidate.source_message_id, []).append(candidate)
         for row in prepared:
             if row.reply_attribution_version <= 0:
                 continue
@@ -507,11 +534,26 @@ class IngestReconciler:
             target_id = (row.reply_target_message_id or "").strip()
             row_actor = ""
             if target_id:
-                target = in_batch.get(target_id)
-                if target is None:
+                # Retain every same-batch candidate. A last-wins dict silently
+                # chooses one row when a merge legitimately put duplicate
+                # opaque message ids under the same owner.
+                candidates = [
+                    candidate for candidate in in_batch.get(target_id, [])
+                    if (row.audience_conversation_id or "").strip()
+                    and (candidate.audience_conversation_id or "").strip()
+                    == (row.audience_conversation_id or "").strip()
+                    and (
+                        not (row.origin_channel_id or "").strip()
+                        or (candidate.origin_channel_id or "").strip()
+                        == (row.origin_channel_id or "").strip()
+                    )
+                ]
+                target = candidates[0] if len(candidates) == 1 else None
+                if target is None and not candidates:
                     target = self._find_row_by_source_message_id(
                         conversation_id,
                         target_id,
+                        audience_conversation_id=row.audience_conversation_id,
                         origin_channel_id=row.origin_channel_id,
                     )
                 if target is not None:
@@ -535,7 +577,8 @@ class IngestReconciler:
             if not label:
                 continue
             matches = self._find_actor_ids_by_label(
-                conversation_id, label, row.origin_channel_id,
+                conversation_id, label, row.audience_conversation_id,
+                row.origin_channel_id,
             )
             # Exactly one durable same-audience actor, or nothing. A label that
             # names two members is not an identity, and "most recent" would be
@@ -548,8 +591,11 @@ class IngestReconciler:
         conversation_id: str,
         source_message_id: str,
         *,
+        audience_conversation_id: str = "",
         origin_channel_id: str = "",
     ) -> "CanonicalTurnRow | None":
+        if not (audience_conversation_id or "").strip():
+            return None
         fn = getattr(self._store, "find_canonical_turn_by_source_message_id", None)
         if not callable(fn):
             return None
@@ -557,6 +603,7 @@ class IngestReconciler:
             return fn(
                 conversation_id,
                 source_message_id,
+                audience_conversation_id=audience_conversation_id,
                 origin_channel_id=origin_channel_id,
             )
         except Exception:
@@ -567,14 +614,22 @@ class IngestReconciler:
             return None
 
     def _find_actor_ids_by_label(
-        self, conversation_id: str, label: str, origin_channel_id: str,
+        self,
+        conversation_id: str,
+        label: str,
+        audience_conversation_id: str,
+        origin_channel_id: str,
     ) -> list[str]:
+        if not (audience_conversation_id or "").strip():
+            return []
         fn = getattr(self._store, "find_actor_ids_by_display_label", None)
         if not callable(fn):
             return []
         try:
             return list(fn(
-                conversation_id, label, origin_channel_id=origin_channel_id,
+                conversation_id, label,
+                audience_conversation_id=audience_conversation_id,
+                origin_channel_id=origin_channel_id,
             ))
         except Exception:
             logger.warning(
@@ -1191,30 +1246,55 @@ class IngestReconciler:
         # This also preserves a value already on an assistant row (from a
         # legacy combined row or a partially deployed database) without ever
         # newly deriving one onto it.
-        if (
-            not (row.sender_actor_id or "").strip()
-            and (existing_row.sender_actor_id or "").strip()
-        ):
+        if (existing_row.sender_actor_id or "").strip():
+            if (
+                (row.sender_actor_id or "").strip()
+                and (row.sender_actor_id or "").strip()
+                != (existing_row.sender_actor_id or "").strip()
+            ):
+                logger.warning(
+                    "CANONICAL_TURN_ACTOR_CONFLICT: turn_id=%s; preserving stored actor",
+                    (existing_row.canonical_turn_id or "")[:12],
+                )
             row.sender_actor_id = existing_row.sender_actor_id
         # Same one-way merge for every reply-edge column, per column. A resend
         # that no longer carries the reply envelope cannot blank a stored edge,
         # and a CONTRADICTORY new value never rewrites a stored one: moving a
         # quoted claim from one member to another is the contamination this
         # design exists to prevent.
-        for name in ("source_message_id", "reply_target_message_id",
-                     "reply_subject_actor_id", "reply_subject_label",
-                     "reply_target_body", "audience_conversation_id"):
-            if not (getattr(row, name) or "").strip():
-                stored = (getattr(existing_row, name) or "").strip()
-                if stored:
-                    setattr(row, name, getattr(existing_row, name))
+        edge_names = (
+            "source_message_id", "reply_target_message_id",
+            "reply_subject_actor_id", "reply_subject_label",
+            "reply_target_body", "audience_conversation_id",
+        )
+        edge_conflict = any(
+            (getattr(existing_row, name) or "").strip()
+            and (getattr(row, name) or "").strip()
+            and (getattr(existing_row, name) or "").strip()
+            != (getattr(row, name) or "").strip()
+            for name in edge_names
+        )
+        if edge_conflict:
+            logger.warning(
+                "CANONICAL_TURN_REPLY_CONFLICT: turn_id=%s; preserving stored edge",
+                (existing_row.canonical_turn_id or "")[:12],
+            )
+        for name in edge_names:
+            stored = (getattr(existing_row, name) or "").strip()
+            if edge_conflict:
+                setattr(row, name, getattr(existing_row, name))
+            elif stored and not (getattr(row, name) or "").strip():
+                setattr(row, name, getattr(existing_row, name))
         # Versions are a high-water mark, so an observed-but-unresolved row
         # stays distinguishable from one that was never looked at.
         for name in ("reply_attribution_version", "audience_attribution_version"):
-            setattr(row, name, max(
-                int(getattr(row, name) or 0),
-                int(getattr(existing_row, name) or 0),
-            ))
+            if edge_conflict:
+                setattr(row, name, int(getattr(existing_row, name) or 0))
+            else:
+                setattr(row, name, max(
+                    int(getattr(row, name) or 0),
+                    int(getattr(existing_row, name) or 0),
+                ))
 
     def _prepare_message_row(
         self,

@@ -636,6 +636,22 @@ def get_reply_subject(
             unresolved_reason="malformed_candidate",
         )
 
+    # Treat the candidate as one atomic identity assertion. Salvaging a valid
+    # sender id or label from a block whose other identity fields are malformed
+    # would turn invalid adapter data into a real actor. The first candidate
+    # still owns the slot, so the honest result is versioned-unresolved.
+    for key in ("sender_id", "sender_label", "name", "message_id", "platform"):
+        if key not in value:
+            continue
+        raw = value.get(key)
+        if not isinstance(raw, str) or any(
+            ord(ch) < 32 or ord(ch) == 127 for ch in raw
+        ):
+            return ReplySubject(
+                version=REPLY_ATTRIBUTION_VERSION,
+                unresolved_reason="malformed_identity",
+            )
+
     label = _actor_clean_str(
         value.get("sender_label") or value.get("name") or ""
     )
