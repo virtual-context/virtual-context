@@ -159,8 +159,152 @@ class CompactionPipeline:
             except Exception as e:
                 logger.warning("Failed to embed fact %s: %s", fact.id, e)
 
+    def _physical_rows_by_group(self) -> dict[int, list["CanonicalTurnRow"]]:
+        """Physical canonical rows of this conversation, grouped by turn group.
+
+        ``get_uncompacted_canonical_turns`` returns LOGICAL rows: both stores
+        run ``_merge_canonical_turn_rows`` inside it, so one logical row can be
+        backed by separate physical user and assistant rows. Fact authorship
+        needs the physical rows, because that is where the actor and the reply
+        edge actually live.
+        """
+        # A store that cannot enumerate physical rows cannot prove provenance.
+        # That is a fail-closed state, not an error: the segment mapping stays
+        # incomplete and every fact author stays empty, which is exactly the
+        # behaviour required of an unprovable mapping.
+        getter = getattr(self._store, "get_all_canonical_turns", None)
+        if not callable(getter):
+            return {}
+        grouped: dict[int, list["CanonicalTurnRow"]] = {}
+        for row in getter(self._config.conversation_id) or ():
+            grouped.setdefault(int(getattr(row, "turn_group_number", -1) or -1), []).append(row)
+        return grouped
+
+    @staticmethod
+    def _segment_source_ids(segment) -> tuple[list[str], bool]:
+        """First-seen deduplicated source ids of a segment, and completeness.
+
+        Completeness requires every non-empty message to carry at least one
+        source id. It is deliberately not derived from ``turn_count``: topic
+        grouping is noncontiguous and the session splitter can turn one source
+        message into two, so a positional slice is not a row mapping.
+        """
+        from ..types import SOURCE_CANONICAL_TURN_IDS_KEY
+
+        ordered: list[str] = []
+        seen: set[str] = set()
+        complete = True
+        for message in segment.messages:
+            if not (getattr(message, "content", "") or "").strip():
+                continue
+            ids = (getattr(message, "metadata", None) or {}).get(
+                SOURCE_CANONICAL_TURN_IDS_KEY
+            ) or []
+            if not ids:
+                complete = False
+                continue
+            for cid in ids:
+                if cid and cid not in seen:
+                    seen.add(cid)
+                    ordered.append(cid)
+        return ordered, complete
+
+    def _build_actor_roster(self, segment, physical_by_id: dict) -> "ActorRoster":
+        """Build one segment's actor roster and fact lanes from physical rows.
+
+        Everything here comes from stored rows, never from model text or a
+        positional cursor. A segment whose mapping is incomplete, or that spans
+        more than one human, will attribute no fact author at all.
+        """
+        from ..types import (
+            AUTHOR_ROLE_ASSISTANT,
+            AUTHOR_ROLE_REQUESTER,
+            AUTHOR_ROLE_SUBJECT,
+            ActorRoster,
+            FactLane,
+        )
+
+        ids, complete = self._segment_source_ids(segment)
+        roster = ActorRoster(complete=complete)
+        if not ids:
+            roster.complete = False
+            return roster
+
+        for cid in ids:
+            row = physical_by_id.get(cid)
+            if row is None:
+                # A source id that no longer resolves to a physical row makes
+                # the mapping incomplete; it must not silently narrow a roster.
+                roster.complete = False
+                continue
+
+            user_text = (row.user_content or "").strip()
+            assistant_text = (row.assistant_content or "").strip()
+            actor = (getattr(row, "sender_actor_id", "") or "").strip()
+            label = (getattr(row, "sender", "") or "").strip()
+
+            if user_text:
+                if actor:
+                    roster.actor_ids.add(actor)
+                    if label:
+                        roster.labels.setdefault(label.casefold(), set()).add(actor)
+                else:
+                    roster.has_unidentified_user_row = True
+
+                # One requester lane per physical user row. It carries that
+                # row's own words and NEVER its quote block.
+                roster.lanes.append(FactLane(
+                    role=AUTHOR_ROLE_REQUESTER,
+                    text=user_text,
+                    actor_id=actor,
+                    source_message_id=(getattr(row, "source_message_id", "") or ""),
+                    canonical_turn_id=row.canonical_turn_id,
+                    speaker_label=label,
+                ))
+
+                quote = (getattr(row, "reply_target_body", "") or "").strip()
+                target_id = (getattr(row, "reply_target_message_id", "") or "").strip()
+                if int(getattr(row, "reply_attribution_version", 0) or 0) > 0:
+                    roster.reply_bearing = True
+                if quote:
+                    # When the reply target resolves to a row we already hold,
+                    # create NO subject lane: that row's own requester lane is
+                    # the source of truth and will produce (or already produced)
+                    # its facts. The quote is current-request context, not a
+                    # second disclosure.
+                    target_present = any(
+                        (getattr(physical_by_id.get(c), "source_message_id", "") or "")
+                        == target_id
+                        for c in ids
+                        if target_id and physical_by_id.get(c) is not None
+                    )
+                    if not target_present:
+                        roster.lanes.append(FactLane(
+                            role=AUTHOR_ROLE_SUBJECT,
+                            text=quote,
+                            # ONLY the resolved subject. Never the requester's
+                            # id: that is the reply-chain contamination path.
+                            actor_id=(
+                                getattr(row, "reply_subject_actor_id", "") or ""
+                            ).strip(),
+                            source_message_id=target_id,
+                            canonical_turn_id=row.canonical_turn_id,
+                            speaker_label=(
+                                getattr(row, "reply_subject_label", "") or ""
+                            ).strip(),
+                        ))
+
+            if assistant_text:
+                roster.lanes.append(FactLane(
+                    role=AUTHOR_ROLE_ASSISTANT,
+                    text=assistant_text,
+                    actor_id="",
+                    canonical_turn_id=row.canonical_turn_id,
+                ))
+        return roster
+
     def _load_compactable_rows(self) -> tuple[list["CanonicalTurnRow"], list["Message"]]:
-        from ..types import Message
+        from ..types import SOURCE_CANONICAL_TURN_IDS_KEY, Message
 
         rows = list(
             self._store.get_uncompacted_canonical_turns(
@@ -168,23 +312,56 @@ class CompactionPipeline:
                 protected_recent_turns=self._config.monitor.protected_recent_turns,
             )
         )
+        by_group = self._physical_rows_by_group()
         messages: list[Message] = []
         for row in rows:
+            group = int(getattr(row, "turn_group_number", -1) or -1)
+            backing = by_group.get(group, [])
+            # Split the backing physical rows by which side actually carries
+            # content. A legacy combined row carries both, and may therefore
+            # legitimately supply the same id to both messages.
+            user_ids = [
+                r.canonical_turn_id for r in backing if (r.user_content or "").strip()
+            ]
+            assistant_ids = [
+                r.canonical_turn_id
+                for r in backing
+                if (r.assistant_content or "").strip()
+            ]
+
             # ``_format_conversation`` labels a message with
             # ``get_sender_name(metadata) or role.capitalize()``. Carry the
             # stored sender in metadata, never in content: content feeds
             # hashes, excerpts, and the summary text itself. Only the user
             # half is attributed; a legacy row may carry the logical-turn
             # sender on both halves, and the assistant is not that speaker.
-            user_metadata = None
+            #
+            # The source ids ride alongside under a reserved key so each
+            # segment's roster can be rebuilt from real rows instead of a
+            # positional cursor. The session splitter copies Message.metadata
+            # into both halves of a split, so the ids survive splits and
+            # noncontiguous topic grouping.
+            user_metadata: dict | None = None
             if (row.sender or "").strip() and (row.user_content or "").strip():
                 user_metadata = {"sender": {"name": row.sender}}
+            if user_ids:
+                user_metadata = dict(user_metadata or {})
+                user_metadata[SOURCE_CANONICAL_TURN_IDS_KEY] = list(user_ids)
+            assistant_metadata: dict | None = None
+            if assistant_ids:
+                assistant_metadata = {
+                    SOURCE_CANONICAL_TURN_IDS_KEY: list(assistant_ids)
+                }
             messages.append(Message(
                 role="user",
                 content=row.user_content,
                 metadata=user_metadata,
             ))
-            messages.append(Message(role="assistant", content=row.assistant_content))
+            messages.append(Message(
+                role="assistant",
+                content=row.assistant_content,
+                metadata=assistant_metadata,
+            ))
         return rows, messages
 
     def _refresh_compaction_watermark(self) -> None:
@@ -1166,10 +1343,28 @@ class CompactionPipeline:
                 **kwargs,
             )
 
+        # Rosters come from the physical rows the segment's own messages name,
+        # not from the positional cursor above: the cursor walks logical merged
+        # rows and cannot survive noncontiguous topic grouping or a session
+        # split, so it is not a safe basis for deciding who authored a fact.
+        physical_by_id = {
+            row.canonical_turn_id: row
+            for rows_in_group in self._physical_rows_by_group().values()
+            for row in rows_in_group
+        }
+        actor_rosters_by_segment = {
+            seg.id: self._build_actor_roster(seg, physical_by_id)
+            for seg in compactable
+        }
+        exact_source_ids = {
+            seg.id: self._segment_source_ids(seg) for seg in compactable
+        }
+
         results = self._compactor.compact(
             compactable,
             fact_signals_by_segment=fact_signals_by_segment,
             code_refs_by_segment=code_refs_by_segment,
+            actor_rosters_by_segment=actor_rosters_by_segment,
             progress_callback=_compactor_progress,
         )
 
@@ -1192,7 +1387,19 @@ class CompactionPipeline:
             result.metadata.start_turn_number = exact_start
             result.metadata.end_turn_number = exact_end
             result.metadata.generated_by_turn_id = generated_by_turn_id
-            result.metadata.canonical_turn_ids = list(segment_canonical_turn_ids.get(seg.id, []))
+            # Prefer the exact per-message provenance. Fall back to the cursor
+            # map only when the segment carried no source ids at all (a legacy
+            # or synthesized segment), and mark that mapping incomplete so no
+            # fact author is derived from it.
+            exact_ids, mapping_complete = exact_source_ids.get(seg.id, ([], False))
+            if exact_ids:
+                result.metadata.canonical_turn_ids = list(exact_ids)
+                result.metadata.source_mapping_complete = bool(mapping_complete)
+            else:
+                result.metadata.canonical_turn_ids = list(
+                    segment_canonical_turn_ids.get(seg.id, [])
+                )
+                result.metadata.source_mapping_complete = False
 
             # Store or update
             if seg.merge_ref:

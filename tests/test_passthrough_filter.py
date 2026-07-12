@@ -184,6 +184,7 @@ class TestPassthroughFilter:
             segments,
             fact_signals_by_segment=None,
             code_refs_by_segment=None,
+            actor_rosters_by_segment=None,
             progress_callback=None,
         ):
             assert progress_callback is not None

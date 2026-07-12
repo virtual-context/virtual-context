@@ -252,8 +252,17 @@ CREATE TABLE IF NOT EXISTS facts (
     turn_numbers_json TEXT NOT NULL DEFAULT '[]',
     mentioned_at TEXT NOT NULL DEFAULT '',
     session_date TEXT NOT NULL DEFAULT '',
-    superseded_by TEXT
+    superseded_by TEXT,
+    author_actor_id TEXT NOT NULL DEFAULT '',
+    author_attribution_version INTEGER NOT NULL DEFAULT 0,
+    author_source_role TEXT NOT NULL DEFAULT '',
+    author_source_message_id TEXT NOT NULL DEFAULT ''
 );
+
+-- idx_facts_author_actor is created by _ensure_fact_author_schema, not here:
+-- on a pre-existing facts table this CREATE TABLE is a no-op, so an index
+-- naming author_actor_id would reference a column the forward migration has
+-- not added yet.
 
 CREATE TABLE IF NOT EXISTS fact_tags (
     fact_id TEXT NOT NULL,
@@ -440,6 +449,17 @@ ACTOR_REPLY_COLUMN_DEFS: dict[str, str] = {
     "audience_attribution_version": "INTEGER NOT NULL DEFAULT 0",
 }
 ACTOR_REPLY_COLUMNS: tuple[str, ...] = tuple(ACTOR_REPLY_COLUMN_DEFS)
+
+# Fact authorship. Same manifest discipline as the canonical columns above:
+# CREATE TABLE, forward migration, and startup assertion must agree, or a
+# half-migrated database silently drops every fact's author.
+FACT_AUTHOR_COLUMN_DEFS: dict[str, str] = {
+    "author_actor_id": "TEXT NOT NULL DEFAULT ''",
+    "author_attribution_version": "INTEGER NOT NULL DEFAULT 0",
+    "author_source_role": "TEXT NOT NULL DEFAULT ''",
+    "author_source_message_id": "TEXT NOT NULL DEFAULT ''",
+}
+FACT_AUTHOR_COLUMNS: tuple[str, ...] = tuple(FACT_AUTHOR_COLUMN_DEFS)
 
 # Postgres FTS: tsvector columns + GIN indexes
 FTS_SQL = """\
@@ -1681,6 +1701,13 @@ class PostgresStore(ContextStore):
             self._ensure_canonical_turn_views()
         except Exception:
             logger.warning("canonical turn bootstrap failed", exc_info=True)
+        # Deliberately its OWN try: an unrelated failure in the canonical
+        # bootstrap above must not skip this migration and leave the assertion
+        # below to condemn a database it could have repaired.
+        try:
+            self._ensure_fact_author_schema()
+        except Exception:
+            logger.warning("fact author bootstrap failed", exc_info=True)
         # The bootstrap above swallows broad failures, and each ADD COLUMN
         # swallows its own, so a half-migrated schema would otherwise run
         # silently and drop identity on every write. Assert the actor column
@@ -1820,6 +1847,49 @@ class PostgresStore(ContextStore):
                     "resolution would fall back to a full scan of "
                     "canonical_turns"
                 )
+
+            # Fact authorship, same rule: a swallowed migration must not become
+            # a database that quietly forgets who said what.
+            fact_columns = _columns(conn, "facts")
+            if not fact_columns:
+                return
+            missing = [c for c in FACT_AUTHOR_COLUMNS if c not in fact_columns]
+            if missing:
+                raise RuntimeError(
+                    f"facts schema is missing {', '.join(missing)}; refusing "
+                    f"to run fact authorship on a half-migrated schema"
+                )
+            fact_index = conn.execute(
+                """SELECT 1 FROM pg_indexes
+                    WHERE tablename = 'facts'
+                      AND indexname = 'idx_facts_author_actor'"""
+            ).fetchone()
+            if not fact_index:
+                raise RuntimeError(
+                    "facts schema is missing idx_facts_author_actor; the "
+                    "cross-conversation actor lookup would fall back to a "
+                    "full scan"
+                )
+
+    def _ensure_fact_author_schema(self) -> None:
+        """Forward-migrate fact authorship onto an existing database."""
+        with self.pool.connection() as conn:
+            for column, definition in FACT_AUTHOR_COLUMN_DEFS.items():
+                try:
+                    conn.execute(
+                        f"ALTER TABLE facts "
+                        f"ADD COLUMN IF NOT EXISTS {column} {definition}"
+                    )
+                except Exception:
+                    pass
+            try:
+                conn.execute(
+                    """CREATE INDEX IF NOT EXISTS idx_facts_author_actor
+                       ON facts(author_actor_id, conversation_id)
+                       WHERE author_actor_id <> ''"""
+                )
+            except Exception:
+                pass
 
     def _ensure_canonical_turn_schema(self) -> None:
         with self.pool.connection() as conn:
@@ -8033,8 +8103,11 @@ class PostgresStore(ContextStore):
                             """INSERT INTO facts
                             (id, subject, verb, object, status, what, who, when_date, "where", why,
                              fact_type, tags_json, segment_ref, conversation_id, turn_numbers_json,
-                             mentioned_at, session_date, superseded_by, operation_id)
-                            SELECT %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
+                             mentioned_at, session_date, superseded_by,
+                             author_actor_id, author_attribution_version, author_source_role,
+                             author_source_message_id, operation_id)
+                            SELECT %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                                   %s,%s,%s,%s,%s
                               FROM compaction_operation
                              WHERE operation_id = %s
                                AND conversation_id = %s
@@ -8049,6 +8122,10 @@ class PostgresStore(ContextStore):
                                 segment_ref=EXCLUDED.segment_ref, conversation_id=EXCLUDED.conversation_id,
                                 turn_numbers_json=EXCLUDED.turn_numbers_json, mentioned_at=EXCLUDED.mentioned_at,
                                 session_date=EXCLUDED.session_date, superseded_by=EXCLUDED.superseded_by,
+                                author_actor_id=EXCLUDED.author_actor_id,
+                                author_attribution_version=EXCLUDED.author_attribution_version,
+                                author_source_role=EXCLUDED.author_source_role,
+                                author_source_message_id=EXCLUDED.author_source_message_id,
                                 operation_id=EXCLUDED.operation_id""",
                             (
                                 fact.id, fact.subject, fact.verb, fact.object, fact.status,
@@ -8056,6 +8133,10 @@ class PostgresStore(ContextStore):
                                 fact.fact_type, json.dumps(fact.tags), fact.segment_ref,
                                 fact.conversation_id, json.dumps(fact.turn_numbers),
                                 _dt_to_str(fact.mentioned_at), fact.session_date, fact.superseded_by,
+                                fact.author_actor_id or "",
+                                int(fact.author_attribution_version or 0),
+                                fact.author_source_role or "",
+                                fact.author_source_message_id or "",
                                 operation_id,
                                 # WHERE clause params:
                                 operation_id, fact.conversation_id,
@@ -8075,8 +8156,11 @@ class PostgresStore(ContextStore):
                             """INSERT INTO facts
                             (id, subject, verb, object, status, what, who, when_date, "where", why,
                              fact_type, tags_json, segment_ref, conversation_id, turn_numbers_json,
-                             mentioned_at, session_date, superseded_by)
-                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                             mentioned_at, session_date, superseded_by,
+                             author_actor_id, author_attribution_version, author_source_role,
+                             author_source_message_id)
+                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                                    %s,%s,%s,%s)
                             ON CONFLICT (id) DO UPDATE SET
                                 subject=EXCLUDED.subject, verb=EXCLUDED.verb, object=EXCLUDED.object,
                                 status=EXCLUDED.status, what=EXCLUDED.what, who=EXCLUDED.who,
@@ -8084,12 +8168,20 @@ class PostgresStore(ContextStore):
                                 fact_type=EXCLUDED.fact_type, tags_json=EXCLUDED.tags_json,
                                 segment_ref=EXCLUDED.segment_ref, conversation_id=EXCLUDED.conversation_id,
                                 turn_numbers_json=EXCLUDED.turn_numbers_json, mentioned_at=EXCLUDED.mentioned_at,
-                                session_date=EXCLUDED.session_date, superseded_by=EXCLUDED.superseded_by""",
+                                session_date=EXCLUDED.session_date, superseded_by=EXCLUDED.superseded_by,
+                                author_actor_id=EXCLUDED.author_actor_id,
+                                author_attribution_version=EXCLUDED.author_attribution_version,
+                                author_source_role=EXCLUDED.author_source_role,
+                                author_source_message_id=EXCLUDED.author_source_message_id""",
                             (fact.id, fact.subject, fact.verb, fact.object, fact.status,
                              fact.what, fact.who, fact.when_date, fact.where, fact.why,
                              fact.fact_type, json.dumps(fact.tags), fact.segment_ref,
                              fact.conversation_id, json.dumps(fact.turn_numbers),
-                             _dt_to_str(fact.mentioned_at), fact.session_date, fact.superseded_by),
+                             _dt_to_str(fact.mentioned_at), fact.session_date, fact.superseded_by,
+                             fact.author_actor_id or "",
+                             int(fact.author_attribution_version or 0),
+                             fact.author_source_role or "",
+                             fact.author_source_message_id or ""),
                         )
                     conn.execute("DELETE FROM fact_tags WHERE fact_id = %s", (fact.id,))
                     for tag in fact.tags:
@@ -8246,8 +8338,11 @@ class PostgresStore(ContextStore):
                             """INSERT INTO facts
                             (id, subject, verb, object, status, what, who, when_date, "where", why,
                              fact_type, tags_json, segment_ref, conversation_id, turn_numbers_json,
-                             mentioned_at, session_date, superseded_by, operation_id)
-                            SELECT %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
+                             mentioned_at, session_date, superseded_by,
+                             author_actor_id, author_attribution_version, author_source_role,
+                             author_source_message_id, operation_id)
+                            SELECT %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                                   %s,%s,%s,%s,%s
                               FROM compaction_operation
                              WHERE operation_id = %s
                                AND conversation_id = %s
@@ -8262,6 +8357,10 @@ class PostgresStore(ContextStore):
                                 segment_ref=EXCLUDED.segment_ref, conversation_id=EXCLUDED.conversation_id,
                                 turn_numbers_json=EXCLUDED.turn_numbers_json, mentioned_at=EXCLUDED.mentioned_at,
                                 session_date=EXCLUDED.session_date, superseded_by=EXCLUDED.superseded_by,
+                                author_actor_id=EXCLUDED.author_actor_id,
+                                author_attribution_version=EXCLUDED.author_attribution_version,
+                                author_source_role=EXCLUDED.author_source_role,
+                                author_source_message_id=EXCLUDED.author_source_message_id,
                                 operation_id=EXCLUDED.operation_id""",
                             (
                                 fact.id, fact.subject, fact.verb, fact.object, fact.status,
@@ -8269,6 +8368,10 @@ class PostgresStore(ContextStore):
                                 fact.fact_type, json.dumps(fact.tags), fact.segment_ref,
                                 fact.conversation_id, json.dumps(fact.turn_numbers),
                                 _dt_to_str(fact.mentioned_at), fact.session_date, fact.superseded_by,
+                                fact.author_actor_id or "",
+                                int(fact.author_attribution_version or 0),
+                                fact.author_source_role or "",
+                                fact.author_source_message_id or "",
                                 operation_id,
                                 # WHERE clause params:
                                 operation_id, fact.conversation_id,
@@ -8294,8 +8397,11 @@ class PostgresStore(ContextStore):
                             """INSERT INTO facts
                             (id, subject, verb, object, status, what, who, when_date, "where", why,
                              fact_type, tags_json, segment_ref, conversation_id, turn_numbers_json,
-                             mentioned_at, session_date, superseded_by)
-                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                             mentioned_at, session_date, superseded_by,
+                             author_actor_id, author_attribution_version, author_source_role,
+                             author_source_message_id)
+                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                                    %s,%s,%s,%s)
                             ON CONFLICT (id) DO UPDATE SET
                                 subject=EXCLUDED.subject, verb=EXCLUDED.verb, object=EXCLUDED.object,
                                 status=EXCLUDED.status, what=EXCLUDED.what, who=EXCLUDED.who,
@@ -8303,12 +8409,20 @@ class PostgresStore(ContextStore):
                                 fact_type=EXCLUDED.fact_type, tags_json=EXCLUDED.tags_json,
                                 segment_ref=EXCLUDED.segment_ref, conversation_id=EXCLUDED.conversation_id,
                                 turn_numbers_json=EXCLUDED.turn_numbers_json, mentioned_at=EXCLUDED.mentioned_at,
-                                session_date=EXCLUDED.session_date, superseded_by=EXCLUDED.superseded_by""",
+                                session_date=EXCLUDED.session_date, superseded_by=EXCLUDED.superseded_by,
+                                author_actor_id=EXCLUDED.author_actor_id,
+                                author_attribution_version=EXCLUDED.author_attribution_version,
+                                author_source_role=EXCLUDED.author_source_role,
+                                author_source_message_id=EXCLUDED.author_source_message_id""",
                             (fact.id, fact.subject, fact.verb, fact.object, fact.status,
                              fact.what, fact.who, fact.when_date, fact.where, fact.why,
                              fact.fact_type, json.dumps(fact.tags), fact.segment_ref,
                              fact.conversation_id, json.dumps(fact.turn_numbers),
-                             _dt_to_str(fact.mentioned_at), fact.session_date, fact.superseded_by),
+                             _dt_to_str(fact.mentioned_at), fact.session_date, fact.superseded_by,
+                             fact.author_actor_id or "",
+                             int(fact.author_attribution_version or 0),
+                             fact.author_source_role or "",
+                             fact.author_source_message_id or ""),
                         )
                     conn.execute("DELETE FROM fact_tags WHERE fact_id = %s", (fact.id,))
                     for tag in fact.tags:
@@ -8694,6 +8808,15 @@ class PostgresStore(ContextStore):
                         turn_numbers=json.loads(row["turn_numbers_json"]) if row["turn_numbers_json"] else [],
                         mentioned_at=_str_to_dt(row["mentioned_at"]) if row["mentioned_at"] else datetime.now(timezone.utc),
                         session_date=row.get("session_date", ""), superseded_by=row["superseded_by"],
+                        # Built by hand rather than through from_dict, so
+                        # authorship has to be carried explicitly or a linked
+                        # fact silently loses its author.
+                        author_actor_id=row.get("author_actor_id") or "",
+                        author_attribution_version=int(
+                            row.get("author_attribution_version") or 0
+                        ),
+                        author_source_role=row.get("author_source_role") or "",
+                        author_source_message_id=row.get("author_source_message_id") or "",
                     )
                     src = row["source_fact_id"]
                     tgt = row["target_fact_id"]

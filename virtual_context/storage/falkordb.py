@@ -72,6 +72,12 @@ class FalkorDBFactStore:
             "mentioned_at": _dt_to_str(fact.mentioned_at),
             "session_date": fact.session_date,
             "superseded_by": fact.superseded_by or "",
+            # Authorship must survive a graph fact delegate, or a CompositeStore
+            # configured with one silently erases who said what.
+            "author_actor_id": fact.author_actor_id,
+            "author_attribution_version": fact.author_attribution_version,
+            "author_source_role": fact.author_source_role,
+            "author_source_message_id": fact.author_source_message_id,
         }
 
     def _node_to_fact(self, node) -> Fact:
