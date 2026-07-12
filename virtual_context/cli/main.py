@@ -1941,10 +1941,15 @@ def _cmd_admin_actor_operation(args, method_name: str, total_keys: tuple[str, ..
             # be deleted between enumeration and processing, and the rest
             # of the tenant's conversations still deserve their pass.
             try:
+                extra_kwargs = {}
+                platform = (getattr(args, "platform", "") or "").strip()
+                if platform:
+                    extra_kwargs["platform"] = platform
                 counts = method(
                     target,
                     dry_run=dry_run,
                     limit=None if all_convs else limit,
+                    **extra_kwargs,
                 )
             except Exception as exc:  # noqa: BLE001
                 errors += 1
@@ -2728,6 +2733,16 @@ def main():
         actor_parser.add_argument("--all-convs-for-tenant", action="store_true")
         actor_parser.add_argument("--dry-run", action="store_true")
         actor_parser.add_argument("--limit", type=int, default=None)
+        if command_name == "backfill-actors":
+            actor_parser.add_argument(
+                "--platform", default="",
+                help=(
+                    "Operator-asserted platform for conversations whose "
+                    "caller keys never named one (e.g. telegram). Never "
+                    "inferred; applies to identity blocks that carry a "
+                    "sender id but no platform proof."
+                ),
+            )
         actor_parser.add_argument(
             "--storage-backend", choices=("sqlite", "postgres", "filesystem"),
         )

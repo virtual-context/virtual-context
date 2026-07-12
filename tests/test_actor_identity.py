@@ -480,3 +480,37 @@ def test_agent_only_stable_key_yields_no_platform():
     assert get_platform_from_conversation_key(
         "sk:agent:bastkid-dedicated:77f110fc"
     ) == ""
+
+
+# ---------------------------------------------------------------------------
+# Operator platform assertion (admin backfill provenance)
+# ---------------------------------------------------------------------------
+
+def test_platform_override_mints_actor_for_opaque_key():
+    _, meta = _extract_envelope_metadata(
+        _block("Conversation info", f'{{"sender_id": "{OPTICS_ID}"}}') + "hi"
+    )
+    assert get_actor_id(meta, UUID_KEY) == ""
+    assert get_actor_id(
+        meta, UUID_KEY, platform_override="telegram",
+    ) == f"actor:telegram:{OPTICS_ID}"
+
+
+def test_platform_override_never_touches_actor_block_platform():
+    payload = f'{{"platform": "discord", "user_id": "{OPTICS_ID}"}}'
+    _, meta = _extract_envelope_metadata(_block("Actor", payload) + "hi")
+    assert get_actor_id(
+        meta, UUID_KEY, platform_override="telegram",
+    ) == f"actor:discord:{OPTICS_ID}"
+
+
+def test_platform_override_is_still_normalized():
+    _, meta = _extract_envelope_metadata(
+        _block("Conversation info", f'{{"sender_id": "{OPTICS_ID}"}}') + "hi"
+    )
+    assert get_actor_id(meta, UUID_KEY, platform_override="Bad Platform!") == ""
+
+
+def test_platform_override_does_not_invent_identity():
+    _, meta = _extract_envelope_metadata("just plain text, no blocks")
+    assert get_actor_id(meta, UUID_KEY, platform_override="telegram") == ""
