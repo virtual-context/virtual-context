@@ -1127,6 +1127,7 @@ class ProxyState:
         *,
         body: dict,
         payload_accounting: dict,
+        source_conversation_key: str = "",
     ) -> PhaseDecision:
         """Run the ingestion flow (, steps 1-8) for one inbound request.
 
@@ -1198,6 +1199,11 @@ class ProxyState:
                     body=body,
                     fmt=fmt,
                     expected_lifecycle_epoch=my_epoch,
+                    # The RAW caller key, before alias resolution. An actor id's
+                    # platform segment lives only here: ``conversation_id`` is
+                    # already resolved and after a VCATTACH it can be a UUID
+                    # that names no platform at all.
+                    source_conversation_key=source_conversation_key,
                 )
             except AttributeError:
                 # No reconciler configured on engine — acceptable for

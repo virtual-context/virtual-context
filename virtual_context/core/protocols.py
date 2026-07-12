@@ -112,6 +112,15 @@ class SegmentStore(Protocol):
         turn_group_number: int = -1,
         origin_channel_id: str = "",
         origin_channel_label: str = "",
+        sender_actor_id: str = "",
+        source_message_id: str = "",
+        reply_target_message_id: str = "",
+        reply_subject_actor_id: str = "",
+        reply_subject_label: str = "",
+        reply_target_body: str = "",
+        reply_attribution_version: int = 0,
+        audience_conversation_id: str = "",
+        audience_attribution_version: int = 0,
     ) -> None: ...
     def update_canonical_turn_senders_if_empty(
         self,
@@ -127,6 +136,36 @@ class SegmentStore(Protocol):
         *,
         expected_lifecycle_epoch: int | None = None,
     ) -> int: ...
+    def update_canonical_turn_actors_if_empty(
+        self,
+        conversation_id: str,
+        updates: dict[str, str],
+        *,
+        expected_lifecycle_epoch: int | None = None,
+    ) -> int: ...
+    def update_canonical_turn_reply_roles_if_empty(
+        self,
+        conversation_id: str,
+        updates: dict[str, dict],
+        *,
+        expected_lifecycle_epoch: int | None = None,
+    ) -> int: ...
+    def find_canonical_turn_by_source_message_id(
+        self,
+        conversation_id: str,
+        source_message_id: str,
+        *,
+        audience_conversation_id: str = "",
+        origin_channel_id: str = "",
+    ) -> "CanonicalTurnRow | None": ...
+    def find_actor_ids_by_display_label(
+        self,
+        conversation_id: str,
+        label: str,
+        *,
+        audience_conversation_id: str = "",
+        origin_channel_id: str = "",
+    ) -> list[str]: ...
     def list_canonical_conversation_ids(
         self,
         *,

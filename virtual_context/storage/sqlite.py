@@ -137,6 +137,15 @@ CREATE TABLE IF NOT EXISTS canonical_turns (
     sender TEXT NOT NULL DEFAULT '',
     origin_channel_id TEXT NOT NULL DEFAULT '',
     origin_channel_label TEXT NOT NULL DEFAULT '',
+    sender_actor_id TEXT NOT NULL DEFAULT '',
+    source_message_id TEXT NOT NULL DEFAULT '',
+    reply_target_message_id TEXT NOT NULL DEFAULT '',
+    reply_subject_actor_id TEXT NOT NULL DEFAULT '',
+    reply_subject_label TEXT NOT NULL DEFAULT '',
+    reply_target_body TEXT NOT NULL DEFAULT '',
+    reply_attribution_version INTEGER NOT NULL DEFAULT 0,
+    audience_conversation_id TEXT NOT NULL DEFAULT '',
+    audience_attribution_version INTEGER NOT NULL DEFAULT 0,
     fact_signals_json TEXT NOT NULL DEFAULT '[]',
     code_refs_json TEXT NOT NULL DEFAULT '[]',
     tagged_at TEXT,
@@ -206,6 +215,26 @@ CREATE INDEX IF NOT EXISTS idx_segments_created_at ON segments(created_at);
 CREATE INDEX IF NOT EXISTS idx_segments_conversation_id ON segments(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_segment_tags_tag ON segment_tags(tag);
 """
+
+# Actor identity and reply-edge columns on ``canonical_turns``, in one place.
+#
+# Four surfaces must agree about this list or identity silently stops
+# persisting: the CREATE TABLE above, the forward migration, the lifecycle
+# table-rebuild's explicit INSERT...SELECT copy list, and the startup
+# assertion. Keeping them as one manifest is what makes a dropped column a
+# failed test instead of a quietly empty column in production.
+ACTOR_REPLY_COLUMN_DEFS: dict[str, str] = {
+    "sender_actor_id": "TEXT NOT NULL DEFAULT ''",
+    "source_message_id": "TEXT NOT NULL DEFAULT ''",
+    "reply_target_message_id": "TEXT NOT NULL DEFAULT ''",
+    "reply_subject_actor_id": "TEXT NOT NULL DEFAULT ''",
+    "reply_subject_label": "TEXT NOT NULL DEFAULT ''",
+    "reply_target_body": "TEXT NOT NULL DEFAULT ''",
+    "reply_attribution_version": "INTEGER NOT NULL DEFAULT 0",
+    "audience_conversation_id": "TEXT NOT NULL DEFAULT ''",
+    "audience_attribution_version": "INTEGER NOT NULL DEFAULT 0",
+}
+ACTOR_REPLY_COLUMNS: tuple[str, ...] = tuple(ACTOR_REPLY_COLUMN_DEFS)
 
 FTS_SQL = """\
 CREATE VIRTUAL TABLE IF NOT EXISTS segments_fts USING fts5(
@@ -633,6 +662,29 @@ def _row_to_canonical_turn(row: sqlite3.Row) -> CanonicalTurnRow:
         updated_at=row["updated_at"] or "",
         origin_channel_id=(row["origin_channel_id"] if "origin_channel_id" in row.keys() else "") or "",
         origin_channel_label=(row["origin_channel_label"] if "origin_channel_label" in row.keys() else "") or "",
+        sender_actor_id=(row["sender_actor_id"] if "sender_actor_id" in row.keys() else "") or "",
+        source_message_id=(row["source_message_id"] if "source_message_id" in row.keys() else "") or "",
+        reply_target_message_id=(
+            row["reply_target_message_id"] if "reply_target_message_id" in row.keys() else ""
+        ) or "",
+        reply_subject_actor_id=(
+            row["reply_subject_actor_id"] if "reply_subject_actor_id" in row.keys() else ""
+        ) or "",
+        reply_subject_label=(
+            row["reply_subject_label"] if "reply_subject_label" in row.keys() else ""
+        ) or "",
+        reply_target_body=(
+            row["reply_target_body"] if "reply_target_body" in row.keys() else ""
+        ) or "",
+        reply_attribution_version=int(
+            (row["reply_attribution_version"] if "reply_attribution_version" in row.keys() else 0) or 0
+        ),
+        audience_conversation_id=(
+            row["audience_conversation_id"] if "audience_conversation_id" in row.keys() else ""
+        ) or "",
+        audience_attribution_version=int(
+            (row["audience_attribution_version"] if "audience_attribution_version" in row.keys() else 0) or 0
+        ),
         origin_conversation_id=(
             row["origin_conversation_id"] if "origin_conversation_id" in row.keys() else ""
         ) or "",
@@ -739,6 +791,42 @@ def _merge_canonical_turn_rows(rows: list[CanonicalTurnRow]) -> dict[int, Canoni
                 merged_row.session_date = row.session_date
             if not merged_row.sender and row.sender:
                 merged_row.sender = row.sender
+            # Actor identity is SPEAKER attribution: take it only from a row
+            # that actually carries user content, so an assistant sibling can
+            # never lend (or be lent) a human actor through the logical merge.
+            if (
+                not merged_row.sender_actor_id
+                and row.sender_actor_id
+                and row.user_content
+            ):
+                merged_row.sender_actor_id = row.sender_actor_id
+            # The reply edge is role-local to the user row for the same reason.
+            # Losing it here would be a silent functional loss even though the
+            # physical rows persisted it correctly.
+            if row.user_content:
+                if not merged_row.source_message_id and row.source_message_id:
+                    merged_row.source_message_id = row.source_message_id
+                if not merged_row.reply_target_message_id and row.reply_target_message_id:
+                    merged_row.reply_target_message_id = row.reply_target_message_id
+                if not merged_row.reply_subject_actor_id and row.reply_subject_actor_id:
+                    merged_row.reply_subject_actor_id = row.reply_subject_actor_id
+                if not merged_row.reply_subject_label and row.reply_subject_label:
+                    merged_row.reply_subject_label = row.reply_subject_label
+                if not merged_row.reply_target_body and row.reply_target_body:
+                    merged_row.reply_target_body = row.reply_target_body
+                if (
+                    not merged_row.audience_conversation_id
+                    and row.audience_conversation_id
+                ):
+                    merged_row.audience_conversation_id = row.audience_conversation_id
+                merged_row.reply_attribution_version = max(
+                    merged_row.reply_attribution_version,
+                    row.reply_attribution_version,
+                )
+                merged_row.audience_attribution_version = max(
+                    merged_row.audience_attribution_version,
+                    row.audience_attribution_version,
+                )
             if row.source_batch_id and not merged_row.source_batch_id:
                 merged_row.source_batch_id = row.source_batch_id
             if row.created_at and (not merged_row.created_at or row.created_at < merged_row.created_at):
@@ -1678,6 +1766,11 @@ CREATE TABLE IF NOT EXISTS request_captures (
             self._ensure_canonical_turn_views(conn)
         except Exception:
             logger.warning("canonical turn bootstrap failed", exc_info=True)
+        # The bootstrap above swallows broad failures, so a half-migrated
+        # schema would otherwise run silently and drop identity on every
+        # write. Assert the actor column on both the base table and the
+        # ordinal view, OUTSIDE that catch, and fail startup instead.
+        self._assert_actor_schema(conn)
         # + migrations run HERE, after all CREATE TABLE statements
         # have completed earlier in _ensure_schema. SQLite has no
         # ADD COLUMN IF NOT EXISTS; we PRAGMA table_info() to check then
@@ -1721,6 +1814,51 @@ CREATE TABLE IF NOT EXISTS request_captures (
             pass
         conn.commit()
         self._repair_fts_if_needed(conn)
+
+    def _assert_actor_schema(self, conn: sqlite3.Connection) -> None:
+        """Fail startup when actor identity would silently not persist.
+
+        Both canonical bootstrap callers swallow broad failures, so without
+        this a half-migrated database runs happily and drops identity and the
+        reply edge on every write. Identity must not silently no-op: assert
+        outside those catches and refuse to start instead.
+        """
+        def _columns(relation: str) -> set[str]:
+            return {
+                row["name"] if isinstance(row, sqlite3.Row) else row[1]
+                for row in conn.execute(f"PRAGMA table_info({relation})").fetchall()
+            }
+
+        # The guarded condition is a HALF-migrated schema: the relation exists
+        # but our columns did not land. A relation that does not exist at all
+        # is a different state, already fatal on every other canonical path,
+        # and not this assertion's to claim.
+        base = _columns("canonical_turns")
+        if not base:
+            return
+        for relation, columns in (
+            ("canonical_turns", base),
+            ("canonical_turns_ordinal", _columns("canonical_turns_ordinal")),
+        ):
+            if not columns:
+                continue
+            missing = [c for c in ACTOR_REPLY_COLUMNS if c not in columns]
+            if missing:
+                raise RuntimeError(
+                    f"canonical turn schema is missing {', '.join(missing)} on "
+                    f"{relation}; refusing to run identity on a half-migrated "
+                    f"schema"
+                )
+        indexes = {
+            row["name"] if isinstance(row, sqlite3.Row) else row[1]
+            for row in conn.execute("PRAGMA index_list(canonical_turns)").fetchall()
+        }
+        if "idx_canonical_turns_source_message" not in indexes:
+            raise RuntimeError(
+                "canonical turn schema is missing "
+                "idx_canonical_turns_source_message; reply-target resolution "
+                "would fall back to a full scan of canonical_turns"
+            )
 
     def _ensure_canonical_turn_views(self, conn: sqlite3.Connection) -> None:
         conn.execute("DROP VIEW IF EXISTS canonical_turns_ordinal")
@@ -1776,20 +1914,35 @@ CREATE TABLE IF NOT EXISTS request_captures (
             )
             pragma_rows = conn.execute("PRAGMA table_info(canonical_turns)").fetchall()
             by_name = {row["name"]: row for row in pragma_rows}
-        # Channel provenance columns must exist BEFORE the lifecycle rebuild
-        # below: that rebuild copies an explicit column list out of the old
-        # table, so a legacy DB missing these columns would fail the SELECT,
-        # and a rebuild that omitted them would silently discard them.
-        for channel_column in ("origin_channel_id", "origin_channel_label"):
-            if channel_column not in by_name:
+        # Enrichment columns must exist BEFORE the lifecycle rebuild below:
+        # that rebuild copies an explicit column list out of the old table, so
+        # a legacy DB missing these columns would fail the SELECT, and a
+        # rebuild that omitted them would silently discard them.
+        for column in ("origin_channel_id", "origin_channel_label", *ACTOR_REPLY_COLUMNS):
+            if column not in by_name:
                 self._add_column_if_missing(
                     conn,
                     "canonical_turns",
-                    channel_column,
-                    "TEXT NOT NULL DEFAULT ''",
+                    column,
+                    ACTOR_REPLY_COLUMN_DEFS.get(column, "TEXT NOT NULL DEFAULT ''"),
                 )
                 pragma_rows = conn.execute("PRAGMA table_info(canonical_turns)").fetchall()
                 by_name = {row["name"]: row for row in pragma_rows}
+        # The reply lookup index is not part of SCHEMA_SQL's CREATE TABLE, so a
+        # forward-migrated DB needs it created explicitly.
+        #
+        # Deliberately NOT unique. A platform message id is opaque, and VCMERGE
+        # moves source and target canonical rows under one owner
+        # ``conversation_id`` while preserving their prior audience in
+        # ``origin_conversation_id``. Two rows legitimately claiming the same
+        # message id can therefore end up under one owner, and a unique index
+        # would reject an otherwise valid merge. Ambiguity is detected at
+        # lookup time and fails closed instead.
+        conn.execute(
+            """CREATE INDEX IF NOT EXISTS idx_canonical_turns_source_message
+               ON canonical_turns(conversation_id, source_message_id)
+               WHERE source_message_id <> ''"""
+        )
         lifecycle_columns = ("tagged_at", "compacted_at", "first_seen_at", "last_seen_at")
         needs_rebuild = any(
             name in by_name and int(by_name[name]["notnull"] or 0) == 1
@@ -1819,6 +1972,15 @@ CREATE TABLE IF NOT EXISTS request_captures (
                     sender TEXT NOT NULL DEFAULT '',
                     origin_channel_id TEXT NOT NULL DEFAULT '',
                     origin_channel_label TEXT NOT NULL DEFAULT '',
+                    sender_actor_id TEXT NOT NULL DEFAULT '',
+                    source_message_id TEXT NOT NULL DEFAULT '',
+                    reply_target_message_id TEXT NOT NULL DEFAULT '',
+                    reply_subject_actor_id TEXT NOT NULL DEFAULT '',
+                    reply_subject_label TEXT NOT NULL DEFAULT '',
+                    reply_target_body TEXT NOT NULL DEFAULT '',
+                    reply_attribution_version INTEGER NOT NULL DEFAULT 0,
+                    audience_conversation_id TEXT NOT NULL DEFAULT '',
+                    audience_attribution_version INTEGER NOT NULL DEFAULT 0,
                     fact_signals_json TEXT NOT NULL DEFAULT '[]',
                     code_refs_json TEXT NOT NULL DEFAULT '[]',
                     tagged_at TEXT,
@@ -1850,6 +2012,15 @@ CREATE TABLE IF NOT EXISTS request_captures (
                     sender,
                     COALESCE(origin_channel_id, ''),
                     COALESCE(origin_channel_label, ''),
+                    COALESCE(sender_actor_id, ''),
+                    COALESCE(source_message_id, ''),
+                    COALESCE(reply_target_message_id, ''),
+                    COALESCE(reply_subject_actor_id, ''),
+                    COALESCE(reply_subject_label, ''),
+                    COALESCE(reply_target_body, ''),
+                    COALESCE(reply_attribution_version, 0),
+                    COALESCE(audience_conversation_id, ''),
+                    COALESCE(audience_attribution_version, 0),
                     fact_signals_json,
                     code_refs_json,
                     NULLIF(tagged_at, ''),
@@ -1866,6 +2037,9 @@ CREATE TABLE IF NOT EXISTS request_captures (
                     ON canonical_turns (conversation_id, sort_key);
                 CREATE INDEX IF NOT EXISTS idx_canonical_turns_conv_hash
                     ON canonical_turns (conversation_id, turn_hash);
+                CREATE INDEX IF NOT EXISTS idx_canonical_turns_source_message
+                    ON canonical_turns (conversation_id, source_message_id)
+                    WHERE source_message_id <> '';
                 COMMIT;
                 """
             )
@@ -1986,7 +2160,11 @@ CREATE TABLE IF NOT EXISTS request_captures (
             """SELECT canonical_turn_id, conversation_id, turn_number, turn_group_number, sort_key, turn_hash, hash_version,
                       normalized_user_text, normalized_assistant_text, user_content, assistant_content,
                       user_raw_content, assistant_raw_content, primary_tag, tags_json, session_date,
-                      sender, origin_channel_id, origin_channel_label, origin_conversation_id,
+                      sender, origin_channel_id, origin_channel_label, sender_actor_id,
+                      source_message_id, reply_target_message_id, reply_subject_actor_id,
+                      reply_subject_label, reply_target_body, reply_attribution_version,
+                      audience_conversation_id, audience_attribution_version,
+                      origin_conversation_id,
                       fact_signals_json, code_refs_json, tagged_at, compacted_at, first_seen_at,
                       last_seen_at, source_batch_id, created_at, updated_at,
                       covered_ingestible_entries
@@ -4122,16 +4300,28 @@ CREATE TABLE IF NOT EXISTS request_captures (
             # canonical_turns moves reset compacted_at = NULL so
             # target's compaction prefix invariant holds. The
             # queue_resegment post-commit pending fires re-compaction.
+            #
+            # ``audience_conversation_id`` is filled the same one-way way as
+            # ``origin_conversation_id``: a row that already recorded the route
+            # it was observed on keeps it, and a historical row that predates
+            # the column inherits the source conversation, because that IS the
+            # audience it was seen on. This is what keeps a DM row from
+            # becoming guild-disclosable merely by being moved under the guild
+            # owner; ``origin_conversation_id`` alone cannot stand in, because a
+            # message ingested through the source alias AFTER the merge is born
+            # under the target and would otherwise lose its route entirely.
             for tbl, col in TABLES_OFFSET_SORT_KEY:
                 cur = conn.execute(
                     f"UPDATE {tbl} "
                     f"   SET conversation_id = ?, "
                     f"       origin_conversation_id = COALESCE(NULLIF(origin_conversation_id, ''), ?), "
+                    f"       audience_conversation_id = COALESCE(NULLIF(audience_conversation_id, ''), ?), "
                     f"       {col} = {col} + ?, "
                     f"       compacted_at = NULL "
                     f" WHERE conversation_id = ?",
                     (target_conversation_id, source_conversation_id,
-                     sort_key_offset, source_conversation_id),
+                     source_conversation_id, sort_key_offset,
+                     source_conversation_id),
                 )
                 rows_moved[tbl] = cur.rowcount
 
@@ -6298,6 +6488,15 @@ CREATE TABLE IF NOT EXISTS request_captures (
         turn_group_number: int = -1,
         origin_channel_id: str = "",
         origin_channel_label: str = "",
+        sender_actor_id: str = "",
+        source_message_id: str = "",
+        reply_target_message_id: str = "",
+        reply_subject_actor_id: str = "",
+        reply_subject_label: str = "",
+        reply_target_body: str = "",
+        reply_attribution_version: int = 0,
+        audience_conversation_id: str = "",
+        audience_attribution_version: int = 0,
     ) -> None:
         now = _dt_to_str(datetime.now(timezone.utc))
         created = created_at or now
@@ -6356,10 +6555,14 @@ CREATE TABLE IF NOT EXISTS request_captures (
             (canonical_turn_id, conversation_id, turn_group_number, sort_key, turn_hash, hash_version,
              normalized_user_text, normalized_assistant_text, user_content, assistant_content,
              user_raw_content, assistant_raw_content, primary_tag, tags_json, session_date, sender,
-             origin_channel_id, origin_channel_label,
+             origin_channel_id, origin_channel_label, sender_actor_id,
+             source_message_id, reply_target_message_id, reply_subject_actor_id,
+             reply_subject_label, reply_target_body, reply_attribution_version,
+             audience_conversation_id, audience_attribution_version,
              fact_signals_json, code_refs_json, tagged_at, compacted_at, first_seen_at, last_seen_at,
              source_batch_id, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(canonical_turn_id) DO UPDATE SET
                 turn_group_number=excluded.turn_group_number,
                 sort_key=excluded.sort_key,
@@ -6377,6 +6580,15 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 sender=excluded.sender,
                 origin_channel_id=excluded.origin_channel_id,
                 origin_channel_label=excluded.origin_channel_label,
+                sender_actor_id=excluded.sender_actor_id,
+                source_message_id=excluded.source_message_id,
+                reply_target_message_id=excluded.reply_target_message_id,
+                reply_subject_actor_id=excluded.reply_subject_actor_id,
+                reply_subject_label=excluded.reply_subject_label,
+                reply_target_body=excluded.reply_target_body,
+                reply_attribution_version=excluded.reply_attribution_version,
+                audience_conversation_id=excluded.audience_conversation_id,
+                audience_attribution_version=excluded.audience_attribution_version,
                 fact_signals_json=excluded.fact_signals_json,
                 code_refs_json=excluded.code_refs_json,
                 tagged_at=excluded.tagged_at,
@@ -6403,6 +6615,15 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 sender or "",
                 origin_channel_id or "",
                 origin_channel_label or "",
+                sender_actor_id or "",
+                source_message_id or "",
+                reply_target_message_id or "",
+                reply_subject_actor_id or "",
+                reply_subject_label or "",
+                reply_target_body or "",
+                int(reply_attribution_version or 0),
+                audience_conversation_id or "",
+                int(audience_attribution_version or 0),
                 json.dumps(fact_signal_payload),
                 json.dumps(list(code_refs or [])),
                 tagged_at,
@@ -6585,6 +6806,248 @@ CREATE TABLE IF NOT EXISTS request_captures (
         conn.commit()
         return updated
 
+    def update_canonical_turn_actors_if_empty(
+        self,
+        conversation_id: str,
+        updates: dict[str, str],
+        *,
+        expected_lifecycle_epoch: int | None = None,
+    ) -> int:
+        """Compare-and-set ``sender_actor_id`` on rows whose stored value is empty.
+
+        Narrow UPDATE by ``canonical_turn_id`` with
+        ``WHERE COALESCE(TRIM(sender_actor_id), '') = ''`` so a stored identity
+        is never overwritten and a re-run is a no-op. The optional epoch
+        predicate lives inside the same statement so the guard cannot race a
+        concurrent epoch bump and write into a resurrected lifecycle.
+        """
+        normalized = {
+            ct_id: (actor_id or "").strip()
+            for ct_id, actor_id in (updates or {}).items()
+            if ct_id and (actor_id or "").strip()
+        }
+        if not normalized:
+            return 0
+        conn = self._get_conn()
+        updated = 0
+        now = utcnow_iso()
+        for canonical_turn_id, actor_id in normalized.items():
+            if expected_lifecycle_epoch is None:
+                cursor = conn.execute(
+                    """UPDATE canonical_turns
+                          SET sender_actor_id = ?, updated_at = ?
+                        WHERE conversation_id = ?
+                          AND canonical_turn_id = ?
+                          AND COALESCE(TRIM(sender_actor_id), '') = ''""",
+                    (actor_id, now, conversation_id, canonical_turn_id),
+                )
+            else:
+                cursor = conn.execute(
+                    """UPDATE canonical_turns
+                          SET sender_actor_id = ?, updated_at = ?
+                        WHERE conversation_id = ?
+                          AND canonical_turn_id = ?
+                          AND COALESCE(TRIM(sender_actor_id), '') = ''
+                          AND EXISTS (
+                              SELECT 1
+                                FROM conversations c
+                               WHERE c.conversation_id = canonical_turns.conversation_id
+                                 AND c.lifecycle_epoch = ?
+                          )""",
+                    (
+                        actor_id,
+                        now,
+                        conversation_id,
+                        canonical_turn_id,
+                        expected_lifecycle_epoch,
+                    ),
+                )
+            updated += int(cursor.rowcount or 0)
+        conn.commit()
+        return updated
+
+    def update_canonical_turn_reply_roles_if_empty(
+        self,
+        conversation_id: str,
+        updates: dict[str, dict],
+        *,
+        expected_lifecycle_epoch: int | None = None,
+    ) -> int:
+        """Compare-and-set the reply edge on rows that carry none yet.
+
+        Per-column one-way fill, exactly like the actor CAS: a stored source
+        id, reply target, or subject actor is never overwritten by a later
+        empty derivation, so a resend whose payload lost the envelope cannot
+        erase the edge and a re-run is a no-op.
+
+        A CONTRADICTORY non-empty value is not merged. The existing edge wins
+        and the caller is told, because silently rewriting an edge would move
+        a quoted claim from one member to another — the exact cross-role
+        contamination this design exists to prevent.
+
+        Returns the number of rows actually updated.
+        """
+        if not updates:
+            return 0
+        conn = self._get_conn()
+        updated = 0
+        now = utcnow_iso()
+        fields = (
+            "source_message_id",
+            "reply_target_message_id",
+            "reply_subject_actor_id",
+            "reply_subject_label",
+            "reply_target_body",
+            "audience_conversation_id",
+        )
+        for canonical_turn_id, edge in updates.items():
+            if not canonical_turn_id or not isinstance(edge, dict):
+                continue
+            sets: list[str] = []
+            params: list[object] = []
+            for field_name in fields:
+                value = (edge.get(field_name) or "").strip()
+                if not value:
+                    continue
+                # Fill only when empty: COALESCE keeps a stored value even
+                # when this observation disagrees with it.
+                sets.append(
+                    f"{field_name} = CASE WHEN COALESCE(TRIM({field_name}), '') = '' "
+                    f"THEN ? ELSE {field_name} END"
+                )
+                params.append(value)
+            for version_field in (
+                "reply_attribution_version",
+                "audience_attribution_version",
+            ):
+                version = int(edge.get(version_field) or 0)
+                if version <= 0:
+                    continue
+                # Version is a high-water mark, so an unresolved-but-observed
+                # row stays distinguishable from a never-looked-at one.
+                sets.append(
+                    f"{version_field} = MAX(COALESCE({version_field}, 0), ?)"
+                )
+                params.append(version)
+            if not sets:
+                continue
+            sql = (
+                "UPDATE canonical_turns SET "
+                + ", ".join(sets)
+                + ", updated_at = ? WHERE conversation_id = ? AND canonical_turn_id = ?"
+            )
+            params.extend([now, conversation_id, canonical_turn_id])
+            if expected_lifecycle_epoch is not None:
+                sql += (
+                    " AND EXISTS (SELECT 1 FROM conversations c"
+                    "  WHERE c.conversation_id = canonical_turns.conversation_id"
+                    "    AND c.lifecycle_epoch = ?)"
+                )
+                params.append(expected_lifecycle_epoch)
+            cursor = conn.execute(sql, tuple(params))
+            updated += int(cursor.rowcount or 0)
+        conn.commit()
+        return updated
+
+    def find_canonical_turn_by_source_message_id(
+        self,
+        conversation_id: str,
+        source_message_id: str,
+        *,
+        audience_conversation_id: str = "",
+        origin_channel_id: str = "",
+    ) -> "CanonicalTurnRow | None":
+        """Exact physical-row lookup for reply resolution, or ``None``.
+
+        Takes the resolved OWNER and the validated pre-alias AUDIENCE origin,
+        because after VCMERGE those differ and the owner alone is not a
+        boundary: a DM source alias and its guild target share one owner, so
+        filtering on the owner would let a guild row resolve a DM's reply
+        target. The audience predicate is applied in SQL, before the row limit.
+
+        The backing index is deliberately non-unique, because VCMERGE can move
+        two rows claiming the same opaque platform message id under one owner
+        conversation. Ambiguity is therefore resolved HERE, and it fails
+        closed: load up to two candidate user rows, apply the audience and the
+        durable channel when the request has one, and resolve only when exactly
+        one row survives. Zero or many is not an identity, and picking one
+        would be guessing which member is being quoted.
+
+        Returns only a row carrying user content: an assistant row is never a
+        reply subject.
+        """
+        wanted = (source_message_id or "").strip()
+        if not wanted:
+            return None
+        conn = self._get_conn()
+        sql = """SELECT * FROM canonical_turns
+                  WHERE conversation_id = ?
+                    AND source_message_id = ?
+                    AND TRIM(COALESCE(user_content, '')) <> ''"""
+        params: list[object] = [conversation_id, wanted]
+        audience = (audience_conversation_id or "").strip()
+        if audience:
+            # The disclosure boundary. A row observed on another route is not
+            # in this request's audience, even though the merge put it under
+            # the same owner. An empty stored audience is UNKNOWN, not
+            # wildcard, so it cannot satisfy a scoped request.
+            sql += " AND audience_conversation_id = ?"
+            params.append(audience)
+        channel = (origin_channel_id or "").strip()
+        if channel:
+            sql += " AND origin_channel_id = ?"
+            params.append(channel)
+        rows = conn.execute(sql + " LIMIT 2", tuple(params)).fetchall()
+        if len(rows) != 1:
+            return None
+        return _row_to_canonical_turn(rows[0])
+
+    def find_actor_ids_by_display_label(
+        self,
+        conversation_id: str,
+        label: str,
+        *,
+        audience_conversation_id: str = "",
+        origin_channel_id: str = "",
+    ) -> list[str]:
+        """Durable actor ids whose stored display name matches *label* exactly.
+
+        Trimmed and casefolded, never fuzzy. Returns every distinct match so
+        the caller can refuse an ambiguous one: a label that maps to two
+        members is not an identity, and picking the most recent would be
+        exactly the cross-user misattribution this design forbids.
+
+        Scoped to the audience the same way the message-id lookup is: the
+        validated pre-alias route first, then the durable channel when the
+        request carries one. A label may only ever resolve against actors the
+        current audience actually saw.
+        """
+        wanted = (label or "").strip().casefold()
+        if not wanted:
+            return []
+        conn = self._get_conn()
+        sql = """SELECT DISTINCT sender_actor_id, sender
+                   FROM canonical_turns
+                  WHERE conversation_id = ?
+                    AND COALESCE(TRIM(sender_actor_id), '') <> ''
+                    AND TRIM(COALESCE(user_content, '')) <> ''"""
+        params: list[object] = [conversation_id]
+        audience = (audience_conversation_id or "").strip()
+        if audience:
+            sql += " AND audience_conversation_id = ?"
+            params.append(audience)
+        channel = (origin_channel_id or "").strip()
+        if channel:
+            sql += " AND origin_channel_id = ?"
+            params.append(channel)
+        rows = conn.execute(sql, tuple(params)).fetchall()
+        found: set[str] = set()
+        for row in rows:
+            sender = (row["sender"] or "").strip().casefold()
+            if sender and sender == wanted:
+                found.add(row["sender_actor_id"])
+        return sorted(found)
+
     def list_canonical_conversation_ids(
         self,
         *,
@@ -6730,7 +7193,10 @@ CREATE TABLE IF NOT EXISTS request_captures (
                       user_content, assistant_content,
                       user_raw_content, assistant_raw_content,
                       primary_tag, tags_json, session_date, sender,
-                      origin_channel_id, origin_channel_label,
+                      origin_channel_id, origin_channel_label, sender_actor_id,
+                      source_message_id, reply_target_message_id, reply_subject_actor_id,
+                      reply_subject_label, reply_target_body, reply_attribution_version,
+                      audience_conversation_id, audience_attribution_version,
                       fact_signals_json, code_refs_json,
                       tagged_at, compacted_at,
                       first_seen_at, last_seen_at,
@@ -6815,7 +7281,10 @@ CREATE TABLE IF NOT EXISTS request_captures (
                    ct.user_content, ct.assistant_content,
                    ct.user_raw_content, ct.assistant_raw_content,
                    ct.primary_tag, ct.tags_json, ct.session_date, ct.sender,
-                   ct.origin_channel_id, ct.origin_channel_label,
+                   ct.origin_channel_id, ct.origin_channel_label, ct.sender_actor_id,
+                   ct.source_message_id, ct.reply_target_message_id, ct.reply_subject_actor_id,
+                   ct.reply_subject_label, ct.reply_target_body, ct.reply_attribution_version,
+                   ct.audience_conversation_id, ct.audience_attribution_version,
                    ct.fact_signals_json, ct.code_refs_json,
                    ct.covered_ingestible_entries,
                    ct.tagged_at, ct.compacted_at,

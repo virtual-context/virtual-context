@@ -421,6 +421,15 @@ class ContextStore(ABC):
         turn_group_number: int = -1,
         origin_channel_id: str = "",
         origin_channel_label: str = "",
+        sender_actor_id: str = "",
+        source_message_id: str = "",
+        reply_target_message_id: str = "",
+        reply_subject_actor_id: str = "",
+        reply_subject_label: str = "",
+        reply_target_body: str = "",
+        reply_attribution_version: int = 0,
+        audience_conversation_id: str = "",
+        audience_attribution_version: int = 0,
     ) -> None:
         """Upsert a canonical turn, using ``turn_number`` only as an ordinal hint."""
 
@@ -631,6 +640,87 @@ class ContextStore(ABC):
         storage keep the no-op default.
         """
         return 0
+
+    def update_canonical_turn_actors_if_empty(
+        self,
+        conversation_id: str,
+        updates: dict[str, str],
+        *,
+        expected_lifecycle_epoch: int | None = None,
+    ) -> int:
+        """Compare-and-set ``sender_actor_id`` on rows whose stored value is empty.
+
+        ``updates`` maps ``canonical_turn_id`` to a candidate actor id. A row
+        is written only when the candidate is non-empty AND the stored column
+        is empty, so a stored identity is never overwritten and a re-run is a
+        no-op. Aligned overlap rows are deliberately fast-skipped and never
+        rewritten, so this narrow UPDATE is the only way an actor id that
+        first became derivable on a later payload can become durable.
+
+        When ``expected_lifecycle_epoch`` is given the write is additionally
+        guarded on the conversation's current epoch, in the same statement, so
+        a CAS issued against a conversation that was deleted and resurrected
+        mid-flight cannot leak into the new lifecycle.
+
+        Returns the number of rows updated. Backends without canonical-row
+        storage keep the no-op default.
+        """
+        return 0
+
+    def update_canonical_turn_reply_roles_if_empty(
+        self,
+        conversation_id: str,
+        updates: dict[str, dict],
+        *,
+        expected_lifecycle_epoch: int | None = None,
+    ) -> int:
+        """Compare-and-set the reply edge on rows that carry none yet.
+
+        ``updates`` maps ``canonical_turn_id`` to a partial edge dict. Each
+        column fills only when its candidate is non-empty AND the stored
+        column is empty, so a stored edge is never overwritten and a re-run is
+        a no-op. A contradictory non-empty value never rewrites the stored
+        edge: moving a quoted claim from one member to another is precisely
+        the cross-role contamination this design forbids.
+
+        Same epoch guard, and the same reason, as the actor CAS above.
+        Backends without canonical-row storage keep the no-op default.
+        """
+        return 0
+
+    def find_canonical_turn_by_source_message_id(
+        self,
+        conversation_id: str,
+        source_message_id: str,
+        *,
+        audience_conversation_id: str = "",
+        origin_channel_id: str = "",
+    ) -> "CanonicalTurnRow | None":
+        """Exact physical-row lookup by platform message id, or ``None``.
+
+        Reply resolution is actor-sensitive, so an ambiguous match must resolve
+        to ``None`` rather than to whichever row the query planner returned.
+        The backing index is non-unique by design, so backends enforce the
+        one-row rule in the query, filtered by the durable audience channel
+        when the request carries one.
+        """
+        return None
+
+    def find_actor_ids_by_display_label(
+        self,
+        conversation_id: str,
+        label: str,
+        *,
+        audience_conversation_id: str = "",
+        origin_channel_id: str = "",
+    ) -> list[str]:
+        """Durable actor ids whose stored display name equals *label* exactly.
+
+        Every distinct match is returned so the caller can refuse an ambiguous
+        one. A label is presentation data, never a key: zero, multiple, or
+        cross-audience matches must leave the subject unresolved.
+        """
+        return []
 
     def list_canonical_conversation_ids(
         self,

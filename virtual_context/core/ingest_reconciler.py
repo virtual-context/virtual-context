@@ -25,6 +25,7 @@ from ..types import (
     CanonicalTurnRow,
     IngestBatchRecord,
     TurnTagEntry,
+    get_actor_id,
     get_origin_channel,
     get_sender_name,
 )
@@ -40,6 +41,74 @@ class _Alignment:
 
 
 logger = logging.getLogger(__name__)
+
+# An assistant physical row never receives a human reply edge.
+_EMPTY_REPLY_EDGE: dict = {
+    "source_message_id": "",
+    "reply_target_message_id": "",
+    "reply_subject_actor_id": "",
+    "reply_subject_label": "",
+    "reply_target_body": "",
+    "reply_attribution_version": 0,
+    "audience_conversation_id": "",
+    "audience_attribution_version": 0,
+}
+
+# The reply-edge columns, in one place, so the CAS and the full-row rewrites
+# cannot drift apart. A full-row upsert defaults every omitted column away, so
+# a rewrite that forgets one of these silently erases the edge.
+_REPLY_EDGE_FIELDS: tuple[str, ...] = tuple(_EMPTY_REPLY_EDGE)
+
+
+def _ordered_channel(metadata: dict | None) -> tuple[str, str]:
+    """Audience channel from the ORDERED first-conversation-info snapshot.
+
+    ``get_origin_channel`` reads the last-wins merged dict, which a member's
+    own typed block can overwrite. That is tolerable for display and it is what
+    the shipped channel derivation does, but it is not tolerable for the
+    audience boundary that gates whose memory is surfaced. Policy-grade
+    provenance reads the ordered snapshot only.
+    """
+    from ..types import get_current_conversation_info, get_origin_channel
+
+    current = get_current_conversation_info(metadata)
+    if not current:
+        return "", ""
+    return get_origin_channel({"conversation info": current})
+
+
+def _has_reply_edge(edge: dict) -> bool:
+    """Does this edge carry anything worth making durable?
+
+    A version stamp alone counts: it is what distinguishes a row that WAS
+    examined and honestly resolved to nothing from one that was never looked
+    at, and that distinction is what keeps backfill idempotent.
+    """
+    if any(int(edge.get(name) or 0) > 0 for name in (
+        "reply_attribution_version", "audience_attribution_version",
+    )):
+        return True
+    return any(
+        (edge.get(name) or "").strip()
+        for name in _REPLY_EDGE_FIELDS
+        if not name.endswith("_version")
+    )
+
+
+def _row_reply_edge(row: "CanonicalTurnRow") -> dict:
+    """The stored edge, re-supplied verbatim on a full-row rewrite.
+
+    Reads through the column default so a row double that predates the reply
+    edge degrades to "no edge" instead of raising on an unrelated write path.
+    """
+    return {
+        name: (
+            getattr(row, name, default)
+            if getattr(row, name, default) is not None
+            else default
+        )
+        for name, default in _EMPTY_REPLY_EDGE.items()
+    }
 
 
 class IngestReconciler:
@@ -65,6 +134,11 @@ class IngestReconciler:
         user_origin_channel_label: str = "",
         assistant_origin_channel_id: str = "",
         assistant_origin_channel_label: str = "",
+        # Separate per-role actor arguments, never one logical value: a single
+        # ``sender_actor_id`` would smear the human speaker onto the assistant
+        # row exactly as the shipped single ``sender`` argument does below.
+        user_sender_actor_id: str = "",
+        assistant_sender_actor_id: str = "",
         fact_signals: list[FactSignal] | None = None,
         code_refs: list[dict] | None = None,
         expected_lifecycle_epoch: int | None = None,
@@ -83,6 +157,7 @@ class IngestReconciler:
                     sender=sender,
                     origin_channel_id=user_origin_channel_id,
                     origin_channel_label=user_origin_channel_label,
+                    sender_actor_id=user_sender_actor_id,
                     fact_signals=fact_signals,
                     code_refs=code_refs,
                 ),
@@ -97,6 +172,7 @@ class IngestReconciler:
                     sender=sender,
                     origin_channel_id=assistant_origin_channel_id,
                     origin_channel_label=assistant_origin_channel_label,
+                    sender_actor_id=assistant_sender_actor_id,
                     fact_signals=fact_signals,
                     code_refs=code_refs,
                 ),
@@ -180,6 +256,22 @@ class IngestReconciler:
                             },
                             expected_lifecycle_epoch=expected_lifecycle_epoch,
                         )
+                    # Same reasoning for the actor id, but with the sender role
+                    # rule: the tail row here is the USER half, so it may carry
+                    # one. The caller's entry epoch fences it for the same
+                    # mid-flight-resurrection reason as the channel CAS above.
+                    tail_candidate_actor = (user_row.sender_actor_id or "").strip()
+                    if (
+                        tail.canonical_turn_id
+                        and tail_candidate_actor
+                        and not (tail.sender_actor_id or "").strip()
+                        and (tail.user_content or "").strip()
+                    ):
+                        self._upgrade_empty_actors(
+                            conversation_id,
+                            {tail.canonical_turn_id: tail_candidate_actor},
+                            expected_lifecycle_epoch=expected_lifecycle_epoch,
+                        )
                     self._preserve_existing_enrichment(user_row, tail)
                     now = utcnow_iso()
                     batch_id = generate_canonical_turn_id()
@@ -238,10 +330,27 @@ class IngestReconciler:
         body: dict,
         fmt: Any,
         expected_lifecycle_epoch: int,
+        source_conversation_key: str = "",
+        source_audience_conversation_id: str = "",
     ) -> CanonicalIngestResult:
         from ..proxy.formats import extract_ingestible_messages
 
         entries, _stats = extract_ingestible_messages(body, fmt, mode="ingest")
+        # The platform segment of an actor id lives only in the RAW caller key.
+        # ``conversation_id`` here is already alias-resolved, so after VCATTACH
+        # it can be a UUID that names no platform. A caller that supplied a raw
+        # key is trusted with it even when it is unparseable: silently falling
+        # back to the resolved id would misattribute the platform.
+        actor_key = (source_conversation_key or "").strip() or conversation_id
+        # The AUDIENCE is a different question from the actor platform, and it
+        # is deliberately not derived from the raw caller key. A caller-supplied
+        # route is only a claim; it becomes the audience only after the
+        # tenant-scoped resolver has PROVED it is the owner itself or a retained
+        # alias to the owner. An unproved route stays empty, which makes the row
+        # policy-ineligible — the honest outcome. Substituting the resolved owner
+        # instead is what would let a DM request through a merged alias inherit
+        # guild-origin influence.
+        audience_id = (source_audience_conversation_id or "").strip()
         prepared: list[CanonicalTurnRow] = []
         for message in entries:
             # Channel is source provenance, not speaker attribution, so it is
@@ -250,6 +359,22 @@ class IngestReconciler:
             # selected text exposed the envelope; the paired user's values are
             # never copied onto it.
             channel_id, channel_label = get_origin_channel(message.metadata)
+            is_user = message.role == "user"
+            edge = (
+                self._derive_reply_edge(message, actor_key, audience_id)
+                if is_user
+                else _EMPTY_REPLY_EDGE
+            )
+            if is_user:
+                # Audience provenance for a user row comes from the ORDERED
+                # first-conversation-info snapshot, not the last-wins merged
+                # dict. The channel is a privacy boundary, so a member's own
+                # typed block must not be able to choose the channel their
+                # memory is filtered against.
+                snapshot_id, snapshot_label = _ordered_channel(message.metadata)
+                if snapshot_id or snapshot_label:
+                    channel_id = snapshot_id or channel_id
+                    channel_label = snapshot_label or channel_label
             prepared.append(
                 self._prepare_message_row(
                     conversation_id,
@@ -263,19 +388,200 @@ class IngestReconciler:
                     # the envelope is stripped.
                     sender=(
                         (get_sender_name(message.metadata) or "")
-                        if message.role == "user"
+                        if is_user
                         else ""
                     ),
                     origin_channel_id=channel_id,
                     origin_channel_label=channel_label,
+                    # Actor follows the SENDER role rule, not the channel one:
+                    # it is speaker attribution, so an assistant row is never
+                    # newly labeled with a human actor.
+                    sender_actor_id=(
+                        get_actor_id(message.metadata, actor_key)
+                        if is_user
+                        else ""
+                    ),
+                    # The reply edge is role-local for the same reason: an
+                    # assistant row never receives a human reply edge.
+                    **edge,
                 )
             )
+        # Resolution runs after every physical row in this batch is prepared,
+        # so a reply to a message that arrived in the SAME payload can still
+        # link by its source id.
+        self._resolve_reply_subjects(conversation_id, prepared)
         return self.ingest_prepared_turns(
             conversation_id,
             prepared_turns=prepared,
             raw_turn_count=len(prepared),
             expected_lifecycle_epoch=expected_lifecycle_epoch,
         )
+
+    @staticmethod
+    def _derive_reply_edge(
+        message: Any, actor_key: str, audience_conversation_id: str = "",
+    ) -> dict:
+        """The durable reply edge for one physical user message.
+
+        ``reply_target_body`` is deliberately NOT merged into ``content``: it
+        is the quoted person's words, and letting it into requester content is
+        what makes a later distiller read their claim as the requester's own
+        belief.
+
+        A non-empty current ``reply_to_id`` is itself a reply-bearing
+        observation, so it stamps the version and drives an exact row lookup
+        even when no reply-target BLOCK was present. The fixtures prove
+        ``reply_to_id`` is the only durable target handle the platform actually
+        sends; suppressing it because a label/body block is absent would throw
+        away the one signal that resolves reliably.
+        """
+        from ..types import (
+            AUDIENCE_ATTRIBUTION_VERSION,
+            REPLY_ATTRIBUTION_VERSION,
+            get_current_conversation_info,
+            get_reply_subject,
+        )
+
+        metadata = message.metadata if isinstance(message.metadata, dict) else {}
+        current = get_current_conversation_info(metadata)
+        subject = get_reply_subject(metadata, actor_key)
+
+        def _clean(value: object) -> str:
+            return value.strip() if isinstance(value, str) else ""
+
+        reply_to_id = _clean(current.get("reply_to_id"))
+        audience = (audience_conversation_id or "").strip()
+
+        return {
+            "source_message_id": _clean(current.get("message_id")),
+            "reply_target_message_id": reply_to_id or subject.target_message_id,
+            "reply_subject_actor_id": subject.subject_actor_id,
+            "reply_subject_label": subject.subject_label,
+            "reply_target_body": subject.target_body,
+            # Version the row when EITHER a reply block claimed the slot or the
+            # current conversation info carries a target id.
+            "reply_attribution_version": (
+                subject.version
+                or (REPLY_ATTRIBUTION_VERSION if reply_to_id else 0)
+            ),
+            # Audience provenance is only versioned when the route was actually
+            # PROVED. An ordered current-conversation snapshot alone is not
+            # proof of route: it is untrusted JSON from the payload.
+            "audience_conversation_id": audience,
+            "audience_attribution_version": (
+                AUDIENCE_ATTRIBUTION_VERSION if audience else 0
+            ),
+        }
+
+    def _resolve_reply_subjects(
+        self,
+        conversation_id: str,
+        prepared: list[CanonicalTurnRow],
+    ) -> None:
+        """Fill ``reply_subject_actor_id`` from the referenced row, then a label.
+
+        Deterministic and fail-closed, in the spec's order:
+
+        1. The exact referenced physical row in the same conversation wins. It
+           is checked against this batch first, then the store.
+        2. A direct target ``sender_id`` with a valid platform was already
+           resolved in ``get_reply_subject``.
+        3. A display label resolves only when it maps to exactly ONE durable
+           actor in the same audience.
+
+        Contradiction between the row and an already-derived id is a hard
+        conflict: the subject goes unresolved rather than picking one of two
+        actors. Zero, multiple, or fuzzy label matches also stay unresolved.
+        """
+        in_batch = {
+            row.source_message_id: row
+            for row in prepared
+            if row.source_message_id and (row.user_content or "").strip()
+        }
+        for row in prepared:
+            if row.reply_attribution_version <= 0:
+                continue
+            if not (row.user_content or "").strip():
+                continue
+
+            target_id = (row.reply_target_message_id or "").strip()
+            row_actor = ""
+            if target_id:
+                target = in_batch.get(target_id)
+                if target is None:
+                    target = self._find_row_by_source_message_id(
+                        conversation_id,
+                        target_id,
+                        origin_channel_id=row.origin_channel_id,
+                    )
+                if target is not None:
+                    row_actor = (target.sender_actor_id or "").strip()
+                    if not row.reply_subject_label and target.sender:
+                        row.reply_subject_label = target.sender
+
+            existing = (row.reply_subject_actor_id or "").strip()
+            if row_actor and existing and row_actor != existing:
+                # The referenced row and the block's own id name different
+                # people. Never pick by precedence across contradictory actors.
+                row.reply_subject_actor_id = ""
+                continue
+            if row_actor:
+                row.reply_subject_actor_id = row_actor
+                continue
+            if existing:
+                continue
+
+            label = (row.reply_subject_label or "").strip()
+            if not label:
+                continue
+            matches = self._find_actor_ids_by_label(
+                conversation_id, label, row.origin_channel_id,
+            )
+            # Exactly one durable same-audience actor, or nothing. A label that
+            # names two members is not an identity, and "most recent" would be
+            # a guess with a real member's name on it.
+            if len(matches) == 1:
+                row.reply_subject_actor_id = matches[0]
+
+    def _find_row_by_source_message_id(
+        self,
+        conversation_id: str,
+        source_message_id: str,
+        *,
+        origin_channel_id: str = "",
+    ) -> "CanonicalTurnRow | None":
+        fn = getattr(self._store, "find_canonical_turn_by_source_message_id", None)
+        if not callable(fn):
+            return None
+        try:
+            return fn(
+                conversation_id,
+                source_message_id,
+                origin_channel_id=origin_channel_id,
+            )
+        except Exception:
+            logger.warning(
+                "REPLY_TARGET_LOOKUP_FAILED: conv=%s", conversation_id[:12],
+                exc_info=True,
+            )
+            return None
+
+    def _find_actor_ids_by_label(
+        self, conversation_id: str, label: str, origin_channel_id: str,
+    ) -> list[str]:
+        fn = getattr(self._store, "find_actor_ids_by_display_label", None)
+        if not callable(fn):
+            return []
+        try:
+            return list(fn(
+                conversation_id, label, origin_channel_id=origin_channel_id,
+            ))
+        except Exception:
+            logger.warning(
+                "REPLY_LABEL_LOOKUP_FAILED: conv=%s", conversation_id[:12],
+                exc_info=True,
+            )
+            return []
 
     def ingest_prepared_turns(
         self,
@@ -515,6 +821,8 @@ class IngestReconciler:
             # ``_write_turn`` for every overlap row.
             sender_upgrades: dict[str, str] = {}
             channel_upgrades: dict[str, tuple[str, str]] = {}
+            actor_upgrades: dict[str, str] = {}
+            reply_upgrades: dict[str, dict] = {}
             for offset, row in enumerate(overlap_incoming):
                 existing_row = overlap_existing[offset]
                 row.canonical_turn_id = existing_row.canonical_turn_id
@@ -547,6 +855,30 @@ class IngestReconciler:
                         candidate_id if fills_id else "",
                         candidate_label if fills_label else "",
                     )
+                incoming_actor = (row.sender_actor_id or "").strip()
+                if (
+                    incoming_actor
+                    and not (existing_row.sender_actor_id or "").strip()
+                    and (row.user_content or "").strip()
+                    and existing_row.canonical_turn_id
+                ):
+                    # Same role rule as ``sender``: never label an
+                    # assistant-only row with a human actor, even when a legacy
+                    # sibling row carries one.
+                    actor_upgrades[existing_row.canonical_turn_id] = incoming_actor
+                # The reply edge needs the same treatment for the same reason:
+                # a fast-skipped overlap row is never rewritten, so an edge
+                # that only became derivable on this payload would never become
+                # durable. Role-local to the user half, and the store-side CAS
+                # fills each column only when it is empty, so a stored edge is
+                # never overwritten by a contradictory one.
+                incoming_edge = _row_reply_edge(row)
+                if (
+                    existing_row.canonical_turn_id
+                    and (row.user_content or "").strip()
+                    and _has_reply_edge(incoming_edge)
+                ):
+                    reply_upgrades[existing_row.canonical_turn_id] = incoming_edge
                 self._preserve_existing_enrichment(row, existing_row)
                 rows_touched.append(row)
                 turns_matched += 1
@@ -562,6 +894,20 @@ class IngestReconciler:
                 self._upgrade_empty_channels(
                     conversation_id,
                     channel_upgrades,
+                    expected_lifecycle_epoch=expected_lifecycle_epoch,
+                )
+
+            if actor_upgrades:
+                self._upgrade_empty_actors(
+                    conversation_id,
+                    actor_upgrades,
+                    expected_lifecycle_epoch=expected_lifecycle_epoch,
+                )
+
+            if reply_upgrades:
+                self._upgrade_empty_reply_roles(
+                    conversation_id,
+                    reply_upgrades,
                     expected_lifecycle_epoch=expected_lifecycle_epoch,
                 )
 
@@ -725,6 +1071,77 @@ class IngestReconciler:
             )
             return 0
 
+    def _upgrade_empty_actors(
+        self,
+        conversation_id: str,
+        upgrades: dict[str, str],
+        *,
+        expected_lifecycle_epoch: int | None = None,
+    ) -> int:
+        """Make a newly-derived actor id durable on fast-skipped rows.
+
+        An already-tagged overlap row takes the tagger's hydration fast path,
+        which never rewrites the canonical row, so an identity that only became
+        derivable on this payload would never become durable. The store-level
+        write is a compare-and-set on an empty ``sender_actor_id`` keyed by
+        ``canonical_turn_id``, so it can never overwrite a stored identity and
+        a re-run is a no-op. A store without the surface (or a failure)
+        degrades to "actor not yet durable" rather than failing the ingest.
+        """
+        updater = getattr(self._store, "update_canonical_turn_actors_if_empty", None)
+        if not callable(updater):
+            return 0
+        try:
+            return int(updater(
+                conversation_id,
+                upgrades,
+                expected_lifecycle_epoch=expected_lifecycle_epoch,
+            ))
+        except Exception:
+            logger.warning(
+                "CANONICAL_TURN_ACTOR_UPGRADE_FAILED: conv=%s rows=%d",
+                conversation_id[:12],
+                len(upgrades),
+                exc_info=True,
+            )
+            return 0
+
+    def _upgrade_empty_reply_roles(
+        self,
+        conversation_id: str,
+        upgrades: dict[str, dict],
+        *,
+        expected_lifecycle_epoch: int | None = None,
+    ) -> int:
+        """Make a newly-derived reply edge durable on fast-skipped rows.
+
+        Same shape and same reason as the actor upgrade: an already-tagged
+        overlap row is never rewritten, so an edge that only became derivable
+        on this payload would never land. The store-level write fills each
+        column only when it is empty, so a stored edge is never overwritten and
+        a re-run is a no-op. A store without the surface (or a failure)
+        degrades to "edge not yet durable" rather than failing the ingest.
+        """
+        updater = getattr(
+            self._store, "update_canonical_turn_reply_roles_if_empty", None,
+        )
+        if not callable(updater):
+            return 0
+        try:
+            return int(updater(
+                conversation_id,
+                upgrades,
+                expected_lifecycle_epoch=expected_lifecycle_epoch,
+            ))
+        except Exception:
+            logger.warning(
+                "CANONICAL_TURN_REPLY_UPGRADE_FAILED: conv=%s rows=%d",
+                conversation_id[:12],
+                len(upgrades),
+                exc_info=True,
+            )
+            return 0
+
     @staticmethod
     def _preserve_existing_enrichment(
         row: CanonicalTurnRow, existing_row: CanonicalTurnRow,
@@ -769,6 +1186,35 @@ class IngestReconciler:
             and (existing_row.origin_channel_label or "").strip()
         ):
             row.origin_channel_label = existing_row.origin_channel_label
+        # One-way merge, exactly like ``sender``: a resend whose payload no
+        # longer carries the identity envelope cannot blank a stored actor id.
+        # This also preserves a value already on an assistant row (from a
+        # legacy combined row or a partially deployed database) without ever
+        # newly deriving one onto it.
+        if (
+            not (row.sender_actor_id or "").strip()
+            and (existing_row.sender_actor_id or "").strip()
+        ):
+            row.sender_actor_id = existing_row.sender_actor_id
+        # Same one-way merge for every reply-edge column, per column. A resend
+        # that no longer carries the reply envelope cannot blank a stored edge,
+        # and a CONTRADICTORY new value never rewrites a stored one: moving a
+        # quoted claim from one member to another is the contamination this
+        # design exists to prevent.
+        for name in ("source_message_id", "reply_target_message_id",
+                     "reply_subject_actor_id", "reply_subject_label",
+                     "reply_target_body", "audience_conversation_id"):
+            if not (getattr(row, name) or "").strip():
+                stored = (getattr(existing_row, name) or "").strip()
+                if stored:
+                    setattr(row, name, getattr(existing_row, name))
+        # Versions are a high-water mark, so an observed-but-unresolved row
+        # stays distinguishable from one that was never looked at.
+        for name in ("reply_attribution_version", "audience_attribution_version"):
+            setattr(row, name, max(
+                int(getattr(row, name) or 0),
+                int(getattr(existing_row, name) or 0),
+            ))
 
     def _prepare_message_row(
         self,
@@ -783,6 +1229,15 @@ class IngestReconciler:
         sender: str = "",
         origin_channel_id: str = "",
         origin_channel_label: str = "",
+        sender_actor_id: str = "",
+        source_message_id: str = "",
+        reply_target_message_id: str = "",
+        reply_subject_actor_id: str = "",
+        reply_subject_label: str = "",
+        reply_target_body: str = "",
+        reply_attribution_version: int = 0,
+        audience_conversation_id: str = "",
+        audience_attribution_version: int = 0,
         fact_signals: list[FactSignal] | None = None,
         code_refs: list[dict] | None = None,
         entry: TurnTagEntry | None = None,
@@ -836,6 +1291,18 @@ class IngestReconciler:
             # the user-derived value onto the assistant physical row.
             origin_channel_id=origin_channel_id or "",
             origin_channel_label=origin_channel_label or "",
+            # Also deliberately NOT sourced from ``entry``: a TurnTagEntry is a
+            # logical turn, so taking the actor from it would smear the human
+            # speaker onto the assistant physical row.
+            sender_actor_id=sender_actor_id or "",
+            source_message_id=source_message_id or "",
+            reply_target_message_id=reply_target_message_id or "",
+            reply_subject_actor_id=reply_subject_actor_id or "",
+            reply_subject_label=reply_subject_label or "",
+            reply_target_body=reply_target_body or "",
+            reply_attribution_version=int(reply_attribution_version or 0),
+            audience_conversation_id=audience_conversation_id or "",
+            audience_attribution_version=int(audience_attribution_version or 0),
             fact_signals=list(fact_signals or []),
             code_refs=list(code_refs or []),
             tagged_at=None,
@@ -985,9 +1452,12 @@ class IngestReconciler:
             source_batch_id=row.source_batch_id or None,
             turn_group_number=row.turn_group_number,
             # The upsert overwrites omitted fields with defaults, so every
-            # full-row rewrite must re-supply both channel columns.
+            # full-row rewrite must re-supply both channel columns and the
+            # actor column.
             origin_channel_id=row.origin_channel_id,
             origin_channel_label=row.origin_channel_label,
+            sender_actor_id=row.sender_actor_id,
+            **_row_reply_edge(row),
         )
         resolved_turn_number = turn_number
         if turn_number < 0 and row.canonical_turn_id:
@@ -1212,6 +1682,8 @@ class IngestReconciler:
                     turn_group_number=row.turn_group_number,
                     origin_channel_id=row.origin_channel_id,
                     origin_channel_label=row.origin_channel_label,
+                    sender_actor_id=row.sender_actor_id,
+                    **_row_reply_edge(row),
                 )
             # Per-row path already updated ``existing`` in place; only the
             # ``rows_touched`` mirrors remain.

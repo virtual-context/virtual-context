@@ -2098,10 +2098,25 @@ class VirtualContextEngine:
         # Per-entry derivation: each half's channel comes from its own
         # metadata. An assistant message with no envelope of its own stays
         # empty rather than inheriting the user's channel.
-        from .types import get_origin_channel
+        from .types import (
+            SOURCE_CONVERSATION_KEY,
+            get_actor_id,
+            get_origin_channel,
+        )
 
         user_channel_id, user_channel_label = get_origin_channel(user_msg.metadata)
         asst_channel_id, asst_channel_label = get_origin_channel(assistant_msg.metadata)
+        # The actor's platform lives in the RAW caller key, which the proxy
+        # stamps onto every inbound message. ``config.conversation_id`` is
+        # already alias-resolved and can be a UUID that names no platform.
+        _user_meta = user_msg.metadata if isinstance(user_msg.metadata, dict) else {}
+        _actor_key = (
+            str(_user_meta.get(SOURCE_CONVERSATION_KEY) or "").strip()
+            or self.config.conversation_id
+        )
+        # Only the user half. An assistant row is never newly labeled with a
+        # human actor, even though it may legitimately own a channel.
+        user_actor_id = get_actor_id(user_msg.metadata, _actor_key)
         try:
             result = IngestReconciler(
                 self._store,
@@ -2120,6 +2135,7 @@ class VirtualContextEngine:
                 user_origin_channel_label=user_channel_label,
                 assistant_origin_channel_id=asst_channel_id,
                 assistant_origin_channel_label=asst_channel_label,
+                user_sender_actor_id=user_actor_id,
                 fact_signals=list(entry.fact_signals or []) if entry else [],
                 code_refs=list(entry.code_refs or []) if entry else [],
                 expected_lifecycle_epoch=self._engine_state.lifecycle_epoch,
