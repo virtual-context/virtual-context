@@ -1934,20 +1934,33 @@ def _cmd_admin_actor_operation(args, method_name: str, total_keys: tuple[str, ..
         )
         totals = {key: 0 for key in total_keys}
         results = []
+        errors = 0
         method = getattr(engine, method_name)
         for target in targets:
-            counts = method(
-                target,
-                dry_run=dry_run,
-                limit=None if all_convs else limit,
-            )
+            # One conversation must not abort the batch: a candidate can
+            # be deleted between enumeration and processing, and the rest
+            # of the tenant's conversations still deserve their pass.
+            try:
+                counts = method(
+                    target,
+                    dry_run=dry_run,
+                    limit=None if all_convs else limit,
+                )
+            except Exception as exc:  # noqa: BLE001
+                errors += 1
+                results.append({
+                    "conversation_id": target, "status": "error",
+                    "error": repr(exc),
+                })
+                continue
             for key in totals:
                 totals[key] += int(counts.get(key, 0))
             results.append({"conversation_id": target, **counts})
         print(json.dumps({
             "status": "ok", "tenant_id": tenant_id, "dry_run": dry_run,
             "storage_backend": config.storage.backend,
-            "conversations": len(targets), **totals, "results": results,
+            "conversations": len(targets), "errors": errors,
+            **totals, "results": results,
         }))
     finally:
         try:
