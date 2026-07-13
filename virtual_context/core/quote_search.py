@@ -21,6 +21,11 @@ from ..types import (
     SpeakerRetrievalContext,
 )
 from .semantic_search import SemanticSearchManager
+from .speaker_labels import (
+    collect_quote_actor_ids,
+    project_quote_speaker_fields,
+    resolve_speaker_labels,
+)
 from .store import ContextStore
 
 logger = logging.getLogger(__name__)
@@ -3254,6 +3259,7 @@ def find_quote(
     *,
     speaker_context: SpeakerRetrievalContext | None = None,
     speaker_conditioning: SpeakerConditioning | None = None,
+    speaker_handles: dict[str, str] | None = None,
 ) -> dict:
     """Search canonical archived turns only.
 
@@ -3264,7 +3270,12 @@ def find_quote(
 
     ``speaker_context`` selects the physical role-local candidate branch and
     is forwarded to both candidate sources; ``None`` keeps the shipped legacy
-    branch byte-identical end to end.
+    branch byte-identical end to end. On the speaker-aware branch each
+    turn-backed result is annotated at this boundary from its physical
+    role-local provenance: audience-scoped label, verification flags, and
+    ``source_role``. ``speaker_handles`` maps internal actor ids to this
+    request's immutable roster snapshot handles; actors outside the map
+    keep an empty ``speaker_handle``.
 
     ``speaker_conditioning`` is the execution layer's already-validated
     conditioning resolution. ``None`` — every legacy caller — changes
@@ -3335,6 +3346,22 @@ def find_quote(
         )
         return response
 
+    # Role-local annotation happens at this search boundary, where physical
+    # provenance is still attached to each candidate. It is projection only:
+    # labels come from the audience-scoped resolver, handles only from the
+    # caller-supplied request snapshot map, and a candidate that proved no
+    # provenance is annotated with nothing. The legacy branch
+    # (``speaker_context=None``) skips all of it byte-identically.
+    speaker_labels: dict[str, str] = {}
+    if speaker_context is not None:
+        speaker_labels = resolve_speaker_labels(
+            store,
+            collect_quote_actor_ids(
+                getattr(qr, "provenance", None) for qr in results
+            ),
+            speaker_context=speaker_context,
+        )
+
     formatted: list[dict[str, object]] = []
     for qr in results:
         entry: dict[str, object] = {
@@ -3355,6 +3382,14 @@ def find_quote(
             entry["match_type"] = qr.match_type
             entry["similarity"] = qr.similarity
         entry["segment_ref"] = qr.segment_ref
+        if speaker_context is not None:
+            entry.update(
+                project_quote_speaker_fields(
+                    getattr(qr, "provenance", None),
+                    speaker_labels,
+                    speaker_handles,
+                )
+            )
         formatted.append(entry)
 
     response = {

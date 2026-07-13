@@ -127,6 +127,7 @@ def _engine(store, semantic=None, *, selection=True, annotations=True):
     def _engine_find_quote(
         query, max_results=None, intent_context="", session_filter="",
         mode="lookup", channel="", *, speaker_context=None,
+        speaker_handles=None,
     ):
         # Mirror SearchEngine's gate router for the unconditioned seam.
         if (
@@ -144,6 +145,9 @@ def _engine(store, semantic=None, *, selection=True, annotations=True):
             conversation_id=OWNER,
             channel=channel,
             speaker_context=speaker_context,
+            speaker_handles=(
+                speaker_handles if speaker_context is not None else None
+            ),
         )
 
     return SimpleNamespace(
@@ -170,6 +174,21 @@ def _mixed_corpus():
         _qr("peptide shipment arrived on tuesday", 7, actor=ALEX),
         _qr("we compared peptide vendors last week", 6, actor=BEA),
     ]
+
+
+def _retrieval_body(response: dict) -> dict:
+    """The C2 parity surface: everything except presented snapshot handles.
+
+    ``speaker_handle`` is annotation presentation bound to the request's
+    live snapshot; identities, order, scores, limits, labels, and ``found``
+    are the retrieval body that must be byte-identical.
+    """
+    body = {k: v for k, v in response.items() if k != "results"}
+    body["results"] = [
+        {k: v for k, v in entry.items() if k != "speaker_handle"}
+        for entry in response.get("results", [])
+    ]
+    return body
 
 
 class TestUnresolvedHintParity:
@@ -199,6 +218,17 @@ class TestUnresolvedHintParity:
             ({"speaker": "bea"}, None),
         ]
         for extra, snapshot in variants:
+            # The parity promise is against the no-hint call of the SAME
+            # request state: annotation (a C3 concern) may present handles
+            # only from a live request-bound snapshot, so the comparison
+            # baseline carries the identical snapshot state.
+            unhinted = _run(
+                _engine(LimitStore(_mixed_corpus())),
+                {"query": "peptide", "mode": "lookup"},
+                ctx=_ctx(), snapshot=snapshot,
+            )
+            for key in _METADATA_KEYS:
+                assert key not in unhinted
             got = _run(
                 _engine(LimitStore(_mixed_corpus())),
                 {"query": "peptide", "mode": "lookup", **extra},
@@ -210,7 +240,12 @@ class TestUnresolvedHintParity:
                 got.pop(key, None)
             # Byte-identical to the no-hint call: identities, order,
             # scores, limits, found — everything but the metadata above.
-            assert got == baseline, extra
+            assert got == unhinted, extra
+            # And the retrieval body — identities, order, scores, limits,
+            # found — is identical to the valid-snapshot baseline too:
+            # only the presented snapshot handles may differ across
+            # snapshot states.
+            assert _retrieval_body(got) == _retrieval_body(baseline), extra
 
     def test_unresolved_hint_sends_identical_source_limits(self):
         plain_store = LimitStore(_mixed_corpus())

@@ -58,6 +58,7 @@ class SearchEngine:
         channel: str = "",
         *,
         speaker_context: SpeakerRetrievalContext | None = None,
+        speaker_handles: dict[str, str] | None = None,
     ) -> dict:
         """Turn-first quote search over stored canonical history.
 
@@ -67,6 +68,10 @@ class SearchEngine:
         normalized to ``None`` before candidate generation, which selects
         the complete legacy retrieval branch byte-for-byte. An ineligible
         context is never repaired to the resolved owner.
+
+        ``speaker_handles`` is the request-snapshot actor-to-handle map
+        used only for result annotation. It rides the same gate: when the
+        context is routed to ``None`` no handle may surface either.
         """
         if max_results is None:
             max_results = self._config.search.find_quote_default_results
@@ -82,6 +87,9 @@ class SearchEngine:
             conversation_id=self._config.conversation_id,
             channel=channel,
             speaker_context=speaker_context,
+            speaker_handles=(
+                speaker_handles if speaker_context is not None else None
+            ),
         )
 
     def _route_speaker_context(

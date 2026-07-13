@@ -125,6 +125,7 @@ def _engine(store, *, selection=True):
     def _engine_find_quote(
         query, max_results=None, intent_context="", session_filter="",
         mode="lookup", channel="", *, speaker_context=None,
+        speaker_handles=None,
     ):
         if speaker_context is None or not speaker_context.eligible:
             speaker_context = None
@@ -137,6 +138,9 @@ def _engine(store, *, selection=True):
             conversation_id=OWNER,
             channel=channel,
             speaker_context=speaker_context,
+            speaker_handles=(
+                speaker_handles if speaker_context is not None else None
+            ),
         )
 
     return SimpleNamespace(

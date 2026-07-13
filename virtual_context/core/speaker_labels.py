@@ -256,6 +256,7 @@ def project_fact_speaker_fields(
 def project_quote_speaker_fields(
     provenance: "SourceProvenance | None",
     labels: dict[str, str] | None,
+    handles: dict[str, str] | None = None,
 ) -> dict[str, object]:
     """Model-visible speaker annotation for one quote-like result.
 
@@ -267,6 +268,12 @@ def project_quote_speaker_fields(
     ``claimed_speaker_label`` with ``speaker_verified=false``. Mixed and
     unattributed text is never assigned one human speaker — it exposes a
     ``speaker_scope`` instead. A result with no provenance gets nothing.
+
+    ``handles`` maps internal actor ids to this request's immutable roster
+    snapshot handles. An actor absent from the map — outside the capped
+    snapshot, no snapshot bound, or roster gate off — keeps its scoped
+    label and known-actor flag but an empty handle; projection never
+    mints, looks up, or reveals a hidden assignment.
     """
     if provenance is None:
         return {}
@@ -276,7 +283,7 @@ def project_quote_speaker_fields(
         actor = getattr(provenance, "actor_id", "") or ""
         if actor:
             fields["speaker_label"] = (labels or {}).get(actor, "")
-            fields["speaker_handle"] = ""
+            fields["speaker_handle"] = (handles or {}).get(actor, "")
             fields["speaker_actor_known"] = True
             fields["speaker_verified"] = True
         else:

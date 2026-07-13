@@ -586,6 +586,38 @@ def _validate_speaker_handle(
     return getattr(matches[0], "actor_id", "") or ""
 
 
+def _annotation_speaker_handles(
+    engine,
+    speaker_context: SpeakerRetrievalContext | None,
+    roster_snapshot,
+) -> dict[str, str] | None:
+    """Actor-to-handle map for result annotation, from THIS request's snapshot.
+
+    Result annotations may present a handle only when it comes from the
+    exact immutable snapshot bound into the request's retrieval context and
+    that snapshot's audience lifecycle epoch is still live — the same
+    binding predicate execution-time selection validation applies. Any
+    other state (no snapshot, roster gate off, stale id, dead epoch)
+    yields ``None`` and every annotated ``speaker_handle`` stays empty.
+    The map is internal plumbing; actor ids in it never serialize.
+    """
+    if roster_snapshot is None or speaker_context is None:
+        return None
+    snapshot_id = getattr(roster_snapshot, "snapshot_id", "") or ""
+    bound_id = getattr(speaker_context, "roster_snapshot_id", "") or ""
+    if not snapshot_id or snapshot_id != bound_id:
+        return None
+    if not _snapshot_lifecycle_is_live(engine, roster_snapshot):
+        return None
+    handles = {
+        entry.actor_id: entry.handle
+        for entry in (getattr(roster_snapshot, "entries", ()) or ())
+        if (getattr(entry, "actor_id", "") or "")
+        and (getattr(entry, "handle", "") or "")
+    }
+    return handles or None
+
+
 def _resolve_speaker_conditioning(
     engine,
     tool_input: dict,
@@ -1436,6 +1468,11 @@ def execute_vc_tool(
             _fq_conditioning = _resolve_speaker_conditioning(
                 engine, tool_input, speaker_context, roster_snapshot,
             )
+            _fq_handles: dict[str, str] | None = None
+            if annotation_ctx is not None:
+                _fq_handles = _annotation_speaker_handles(
+                    engine, speaker_context, roster_snapshot,
+                )
             if _fq_conditioning is not None:
                 # The conditioned unit runs the module-level entrypoint with
                 # the engine's own store and semantic manager: the resolution
@@ -1455,14 +1492,19 @@ def execute_vc_tool(
                     channel=fq_channel,
                     speaker_context=speaker_context,
                     speaker_conditioning=_fq_conditioning,
+                    speaker_handles=_fq_handles,
                 )
             else:
                 # The context is forwarded only when the caller derived one,
                 # so the legacy call shape stays byte-identical and engine
-                # doubles predating the argument keep working.
+                # doubles predating the argument keep working. The handle
+                # map is likewise forwarded only when this request bound a
+                # live snapshot.
                 _fq_kwargs: dict = {}
                 if speaker_context is not None:
                     _fq_kwargs["speaker_context"] = speaker_context
+                if _fq_handles is not None:
+                    _fq_kwargs["speaker_handles"] = _fq_handles
                 result = engine.find_quote(
                     query=fq_query,
                     max_results=_fq_max,
