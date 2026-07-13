@@ -36,6 +36,7 @@ class EmbeddingTagGenerator:
         embed_fn: Callable[[list[str]], list[list[float]]] | None = None,
         load_cached_embeddings: Callable[[str, list[str]], dict[str, list[float]]] | None = None,
         save_cached_embeddings: Callable[[str, dict[str, list[float]]], None] | None = None,
+        allow_local_load: bool = True,
     ) -> None:
         self.config = config
         self.model_name = model_name
@@ -45,13 +46,16 @@ class EmbeddingTagGenerator:
         self._load_cached_embeddings = load_cached_embeddings
         self._save_cached_embeddings = save_cached_embeddings
 
-        self._runtime_fallback = None
         self._degraded_logged = False
 
         if embed_fn:
             self._embed = embed_fn
-        else:
+        elif allow_local_load:
             self._embed = self._load_model(model_name)
+        else:
+            # No callable and local loading forbidden: every call returns the
+            # established degraded result until a callable path exists again.
+            self._embed = None
 
     @staticmethod
     def _load_model(model_name: str) -> Callable[[list[str]], list[list[float]]]:
@@ -126,6 +130,11 @@ class EmbeddingTagGenerator:
             missing = [tag for tag in missing if tag not in self._tag_embeddings]
 
         embedded_missing = 0
+        if missing and self._embed is None:
+            # A degraded generator (no embed callable) can still absorb
+            # cached vocabulary; tags without cached vectors simply stay
+            # unembedded rather than crashing the caller.
+            return local_hits, shared_hits, 0
         if missing:
             _embed_stage = time.monotonic()
             embeddings = self._embed(missing)
@@ -149,38 +158,42 @@ class EmbeddingTagGenerator:
         self, text: str, existing_tags: list[str] | None = None,
         context_turns: list[str] | None = None,
     ) -> TagResult:
-        """Generate tags, degrading to keyword matching if embedding fails.
+        """Generate tags, degrading to an explicit ``_general`` fallback.
 
         The embed callable can be remote; a runtime failure there must not
-        fail the request and must not trigger any local model load. Keyword
-        matching is the degraded mode, and recovery happens automatically on
+        fail the request and must not trigger any local model load. The
+        degraded result is an alertable ``_general`` fallback rather than a
+        silent substitute vocabulary, and recovery happens automatically on
         the next successful embedded call.
         """
+        if self._embed is None:
+            return self._degraded_result()
         try:
             result = self._generate_tags_embedded(text, existing_tags, context_turns)
         except Exception:
             if not self._degraded_logged:
                 logger.warning(
-                    "EMBED_TAGGER_DEGRADED: embed callable failed; using "
-                    "keyword matching until it recovers",
+                    "EMBED_TAGGER_DEGRADED: embed callable failed; returning "
+                    "the _general fallback until it recovers",
                     exc_info=True,
                 )
                 self._degraded_logged = True
-            return self._keyword_fallback_result(text, existing_tags)
+            return self._degraded_result()
         if self._degraded_logged:
             logger.info("EMBED_TAGGER_RECOVERED: embedded matching restored")
             self._degraded_logged = False
         return result
 
-    def _keyword_fallback_result(
-        self, text: str, existing_tags: list[str] | None,
-    ) -> TagResult:
-        if self._runtime_fallback is None:
-            from ..types import KeywordTagConfig
-            from .tag_generator import KeywordTagGenerator
+    @staticmethod
+    def _degraded_result() -> TagResult:
+        """The system's established no-tagging degradation.
 
-            self._runtime_fallback = KeywordTagGenerator(config=KeywordTagConfig())
-        return self._runtime_fallback.generate_tags(text, existing_tags)
+        ``_general`` is the long-standing fallback tag; downstream health
+        monitoring alerts on persisted ``_general`` tags, so an embedding
+        outage surfaces on the existing alert rail instead of being masked
+        by a substitute tagger that was never validated.
+        """
+        return TagResult(tags=["_general"], primary="_general", source="fallback")
 
     def _generate_tags_embedded(
         self, text: str, existing_tags: list[str] | None = None,

@@ -1123,14 +1123,11 @@ class VirtualContextEngine:
 
         embed_fn = self._embedding_provider.get_embed_fn() if self._embedding_provider else None
         if embed_fn is None and self._embedding_provider is not None:
-            from .core.tag_generator import KeywordTagGenerator
-            from .types import KeywordTagConfig
-
-            logger.info(
+            logger.warning(
                 "Inbound embedding matching unavailable (provider yields no "
-                "embed fn) — using keyword matching",
+                "embed fn) — inbound tagging returns the _general fallback, "
+                "which downstream health monitoring alerts on",
             )
-            return KeywordTagGenerator(config=KeywordTagConfig())
         logger.info(
             "Using embedding-based inbound matching (model=%s, threshold=%.2f)",
             self.config.retriever.embedding_model,
@@ -1138,6 +1135,7 @@ class VirtualContextEngine:
         )
         return EmbeddingTagGenerator(
             config=self.config.tag_generator,
+            allow_local_load=self._embedding_provider is None,
             model_name=self.config.retriever.embedding_model,
             similarity_threshold=self.config.retriever.embedding_threshold,
             embed_fn=embed_fn,

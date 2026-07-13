@@ -804,19 +804,20 @@ def build_tag_generator(
         _embed_fn = embed_fn_factory() if embed_fn_factory else None
         if embed_fn_factory is not None and _embed_fn is None:
             # A supplied factory that yields nothing means embeddings are
-            # deliberately unavailable (disabled or failed provider). Falling
-            # through to the generator's own local model load would override
-            # that decision, so degrade to keyword tagging instead.
-            logger.info(
+            # deliberately unavailable (disabled or failed provider). The
+            # generator is still built without a local model and returns the
+            # established _general degradation, which downstream health
+            # monitoring alerts on. A configured keyword fallback is a tagger
+            # choice, not an outage mask: substituting it here would hide the
+            # degradation from that same monitoring.
+            logger.warning(
                 "Embedding tag generation unavailable (factory yields no "
-                "embed fn) — using keyword tagging",
+                "embed fn) — tagging degrades to the _general fallback",
             )
-            if config.keyword_fallback:
-                return KeywordTagGenerator(config=config.keyword_fallback)
-            return KeywordTagGenerator(config=KeywordTagConfig())
         return EmbeddingTagGenerator(
             config=config,
             embed_fn=_embed_fn,
+            allow_local_load=embed_fn_factory is None,
             model_name=embedding_model_name,
             load_cached_embeddings=load_cached_embeddings,
             save_cached_embeddings=save_cached_embeddings,
