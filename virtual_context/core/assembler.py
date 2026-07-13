@@ -17,6 +17,11 @@ _ASSEMBLE_BREAKDOWN_LOG_THRESHOLD_MS = 200.0
 _ASSEMBLE_BREAKDOWN_MAX_STAGES = 8
 
 from .llm_utils import format_code_ref
+from .speaker_roster import (
+    build_speaker_roster,
+    evict_least_recent,
+    render_speaker_roster,
+)
 
 from ..types import (
     AssembledContext,
@@ -25,6 +30,8 @@ from ..types import (
     Fact,
     Message,
     RetrievalResult,
+    SpeakerRetrievalContext,
+    SpeakerRosterSnapshot,
     StoredSegment,
     StoredSummary,
     TagPromptRule,
@@ -220,6 +227,51 @@ class ContextAssembler:
         # inject and charge zero.
         return "", 0, []
 
+    # ------------------------------------------------------------------
+    # Speaker roster
+    # ------------------------------------------------------------------
+
+    def _build_speaker_roster(
+        self,
+        speaker_context,
+        base_pool: int,
+    ) -> tuple[str, int, "SpeakerRosterSnapshot | None",
+               "SpeakerRetrievalContext | None"]:
+        """Build, cap, and render the request's speaker roster.
+
+        Returns ``(text, tokens, surviving_snapshot, bound_context)``. The
+        gate is checked FIRST: off means no roster or handle-assignment read
+        at all, no budget key, and output byte-identical to before the
+        feature existed. Every other failure mode — no context, unproved
+        audience, no store, membership or handle failure, a wrapper that
+        cannot fit — returns ``("", 0, None, None)`` and leaves ordinary
+        assembly untouched.
+        """
+        if not self.config.speaker_roster_enabled:
+            return "", 0, None, None
+        if speaker_context is None or not getattr(speaker_context, "eligible", False):
+            return "", 0, None, None
+        if self._store is None:
+            return "", 0, None, None
+
+        cap = max(0, int(self.config.speaker_roster_max_tokens))
+        allowed = min(cap, max(0, int(base_pool)))
+        if allowed <= 0:
+            return "", 0, None, None
+        try:
+            build = build_speaker_roster(
+                self._store,
+                speaker_context=speaker_context,
+                token_counter=self.token_counter,
+                max_tokens=allowed,
+            )
+        except Exception:
+            logger.warning("speaker roster build failed", exc_info=True)
+            return "", 0, None, None
+        if build.snapshot is None:
+            return "", 0, None, None
+        return build.text, build.tokens, build.snapshot, build.speaker_context
+
     def assemble(
         self,
         core_context: str,
@@ -231,6 +283,7 @@ class ContextAssembler:
         full_segments: dict[str, list[StoredSegment]] | None = None,
         max_context_tokens: int | None = None,
         request_roles=None,
+        speaker_context=None,
     ) -> AssembledContext:
         """Build final context within token budget.
 
@@ -304,7 +357,21 @@ class ContextAssembler:
         )
         _note("build_actor_card", _stage)
 
-        pool = max(0, base_pool - card_tokens)
+        # The roster is adjacent to but independent of the requester card:
+        # neither gate implies the other. Rendered and counted once, then
+        # subtracted from the pool exactly once, wrapper included.
+        _stage = time.monotonic()
+        (
+            roster_text,
+            roster_tokens,
+            roster_snapshot,
+            roster_context,
+        ) = self._build_speaker_roster(
+            speaker_context, base_pool - card_tokens,
+        )
+        _note("build_speaker_roster", _stage)
+
+        pool = max(0, base_pool - card_tokens - roster_tokens)
         tag_cap = self.config.tag_context_max_tokens
         facts_cap = self.config.facts_max_tokens
 
@@ -516,7 +583,7 @@ class ContextAssembler:
         # Conversation budget = remaining tokens
         conversation_budget = (
             token_budget - core_tokens - tag_tokens - hint_tokens
-            - facts_tokens_actual - card_tokens
+            - facts_tokens_actual - card_tokens - roster_tokens
         )
 
         # Trim conversation to budget
@@ -537,6 +604,8 @@ class ContextAssembler:
                 parts.append(core)
             if actor_card_text:
                 parts.append(actor_card_text)
+            if roster_text:
+                parts.append(roster_text)
             if context_hint:
                 parts.append(context_hint)
             for tag in sorted_tags:
@@ -577,7 +646,29 @@ class ContextAssembler:
                 if prepend_tokens <= token_budget:
                     break
 
-            # Still over after tag eviction: drop whole low-confidence card
+            # Still over after tag eviction: drop whole least-recent roster
+            # entries, in the deterministic snapshot order, and rebuild. The
+            # surviving snapshot keeps its id so any schema built from it and
+            # the rendered roster can never disagree. If every entry goes,
+            # the wrapper goes with it — nothing is emitted and no dynamic
+            # speaker parameter may be exposed for this request.
+            while (
+                prepend_tokens > token_budget
+                and roster_snapshot is not None
+                and roster_snapshot.entries
+            ):
+                roster_snapshot = evict_least_recent(roster_snapshot)
+                if roster_snapshot.entries:
+                    roster_text = render_speaker_roster(roster_snapshot)
+                    roster_tokens = self.token_counter(roster_text)
+                else:
+                    roster_text, roster_tokens = "", 0
+                    roster_snapshot = None
+                    roster_context = None
+                prepend_text = _build_prepend()
+                prepend_tokens = self.token_counter(prepend_text)
+
+            # Still over after roster eviction: drop whole low-confidence card
             # entries, in the same stable order, and rebuild. Never truncate an
             # entry. The whole-prepend recount is authoritative because token
             # counts need not be additive across the "\n\n" separators.
@@ -593,7 +684,7 @@ class ContextAssembler:
 
         total_tokens = (
             core_tokens + hint_tokens + tag_tokens + facts_tokens_actual
-            + card_tokens + conv_tokens
+            + card_tokens + roster_tokens + conv_tokens
         )
 
         # Compute presented_tags from rendered <virtual-context tags="..."> headers
@@ -637,6 +728,10 @@ class ContextAssembler:
         # With the gate off, no new budget key appears at all.
         if self.config.actor_card_enabled:
             _budget_breakdown["actor_card"] = card_tokens
+        # Independent gate, same rule: the key exists only when the roster
+        # gate is on, and the charge is the wrapper-inclusive actual cost.
+        if self.config.speaker_roster_enabled:
+            _budget_breakdown["speaker_roster"] = roster_tokens
 
         return AssembledContext(
             core_context=core,
@@ -646,6 +741,9 @@ class ContextAssembler:
             total_tokens=total_tokens,
             budget_breakdown=_budget_breakdown,
             actor_card_text=actor_card_text,
+            speaker_roster_text=roster_text,
+            speaker_roster_snapshot=roster_snapshot,
+            speaker_context=roster_context,
             prepend_text=prepend_text,
             presented_segment_refs=presented_refs,
             selected_facts=selected_facts,

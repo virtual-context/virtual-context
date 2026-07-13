@@ -397,18 +397,78 @@ def _runtime_supports_restore(tool_runtime: VCToolRuntime | None) -> bool:
         return False
 
 
+# Tools whose request-local schema may carry an explicit ``speaker``
+# selection: raw quote retrieval, fact retrieval, and temporal recall over
+# those sources. Aggregate-only tools never advertise a speaker input.
+_SPEAKER_SELECTABLE_TOOLS: frozenset[str] = frozenset({
+    "vc_find_quote",
+    "vc_query_facts",
+    "vc_remember_when",
+})
+
+# Fixed prose. Roster names are presentation data and are NEVER interpolated
+# into tool descriptions; the closed selection is the handle enum alone.
+_SPEAKER_PROPERTY_DESCRIPTION = (
+    "Optional speaker handle selected from this request's speaker-roster "
+    "list. Choose a listed handle only when the question is about what that "
+    "specific participant said; omit it otherwise."
+)
+
+
+def _attach_speaker_selection(defs: list[dict], roster_snapshot) -> list[dict]:
+    """Bind the request-local ``speaker`` enum to eligible tool schemas.
+
+    The enum contains exactly the surviving snapshot's handles — no names,
+    no actor ids, no free strings. With no snapshot (roster gate off, an
+    ineligible request, or full eviction) the catalogue is returned
+    byte-identical, so no schema can ever advertise a selection the server
+    has no snapshot to validate against.
+    """
+    entries = getattr(roster_snapshot, "entries", ()) or ()
+    handles = [
+        entry.handle for entry in entries
+        if isinstance(getattr(entry, "handle", None), str) and entry.handle
+    ]
+    if not handles:
+        return defs
+    for definition in defs:
+        if definition.get("name") not in _SPEAKER_SELECTABLE_TOOLS:
+            continue
+        schema = definition.get("input_schema")
+        if not isinstance(schema, dict):
+            continue
+        properties = schema.setdefault("properties", {})
+        properties["speaker"] = {
+            "type": "string",
+            "enum": list(handles),
+            "description": _SPEAKER_PROPERTY_DESCRIPTION,
+        }
+    return defs
+
+
 def vc_tool_definitions_for_runtime(
     tool_runtime: VCToolRuntime | None = None,
     *,
     restore_available: bool | None = None,
+    roster_snapshot=None,
 ) -> list[dict]:
-    """Return the VC tool catalogue filtered for the active runtime."""
+    """Return the VC tool catalogue filtered for the active runtime.
+
+    *roster_snapshot* is the request's surviving immutable roster snapshot.
+    When present and non-empty, eligible retrieval tools gain a request-local
+    ``speaker`` enum bound to exactly that snapshot's handles. Execution does
+    not read the argument yet: an arriving ``speaker`` value is simply not
+    consumed by ``execute_vc_tool``. Omitting the snapshot leaves the
+    catalogue byte-identical.
+    """
     defs = vc_tool_definitions()
     if restore_available is None:
         restore_available = _runtime_supports_restore(tool_runtime)
-    if restore_available:
-        return defs
-    return [d for d in defs if d.get("name") != "vc_restore_tool"]
+    if not restore_available:
+        defs = [d for d in defs if d.get("name") != "vc_restore_tool"]
+    if roster_snapshot is not None:
+        defs = _attach_speaker_selection(defs, roster_snapshot)
+    return defs
 
 
 _SUPPRESSION_MARKER = "[Older session ("
