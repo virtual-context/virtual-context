@@ -4027,6 +4027,7 @@ class VirtualContextEngine:
         channel: str = "",
         *,
         speaker_context: "SpeakerRetrievalContext | None" = None,
+        speaker_handles: dict[str, str] | None = None,
     ) -> dict:
         return self._search.find_quote(
             query,
@@ -4036,6 +4037,7 @@ class VirtualContextEngine:
             mode=mode,
             channel=channel,
             speaker_context=speaker_context,
+            speaker_handles=speaker_handles,
         )
 
     def get_turns_by_tag(
