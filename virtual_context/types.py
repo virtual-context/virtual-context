@@ -1895,6 +1895,15 @@ class SearchConfig:
     semantic_search_max_results: int = 5   # max results from embedding-based search
     query_facts_default_limit: int = 50    # default limit for query_facts()
     search_facts_max_results: int = 10     # max results from FTS fact search
+    # Repetition guard for query-driven search tools.  Once one
+    # conversation has run tool_guard_threshold executions of the same
+    # search tool inside a tool_guard_window_seconds sliding window,
+    # further calls return a synthetic stop instruction (listing the
+    # distinct queries tried) instead of executing.  Guard state is
+    # in-process per worker; nothing is persisted.
+    tool_guard_enabled: bool = True
+    tool_guard_window_seconds: int = 120
+    tool_guard_threshold: int = 10
 
 
 @dataclass

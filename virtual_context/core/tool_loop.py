@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 import httpx
 
 from ..types import ToolCallRecord, ToolLoopResult
+from .tool_guard import guard_tool_execution
 
 # Re-exported for existing importers
 from .provider_adapters import (  # noqa: F401
@@ -809,6 +810,13 @@ def execute_vc_tool(
     (from assembly or prior tool calls).  find_quote results from these
     segments are suppressed to avoid repeating the same content.
     """
+    guarded = guard_tool_execution(
+        getattr(engine.config, "conversation_id", ""), name, tool_input,
+        getattr(engine.config, "search", None),
+    )
+    if guarded is not None:
+        return guarded
+
     def _trim_find_quote_payload(raw: object) -> object:
         """Return only model-relevant find_quote fields for tool output."""
         if not isinstance(raw, dict):
