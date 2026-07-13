@@ -2122,6 +2122,15 @@ class SearchConfig:
     # legacy lexical/semantic branch stays authoritative byte-for-byte even
     # though callers already thread the context through.
     speaker_annotations_enabled: bool = False
+    # Activation gate for the atomic speaker-input unit: request-local
+    # ``speaker`` selection, execution-time snapshot validation, affinity
+    # ordering, requester-intent conditioning, and ``speaker_only``
+    # filtering activate together behind this gate.  While False (the
+    # default), an arriving ``speaker`` or ``speaker_only`` tool argument
+    # is never consumed and tool results carry no conditioning metadata,
+    # byte-identical to the pre-selection behavior.
+    # YAML key: search.speaker_selection_enabled.
+    speaker_selection_enabled: bool = False
 
 
 @dataclass

@@ -233,6 +233,7 @@ def _build_config(raw: dict[str, Any], *, validate: bool = True) -> VirtualConte
         tool_guard_window_seconds=search_raw.get("tool_guard_window_seconds", _sch_defaults.tool_guard_window_seconds),
         tool_guard_threshold=search_raw.get("tool_guard_threshold", _sch_defaults.tool_guard_threshold),
         speaker_annotations_enabled=search_raw.get("speaker_annotations_enabled", _sch_defaults.speaker_annotations_enabled),
+        speaker_selection_enabled=search_raw.get("speaker_selection_enabled", _sch_defaults.speaker_selection_enabled),
     )
 
     # Facts
