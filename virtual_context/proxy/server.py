@@ -43,6 +43,7 @@ from ..types import (  # noqa: F401 — re-exported
     Message,
     PreparedPayload,
     RequestRoles,
+    SpeakerRetrievalContext,
     SplitResult,
     StoredSummary,
     get_actor_id,
@@ -766,6 +767,63 @@ async def prepare_payload(
     _note_prep("extract_user_message", _extract_user_stage)
     is_streaming = body.get("stream", False)
 
+    # ---------------------------------------------------------------
+    # Request roles + speaker retrieval context — derived BEFORE command
+    # dispatch so command paths carry the same trusted authority as the
+    # enrichment paths. Read-only: no ingest, tagging, media mutation, or
+    # ordinary assembly runs here. An empty or unproved audience produces
+    # an ineligible context; the resolved owner is never substituted.
+    # ---------------------------------------------------------------
+    from .helpers import (
+        _extract_ingestible_messages as _extract_ingestible_messages_raw,
+    )
+
+    def _extract_ingestible_messages(payload: dict) -> list:
+        """Parse the payload and stamp the RAW caller key on every message.
+
+        The tagger derives an actor id from ``Message.metadata``, but the
+        platform segment of that id lives only in the pre-alias caller key —
+        ``config.conversation_id`` is resolved by then and can be a UUID.
+
+        Every message is stamped, not just the active tail: the historical
+        tagger path re-derives identity from the completed-history messages, so
+        stamping only the tail would leave every alias-routed conversation's
+        history actor-blind.
+        """
+        messages = _extract_ingestible_messages_raw(payload)
+        raw_key = (inbound_conversation_id or "").strip()
+        if raw_key:
+            for message in messages:
+                if message.metadata is None:
+                    message.metadata = {}
+                if isinstance(message.metadata, dict):
+                    message.metadata[_SOURCE_CONVERSATION_KEY] = raw_key
+        return messages
+
+    _request_messages = _extract_ingestible_messages(body)
+    _active_user = next(
+        (message for message in reversed(_request_messages) if message.role == "user"),
+        None,
+    )
+    _audience_conversation_id = _resolve_request_audience(
+        state, inbound_conversation_id,
+    )
+    _request_roles = _roles_for_active_user(
+        state,
+        _active_user,
+        user_message,
+        inbound_conversation_id=inbound_conversation_id,
+        audience_conversation_id=_audience_conversation_id,
+    )
+    _tenant_raw = (
+        getattr(state.engine.config, "tenant_id", "") if state is not None else ""
+    )
+    _speaker_context = SpeakerRetrievalContext.from_roles(
+        _tenant_raw if isinstance(_tenant_raw, str) else "",
+        _request_roles,
+        (_active_user.content or "") if _active_user is not None else "",
+    )
+
     # --- VC command detection (VCATTACH, VCLABEL, VCSTATUS, VCRECALL, VCCOMPACT, VCLIST, VCFORGET) ---
     # OpenClaw wraps user messages in metadata envelopes (```json``` fenced blocks)
     # with the actual user text after the last fence. Strip the envelope first.
@@ -833,51 +891,15 @@ async def prepare_payload(
             vcattach_label=_vc_arg if _vc_cmd == "ATTACH" else "",
             vc_command=_vc_cmd.lower(),
             vc_command_arg=_vc_arg,
+            speaker_context=_speaker_context,
         )
 
     # Resolve upstream context window limit for this model
     from .helpers import (
-        _extract_ingestible_messages as _extract_ingestible_messages_raw,
         _inject_context,
         _inject_vc_tools,
     )
     from ..model_limits import resolve_upstream_limit
-
-    def _extract_ingestible_messages(payload: dict) -> list:
-        """Parse the payload and stamp the RAW caller key on every message.
-
-        The tagger derives an actor id from ``Message.metadata``, but the
-        platform segment of that id lives only in the pre-alias caller key —
-        ``config.conversation_id`` is resolved by then and can be a UUID.
-
-        Every message is stamped, not just the active tail: the historical
-        tagger path re-derives identity from the completed-history messages, so
-        stamping only the tail would leave every alias-routed conversation's
-        history actor-blind.
-        """
-        messages = _extract_ingestible_messages_raw(payload)
-        raw_key = (inbound_conversation_id or "").strip()
-        if raw_key:
-            for message in messages:
-                if message.metadata is None:
-                    message.metadata = {}
-                if isinstance(message.metadata, dict):
-                    message.metadata[_SOURCE_CONVERSATION_KEY] = raw_key
-        return messages
-
-    _request_messages = _extract_ingestible_messages(body)
-    _active_user = next(
-        (message for message in reversed(_request_messages) if message.role == "user"),
-        None,
-    )
-    _audience_conversation_id = _resolve_request_audience(
-        state, inbound_conversation_id,
-    )
-    _request_roles = RequestRoles(
-        owner_conversation_id=(
-            state.engine.config.conversation_id if state is not None else ""
-        ),
-    )
 
     _model_name = body.get("model", "")
     if state:
@@ -962,14 +984,6 @@ async def prepare_payload(
                 phase="ingesting", started_tagger=False,
             )
         _note_prep("handle_prepare_payload", _hpp_stage)
-
-    _request_roles = _roles_for_active_user(
-        state,
-        _active_user,
-        user_message,
-        inbound_conversation_id=inbound_conversation_id,
-        audience_conversation_id=_audience_conversation_id,
-    )
 
     # ---------------------------------------------------------------
     # State-aware dispatch: PASSTHROUGH/INGESTING vs ACTIVE
@@ -1287,6 +1301,7 @@ async def prepare_payload(
                 inbound_bytes=_inbound_bytes,
                 outbound_bytes=_outbound_bytes,
                 metadata=_prepare_meta,
+                speaker_context=_speaker_context,
             )
 
     # ---------------------------------------------------------------
@@ -2461,6 +2476,7 @@ async def prepare_payload(
         inbound_bytes=_inbound_bytes,
         outbound_bytes=_outbound_bytes,
         metadata=_prepare_meta,
+        speaker_context=_speaker_context,
     )
 
 
@@ -2888,6 +2904,8 @@ def create_app(
             _skip_sid = state.engine.config.conversation_id if state else ""
             _skip_turn = len(state.engine._turn_tag_index.entries) if state else 0
             _skip_turn_id = uuid.uuid4().hex[:12]
+            # No active user was selected, so no authority was derived —
+            # explicit ineligible context rather than a silent default.
             if is_streaming:
                 return await _handle_streaming(
                     client, url, fwd_headers, body, api_format, state,
@@ -2895,6 +2913,7 @@ def create_app(
                     conversation_id=_skip_sid, response_log_path=_response_log_path,
                     session_log_path=_session_log_path,
                     request_log_dir=_effective_log_dir, log_prefix=_log_prefix,
+                    speaker_context=SpeakerRetrievalContext.ineligible(),
                 )
             else:
                 return await _handle_non_streaming(
@@ -2903,6 +2922,7 @@ def create_app(
                     conversation_id=_skip_sid, response_log_path=_response_log_path,
                     session_log_path=_session_log_path,
                     request_log_dir=_effective_log_dir, log_prefix=_log_prefix,
+                    speaker_context=SpeakerRetrievalContext.ineligible(),
                 )
 
         # ---------------------------------------------------------------
@@ -2935,6 +2955,7 @@ def create_app(
                     session_log_path=_session_log_path,
                     request_log_dir=_effective_log_dir, log_prefix=_log_prefix,
                     skip_marker_injection=bool(inbound_conversation_id),
+                    speaker_context=result.speaker_context,
                 )
             else:
                 return await _handle_non_streaming(
@@ -2945,6 +2966,7 @@ def create_app(
                     session_log_path=_session_log_path,
                     request_log_dir=_effective_log_dir, log_prefix=_log_prefix,
                     skip_marker_injection=bool(inbound_conversation_id),
+                    speaker_context=result.speaker_context,
                 )
         else:
             _intercept_vc_tools = result.paging_enabled or result.tool_output_find_quote or result.restore_tool_injected
@@ -2961,6 +2983,7 @@ def create_app(
                     request_log_dir=_effective_log_dir,
                     log_prefix=_log_prefix if _effective_log_dir else "",
                     skip_marker_injection=bool(inbound_conversation_id),
+                    speaker_context=result.speaker_context,
                 )
             else:
                 return await _handle_non_streaming(
@@ -2972,6 +2995,7 @@ def create_app(
                     session_log_path=_session_log_path,
                     request_log_dir=_effective_log_dir, log_prefix=_log_prefix,
                     skip_marker_injection=bool(inbound_conversation_id),
+                    speaker_context=result.speaker_context,
                 )
 
     return app

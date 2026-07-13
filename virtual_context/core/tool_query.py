@@ -11,7 +11,7 @@ import logging
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from ..types import ToolLoopResult, VirtualContextConfig
+    from ..types import SpeakerRetrievalContext, ToolLoopResult, VirtualContextConfig
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +45,7 @@ class ToolQueryRunner:
         provider: str = "anthropic",
         extended_thinking: bool = False,
         tool_runtime=None,
+        speaker_context: SpeakerRetrievalContext | None = None,
     ) -> ToolLoopResult:
         """Send a query to an LLM with VC tool support.
 
@@ -84,6 +85,10 @@ class ToolQueryRunner:
         provider : str
             LLM provider: ``"anthropic"``, ``"openai"``,
             ``"openai-codex"``, or ``"gemini"``.
+        speaker_context : SpeakerRetrievalContext | None
+            Request-owned retrieval authority derived by the caller from
+            trusted request state, never from tool input. Forwarded to the
+            tool loop so every VC tool execution receives it.
 
         Returns
         -------
@@ -211,6 +216,7 @@ class ToolQueryRunner:
                 url=url, max_loops=effective_loops,
                 extra_headers=_extra_hdrs or None,
                 tool_runtime=tool_runtime,
+                speaker_context=speaker_context,
             )
             # Prepend the initial request to raw_requests
             loop_result.raw_requests.insert(0, body)

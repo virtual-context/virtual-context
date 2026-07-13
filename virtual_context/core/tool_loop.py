@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import httpx
 
-from ..types import ToolCallRecord, ToolLoopResult
+from ..types import SpeakerRetrievalContext, ToolCallRecord, ToolLoopResult
 from .tool_guard import guard_tool_execution
 
 # Re-exported for existing importers
@@ -803,12 +803,19 @@ def execute_vc_tool(
     presented_segment_refs: set[str] | None = None,
     presented_fact_ids: set[str] | None = None,
     tool_runtime: VCToolRuntime | None = None,
+    speaker_context: SpeakerRetrievalContext | None = None,
 ) -> str:
     """Execute a VC paging tool and return a JSON result string.
 
     presented_segment_refs: segment refs already shown to the reader
     (from assembly or prior tool calls).  find_quote results from these
     segments are suppressed to avoid repeating the same content.
+
+    speaker_context: request-owned retrieval authority derived by the
+    server from the trusted request, never from tool input. Accepted on
+    every execution path so the authority reaches tool execution; the
+    engine entrypoints below do not consume it yet. ``None`` means the
+    caller derived no authority — it is never repaired to the owner.
     """
     guarded = guard_tool_execution(
         getattr(engine.config, "conversation_id", ""), name, tool_input,
@@ -1355,6 +1362,7 @@ def _execute_pending_tools(
     presented_refs: set[str],
     presented_facts: set[str],
     tool_runtime: VCToolRuntime | None = None,
+    speaker_context: SpeakerRetrievalContext | None = None,
 ) -> list[dict]:
     """Execute pending VC tool calls, record them, return provider-formatted results."""
     tool_results: list[dict] = []
@@ -1366,6 +1374,7 @@ def _execute_pending_tools(
             presented_segment_refs=presented_refs,
             presented_fact_ids=presented_facts,
             tool_runtime=tool_runtime,
+            speaker_context=speaker_context,
         )
         dur = round((time.monotonic() - t0) * 1000, 1)
         result.tool_calls.append(ToolCallRecord(
@@ -1465,6 +1474,7 @@ def run_tool_loop(
     max_loops: int = _DEFAULT_MAX_LOOPS,
     extra_headers: dict | None = None,
     tool_runtime: VCToolRuntime | None = None,
+    speaker_context: SpeakerRetrievalContext | None = None,
 ) -> ToolLoopResult:
     """Run a synchronous non-streaming tool loop.
 
@@ -1561,6 +1571,7 @@ def run_tool_loop(
                     presented_segment_refs=presented_refs,
                     presented_fact_ids=presented_facts,
                     tool_runtime=tool_runtime,
+                    speaker_context=speaker_context,
                 )
                 duration_ms = round((time.monotonic() - t0) * 1000, 1)
 
@@ -1699,6 +1710,7 @@ def run_tool_loop(
                             engine, vc_tools, adapter, result,
                             intent_context, presented_refs, presented_facts,
                             tool_runtime=tool_runtime,
+                            speaker_context=speaker_context,
                         )
                         _force_text_response(
                             client, url, headers, cont_body,
@@ -1726,6 +1738,7 @@ def run_tool_loop(
                     engine, vc_tools, adapter, result,
                     intent_context, presented_refs, presented_facts,
                     tool_runtime=tool_runtime,
+                    speaker_context=speaker_context,
                 )
                 _force_text_response(
                     client, url, headers, cont_body,
