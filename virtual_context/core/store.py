@@ -18,6 +18,7 @@ from ..types import (
     FactSignal,
     Message,
     QuoteResult,
+    SpeakerRetrievalContext,
     StoredSegment,
     StoredSummary,
     TagStats,
@@ -265,11 +266,19 @@ class ContextStore(ABC):
         limit: int = 5,
         conversation_id: str | None = None,
         channel: str = "",
+        *,
+        speaker_context: SpeakerRetrievalContext | None = None,
     ) -> list[QuoteResult]:
         """Search canonical turn text across stored conversation turns.
 
         A non-empty ``channel`` filters candidates to rows whose stored
         channel provenance matches, before the query's ``LIMIT``.
+
+        ``speaker_context`` opts in to the speaker-aware projection:
+        physical role-local candidates carrying ``SourceProvenance``, a
+        split of both-side rows into requester and assistant halves, and
+        the reply-body subject lane. ``None`` selects the legacy branch
+        unchanged.
         """
         return []
 
