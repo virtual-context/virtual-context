@@ -357,3 +357,28 @@ class TestMultiInstanceConfig:
         }, validate=False)
         errors = validate_config(config)
         assert any("label 'myproxy' duplicates" in e for e in errors)
+
+
+class TestSearchKnobPlumbing:
+    """The search: block's guard and speaker-gate knobs reach SearchConfig."""
+
+    def test_search_yaml_overrides_reach_the_typed_config(self):
+        config = load_config(config_dict={
+            "search": {
+                "tool_guard_enabled": False,
+                "tool_guard_window_seconds": 60,
+                "tool_guard_threshold": 3,
+                "speaker_annotations_enabled": True,
+            },
+        }, validate=False)
+        assert config.search.tool_guard_enabled is False
+        assert config.search.tool_guard_window_seconds == 60
+        assert config.search.tool_guard_threshold == 3
+        assert config.search.speaker_annotations_enabled is True
+
+    def test_defaults_keep_the_guard_on_and_annotations_dark(self):
+        config = load_config(config_dict={}, validate=False)
+        assert config.search.tool_guard_enabled is True
+        assert config.search.tool_guard_window_seconds == 120
+        assert config.search.tool_guard_threshold == 10
+        assert config.search.speaker_annotations_enabled is False
