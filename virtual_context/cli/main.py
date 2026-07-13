@@ -2004,6 +2004,21 @@ def cmd_admin_rebuild_actor_cards(args):
     ))
 
 
+def cmd_admin_reindex_canonical_turn_embeddings(args):
+    """Backfill reply-subject turn chunks and repair orphaned turn chunks.
+
+    Dry-run is the DEFAULT: the batch shell reads ``args.dry_run``, so the
+    ``--apply`` flag is inverted here rather than exposing a ``--dry-run``
+    flag whose absence would mean live writes.
+    """
+    args.dry_run = not bool(getattr(args, "apply", False))
+    _cmd_admin_actor_operation(args, "reindex_canonical_turn_embeddings", (
+        "subject_ok", "subject_missing", "subject_stale", "subject_created",
+        "subject_replaced", "orphan_chunks", "orphan_rows", "orphan_deleted",
+        "skipped_no_canonical_id", "skipped_no_embedder", "failed",
+    ))
+
+
 def cmd_admin_retag_canonical_turns(args):
     """Re-tag canonical rows that carry degraded fallback tags.
 
@@ -2750,6 +2765,33 @@ def main():
         actor_parser.add_argument("--sqlite-path")
 
     # ------------------------------------------------------------------
+    # admin reindex-canonical-turn-embeddings
+    # ------------------------------------------------------------------
+    reindex_parser = admin_sub.add_parser(
+        "reindex-canonical-turn-embeddings",
+        help=(
+            "Backfill reply-subject turn chunks and repair orphaned turn "
+            "chunks (reports only unless --apply is set)"
+        ),
+    )
+    reindex_parser.add_argument(
+        "conversation_id", nargs="?", default=None,
+        help="Conversation id (omit with --all-convs-for-tenant)",
+    )
+    reindex_parser.add_argument("--tenant-id", default="")
+    reindex_parser.add_argument("--all-convs-for-tenant", action="store_true")
+    reindex_parser.add_argument(
+        "--apply", action="store_true",
+        help="Write repairs; the default is a dry-run report",
+    )
+    reindex_parser.add_argument("--limit", type=int, default=None)
+    reindex_parser.add_argument(
+        "--storage-backend", choices=("sqlite", "postgres", "filesystem"),
+    )
+    reindex_parser.add_argument("--postgres-dsn")
+    reindex_parser.add_argument("--sqlite-path")
+
+    # ------------------------------------------------------------------
     # admin retag-canonical-turns
     # ------------------------------------------------------------------
     retag_parser = admin_sub.add_parser(
@@ -2951,6 +2993,8 @@ def main():
             cmd_admin_backfill_fact_authors(args)
         elif args.admin_command == "rebuild-actor-cards":
             cmd_admin_rebuild_actor_cards(args)
+        elif args.admin_command == "reindex-canonical-turn-embeddings":
+            cmd_admin_reindex_canonical_turn_embeddings(args)
         elif args.admin_command == "backfill-session-state-markers":
             cmd_admin_backfill_session_state_markers(args)
         else:
@@ -2960,6 +3004,7 @@ def main():
                 "  virtual-context admin backfill-fact-embeddings <conversation_id> [--tenant-id <id>] [--since <ts>] [--until <ts>] [--force-rebuild]\n"
                 "  virtual-context admin backfill-senders [<conversation_id>] [--tenant-id <id>] [--all-convs-for-tenant] [--dry-run] [--limit N]\n"
                 "  virtual-context admin backfill-channels [<conversation_id>] [--tenant-id <id>] [--all-convs-for-tenant] [--dry-run] [--limit N]\n"
+                "  virtual-context admin reindex-canonical-turn-embeddings [<conversation_id>] [--tenant-id <id>] [--all-convs-for-tenant] [--apply] [--limit N]\n"
                 "  virtual-context admin backfill-session-state-markers [<conversation_id>] [--tenant-id <id>] [--all-convs-for-tenant] [--dry-run] [--limit N] [--redis-url <url>]"
             )
             sys.exit(1)
