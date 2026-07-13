@@ -1095,6 +1095,64 @@ class CompositeStore:
             return int(fn(conversation_id, reason=reason))
         return 0
 
+    # ------------------------------------------------------------------
+    # Durable speaker handles — forwarded to the SEGMENT delegate, where the
+    # canonical rows and conversation lifecycle state live, so allocation,
+    # deletion, and merge share one transactional lock domain. A delegate
+    # that cannot back these degrades asymmetrically: reads are empty (an
+    # annotation simply shows no handle) but allocation refuses rather than
+    # minting process-local handles another worker could contradict.
+    # ------------------------------------------------------------------
+
+    def supports_speaker_handles(self) -> bool:
+        fn = getattr(self._segments, "supports_speaker_handles", None)
+        if callable(fn):
+            return bool(fn())
+        return False
+
+    def get_speaker_handles(
+        self,
+        tenant_id: str,
+        audience_conversation_id: str,
+        actor_ids: list[str],
+    ) -> list:
+        fn = getattr(self._segments, "get_speaker_handles", None)
+        if callable(fn):
+            return list(fn(tenant_id, audience_conversation_id, actor_ids))
+        return []
+
+    def allocate_speaker_handles(
+        self,
+        tenant_id: str,
+        audience_conversation_id: str,
+        candidates: list,
+        *,
+        owner_conversation_id: str,
+        expected_lifecycle_epoch: int,
+    ) -> list:
+        fn = getattr(self._segments, "allocate_speaker_handles", None)
+        if not callable(fn):
+            raise NotImplementedError(
+                "segment delegate cannot allocate durable speaker handles"
+            )
+        return list(fn(
+            tenant_id,
+            audience_conversation_id,
+            candidates,
+            owner_conversation_id=owner_conversation_id,
+            expected_lifecycle_epoch=expected_lifecycle_epoch,
+        ))
+
+    def delete_speaker_handles_for_audience(
+        self,
+        tenant_id: str,
+        audience_conversation_id: str,
+    ) -> int:
+        fn = getattr(self._segments, "delete_speaker_handles_for_audience", None)
+        if callable(fn):
+            return int(fn(tenant_id, audience_conversation_id))
+        return 0
+
     def update_canonical_turn_reply_roles_if_empty(
         self,
         conversation_id: str,

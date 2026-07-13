@@ -18,6 +18,8 @@ from ..types import (
     FactSignal,
     Message,
     QuoteResult,
+    SpeakerHandleAssignment,
+    SpeakerHandleCandidate,
     SpeakerRetrievalContext,
     StoredSegment,
     StoredSummary,
@@ -800,6 +802,67 @@ class ContextStore(ABC):
         reason: str = "",
     ) -> int:
         """Remove every card entry this conversation contributed to."""
+        return 0
+
+    # ------------------------------------------------------------------
+    # Durable speaker handles
+    #
+    # Assignments are keyed ``(tenant_id, audience_conversation_id,
+    # actor_id)`` — per validated pre-alias audience, never per
+    # alias-resolved owner — and are immutable within an audience lifecycle.
+    # A backend without co-located, transactional lifecycle state keeps
+    # these defaults: reads degrade to empty (an annotation simply shows no
+    # handle) while allocation fails closed rather than minting unstable
+    # process-local handles that another worker could contradict.
+    # ------------------------------------------------------------------
+
+    def supports_speaker_handles(self) -> bool:
+        """True only when durable, lifecycle-fenced handle storage is backed."""
+        return False
+
+    def get_speaker_handles(
+        self,
+        tenant_id: str,
+        audience_conversation_id: str,
+        actor_ids: list[str],
+    ) -> list[SpeakerHandleAssignment]:
+        """Fetch assignments for an already policy-derived actor set.
+
+        Never enumerates the assignment relation to discover participants:
+        membership comes from admissible physical rows first, and only that
+        eligible actor set may be looked up here.
+        """
+        return []
+
+    def allocate_speaker_handles(
+        self,
+        tenant_id: str,
+        audience_conversation_id: str,
+        candidates: list[SpeakerHandleCandidate],
+        *,
+        owner_conversation_id: str,
+        expected_lifecycle_epoch: int,
+    ) -> list[SpeakerHandleAssignment]:
+        """Allocate immutable handles for eligible actors without one.
+
+        Runs in one lifecycle-fenced write transaction that re-proves tenant,
+        live audience, owner-or-retained-alias validity, and the expected
+        audience ``lifecycle_epoch`` before inserting. Unassigned candidates
+        are processed in deterministic ``(first_seen_sort_key, actor_id)``
+        order and a handle collision advances through deterministic suffixes
+        inside the same transaction. Existing assignments are returned as-is:
+        upsert-by-handle, reassignment, and repointing are forbidden.
+        """
+        raise NotImplementedError(
+            "this storage backend cannot allocate durable speaker handles"
+        )
+
+    def delete_speaker_handles_for_audience(
+        self,
+        tenant_id: str,
+        audience_conversation_id: str,
+    ) -> int:
+        """Remove one audience's handle assignments; returns rows removed."""
         return 0
 
     def update_canonical_turn_reply_roles_if_empty(

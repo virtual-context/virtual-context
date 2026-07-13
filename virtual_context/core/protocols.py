@@ -16,6 +16,8 @@ from ..types import (
     CanonicalTurnRow,
     LinkedFact,
     QuoteResult,
+    SpeakerHandleAssignment,
+    SpeakerHandleCandidate,
     SpeakerRetrievalContext,
     StoredSegment,
     StoredSummary,
@@ -263,6 +265,42 @@ class SegmentStore(Protocol):
         *,
         limit: int,
     ) -> list[CanonicalTurnRow]: ...
+
+
+@runtime_checkable
+class SpeakerHandleStore(Protocol):
+    """Durable, audience-scoped speaker-handle assignments.
+
+    Assignments are keyed ``(tenant_id, audience_conversation_id, actor_id)``
+    and must be co-located with the canonical conversation lifecycle state so
+    allocation, deletion, and merge share one transactional lock domain. Every
+    method is tenant- and audience-scoped; an owner-only or actor-only surface
+    is not contract-compatible. A backend that cannot provide the fenced
+    transaction must not claim support: reads may degrade to empty, but
+    allocation fails rather than minting unstable process-local handles.
+    """
+
+    def supports_speaker_handles(self) -> bool: ...
+    def get_speaker_handles(
+        self,
+        tenant_id: str,
+        audience_conversation_id: str,
+        actor_ids: list[str],
+    ) -> list[SpeakerHandleAssignment]: ...
+    def allocate_speaker_handles(
+        self,
+        tenant_id: str,
+        audience_conversation_id: str,
+        candidates: list[SpeakerHandleCandidate],
+        *,
+        owner_conversation_id: str,
+        expected_lifecycle_epoch: int,
+    ) -> list[SpeakerHandleAssignment]: ...
+    def delete_speaker_handles_for_audience(
+        self,
+        tenant_id: str,
+        audience_conversation_id: str,
+    ) -> int: ...
 
 
 @runtime_checkable
