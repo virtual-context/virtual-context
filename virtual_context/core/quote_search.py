@@ -10,14 +10,65 @@ from __future__ import annotations
 import logging
 import re
 from collections import OrderedDict
+from dataclasses import dataclass, field
 from datetime import date
 from itertools import product
 
-from ..types import QuoteResult, SegmentMetadata, SpeakerRetrievalContext
+from ..types import (
+    AUDIENCE_ATTRIBUTION_VERSION,
+    QuoteResult,
+    SegmentMetadata,
+    SpeakerRetrievalContext,
+)
 from .semantic_search import SemanticSearchManager
 from .store import ContextStore
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class SpeakerConditioning:
+    """Resolved execution-time speaker conditioning for one retrieval call.
+
+    Built by the tool-execution layer AFTER validating any explicit
+    ``speaker`` selection against the request's immutable roster snapshot
+    and AFTER classifying requester intent from the request's original
+    active-user text. Never constructed from raw tool input: by the time
+    this object exists, exactly one conditioning target has been resolved
+    with the contract precedence (valid explicit roster handle, else
+    trusted requester intent, else none).
+
+    ``conditioning_actor_id`` is internal provenance (``repr=False``); it
+    must never surface in results, warnings, logs, or telemetry — the
+    response reports only ``conditioning_source``. ``filter_active`` is
+    true only for a VALID ``speaker_only`` selection; an unresolved or
+    absent selection with ``speaker_only`` requested keeps it false so the
+    exact unconditioned path runs with the mandatory warning.
+    """
+
+    conditioning_actor_id: str = field(default="", repr=False)
+    conditioning_source: str = "none"  # "explicit_roster" | "requester_intent" | "none"
+    filter_active: bool = False
+    hint_arrived: bool = False
+    hint_unresolved: bool = False
+    speaker_only_requested: bool = False
+
+
+# Mandatory sanitized warning for ``speaker_only`` without a valid roster
+# selection. Fixed prose: it never echoes the rejected input and never
+# names an actor.
+_NO_ATTRIBUTION_FILTER_WARNING = (
+    "speaker_only was requested but no valid speaker selection from this "
+    "request's roster was provided; NO attribution filter was applied and "
+    "the results below are the ordinary unfiltered search results."
+)
+
+# ``speaker_only`` fetches more candidates from each source so the actor
+# predicate is applied before that source's own limit rather than to a
+# truncated top-N. The window is bounded; a match deeper than it is not
+# recovered until the stores expose predicate pushdown.
+_SPEAKER_ONLY_SOURCE_OVERFETCH = 5
+_SPEAKER_ONLY_SOURCE_MIN_FETCH = 100
 
 _FIND_QUOTE_MODES = {"lookup", "exact_value"}
 _SEARCH_SUMMARY_MODES = {"lookup", "coverage", "aggregate_total"}
@@ -773,6 +824,110 @@ def _base_quote_score(qr: QuoteResult, query: str, mode: str) -> tuple[float, ..
     )
 
 
+def _speaker_affinity(
+    qr: QuoteResult,
+    conditioning: SpeakerConditioning | None,
+) -> float:
+    """Bounded ordering signal: 1.0 for a role-local match, else 0.0.
+
+    Evaluated only from deterministic physical provenance. A requester
+    lane speaks through ``sender_actor_id`` and a subject lane through
+    ``reply_subject_actor_id`` — both already projected into
+    ``provenance.actor_id``. Assistant, mixed, unattributed, and
+    provenance-free candidates never match, and presentation labels never
+    participate. With no conditioning target the value is a constant 0.0,
+    which leaves every ranking comparison byte-identical.
+    """
+    if conditioning is None:
+        return 0.0
+    actor = conditioning.conditioning_actor_id
+    if not actor:
+        return 0.0
+    provenance = getattr(qr, "provenance", None)
+    if provenance is None:
+        return 0.0
+    if (getattr(provenance, "source_role", "") or "") not in ("requester", "subject"):
+        return 0.0
+    return 1.0 if (getattr(provenance, "actor_id", "") or "") == actor else 0.0
+
+
+def _classify_speaker_only_candidate(
+    qr: QuoteResult,
+    conditioning: SpeakerConditioning,
+    speaker_context: SpeakerRetrievalContext,
+) -> str:
+    """Classify one candidate for exact attribution: one disjoint class.
+
+    Runs AFTER the source's ordinary relevance threshold (the candidate
+    already matched) and BEFORE the source limit. Returns:
+
+    * ``"ineligible"`` — no count and no result. Aggregate/segment-backed
+      source classes, candidates with no physical provenance, and
+      candidates whose provenance does not prove the request's validated
+      audience (exact audience, current attribution version, exact durable
+      channel with empty failing closed). Counts contain only
+      authorized-audience data.
+    * ``"match"`` — deterministic role-local actor equals the selected
+      roster actor (requester lane via ``sender_actor_id``, subject lane
+      via ``reply_subject_actor_id``).
+    * ``"other"`` — a deterministic, non-selected human actor or the
+      reserved assistant identity.
+    * ``"unknown"`` — mixed, unattributed, or empty-actor candidates; an
+      unknown actor is never assigned to the only known roster member.
+    """
+    provenance = getattr(qr, "provenance", None)
+    if provenance is None or (qr.source_scope or "") != "turn":
+        return "ineligible"
+    audience = speaker_context.audience_conversation_id or ""
+    if (getattr(provenance, "audience_conversation_id", "") or "") != audience:
+        return "ineligible"
+    version = int(getattr(provenance, "audience_attribution_version", 0) or 0)
+    if version != AUDIENCE_ATTRIBUTION_VERSION:
+        return "ineligible"
+    wanted_channel = speaker_context.audience_channel_id or ""
+    if wanted_channel:
+        if (getattr(provenance, "origin_channel_id", "") or "") != wanted_channel:
+            return "ineligible"
+    role = getattr(provenance, "source_role", "") or "unattributed"
+    if role in ("requester", "subject"):
+        actor = getattr(provenance, "actor_id", "") or ""
+        if not actor:
+            return "unknown"
+        return "match" if actor == conditioning.conditioning_actor_id else "other"
+    if role == "assistant":
+        return "other"
+    return "unknown"
+
+
+def _filter_speaker_only_candidates(
+    candidates: list[QuoteResult],
+    conditioning: SpeakerConditioning,
+    speaker_context: SpeakerRetrievalContext,
+    exclusion_counts: dict[str, int],
+    counted_identities: set[tuple[object, ...]],
+) -> list[QuoteResult]:
+    """Apply the role-local actor predicate and populate exclusion counts.
+
+    One classification pass per candidate: the three count classes are
+    disjoint, populated post-threshold and pre-limit, and deduplicated by
+    physical identity across sources so a candidate surfaced by both the
+    lexical and semantic source is counted exactly once. Only ``"match"``
+    candidates survive, in their source order.
+    """
+    kept: list[QuoteResult] = []
+    for qr in candidates:
+        klass = _classify_speaker_only_candidate(qr, conditioning, speaker_context)
+        if klass == "ineligible":
+            continue
+        identity = _candidate_identity(qr, speaker_aware=True)
+        if identity not in counted_identities:
+            counted_identities.add(identity)
+            exclusion_counts[klass] += 1
+        if klass == "match":
+            kept.append(qr)
+    return kept
+
+
 def _rerank_quote_results(
     results: list[QuoteResult],
     query: str,
@@ -780,6 +935,7 @@ def _rerank_quote_results(
     max_results: int,
     mode: str,
     coverage_components: list[str] | None = None,
+    speaker_conditioning: SpeakerConditioning | None = None,
 ) -> list[QuoteResult]:
     if mode == "lookup":
         ordered_tokens = _ordered_query_tokens(query)
@@ -820,6 +976,11 @@ def _rerank_quote_results(
         if not term_doc_counts and not bigram_doc_counts and not trigram_doc_counts:
             return results[:max_results]
 
+        # Speaker affinity is evaluated after every relevance and coverage
+        # component and immediately before the stable input-order tie: a
+        # same-speaker candidate may move only inside an equal-relevance
+        # bucket, and with no conditioning target the component is a
+        # constant 0.0 that changes no comparison.
         ranked = sorted(
             profiles,
             key=lambda item: (
@@ -832,6 +993,7 @@ def _rerank_quote_results(
                 item["starts_with_user"],
                 -int(item["term_span"]),
                 *_base_quote_score(item["result"], query, mode),
+                _speaker_affinity(item["result"], speaker_conditioning),
                 -int(item["index"]),
             ),
             reverse=True,
@@ -866,6 +1028,7 @@ def _rerank_quote_results(
                     item["starts_with_user"],
                     -int(item["term_span"]),
                     *_base_quote_score(item["result"], query, mode),
+                    _speaker_affinity(item["result"], speaker_conditioning),
                     -int(item["index"]),
                 )
                 if best_key is None or key > best_key:
@@ -882,9 +1045,15 @@ def _rerank_quote_results(
     if mode == "aggregate_total":
         target_results = max(max_results * 4, 20)
 
+    # Affinity again sits after the complete base relevance key and before
+    # the stable tie (Python's stable sort keeps input order for equal
+    # keys); a constant 0.0 with no conditioning changes nothing.
     ranked = sorted(
         results,
-        key=lambda qr: _base_quote_score(qr, query, mode),
+        key=lambda qr: (
+            *_base_quote_score(qr, query, mode),
+            _speaker_affinity(qr, speaker_conditioning),
+        ),
         reverse=True,
     )
 
@@ -944,6 +1113,7 @@ def _rerank_quote_results(
                     -float(total_quantity_count),
                     float(_source_weight(qr.match_type, mode)),
                     *_base_quote_score(qr, query, mode),
+                    _speaker_affinity(qr, speaker_conditioning),
                 )
                 if best_score is None or score > best_score:
                     best_score = score
@@ -992,7 +1162,7 @@ def _rerank_quote_results(
                 1.5 if (qr.session_date or "") not in seen_sessions else 0.0,
                 1.0 if qr.tag not in seen_tags else 0.0,
             )
-            score = base + novelty
+            score = base + novelty + (_speaker_affinity(qr, speaker_conditioning),)
             if best_score is None or score > best_score:
                 best_score = score
                 best_idx = idx
@@ -1139,6 +1309,8 @@ def _search_find_quote_candidates(
     include_tool_outputs: bool = True,
     channel: str = "",
     speaker_context: SpeakerRetrievalContext | None = None,
+    speaker_conditioning: SpeakerConditioning | None = None,
+    exclusion_counts: dict[str, int] | None = None,
 ) -> list[QuoteResult]:
     results: list[QuoteResult] = []
     lexical_limit = limit
@@ -1147,6 +1319,22 @@ def _search_find_quote_candidates(
     if mode == "exact_value" and limit > 1:
         semantic_limit = max(1, min(limit // 3, 8))
         lexical_limit = max(1, limit - semantic_limit)
+
+    # Valid ``speaker_only`` filters at each source, after that source's own
+    # relevance predicate/threshold and BEFORE that source's limit: each
+    # source is overfetched, one classification pass populates the disjoint
+    # exclusion counts, the role-local actor predicate keeps only the
+    # selected actor's candidates, and then the source's UNCHANGED limit is
+    # re-applied. Anything else — absent, invalid, stale, or off-snapshot
+    # selection — leaves both source calls byte-identical to the
+    # unconditioned path and performs no speculative count scan.
+    filtering = (
+        speaker_conditioning is not None
+        and speaker_conditioning.filter_active
+        and speaker_context is not None
+        and exclusion_counts is not None
+    )
+    counted_identities: set[tuple[object, ...]] = set()
 
     # Both sources are scoped at their own boundary, before their own limits.
     # Fetching a global top-N and filtering the returned list here would
@@ -1163,27 +1351,53 @@ def _search_find_quote_candidates(
 
     search_turn_text = getattr(store, "search_canonical_turn_text", None)
     if callable(search_turn_text):
-        results.extend(
-            search_turn_text(
-                query,
-                limit=lexical_limit,
-                conversation_id=conversation_id,
-                **scope,
+        lexical_fetch = lexical_limit
+        if filtering:
+            lexical_fetch = max(
+                lexical_limit * _SPEAKER_ONLY_SOURCE_OVERFETCH,
+                _SPEAKER_ONLY_SOURCE_MIN_FETCH,
             )
+        lexical_results = search_turn_text(
+            query,
+            limit=lexical_fetch,
+            conversation_id=conversation_id,
+            **scope,
         )
+        if filtering:
+            lexical_results = _filter_speaker_only_candidates(
+                lexical_results,
+                speaker_conditioning,
+                speaker_context,
+                exclusion_counts,
+                counted_identities,
+            )[:lexical_limit]
+        results.extend(lexical_results)
 
     if mode != "exact_value":
         semantic_limit = max(0, limit - len(results))
 
     if semantic_limit > 0:
-        results.extend(
-            semantic.semantic_canonical_turn_search(
-                query,
-                max_results=semantic_limit,
-                conversation_id=conversation_id,
-                **scope,
+        semantic_fetch = semantic_limit
+        if filtering:
+            semantic_fetch = max(
+                semantic_limit * _SPEAKER_ONLY_SOURCE_OVERFETCH,
+                _SPEAKER_ONLY_SOURCE_MIN_FETCH,
             )
+        semantic_results = semantic.semantic_canonical_turn_search(
+            query,
+            max_results=semantic_fetch,
+            conversation_id=conversation_id,
+            **scope,
         )
+        if filtering:
+            semantic_results = _filter_speaker_only_candidates(
+                semantic_results,
+                speaker_conditioning,
+                speaker_context,
+                exclusion_counts,
+                counted_identities,
+            )[:semantic_limit]
+        results.extend(semantic_results)
 
     deduped: list[QuoteResult] = []
     seen: set[tuple[object, ...]] = set()
@@ -2996,6 +3210,37 @@ def search_summaries(
     return response
 
 
+def _apply_speaker_conditioning_metadata(
+    response: dict,
+    conditioning: SpeakerConditioning | None,
+    exclusion_counts: dict[str, int] | None,
+) -> None:
+    """Attach the model-visible conditioning metadata, never an actor id.
+
+    With no conditioning object (selection unit inactive) the response is
+    left byte-identical. An unresolved explicit hint adds exactly
+    ``speaker_hint="unresolved"`` and ``filter_applied=false`` on top of
+    the unconditioned response. A valid ``speaker_only`` reports
+    ``filter_applied=true`` plus the three disjoint audience-scoped counts;
+    ``speaker_only`` without a valid selection reports
+    ``filter_applied=false`` and the mandatory sanitized warning.
+    """
+    if conditioning is None:
+        return
+    response["conditioning_source"] = conditioning.conditioning_source
+    if conditioning.hint_unresolved:
+        response["speaker_hint"] = "unresolved"
+        response["filter_applied"] = False
+    if conditioning.filter_active and exclusion_counts is not None:
+        response["filter_applied"] = True
+        response["pre_filter_matching_count"] = exclusion_counts["match"]
+        response["excluded_other_speakers"] = exclusion_counts["other"]
+        response["excluded_unknown_speaker"] = exclusion_counts["unknown"]
+    elif conditioning.speaker_only_requested:
+        response["filter_applied"] = False
+        response["warning"] = _NO_ATTRIBUTION_FILTER_WARNING
+
+
 def find_quote(
     store: ContextStore,
     semantic: SemanticSearchManager,
@@ -3008,6 +3253,7 @@ def find_quote(
     channel: str = "",
     *,
     speaker_context: SpeakerRetrievalContext | None = None,
+    speaker_conditioning: SpeakerConditioning | None = None,
 ) -> dict:
     """Search canonical archived turns only.
 
@@ -3019,6 +3265,15 @@ def find_quote(
     ``speaker_context`` selects the physical role-local candidate branch and
     is forwarded to both candidate sources; ``None`` keeps the shipped legacy
     branch byte-identical end to end.
+
+    ``speaker_conditioning`` is the execution layer's already-validated
+    conditioning resolution. ``None`` — every legacy caller — changes
+    nothing. A resolved target orders equal-relevance ties by speaker
+    affinity without touching candidate eligibility, thresholds, or source
+    limits; a valid ``speaker_only`` filters role-locally at each source
+    before that source's limit and reports its audience-scoped exclusion
+    counts. An unresolved selection runs this exact unconditioned path and
+    only adds the unresolved-hint metadata.
     """
     if not query.strip():
         return {"error": "empty query"}
@@ -3037,6 +3292,14 @@ def find_quote(
             "mode": mode,
         }
 
+    exclusion_counts: dict[str, int] | None = None
+    if (
+        speaker_conditioning is not None
+        and speaker_conditioning.filter_active
+        and speaker_context is not None
+    ):
+        exclusion_counts = {"match": 0, "other": 0, "unknown": 0}
+
     limit = _candidate_limit(max_results, mode)
     results = _search_find_quote_candidates(
         store,
@@ -3047,6 +3310,8 @@ def find_quote(
         conversation_id=conversation_id,
         channel=channel,
         speaker_context=speaker_context,
+        speaker_conditioning=speaker_conditioning,
+        exclusion_counts=exclusion_counts,
     )
     results = _rerank_quote_results(
         results,
@@ -3054,16 +3319,21 @@ def find_quote(
         max_results=max_results,
         mode=mode,
         coverage_components=[],
+        speaker_conditioning=speaker_conditioning,
     )
 
     if not results:
-        return {
+        response: dict[str, object] = {
             "query": query,
             "mode": mode,
             "found": False,
             "results": [],
             "message": f"No matches for '{query}' in stored conversation history.",
         }
+        _apply_speaker_conditioning_metadata(
+            response, speaker_conditioning, exclusion_counts,
+        )
+        return response
 
     formatted: list[dict[str, object]] = []
     for qr in results:
@@ -3094,6 +3364,9 @@ def find_quote(
         "found": True,
         "results": formatted,
     }
+    _apply_speaker_conditioning_metadata(
+        response, speaker_conditioning, exclusion_counts,
+    )
     if mode == "exact_value":
         _apply_exact_value_metadata(
             response,

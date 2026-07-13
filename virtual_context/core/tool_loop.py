@@ -18,7 +18,14 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import httpx
 
-from ..types import SpeakerRetrievalContext, ToolCallRecord, ToolLoopResult
+from ..types import (
+    SpeakerRetrievalContext,
+    ToolCallRecord,
+    ToolLoopResult,
+    is_valid_speaker_handle,
+)
+from .quote_search import SpeakerConditioning
+from .quote_search import find_quote as _conditioned_find_quote
 from .speaker_labels import (
     annotate_aggregate_entry,
     annotation_speaker_context,
@@ -414,6 +421,25 @@ _SPEAKER_PROPERTY_DESCRIPTION = (
     "specific participant said; omit it otherwise."
 )
 
+# Tools whose execution implements exact-attribution filtering. Advertised
+# more narrowly than the ``speaker`` hint: a schema-valid ``speaker_only``
+# must never reach a tool whose execution would silently ignore it.
+_SPEAKER_ONLY_TOOLS: frozenset[str] = frozenset({
+    "vc_find_quote",
+})
+
+_SPEAKER_ONLY_PROPERTY_DESCRIPTION = (
+    "Optional exact-attribution mode. Set true together with a selected "
+    "speaker handle only for questions like 'what exactly did X say'; "
+    "results are then restricted to statements verifiably made by that "
+    "participant, with exclusion counts reported."
+)
+
+# First-person / possessive intent shapes ("what did I say", "my dosage").
+# Classified ONLY over the request's immutable original active-user text,
+# never over the model-generated tool query.
+_FIRST_PERSON_INTENT_RE = re.compile(r"\b(i|me|my|mine|myself)\b", re.IGNORECASE)
+
 
 def _attach_speaker_selection(defs: list[dict], roster_snapshot) -> list[dict]:
     """Bind the request-local ``speaker`` enum to eligible tool schemas.
@@ -443,6 +469,11 @@ def _attach_speaker_selection(defs: list[dict], roster_snapshot) -> list[dict]:
             "enum": list(handles),
             "description": _SPEAKER_PROPERTY_DESCRIPTION,
         }
+        if definition.get("name") in _SPEAKER_ONLY_TOOLS:
+            properties["speaker_only"] = {
+                "type": "boolean",
+                "description": _SPEAKER_ONLY_PROPERTY_DESCRIPTION,
+            }
     return defs
 
 
@@ -456,10 +487,13 @@ def vc_tool_definitions_for_runtime(
 
     *roster_snapshot* is the request's surviving immutable roster snapshot.
     When present and non-empty, eligible retrieval tools gain a request-local
-    ``speaker`` enum bound to exactly that snapshot's handles. Execution does
-    not read the argument yet: an arriving ``speaker`` value is simply not
-    consumed by ``execute_vc_tool``. Omitting the snapshot leaves the
-    catalogue byte-identical.
+    ``speaker`` enum bound to exactly that snapshot's handles (plus
+    ``speaker_only`` on the tools whose execution implements it). The caller
+    may pass a snapshot only when ``speaker_selection_enabled`` is on:
+    execution consumes the arguments behind that same gate, so a schema
+    that advertises a selection is always paired with a release that
+    validates and executes it. Omitting the snapshot leaves the catalogue
+    byte-identical.
     """
     defs = vc_tool_definitions()
     if restore_available is None:
@@ -469,6 +503,156 @@ def vc_tool_definitions_for_runtime(
     if roster_snapshot is not None:
         defs = _attach_speaker_selection(defs, roster_snapshot)
     return defs
+
+
+# ---------------------------------------------------------------------------
+# Execution-time speaker-selection resolution
+# ---------------------------------------------------------------------------
+
+
+def _original_intent_is_first_person(text: str) -> bool:
+    """First-person/possessive classification over the ORIGINAL user text.
+
+    The model can neither create first-person intent by rewriting a tool
+    query nor remove it by shortening one: this reads only the immutable
+    ``original_active_user_text`` captured by the request runtime.
+    """
+    return bool(_FIRST_PERSON_INTENT_RE.search(text or ""))
+
+
+def _snapshot_lifecycle_is_live(engine, roster_snapshot) -> bool:
+    """Whether the snapshot's audience lifecycle epoch is still current.
+
+    A lifecycle change (delete, resurrect, merge) after the snapshot was
+    built makes every selection from it stale. Identity fails closed: a
+    store that cannot prove the live epoch yields ``False`` and the
+    selection is treated as unresolved, while retrieval itself is
+    untouched.
+    """
+    audience = getattr(roster_snapshot, "audience_conversation_id", "") or ""
+    store = getattr(engine, "_store", None)
+    epoch_getter = getattr(store, "get_lifecycle_epoch", None)
+    if not audience or not callable(epoch_getter):
+        return False
+    try:
+        live_epoch = int(epoch_getter(audience) or 0)
+    except Exception:
+        logger.debug(
+            "speaker selection lifecycle check failed; selection unresolved",
+            exc_info=True,
+        )
+        return False
+    return live_epoch == int(getattr(roster_snapshot, "lifecycle_epoch", 0) or 0)
+
+
+def _validate_speaker_handle(
+    engine,
+    raw_speaker: object,
+    speaker_context: SpeakerRetrievalContext,
+    roster_snapshot,
+) -> str:
+    """Resolve an explicit ``speaker`` value against the request snapshot.
+
+    Returns the internal actor id only when every check passes: string
+    type, bounded handle grammar, a snapshot present whose id equals the
+    id bound into this request's context, a live audience lifecycle
+    epoch, and exactly one surviving snapshot entry carrying that handle.
+    A schema-valid value from a different, stale, or evicted snapshot is
+    unresolved; it is never re-resolved against a newer roster, a durable
+    assignment read, or a result annotation. Returns ``""`` when
+    unresolved.
+    """
+    if not isinstance(raw_speaker, str) or not raw_speaker:
+        return ""
+    if not is_valid_speaker_handle(raw_speaker):
+        return ""
+    if roster_snapshot is None:
+        return ""
+    snapshot_id = getattr(roster_snapshot, "snapshot_id", "") or ""
+    bound_id = getattr(speaker_context, "roster_snapshot_id", "") or ""
+    if not snapshot_id or snapshot_id != bound_id:
+        return ""
+    if not _snapshot_lifecycle_is_live(engine, roster_snapshot):
+        return ""
+    matches = [
+        entry
+        for entry in (getattr(roster_snapshot, "entries", ()) or ())
+        if getattr(entry, "handle", "") == raw_speaker
+    ]
+    if len(matches) != 1:
+        # Absent from the surviving snapshot (including handles evicted by
+        # the hard-cap rebuild) or ambiguous: both are unresolved.
+        return ""
+    return getattr(matches[0], "actor_id", "") or ""
+
+
+def _resolve_speaker_conditioning(
+    engine,
+    tool_input: dict,
+    speaker_context: SpeakerRetrievalContext | None,
+    roster_snapshot,
+) -> SpeakerConditioning | None:
+    """Resolve the single conditioning target before candidate generation.
+
+    Returns ``None`` — and consumes nothing from *tool_input* — unless the
+    ``speaker_selection_enabled`` gate is on AND the speaker-aware
+    annotation branch is active for this request (annotations gate on plus
+    a proved audience). Gate-off execution is byte-identical to the
+    pre-selection behavior.
+
+    When active, exactly one target is resolved with contract precedence:
+    a valid explicit roster handle; otherwise the trusted requester when
+    the ORIGINAL active-user intent is first-person and request roles
+    supplied a requester; otherwise none. Explicit and requester signals
+    are never combined. An explicit value that fails validation normalizes
+    to no explicit target and follows the identical path an absent hint
+    takes, recording only the unresolved-hint metadata; ``filter_active``
+    is set only for a VALID ``speaker_only`` selection, so an invalid one
+    can never trigger a speculative exclusion scan.
+    """
+    config = getattr(engine, "config", None)
+    search_config = getattr(config, "search", None)
+    # Strict identity check: a doubles/mock config whose attributes are
+    # merely truthy must not activate the unit.
+    if getattr(search_config, "speaker_selection_enabled", False) is not True:
+        return None
+    if annotation_speaker_context(config, speaker_context) is None:
+        return None
+    if not isinstance(tool_input, dict):
+        tool_input = {}
+
+    raw_speaker = tool_input.get("speaker")
+    hint_arrived = "speaker" in tool_input and raw_speaker is not None
+    speaker_only_requested = tool_input.get("speaker_only") is True
+
+    if hint_arrived:
+        actor = _validate_speaker_handle(
+            engine, raw_speaker, speaker_context, roster_snapshot,
+        )
+        if actor:
+            return SpeakerConditioning(
+                conditioning_actor_id=actor,
+                conditioning_source="explicit_roster",
+                filter_active=speaker_only_requested,
+                hint_arrived=True,
+                hint_unresolved=False,
+                speaker_only_requested=speaker_only_requested,
+            )
+
+    requester = getattr(speaker_context, "requester_actor_id", "") or ""
+    original_text = getattr(speaker_context, "original_active_user_text", "") or ""
+    if requester and _original_intent_is_first_person(original_text):
+        conditioning_source, conditioning_actor = "requester_intent", requester
+    else:
+        conditioning_source, conditioning_actor = "none", ""
+    return SpeakerConditioning(
+        conditioning_actor_id=conditioning_actor,
+        conditioning_source=conditioning_source,
+        filter_active=False,
+        hint_arrived=hint_arrived,
+        hint_unresolved=hint_arrived,
+        speaker_only_requested=speaker_only_requested,
+    )
 
 
 _SUPPRESSION_MARKER = "[Older session ("
@@ -895,6 +1079,7 @@ def execute_vc_tool(
     presented_fact_ids: set[str] | None = None,
     tool_runtime: VCToolRuntime | None = None,
     speaker_context: SpeakerRetrievalContext | None = None,
+    roster_snapshot=None,
 ) -> str:
     """Execute a VC paging tool and return a JSON result string.
 
@@ -910,6 +1095,14 @@ def execute_vc_tool(
     active; the remaining entrypoints gain their forwarding with their
     own speaker-aware surfaces. ``None`` means the caller derived no
     authority — it is never repaired to the owner.
+
+    roster_snapshot: the request's surviving immutable roster snapshot —
+    the SAME object the request-local schema enum was built from, carried
+    by the caller's request state, never rebuilt from current store state.
+    With ``speaker_selection_enabled`` on, an arriving ``speaker`` /
+    ``speaker_only`` argument is validated against exactly this snapshot
+    at execution; with the gate off or no snapshot, a schema-valid value
+    from any other source is unresolved and the unconditioned path runs.
     """
     guarded = guard_tool_execution(
         getattr(engine.config, "conversation_id", ""), name, tool_input,
@@ -984,6 +1177,28 @@ def execute_vc_tool(
         mode = raw.get("mode")
         if isinstance(mode, str) and mode.strip():
             trimmed["mode"] = mode
+        # Speaker-conditioning metadata (present only when the selection
+        # unit is active): the conditioning-source class, unresolved-hint
+        # marker, filter state, disjoint exclusion counts, and the
+        # mandatory no-filter warning. Never an actor id.
+        conditioning_source = raw.get("conditioning_source")
+        if isinstance(conditioning_source, str) and conditioning_source:
+            trimmed["conditioning_source"] = conditioning_source
+        speaker_hint = raw.get("speaker_hint")
+        if isinstance(speaker_hint, str) and speaker_hint:
+            trimmed["speaker_hint"] = speaker_hint
+        if isinstance(raw.get("filter_applied"), bool):
+            trimmed["filter_applied"] = raw["filter_applied"]
+        for _count_key in (
+            "pre_filter_matching_count",
+            "excluded_other_speakers",
+            "excluded_unknown_speaker",
+        ):
+            if isinstance(raw.get(_count_key), int):
+                trimmed[_count_key] = raw[_count_key]
+        speaker_warning = raw.get("warning")
+        if isinstance(speaker_warning, str) and speaker_warning.strip():
+            trimmed["warning"] = speaker_warning
         if raw.get("current_state_multi_session") is True:
             trimmed["current_state_multi_session"] = True
         priority_label = raw.get("priority_label")
@@ -1218,20 +1433,44 @@ def execute_vc_tool(
             fq_mode = tool_input.get("mode", "lookup")
             fq_channel = tool_input.get("channel", "") or ""
             _fq_max = engine.config.search.find_quote_max_results
-            # The context is forwarded only when the caller derived one, so
-            # the legacy call shape stays byte-identical and engine doubles
-            # predating the argument keep working.
-            _fq_kwargs: dict = {}
-            if speaker_context is not None:
-                _fq_kwargs["speaker_context"] = speaker_context
-            result = engine.find_quote(
-                query=fq_query,
-                max_results=_fq_max,
-                intent_context=intent_context,
-                mode=fq_mode,
-                channel=fq_channel,
-                **_fq_kwargs,
+            _fq_conditioning = _resolve_speaker_conditioning(
+                engine, tool_input, speaker_context, roster_snapshot,
             )
+            if _fq_conditioning is not None:
+                # The conditioned unit runs the module-level entrypoint with
+                # the engine's own store and semantic manager: the resolution
+                # above already applied the gate router's exact predicate
+                # (selection gate + annotations gate + proved audience), and
+                # the engine seam does not yet forward a conditioning
+                # argument. Same store, same semantic manager, same limits
+                # and conversation scope as the engine path.
+                result = _conditioned_find_quote(
+                    engine._store,
+                    engine._semantic,
+                    fq_query,
+                    max_results=_fq_max,
+                    intent_context=intent_context,
+                    mode=fq_mode,
+                    conversation_id=engine.config.conversation_id,
+                    channel=fq_channel,
+                    speaker_context=speaker_context,
+                    speaker_conditioning=_fq_conditioning,
+                )
+            else:
+                # The context is forwarded only when the caller derived one,
+                # so the legacy call shape stays byte-identical and engine
+                # doubles predating the argument keep working.
+                _fq_kwargs: dict = {}
+                if speaker_context is not None:
+                    _fq_kwargs["speaker_context"] = speaker_context
+                result = engine.find_quote(
+                    query=fq_query,
+                    max_results=_fq_max,
+                    intent_context=intent_context,
+                    mode=fq_mode,
+                    channel=fq_channel,
+                    **_fq_kwargs,
+                )
             result = _suppress_presented_segments(result, presented_segment_refs)
             result = _trim_find_quote_payload(result)
             result = _attach_related_facts(
@@ -1520,6 +1759,7 @@ def _execute_pending_tools(
     presented_facts: set[str],
     tool_runtime: VCToolRuntime | None = None,
     speaker_context: SpeakerRetrievalContext | None = None,
+    roster_snapshot=None,
 ) -> list[dict]:
     """Execute pending VC tool calls, record them, return provider-formatted results."""
     tool_results: list[dict] = []
@@ -1532,6 +1772,7 @@ def _execute_pending_tools(
             presented_fact_ids=presented_facts,
             tool_runtime=tool_runtime,
             speaker_context=speaker_context,
+            roster_snapshot=roster_snapshot,
         )
         dur = round((time.monotonic() - t0) * 1000, 1)
         result.tool_calls.append(ToolCallRecord(
@@ -1632,6 +1873,7 @@ def run_tool_loop(
     extra_headers: dict | None = None,
     tool_runtime: VCToolRuntime | None = None,
     speaker_context: SpeakerRetrievalContext | None = None,
+    roster_snapshot=None,
 ) -> ToolLoopResult:
     """Run a synchronous non-streaming tool loop.
 
@@ -1729,6 +1971,7 @@ def run_tool_loop(
                     presented_fact_ids=presented_facts,
                     tool_runtime=tool_runtime,
                     speaker_context=speaker_context,
+                    roster_snapshot=roster_snapshot,
                 )
                 duration_ms = round((time.monotonic() - t0) * 1000, 1)
 
@@ -1868,6 +2111,7 @@ def run_tool_loop(
                             intent_context, presented_refs, presented_facts,
                             tool_runtime=tool_runtime,
                             speaker_context=speaker_context,
+                            roster_snapshot=roster_snapshot,
                         )
                         _force_text_response(
                             client, url, headers, cont_body,
@@ -1896,6 +2140,7 @@ def run_tool_loop(
                     intent_context, presented_refs, presented_facts,
                     tool_runtime=tool_runtime,
                     speaker_context=speaker_context,
+                    roster_snapshot=roster_snapshot,
                 )
                 _force_text_response(
                     client, url, headers, cont_body,
