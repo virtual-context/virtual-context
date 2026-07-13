@@ -823,6 +823,11 @@ async def prepare_payload(
         _request_roles,
         (_active_user.content or "") if _active_user is not None else "",
     )
+    # Assigned only by roster construction inside assembly. Every path that
+    # never assembles (command dispatch, passthrough, engine error) keeps it
+    # None, so no snapshot, schema enum, or handle can outlive the request
+    # that proved its audience.
+    _roster_snapshot = None
 
     # --- VC command detection (VCATTACH, VCLABEL, VCSTATUS, VCRECALL, VCCOMPACT, VCLIST, VCFORGET) ---
     # OpenClaw wraps user messages in metadata envelopes (```json``` fenced blocks)
@@ -1400,6 +1405,17 @@ async def prepare_payload(
                 )
                 inbound_ms = _note_prep("on_message_inbound", t1)
 
+                # Roster construction is the single point that mints a
+                # snapshot id, and it hands back this request's context with
+                # that id bound in. Adopt it: execution validates a selection
+                # and resolves annotation handles against exactly the
+                # snapshot whose id the context carries, so the two must not
+                # drift apart. With no roster the derived context stands
+                # unchanged.
+                if assembled.speaker_context is not None:
+                    _speaker_context = assembled.speaker_context
+                _roster_snapshot = assembled.speaker_roster_snapshot
+
                 prepend_text = assembled.prepend_text
         except Exception as e:
             logger.error("Engine error (forwarding unmodified): %s", e)
@@ -1708,11 +1724,25 @@ async def prepare_payload(
                 compacted_count = 0
             require_tools = compacted_count > 0
             _paging_stage = time.monotonic()
+            # Atomicity: the request-local speaker enum reaches the catalogue
+            # only while the selection gate is on, because execution consumes
+            # the ``speaker`` argument behind that same gate. Gate off, the
+            # injected tools are byte-identical to the pre-feature catalogue.
+            _schema_snapshot = (
+                _roster_snapshot
+                if getattr(
+                    state.engine.config.search,
+                    "speaker_selection_enabled",
+                    False,
+                ) is True
+                else None
+            )
             enriched_body = _inject_vc_tools(
                 enriched_body,
                 state.engine,
                 require_tool_use=require_tools,
                 restore_available=_tool_stubs_present,
+                roster_snapshot=_schema_snapshot,
             )
             _note_prep("inject_paging_tools", _paging_stage)
             paging_enabled = True
@@ -2478,6 +2508,7 @@ async def prepare_payload(
         outbound_bytes=_outbound_bytes,
         metadata=_prepare_meta,
         speaker_context=_speaker_context,
+        speaker_roster_snapshot=_roster_snapshot,
     )
 
 
@@ -2985,6 +3016,7 @@ def create_app(
                     log_prefix=_log_prefix if _effective_log_dir else "",
                     skip_marker_injection=bool(inbound_conversation_id),
                     speaker_context=result.speaker_context,
+                    roster_snapshot=result.speaker_roster_snapshot,
                 )
             else:
                 return await _handle_non_streaming(

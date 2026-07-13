@@ -542,6 +542,7 @@ async def _handle_streaming(
     log_prefix: str = "",
     skip_marker_injection: bool = False,
     speaker_context: SpeakerRetrievalContext | None = None,
+    roster_snapshot=None,
 ) -> StreamingResponse | JSONResponse:
     """Forward SSE stream, accumulating assistant text for on_turn_complete.
 
@@ -556,6 +557,14 @@ async def _handle_streaming(
 
     Non-2xx upstream responses (rate limits, overloads) are returned as
     JSON errors instead of broken SSE streams.
+
+    ``roster_snapshot`` is the request's immutable roster snapshot, carried
+    into every intercepted VC tool execution alongside ``speaker_context``.
+    Execution re-validates a model-selected handle against this exact
+    snapshot and resolves annotation handles from it, so a value from a
+    stale or different snapshot is unresolved rather than silently
+    reinterpreted. ``None`` means no roster was emitted and no tool may
+    surface a handle.
     """
     _MAX_CONTINUATION_LOOPS = 5
 
@@ -1090,6 +1099,7 @@ async def _handle_streaming(
                             tool_input,
                             tool_runtime=tool_runtime,
                             speaker_context=speaker_context,
+                            roster_snapshot=roster_snapshot,
                         )
                         tool_ms = round(
                             (time.monotonic() - t_tool) * 1000, 1,

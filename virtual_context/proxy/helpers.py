@@ -128,13 +128,23 @@ def _inject_vc_tools(
     *,
     tool_runtime=None,
     restore_available: bool | None = None,
+    roster_snapshot=None,
 ) -> dict:
+    """Inject the VC tool catalogue into *body*.
+
+    *roster_snapshot* is the request's immutable roster snapshot. The caller
+    supplies it only when ``search.speaker_selection_enabled`` is on, because
+    execution consumes the ``speaker`` argument behind that same gate: a
+    schema may never advertise a selection the release would not validate.
+    Without a snapshot the catalogue is byte-identical.
+    """
     from ..core.tool_loop import vc_tool_definitions_for_runtime
     fmt = detect_format(body)
     defs = [
         d for d in vc_tool_definitions_for_runtime(
             tool_runtime,
             restore_available=restore_available,
+            roster_snapshot=roster_snapshot,
         )
         if d.get("name") != "vc_remember_when"
     ]

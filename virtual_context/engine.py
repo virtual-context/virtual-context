@@ -4118,6 +4118,7 @@ class VirtualContextEngine:
         extended_thinking: bool = False,
         tool_runtime=None,
         speaker_context: "SpeakerRetrievalContext | None" = None,
+        roster_snapshot=None,
     ) -> "ToolLoopResult":
         """Send a query to an LLM with VC tool support.
 
@@ -4161,6 +4162,11 @@ class VirtualContextEngine:
             Request-owned retrieval authority derived by the caller from
             trusted request state, never from tool input. Forwarded to
             every VC tool execution in the loop.
+        roster_snapshot : SpeakerRosterSnapshot | None
+            The request's immutable roster snapshot, as surviving assembly's
+            final hard-cap rebuild. It binds the request-local ``speaker``
+            enum and is re-validated at execution. ``None`` leaves the tool
+            catalogue byte-identical and emits no selection parameter.
 
         Returns
         -------
@@ -4183,6 +4189,7 @@ class VirtualContextEngine:
             extended_thinking=extended_thinking,
             tool_runtime=tool_runtime,
             speaker_context=speaker_context,
+            roster_snapshot=roster_snapshot,
         )
 
     def get_telemetry(self) -> TelemetryLedger:
