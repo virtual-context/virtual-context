@@ -597,6 +597,62 @@ class ReplySubject:
     unresolved_reason: str = ""
 
 
+@dataclass(frozen=True)
+class SpeakerRetrievalContext:
+    """Request-owned retrieval authority, constructed once from trusted state.
+
+    Carries exactly the fields every speaker-aware read needs: who is asking,
+    which owner row-set may be read, and which validated pre-alias audience
+    bounds what may surface. No field is ever accepted from a tool argument,
+    and the object is immutable for the life of the request.
+
+    An unproved audience makes the context ineligible: speaker-aware behavior
+    is disabled for the request rather than silently substituting the
+    alias-resolved owner, which is the DM-to-guild leak. Actor ids and the
+    captured user text are excluded from ``repr`` so the object can never
+    leak identity or content through generic logging or exception formatting.
+    """
+
+    tenant_id: str = ""
+    owner_conversation_id: str = ""
+    audience_conversation_id: str = ""
+    audience_channel_id: str = ""
+    requester_actor_id: str = field(default="", repr=False)
+    roster_snapshot_id: str = ""
+    original_active_user_text: str = field(default="", repr=False)
+
+    @property
+    def eligible(self) -> bool:
+        """True only when the request proved a pre-alias audience."""
+        return bool(self.audience_conversation_id)
+
+    @classmethod
+    def ineligible(cls) -> "SpeakerRetrievalContext":
+        """Explicit empty context for no-user and passthrough returns.
+
+        Callers use this instead of ``None`` or an implicit default so every
+        early return states that no authority was derived, rather than
+        silently dropping authority that was.
+        """
+        return cls()
+
+    @classmethod
+    def from_roles(
+        cls,
+        tenant_id: str,
+        roles: "RequestRoles",
+        original_active_user_text: str,
+    ) -> "SpeakerRetrievalContext":
+        return cls(
+            tenant_id=tenant_id or "",
+            owner_conversation_id=roles.owner_conversation_id or "",
+            audience_conversation_id=roles.audience_conversation_id or "",
+            audience_channel_id=roles.audience_channel_id or "",
+            requester_actor_id=roles.requester_actor_id or "",
+            original_active_user_text=original_active_user_text or "",
+        )
+
+
 @dataclass
 class RequestRoles:
     """Who is asking, whose statement is analyzed, and where it may surface.
