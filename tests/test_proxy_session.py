@@ -1626,3 +1626,22 @@ class TestSessionStateMachine:
         metrics.capture_request(0, {"messages": []}, "anthropic")
         req = metrics.get_captured_request(0)
         assert req["passthrough"] is False
+
+
+class TestShutdownClosesEngine:
+    def test_state_shutdown_closes_engine_store_pools(self):
+        """shutdown() must close the engine, which owns database connection
+        pools; otherwise every evicted conversation leaks its pool's
+        connections for the life of the process."""
+        engine = MagicMock()
+        engine.config.conversation_id = "s-close"
+        state = ProxyState(engine, metrics=ProxyMetrics())
+        state.shutdown(wait=False, cancel_futures=True)
+        engine.close.assert_called_once()
+
+    def test_state_shutdown_survives_engine_close_failure(self):
+        engine = MagicMock()
+        engine.config.conversation_id = "s-close-err"
+        engine.close.side_effect = RuntimeError("pool already gone")
+        state = ProxyState(engine, metrics=ProxyMetrics())
+        state.shutdown(wait=False, cancel_futures=True)  # must not raise

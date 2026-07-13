@@ -4062,3 +4062,11 @@ class ProxyState:
             self._cancel_background_work()
         self._pool.shutdown(wait=wait, cancel_futures=cancel_futures)
         self._compact_pool.shutdown(wait=wait, cancel_futures=cancel_futures)
+        # The engine owns database connection pools. Leaving them open after
+        # shutdown leaks one pool's connections per evicted conversation for
+        # the life of the process, piling idle server backends until the
+        # process restarts.
+        try:
+            self.engine.close()
+        except Exception:
+            logger.warning("Failed to close engine during shutdown", exc_info=True)
