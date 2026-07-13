@@ -398,6 +398,12 @@ def register_dashboard_routes(
                         conversation_id,
                         exc_info=True,
                     )
+            # Purge durable rows BEFORE shutting the state down: shutdown
+            # closes the engine's store, and this handler resolved its store
+            # from that same engine, so the reverse order would purge through
+            # a closed pool.
+            deleted = await asyncio.to_thread(store.delete_conversation, conversation_id)
+            if target_state is not None:
                 try:
                     await asyncio.to_thread(
                         target_state.shutdown,
@@ -410,7 +416,6 @@ def register_dashboard_routes(
                         conversation_id,
                         exc_info=True,
                     )
-            deleted = await asyncio.to_thread(store.delete_conversation, conversation_id)
             if metrics:
                 await asyncio.to_thread(
                     metrics.delete_conversation_artifacts,
