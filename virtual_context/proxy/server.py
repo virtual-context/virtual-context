@@ -1396,6 +1396,7 @@ async def prepare_payload(
                     state.conversation_history,
                     body.get("model", ""),
                     request_roles=_request_roles,
+                    speaker_context=_speaker_context,
                 )
                 inbound_ms = _note_prep("on_message_inbound", t1)
 

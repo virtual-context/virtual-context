@@ -2464,6 +2464,7 @@ class VirtualContextEngine:
         max_context_tokens: int | None = None,
         *,
         request_roles: "RequestRoles | None" = None,
+        speaker_context: "SpeakerRetrievalContext | None" = None,
     ) -> AssembledContext:
         """Assemble context for an inbound message.
 
@@ -2472,10 +2473,17 @@ class VirtualContextEngine:
         active user entry and passed explicitly; assembly never sniffs it back
         out of ``conversation_history``, and a "latest row" lookup is never the
         selector. Defaults empty, so every existing caller is unchanged.
+
+        *speaker_context* is the caller's request-owned retrieval authority.
+        It is what roster construction consumes, and the returned
+        ``AssembledContext`` carries the snapshot-bound replacement the caller
+        must adopt for the rest of the request. ``None`` builds no roster,
+        so every existing caller is unchanged.
         """
         return self._retrieval.on_message_inbound(
             message, conversation_history, model_name, max_context_tokens,
             request_roles=request_roles,
+            speaker_context=speaker_context,
         )
 
     def tag_turn(
