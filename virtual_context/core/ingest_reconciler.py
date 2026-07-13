@@ -1554,6 +1554,7 @@ class IngestReconciler:
                     assistant_text=row.assistant_content,
                     user_raw_content=row.user_raw_content,
                     assistant_raw_content=row.assistant_raw_content,
+                    reply_target_body=row.reply_target_body or "",
                 )
             except Exception:
                 logger.warning(
