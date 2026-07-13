@@ -16,6 +16,7 @@ from ..types import (
     CanonicalTurnRow,
     LinkedFact,
     QuoteResult,
+    SpeakerRetrievalContext,
     StoredSegment,
     StoredSummary,
     TagStats,
@@ -181,6 +182,12 @@ class SegmentStore(Protocol):
         conversation_id: str,
         turn_numbers: list[int],
     ) -> dict[int, CanonicalTurnRow]: ...
+    def get_canonical_turn_rows_by_id(
+        self,
+        keys: list[tuple[str, str]],
+        *,
+        speaker_context: SpeakerRetrievalContext,
+    ) -> dict[tuple[str, str], CanonicalTurnRow]: ...
     def get_all_canonical_turns(
         self,
         conversation_id: str,
@@ -434,6 +441,8 @@ class SearchStore(Protocol):
         limit: int = 5,
         conversation_id: str | None = None,
         channel: str = "",
+        *,
+        speaker_context: SpeakerRetrievalContext | None = None,
     ) -> list[QuoteResult]: ...
     def store_chunk_embeddings(
         self,
@@ -456,6 +465,12 @@ class SearchStore(Protocol):
         canonical_turn_id: str | None = None,
     ) -> None: ...
     def get_all_canonical_turn_chunk_embeddings(
+        self,
+        conversation_id: str | None = None,
+        *,
+        speaker_context: SpeakerRetrievalContext | None = None,
+    ) -> list[CanonicalTurnChunkEmbedding]: ...
+    def get_orphan_canonical_turn_chunk_embeddings(
         self,
         conversation_id: str | None = None,
     ) -> list[CanonicalTurnChunkEmbedding]: ...
