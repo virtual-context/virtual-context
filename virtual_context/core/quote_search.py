@@ -13,7 +13,7 @@ from collections import OrderedDict
 from datetime import date
 from itertools import product
 
-from ..types import QuoteResult, SegmentMetadata
+from ..types import QuoteResult, SegmentMetadata, SpeakerRetrievalContext
 from .semantic_search import SemanticSearchManager
 from .store import ContextStore
 
@@ -1094,6 +1094,40 @@ def _hydrate_lookup_summary_results(
     return hydrated
 
 
+def _candidate_identity(
+    qr: QuoteResult, *, speaker_aware: bool,
+) -> tuple[object, ...]:
+    """Dedupe identity for one quote candidate.
+
+    The legacy branch collapses turn results by logical turn number,
+    byte-identically to the shipped behavior. The speaker-aware branch
+    dedupes by the physical row and role-local lane instead: duplicate
+    message ids, physical sibling rows, logical merging, and VCMERGE may
+    not collapse or transfer authorship across physical rows or roles.
+    A speaker-aware candidate that projected no physical provenance falls
+    back to the legacy key, which only ever collapses more, never less.
+    """
+    if speaker_aware:
+        provenance = getattr(qr, "provenance", None)
+        canonical_turn_id = (
+            getattr(provenance, "canonical_turn_id", "") or ""
+            if provenance is not None
+            else ""
+        )
+        if canonical_turn_id:
+            return (
+                "physical",
+                getattr(provenance, "conversation_id", "") or "",
+                canonical_turn_id,
+                getattr(provenance, "source_role", "") or "",
+            )
+    if qr.turn_number is not None:
+        return ("turn", qr.turn_number)
+    if qr.segment_ref:
+        return ("segment", qr.segment_ref)
+    return ("text", qr.text)
+
+
 def _search_find_quote_candidates(
     store: ContextStore,
     semantic: SemanticSearchManager,
@@ -1104,6 +1138,7 @@ def _search_find_quote_candidates(
     conversation_id: str | None,
     include_tool_outputs: bool = True,
     channel: str = "",
+    speaker_context: SpeakerRetrievalContext | None = None,
 ) -> list[QuoteResult]:
     results: list[QuoteResult] = []
     lexical_limit = limit
@@ -1119,7 +1154,12 @@ def _search_find_quote_candidates(
     #
     # ``channel`` is omitted entirely on an unscoped call so a store or
     # semantic manager predating this argument keeps working unchanged.
-    scope: dict[str, str] = {"channel": channel} if channel else {}
+    # ``speaker_context`` follows the same rule: it is forwarded only when
+    # the caller selected the speaker-aware branch, so the legacy call shape
+    # stays byte-identical.
+    scope: dict[str, object] = {"channel": channel} if channel else {}
+    if speaker_context is not None:
+        scope["speaker_context"] = speaker_context
 
     search_turn_text = getattr(store, "search_canonical_turn_text", None)
     if callable(search_turn_text):
@@ -1147,13 +1187,9 @@ def _search_find_quote_candidates(
 
     deduped: list[QuoteResult] = []
     seen: set[tuple[object, ...]] = set()
+    speaker_aware = speaker_context is not None
     for qr in results:
-        if qr.turn_number is not None:
-            key = ("turn", qr.turn_number)
-        elif qr.segment_ref:
-            key = ("segment", qr.segment_ref)
-        else:
-            key = ("text", qr.text)
+        key = _candidate_identity(qr, speaker_aware=speaker_aware)
         if key in seen:
             continue
         seen.add(key)
@@ -2970,6 +3006,8 @@ def find_quote(
     mode: str = "lookup",
     conversation_id: str | None = None,
     channel: str = "",
+    *,
+    speaker_context: SpeakerRetrievalContext | None = None,
 ) -> dict:
     """Search canonical archived turns only.
 
@@ -2977,6 +3015,10 @@ def find_quote(
     channel provenance matches, before their limits and before reranking, and
     labels each excerpt with an outer ``[#channel]`` prefix. An empty
     ``channel`` is byte-identical to the unscoped behavior.
+
+    ``speaker_context`` selects the physical role-local candidate branch and
+    is forwarded to both candidate sources; ``None`` keeps the shipped legacy
+    branch byte-identical end to end.
     """
     if not query.strip():
         return {"error": "empty query"}
@@ -3004,6 +3046,7 @@ def find_quote(
         mode=mode,
         conversation_id=conversation_id,
         channel=channel,
+        speaker_context=speaker_context,
     )
     results = _rerank_quote_results(
         results,
