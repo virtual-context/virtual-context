@@ -21,7 +21,7 @@ from ..core.tool_loop import (
     is_vc_tool,
     execute_vc_tool,
 )
-from ..types import Message
+from ..types import Message, SpeakerRetrievalContext
 
 from .formats import get_format
 from .helpers import (
@@ -243,11 +243,19 @@ class _ProxyToolRuntime:
         api_format: str,
         conversation_id: str,
         get_target_body,
+        speaker_context: SpeakerRetrievalContext | None = None,
     ) -> None:
         self._engine = engine
         self._api_format = api_format
         self._conversation_id = conversation_id
         self._get_target_body = get_target_body
+        # Request-owned retrieval authority carried for the life of the
+        # request. Server-derived only — never accepted from tool input.
+        self._speaker_context = speaker_context
+
+    @property
+    def speaker_context(self) -> SpeakerRetrievalContext | None:
+        return self._speaker_context
 
     def has_restorable_stubs(self) -> bool:
         return True
@@ -533,6 +541,7 @@ async def _handle_streaming(
     request_log_dir: object | None = None,
     log_prefix: str = "",
     skip_marker_injection: bool = False,
+    speaker_context: SpeakerRetrievalContext | None = None,
 ) -> StreamingResponse | JSONResponse:
     """Forward SSE stream, accumulating assistant text for on_turn_complete.
 
@@ -1063,6 +1072,7 @@ async def _handle_streaming(
                     api_format=api_format,
                     conversation_id=conversation_id,
                     get_target_body=lambda: cont_body if cont_body is not None else body,
+                    speaker_context=speaker_context,
                 )
 
                 for loop_i in range(_MAX_CONTINUATION_LOOPS):
@@ -1079,6 +1089,7 @@ async def _handle_streaming(
                             tool_name,
                             tool_input,
                             tool_runtime=tool_runtime,
+                            speaker_context=speaker_context,
                         )
                         tool_ms = round(
                             (time.monotonic() - t_tool) * 1000, 1,
@@ -1667,8 +1678,15 @@ async def _handle_non_streaming(
     request_log_dir: object | None = None,
     log_prefix: str = "",
     skip_marker_injection: bool = False,
+    speaker_context: SpeakerRetrievalContext | None = None,
 ) -> JSONResponse:
-    """Forward JSON response, parse assistant text, fire on_turn_complete."""
+    """Forward JSON response, parse assistant text, fire on_turn_complete.
+
+    ``speaker_context`` is the request-owned retrieval authority. This
+    handler performs no local VC tool interception today, so the context is
+    accepted and retained for the interception loop that will need it; it is
+    unused until then.
+    """
     t_upstream = time.monotonic()
     resp = await client.request("POST", url, headers=headers, json=body)
     upstream_ms = round((time.monotonic() - t_upstream) * 1000, 1)
@@ -2031,7 +2049,10 @@ async def _handle_vc_command(
     elif cmd == "status":
         text = _handle_vcstatus(conv_id, state, tenant_registry, tenant_id)
     elif cmd == "recall":
-        text = _handle_vcrecall(arg, state)
+        text = _handle_vcrecall(
+            arg, state,
+            speaker_context=getattr(result, "speaker_context", None),
+        )
     elif cmd == "compact":
         text = _handle_vccompact(state)
     elif cmd == "list":
@@ -2251,8 +2272,20 @@ def _handle_vcstatus(conv_id: str, state, tenant_registry, tenant_id):
     return "\n".join(lines)
 
 
-def _handle_vcrecall(query: str, state):
-    """Search for content and promote matching tags to working set."""
+def _handle_vcrecall(
+    query: str,
+    state,
+    *,
+    speaker_context: SpeakerRetrievalContext | None = None,
+):
+    """Search for content and promote matching tags to working set.
+
+    ``speaker_context`` is the request-owned retrieval authority derived
+    before command dispatch. The raw ``find_quote`` call below does not
+    consume it yet; it is accepted here so the command path already carries
+    the context this search will require once the context-bearing search
+    entrypoint exists. An ineligible context never falls back to the owner.
+    """
     if not query:
         return "Usage: VCRECALL <query>"
     if not state:
@@ -2680,7 +2713,10 @@ def _handle_vc_command_rest(
     elif cmd == "status":
         text = _handle_vcstatus(conv_id, state, registry, tenant_id)
     elif cmd == "recall":
-        text = _handle_vcrecall(arg, state)
+        text = _handle_vcrecall(
+            arg, state,
+            speaker_context=getattr(result, "speaker_context", None),
+        )
     elif cmd == "compact":
         text = _handle_vccompact(state)
     elif cmd == "list":

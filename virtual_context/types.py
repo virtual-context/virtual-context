@@ -2053,6 +2053,15 @@ class PreparedPayload:
     # Generic VC command support (attach, label, status, recall, compact, list, forget)
     vc_command: str = ""
     vc_command_arg: str = ""
+    # Request-owned retrieval authority, derived once before command dispatch
+    # and carried through the handlers and tool runtime. Never accepted from
+    # tool input. An unproved audience leaves the context ineligible; it is
+    # never substituted with the resolved owner. The default exists only for
+    # constructors that never derived authority — every prepare return sets
+    # it explicitly so no early return silently drops derived authority.
+    speaker_context: SpeakerRetrievalContext = field(
+        default_factory=SpeakerRetrievalContext.ineligible,
+    )
 
 
 @dataclass
