@@ -813,9 +813,12 @@ def execute_vc_tool(
 
     speaker_context: request-owned retrieval authority derived by the
     server from the trusted request, never from tool input. Accepted on
-    every execution path so the authority reaches tool execution; the
-    engine entrypoints below do not consume it yet. ``None`` means the
-    caller derived no authority — it is never repaired to the owner.
+    every execution path so the authority reaches tool execution.
+    ``vc_find_quote`` forwards it into the search entrypoint, whose gate
+    router selects the legacy branch unless speaker annotations are
+    active; the remaining entrypoints gain their forwarding with their
+    own speaker-aware surfaces. ``None`` means the caller derived no
+    authority — it is never repaired to the owner.
     """
     guarded = guard_tool_execution(
         getattr(engine.config, "conversation_id", ""), name, tool_input,
@@ -1098,12 +1101,19 @@ def execute_vc_tool(
             fq_mode = tool_input.get("mode", "lookup")
             fq_channel = tool_input.get("channel", "") or ""
             _fq_max = engine.config.search.find_quote_max_results
+            # The context is forwarded only when the caller derived one, so
+            # the legacy call shape stays byte-identical and engine doubles
+            # predating the argument keep working.
+            _fq_kwargs: dict = {}
+            if speaker_context is not None:
+                _fq_kwargs["speaker_context"] = speaker_context
             result = engine.find_quote(
                 query=fq_query,
                 max_results=_fq_max,
                 intent_context=intent_context,
                 mode=fq_mode,
                 channel=fq_channel,
+                **_fq_kwargs,
             )
             result = _suppress_presented_segments(result, presented_segment_refs)
             result = _trim_find_quote_payload(result)

@@ -35,6 +35,7 @@ from .types import (
     EngineStateSnapshot,
     Message,
     RetrievalResult,
+    SpeakerRetrievalContext,
     SplitResult,
     ToolLoopResult,
     TurnTagEntry,
@@ -4024,6 +4025,8 @@ class VirtualContextEngine:
         session_filter: str = "",
         mode: str = "lookup",
         channel: str = "",
+        *,
+        speaker_context: "SpeakerRetrievalContext | None" = None,
     ) -> dict:
         return self._search.find_quote(
             query,
@@ -4032,6 +4035,7 @@ class VirtualContextEngine:
             session_filter=session_filter,
             mode=mode,
             channel=channel,
+            speaker_context=speaker_context,
         )
 
     def get_turns_by_tag(
@@ -4103,6 +4107,7 @@ class VirtualContextEngine:
         provider: str = "anthropic",
         extended_thinking: bool = False,
         tool_runtime=None,
+        speaker_context: "SpeakerRetrievalContext | None" = None,
     ) -> "ToolLoopResult":
         """Send a query to an LLM with VC tool support.
 
@@ -4142,6 +4147,10 @@ class VirtualContextEngine:
         provider : str
             LLM provider: ``"anthropic"``, ``"openai"``,
             ``"openai-codex"``, or ``"gemini"``.
+        speaker_context : SpeakerRetrievalContext | None
+            Request-owned retrieval authority derived by the caller from
+            trusted request state, never from tool input. Forwarded to
+            every VC tool execution in the loop.
 
         Returns
         -------
@@ -4163,6 +4172,7 @@ class VirtualContextEngine:
             provider=provider,
             extended_thinking=extended_thinking,
             tool_runtime=tool_runtime,
+            speaker_context=speaker_context,
         )
 
     def get_telemetry(self) -> TelemetryLedger:

@@ -1943,6 +1943,12 @@ class SearchConfig:
     tool_guard_enabled: bool = True
     tool_guard_window_seconds: int = 120
     tool_guard_threshold: int = 10
+    # Activation gate for the speaker-aware retrieval branch.  While False
+    # (the default), search entrypoints normalize any supplied
+    # SpeakerRetrievalContext to None before candidate generation, so the
+    # legacy lexical/semantic branch stays authoritative byte-for-byte even
+    # though callers already thread the context through.
+    speaker_annotations_enabled: bool = False
 
 
 @dataclass
