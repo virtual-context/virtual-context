@@ -369,8 +369,51 @@ class ContextStore(ABC):
     def get_all_canonical_turn_chunk_embeddings(
         self,
         conversation_id: str | None = None,
+        *,
+        speaker_context: SpeakerRetrievalContext | None = None,
     ) -> list[CanonicalTurnChunkEmbedding]:
+        """Enumerate live turn-chunk embeddings for semantic scoring.
+
+        ``speaker_context`` opts in to the physical branch: chunks are
+        admitted only through their physical canonical row, never through
+        the logical ordinal seam. ``None`` selects the legacy enumeration
+        unchanged.
+        """
         return []
+
+    def get_orphan_canonical_turn_chunk_embeddings(
+        self,
+        conversation_id: str | None = None,
+    ) -> list[CanonicalTurnChunkEmbedding]:
+        """Raw reconciliation inventory: chunks with no physical row.
+
+        Live search never returns these; the admin reindex reports and
+        deletes them. Backends return the raw chunk identity/text/vector
+        with ``turn_number=-1`` because the missing canonical row is the
+        condition being reported. The base raises rather than returning
+        an empty list: a backend without the anti-join cannot distinguish
+        "no orphans" from "cannot look", and a repair report must never
+        fabricate the former.
+        """
+        raise NotImplementedError(
+            "this store cannot enumerate orphan canonical turn chunks"
+        )
+
+    def get_canonical_turn_rows_by_id(
+        self,
+        keys: list[tuple[str, str]],
+        *,
+        speaker_context: SpeakerRetrievalContext,
+    ) -> dict[tuple[str, str], CanonicalTurnRow]:
+        """Batched physical row lookup by (conversation_id, canonical_turn_id).
+
+        Context-requiring hydration for the speaker-aware branch: rows are
+        returned exactly as stored (no logical sibling merge), missing or
+        inadmissible keys are omitted, and each row keeps its own stored
+        conversation id. The base implementation returns nothing so a
+        backend without the surface fails closed on hydration.
+        """
+        return {}
 
     def delete_canonical_turn_chunk_embeddings(
         self,

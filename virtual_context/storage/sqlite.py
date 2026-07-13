@@ -6448,7 +6448,16 @@ CREATE TABLE IF NOT EXISTS request_captures (
     def get_all_canonical_turn_chunk_embeddings(
         self,
         conversation_id: str | None = None,
+        *,
+        speaker_context: SpeakerRetrievalContext | None = None,
     ) -> list[CanonicalTurnChunkEmbedding]:
+        # ``speaker_context`` opts in to the physical branch. ``None`` —
+        # every existing caller — takes the legacy enumeration below,
+        # byte-for-byte unchanged.
+        if speaker_context is not None:
+            return self._get_all_canonical_turn_chunk_embeddings_speaker(
+                conversation_id, speaker_context,
+            )
         conn = self._get_conn()
         if conversation_id is None:
             rows = conn.execute(
@@ -6475,6 +6484,95 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 conversation_id=row["conversation_id"],
                 canonical_turn_id=(row["canonical_turn_id"] or ""),
                 turn_number=row["turn_number"],
+                side=row["side"],
+                chunk_index=row["chunk_index"],
+                text=row["text"],
+                embedding=json.loads(row["embedding_json"]),
+            )
+            for row in rows
+        ]
+
+    def _get_all_canonical_turn_chunk_embeddings_speaker(
+        self,
+        conversation_id: str | None,
+        speaker_context: SpeakerRetrievalContext,
+    ) -> list[CanonicalTurnChunkEmbedding]:
+        """Physical chunk enumeration for the speaker-aware branch.
+
+        Chunks are admitted only through their physical ``canonical_turns``
+        row — never through the logical ordinal seam — so an orphan chunk
+        can never reach vector scoring. The optional ``conversation_id``
+        may narrow the context's proved owner only; a conflicting value
+        returns no candidates rather than widening scope. ``turn_number``
+        is deliberately not projected here (``-1``): the physical hydration
+        lookup supplies presentation ordinals from the row itself.
+        """
+        owner = speaker_context.owner_conversation_id or ""
+        if owner:
+            if conversation_id is not None and conversation_id != owner:
+                return []
+            scope_id: str | None = owner
+        else:
+            scope_id = conversation_id
+        conn = self._get_conn()
+        sql = """SELECT ctc.conversation_id, ctc.canonical_turn_id, ctc.side,
+                        ctc.chunk_index, ctc.text, ctc.embedding_json
+                 FROM canonical_turn_chunks ctc
+                 JOIN canonical_turns ct
+                   ON ct.conversation_id = ctc.conversation_id
+                  AND ct.canonical_turn_id = ctc.canonical_turn_id"""
+        params: list[object] = []
+        if scope_id is not None:
+            sql += " WHERE ctc.conversation_id = ?"
+            params.append(scope_id)
+        sql += " ORDER BY ctc.conversation_id, ct.sort_key, ctc.side, ctc.chunk_index"
+        rows = conn.execute(sql, params).fetchall()
+        return [
+            CanonicalTurnChunkEmbedding(
+                conversation_id=row["conversation_id"],
+                canonical_turn_id=(row["canonical_turn_id"] or ""),
+                turn_number=-1,
+                side=row["side"],
+                chunk_index=row["chunk_index"],
+                text=row["text"],
+                embedding=json.loads(row["embedding_json"]),
+            )
+            for row in rows
+        ]
+
+    def get_orphan_canonical_turn_chunk_embeddings(
+        self,
+        conversation_id: str | None = None,
+    ) -> list[CanonicalTurnChunkEmbedding]:
+        """Raw reconciliation inventory: chunks whose physical row is gone.
+
+        Anti-join from ``canonical_turn_chunks`` to the physical
+        ``canonical_turns`` table. It must not touch the ordinal view —
+        the absent canonical row is the condition being reported — and the
+        optional literal conversation filter applies before ordering.
+        ``turn_number`` is ``-1`` because no row exists to supply one.
+        """
+        conn = self._get_conn()
+        sql = """SELECT ctc.conversation_id, ctc.canonical_turn_id, ctc.side,
+                        ctc.chunk_index, ctc.text, ctc.embedding_json
+                 FROM canonical_turn_chunks ctc
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM canonical_turns ct
+                     WHERE ct.conversation_id = ctc.conversation_id
+                       AND ct.canonical_turn_id = ctc.canonical_turn_id
+                 )"""
+        params: list[object] = []
+        if conversation_id is not None:
+            sql += " AND ctc.conversation_id = ?"
+            params.append(conversation_id)
+        sql += """ ORDER BY ctc.conversation_id, ctc.canonical_turn_id,
+                            ctc.side, ctc.chunk_index"""
+        rows = conn.execute(sql, params).fetchall()
+        return [
+            CanonicalTurnChunkEmbedding(
+                conversation_id=row["conversation_id"],
+                canonical_turn_id=(row["canonical_turn_id"] or ""),
+                turn_number=-1,
                 side=row["side"],
                 chunk_index=row["chunk_index"],
                 text=row["text"],
@@ -7630,6 +7728,67 @@ CREATE TABLE IF NOT EXISTS request_captures (
             for turn_number in turn_numbers
             if turn_number in merged_rows
         }
+
+    def get_canonical_turn_rows_by_id(
+        self,
+        keys: list[tuple[str, str]],
+        *,
+        speaker_context: SpeakerRetrievalContext,
+    ) -> dict[tuple[str, str], CanonicalTurnRow]:
+        """Batched PHYSICAL row lookup for the speaker-aware branch.
+
+        Rows are fetched by exact ``(conversation_id, canonical_turn_id)``
+        with no ``_merge_canonical_turn_rows`` pass, so a sibling half can
+        never supply another row's text or provenance. Each returned row
+        keeps its stored conversation id; missing keys are omitted. A key
+        naming a conversation other than the context's proved owner is
+        rejected rather than widening scope.
+        """
+        if not keys:
+            return {}
+        owner = speaker_context.owner_conversation_id or ""
+        by_conversation: dict[str, list[str]] = {}
+        for conversation_id, canonical_turn_id in keys:
+            if not conversation_id or not canonical_turn_id:
+                continue
+            if owner and conversation_id != owner:
+                continue
+            bucket = by_conversation.setdefault(conversation_id, [])
+            if canonical_turn_id not in bucket:
+                bucket.append(canonical_turn_id)
+        if not by_conversation:
+            return {}
+        conn = self._get_conn()
+        out: dict[tuple[str, str], CanonicalTurnRow] = {}
+        for conversation_id, turn_ids in by_conversation.items():
+            placeholders = ",".join("?" for _ in turn_ids)
+            rows = conn.execute(
+                f"""SELECT canonical_turn_id, conversation_id, turn_number, turn_group_number,
+                           sort_key, turn_hash, hash_version,
+                           normalized_user_text, normalized_assistant_text,
+                           user_content, assistant_content,
+                           user_raw_content, assistant_raw_content,
+                           primary_tag, tags_json, session_date, sender,
+                           origin_channel_id, origin_channel_label, sender_actor_id,
+                           source_message_id, reply_target_message_id, reply_subject_actor_id,
+                           reply_subject_label, reply_target_body, reply_attribution_version,
+                           audience_conversation_id, audience_attribution_version,
+                           fact_signals_json, code_refs_json,
+                           tagged_at, compacted_at,
+                           first_seen_at, last_seen_at,
+                           source_batch_id, created_at, updated_at
+                    FROM canonical_turns_ordinal
+                    WHERE conversation_id = ?
+                      AND canonical_turn_id IN ({placeholders})""",
+                [conversation_id, *turn_ids],
+            ).fetchall()
+            for row in rows:
+                parsed = _row_to_canonical_turn(row)
+                out[(
+                    parsed.conversation_id or conversation_id,
+                    parsed.canonical_turn_id,
+                )] = parsed
+        return out
 
     def get_all_canonical_turns(
         self,

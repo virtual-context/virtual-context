@@ -3786,6 +3786,14 @@ class VirtualContextEngine:
             raise RuntimeError(
                 "the configured store cannot enumerate orphan canonical turn chunks"
             )
+        # Enumerate up front (read-only) so a store without the real
+        # anti-join fails the whole operation before any live write.
+        try:
+            orphans = orphan_fn(conversation_id)
+        except NotImplementedError as exc:
+            raise RuntimeError(
+                "the configured store cannot enumerate orphan canonical turn chunks"
+            ) from exc
 
         from .core.semantic_search import chunk_turn_text
         from .types import CanonicalTurnChunkEmbedding
@@ -3867,7 +3875,6 @@ class VirtualContextEngine:
                 "subject_created" if state == "subject_missing" else "subject_replaced"
             ] += 1
 
-        orphans = orphan_fn(conversation_id)
         report["orphan_chunks"] = len(orphans)
         orphan_keys: set[tuple[str, str]] = set()
         for chunk in orphans:

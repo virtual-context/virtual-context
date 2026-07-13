@@ -345,6 +345,18 @@ class CompositeStore:
     ) -> dict[int, CanonicalTurnRow]:
         return self._segments.get_canonical_turn_rows(conversation_id, turn_numbers)
 
+    def get_canonical_turn_rows_by_id(
+        self,
+        keys: list[tuple[str, str]],
+        *,
+        speaker_context: "SpeakerRetrievalContext",
+    ) -> dict[tuple[str, str], CanonicalTurnRow]:
+        # The exact request context is forwarded so the backend proves scope
+        # itself; the composite never post-filters returned rows into scope.
+        return self._segments.get_canonical_turn_rows_by_id(
+            keys, speaker_context=speaker_context,
+        )
+
     def get_all_canonical_turns(
         self,
         conversation_id: str,
@@ -859,8 +871,25 @@ class CompositeStore:
     def get_all_canonical_turn_chunk_embeddings(
         self,
         conversation_id: str | None = None,
+        *,
+        speaker_context: "SpeakerRetrievalContext | None" = None,
     ) -> list[CanonicalTurnChunkEmbedding]:
+        # Forwarded only when supplied, so a search backend predating the
+        # argument keeps working unchanged on the legacy call shape.
+        if speaker_context is not None:
+            return self._search.get_all_canonical_turn_chunk_embeddings(
+                conversation_id=conversation_id,
+                speaker_context=speaker_context,
+            )
         return self._search.get_all_canonical_turn_chunk_embeddings(
+            conversation_id=conversation_id,
+        )
+
+    def get_orphan_canonical_turn_chunk_embeddings(
+        self,
+        conversation_id: str | None = None,
+    ) -> list[CanonicalTurnChunkEmbedding]:
+        return self._search.get_orphan_canonical_turn_chunk_embeddings(
             conversation_id=conversation_id,
         )
 
