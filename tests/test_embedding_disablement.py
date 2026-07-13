@@ -46,10 +46,29 @@ class TestDisabledProvider:
 
 
 class TestFactoryKeywordFallback:
-    def test_factory_yielding_none_selects_keyword(self):
+    def test_factory_yielding_none_degrades_to_general_not_keyword(self):
+        """An unavailable factory must not silently substitute a keyword
+        tagger; it builds a degraded embedding generator whose calls return
+        the established _general fallback, which health monitoring alerts
+        on."""
         config = TagGeneratorConfig(type="embedding", max_tags=3, min_tags=1)
         gen = build_tag_generator(config, embed_fn_factory=lambda: None)
-        assert isinstance(gen, KeywordTagGenerator)
+        assert isinstance(gen, EmbeddingTagGenerator)
+        result = gen.generate_tags("some text", ["real-tag"])
+        assert result.primary == "_general"
+        assert result.source == "fallback"
+
+    def test_factory_yielding_none_ignores_configured_keyword_fallback(self):
+        from virtual_context.types import KeywordTagConfig
+        config = TagGeneratorConfig(
+            type="embedding", max_tags=3, min_tags=1,
+            keyword_fallback=KeywordTagConfig(),
+        )
+        gen = build_tag_generator(config, embed_fn_factory=lambda: None)
+        assert isinstance(gen, EmbeddingTagGenerator)
+        result = gen.generate_tags("anything")
+        assert result.primary == "_general"
+        assert result.source == "fallback"
 
     def test_factory_yielding_fn_selects_embedding(self):
         config = TagGeneratorConfig(type="embedding", max_tags=3, min_tags=1)
@@ -140,3 +159,22 @@ class TestRelevanceGateFailOpen:
         ok, score = manager.context_is_relevant_with_score("current turn", ["a", "b"])
         assert ok is True
         assert score == -1.0
+
+
+def test_degraded_generator_never_substitutes_keyword_matching():
+    """The degraded result is an alertable _general, not a silent keyword
+    substitute — even when a keyword config would have matched the text."""
+    from virtual_context.types import KeywordTagConfig, TagGeneratorConfig
+    from virtual_context.core.tag_generator import build_tag_generator
+
+    config = TagGeneratorConfig(
+        type="embedding",
+        keyword_fallback=KeywordTagConfig(
+            tag_keywords={"databases": ["postgres"]},
+        ),
+    )
+    gen = build_tag_generator(config, embed_fn_factory=lambda: None)
+    result = gen.generate_tags("postgres connection pooling question")
+    assert result.primary == "_general"
+    assert result.tags == ["_general"]
+    assert result.source == "fallback"
