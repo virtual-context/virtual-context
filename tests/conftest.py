@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
+import os
 import tempfile
+
+# Embedding models are pre-cached; without these flags each model
+# construction performs a network revision check against the hub CDN,
+# which can stall the suite for minutes under a degraded network.
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
