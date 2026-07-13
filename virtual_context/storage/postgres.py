@@ -54,11 +54,17 @@ from ..types import (
     CARD_SCOPES,
     CARD_SENSITIVITIES,
     CARD_SENSITIVITY_NORMAL,
+    RESERVED_SPEAKER_HANDLES,
     ActorCard,
     ActorCardEntry,
     ActorCardEntrySource,
     ActorFactSource,
     ActorProfile,
+    SpeakerHandleAssignment,
+    SpeakerHandleCandidate,
+    is_valid_speaker_handle,
+    normalize_speaker_handle_base,
+    speaker_handle_for_rank,
 )
 from .helpers import dt_to_str as _dt_to_str, str_to_dt as _str_to_dt, extract_excerpt as _extract_excerpt
 
@@ -481,6 +487,25 @@ FACT_AUTHOR_COLUMN_DEFS: dict[str, str] = {
     "author_source_message_id": "TEXT NOT NULL DEFAULT ''",
 }
 FACT_AUTHOR_COLUMNS: tuple[str, ...] = tuple(FACT_AUTHOR_COLUMN_DEFS)
+
+# Durable speaker-handle assignments. Same manifest discipline: the CREATE
+# TABLE and the startup assertion must agree, or a half-migrated database
+# silently mints unstable handles instead of failing startup.
+SPEAKER_HANDLE_COLUMNS: tuple[str, ...] = (
+    "tenant_id",
+    "audience_conversation_id",
+    "actor_id",
+    "handle",
+    "normalized_base",
+    "first_seen_sort_key",
+    "created_at",
+    "lifecycle_epoch",
+)
+# Both contract-required unique keys, as ordered column tuples.
+SPEAKER_HANDLE_UNIQUE_KEYS: tuple[tuple[str, ...], ...] = (
+    ("tenant_id", "audience_conversation_id", "actor_id"),
+    ("tenant_id", "audience_conversation_id", "handle"),
+)
 
 # Postgres FTS: tsvector columns + GIN indexes
 FTS_SQL = """\
@@ -1739,11 +1764,18 @@ class PostgresStore(ContextStore):
             self._ensure_actor_card_schema()
         except Exception:
             logger.warning("actor card bootstrap failed", exc_info=True)
+        try:
+            self._ensure_speaker_handle_schema()
+        except Exception:
+            logger.warning("speaker handle bootstrap failed", exc_info=True)
         # The bootstrap above swallows broad failures, and each ADD COLUMN
         # swallows its own, so a half-migrated schema would otherwise run
         # silently and drop identity on every write. Assert the actor column
         # on both the base table and the ordinal view, OUTSIDE those catches.
         self._assert_actor_schema()
+        # Same rule for the handle relation: a swallowed CREATE must not
+        # become a process that silently cannot persist stable handles.
+        self._assert_speaker_handle_schema()
         # Required fence DDL runs outside the broad canonical-turn
         # try/catch so a real failure (permission, type, persistent
         # lock timeout) blocks startup. M0 cleanup DELETEs depend on
@@ -2019,6 +2051,102 @@ class PostgresStore(ContextStore):
                 """CREATE INDEX IF NOT EXISTS idx_actor_card_sources_fact
                    ON actor_card_entry_sources(fact_id)"""
             )
+
+    def _ensure_speaker_handle_schema(self) -> None:
+        """Create the durable speaker-handle assignment relation.
+
+        Assignments are keyed per validated pre-alias audience conversation,
+        never per alias-resolved owner, so a DM and a guild that come to share
+        a VCMERGE owner keep separate handle namespaces. Two unique keys are
+        load-bearing: one actor cannot hold two handles, and one handle cannot
+        name two actors, within an audience. ``lifecycle_epoch`` records the
+        audience epoch at allocation so delete-and-resurrect starts a fresh
+        namespace and a stale worker cannot recreate old assignments.
+        """
+        with self.pool.connection() as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS speaker_handles (
+                    tenant_id TEXT NOT NULL,
+                    audience_conversation_id TEXT NOT NULL,
+                    actor_id TEXT NOT NULL,
+                    handle TEXT NOT NULL,
+                    normalized_base TEXT NOT NULL DEFAULT '',
+                    first_seen_sort_key DOUBLE PRECISION NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    lifecycle_epoch INT NOT NULL DEFAULT 1,
+                    PRIMARY KEY (tenant_id, audience_conversation_id, actor_id)
+                )
+            """)
+            conn.execute(
+                """CREATE UNIQUE INDEX IF NOT EXISTS
+                       idx_speaker_handles_handle_unique
+                   ON speaker_handles(tenant_id, audience_conversation_id,
+                                      handle)"""
+            )
+            conn.execute(
+                """CREATE INDEX IF NOT EXISTS idx_speaker_handles_base
+                   ON speaker_handles(tenant_id, audience_conversation_id,
+                                      normalized_base)"""
+            )
+            conn.execute(
+                """CREATE INDEX IF NOT EXISTS idx_speaker_handles_audience
+                   ON speaker_handles(audience_conversation_id)"""
+            )
+
+    def _assert_speaker_handle_schema(self) -> None:
+        """Fail startup when durable handles would silently not persist.
+
+        The bootstrap swallows broad failures, so without this a database
+        whose handle DDL failed would run happily while every roster build
+        found no stable storage. Handles are identity state: refuse to start
+        on a missing or half-migrated relation instead.
+        """
+        with self.pool.connection() as conn:
+            hit = conn.execute(
+                "SELECT to_regclass('public.speaker_handles') AS reg"
+            ).fetchone()
+            if not hit or not (hit["reg"] if isinstance(hit, dict) else hit[0]):
+                raise RuntimeError(
+                    "speaker_handles is missing; refusing to run speaker "
+                    "rosters without durable handle storage"
+                )
+            rows = conn.execute(
+                """SELECT column_name FROM information_schema.columns
+                    WHERE table_name = 'speaker_handles'"""
+            ).fetchall()
+            columns = {
+                (r["column_name"] if isinstance(r, dict) else r[0])
+                for r in (rows or ())
+            }
+            missing = [c for c in SPEAKER_HANDLE_COLUMNS if c not in columns]
+            if missing:
+                raise RuntimeError(
+                    f"speaker_handles is missing {', '.join(missing)}; "
+                    f"refusing to run speaker rosters on a half-migrated "
+                    f"schema"
+                )
+            unique_rows = conn.execute(
+                """SELECT array_agg(a.attname ORDER BY k.ord) AS cols
+                     FROM pg_index i
+                     JOIN LATERAL unnest(i.indkey)
+                          WITH ORDINALITY AS k(attnum, ord) ON TRUE
+                     JOIN pg_attribute a
+                       ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+                    WHERE i.indrelid = 'speaker_handles'::regclass
+                      AND i.indisunique
+                    GROUP BY i.indexrelid"""
+            ).fetchall()
+            unique_keys = {
+                tuple((r["cols"] if isinstance(r, dict) else r[0]) or ())
+                for r in (unique_rows or ())
+            }
+            for required in SPEAKER_HANDLE_UNIQUE_KEYS:
+                if required not in unique_keys:
+                    raise RuntimeError(
+                        f"speaker_handles is missing the unique key on "
+                        f"({', '.join(required)}); without it concurrent "
+                        f"allocators could duplicate or repoint a handle"
+                    )
 
     def _ensure_canonical_turn_schema(self) -> None:
         with self.pool.connection() as conn:
@@ -2954,6 +3082,18 @@ class PostgresStore(ContextStore):
                    AND status IN ('queued', 'running')
                 """,
                 (now, conversation_id),
+            )
+            # Same transaction: a deleted audience's speaker-handle
+            # assignments must be gone before the conversation can
+            # disappear, and a stale allocator then fails its
+            # in-transaction phase/epoch re-proof instead of recreating
+            # them.
+            conn.execute(
+                """
+                DELETE FROM speaker_handles
+                 WHERE audience_conversation_id = %s
+                """,
+                (conversation_id,),
             )
 
     def increment_lifecycle_epoch_on_resurrect(self, conversation_id: str) -> int:
@@ -4545,6 +4685,13 @@ class PostgresStore(ContextStore):
                 for cid in sorted({source_conversation_id, target_conversation_id}):
                     self._invalidate_actor_cards(conn, cid)
 
+                # speaker_handles rows are deliberately NOT moved, rekeyed, or
+                # coalesced by the merge: assignments are keyed per audience
+                # conversation, and the source and target audiences remain
+                # separate handle namespaces after the merge. Rekeying them
+                # under the new owner could repoint a handle onto a different
+                # actor, which is forbidden.
+
             # Outer transaction commits here. The combined-with above
             # has already exited (resetting the scope contextvar). The
             # local ``post_commit_scope`` dict is still bound in this
@@ -5570,6 +5717,17 @@ class PostgresStore(ContextStore):
                     "conversations",
                 ):
                     self._delete_conversation_rows(conn, table, conversation_id)
+
+                # speaker_handles is keyed by audience conversation, not by
+                # ``conversation_id``, so the loop above cannot reach it.
+                # Remove the deleted audience's assignments in the same
+                # transaction: a handle namespace must not outlive its
+                # audience.
+                conn.execute(
+                    """DELETE FROM speaker_handles
+                        WHERE audience_conversation_id = %s""",
+                    (conversation_id,),
+                )
 
                 # A profile with no surviving actor rows and no surviving facts
                 # is not a person we know anything about any more.
@@ -9782,6 +9940,276 @@ class PostgresStore(ContextStore):
                            AND c.tenant_id = p.tenant_id)""",
             (tenant_id, actor_ids),
         )
+        return int(result.rowcount or 0)
+
+    # ------------------------------------------------------------------
+    # Durable speaker handles
+    #
+    # Assignments are keyed ``(tenant_id, audience_conversation_id,
+    # actor_id)`` and immutable within an audience lifecycle. Allocation
+    # participates in the canonical lifecycle lock domain: the
+    # ``conversation_lifecycle`` row is locked first (same order as the
+    # merge and delete bodies), then the audience's ``conversations`` row is
+    # locked FOR UPDATE and re-proved (tenant, live phase,
+    # owner-or-retained-alias, exact expected lifecycle epoch) inside the
+    # same insertion transaction. The FOR UPDATE serializes concurrent
+    # allocators per audience; the lifecycle share lock is NOT the
+    # authoritative epoch check.
+    # ------------------------------------------------------------------
+
+    def supports_speaker_handles(self) -> bool:
+        return True
+
+    @staticmethod
+    def _row_to_speaker_handle(row) -> SpeakerHandleAssignment:
+        def _get(key: str, idx: int):
+            return row[key] if isinstance(row, dict) else row[idx]
+
+        return SpeakerHandleAssignment(
+            tenant_id=_get("tenant_id", 0) or "",
+            audience_conversation_id=_get("audience_conversation_id", 1) or "",
+            actor_id=_get("actor_id", 2) or "",
+            handle=_get("handle", 3) or "",
+            normalized_base=_get("normalized_base", 4) or "",
+            first_seen_sort_key=float(_get("first_seen_sort_key", 5) or 0.0),
+            created_at=_get("created_at", 6) or "",
+            lifecycle_epoch=int(_get("lifecycle_epoch", 7) or 0),
+        )
+
+    def get_speaker_handles(
+        self,
+        tenant_id: str,
+        audience_conversation_id: str,
+        actor_ids: list[str],
+    ) -> list[SpeakerHandleAssignment]:
+        """Fetch assignments for an already policy-derived actor set only."""
+        if not tenant_id or not audience_conversation_id:
+            return []
+        wanted = [a for a in dict.fromkeys(actor_ids or []) if a]
+        if not wanted:
+            return []
+        with self.pool.connection() as conn:
+            rows = conn.execute(
+                """SELECT tenant_id, audience_conversation_id, actor_id,
+                          handle, normalized_base, first_seen_sort_key,
+                          created_at, lifecycle_epoch
+                     FROM speaker_handles
+                    WHERE tenant_id = %s
+                      AND audience_conversation_id = %s
+                      AND actor_id = ANY(%s)
+                    ORDER BY first_seen_sort_key, actor_id""",
+                (tenant_id, audience_conversation_id, wanted),
+            ).fetchall()
+        return [self._row_to_speaker_handle(row) for row in rows or ()]
+
+    def allocate_speaker_handles(
+        self,
+        tenant_id: str,
+        audience_conversation_id: str,
+        candidates: list[SpeakerHandleCandidate],
+        *,
+        owner_conversation_id: str,
+        expected_lifecycle_epoch: int,
+    ) -> list[SpeakerHandleAssignment]:
+        """Allocate immutable handles inside one lifecycle-fenced transaction.
+
+        Existing assignments are returned unchanged — never updated,
+        re-based, or repointed, even when the candidate arrives with a new
+        normalized base after a rename. Unassigned candidates are processed
+        in deterministic ``(first_seen_sort_key, actor_id)`` order; a handle
+        collision advances through ``base``, ``base.2``, ``base.3``, … inside
+        the same transaction.
+        """
+        from ..core.exceptions import LifecycleEpochMismatch
+
+        if not tenant_id or not audience_conversation_id or not owner_conversation_id:
+            raise ValueError(
+                "speaker-handle allocation requires tenant, audience, and owner"
+            )
+
+        def _col(row, key, idx):
+            return row[key] if isinstance(row, dict) else row[idx]
+
+        assigned: dict[str, SpeakerHandleAssignment] = {}
+        with self.pool.connection() as conn:
+            with conn.transaction():
+                self._acquire_lifecycle_share_lock(
+                    conn, audience_conversation_id,
+                )
+                row = conn.execute(
+                    """SELECT tenant_id, lifecycle_epoch, phase, deleted_at
+                         FROM conversations
+                        WHERE conversation_id = %s
+                          FOR UPDATE""",
+                    (audience_conversation_id,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(audience_conversation_id)
+                if str(_col(row, "tenant_id", 0) or "") != str(tenant_id):
+                    raise ValueError(
+                        "audience conversation belongs to a different "
+                        "tenant; refusing handle allocation"
+                    )
+                if (
+                    str(_col(row, "phase", 2) or "") == "deleted"
+                    or _col(row, "deleted_at", 3) is not None
+                ):
+                    raise LifecycleEpochMismatch(
+                        f"audience conversation {audience_conversation_id} "
+                        f"is deleted; refusing handle allocation"
+                    )
+                if int(_col(row, "lifecycle_epoch", 1) or 0) != int(
+                    expected_lifecycle_epoch
+                ):
+                    raise LifecycleEpochMismatch(
+                        f"audience lifecycle_epoch advanced "
+                        f"({_col(row, 'lifecycle_epoch', 1)} != "
+                        f"{expected_lifecycle_epoch}); refusing stale handle "
+                        f"allocation"
+                    )
+                if audience_conversation_id != owner_conversation_id:
+                    alias = conn.execute(
+                        """SELECT target_id FROM conversation_aliases
+                            WHERE alias_id = %s""",
+                        (audience_conversation_id,),
+                    ).fetchone()
+                    if alias is None or str(
+                        _col(alias, "target_id", 0) or ""
+                    ) != str(owner_conversation_id):
+                        raise ValueError(
+                            "audience is neither the owner conversation nor "
+                            "a retained alias of it; refusing handle "
+                            "allocation"
+                        )
+
+                by_actor: dict[str, SpeakerHandleCandidate] = {}
+                for cand in candidates or []:
+                    actor = (cand.actor_id or "").strip()
+                    if actor and actor not in by_actor:
+                        by_actor[actor] = cand
+                if by_actor:
+                    for erow in conn.execute(
+                        """SELECT tenant_id, audience_conversation_id,
+                                  actor_id, handle, normalized_base,
+                                  first_seen_sort_key, created_at,
+                                  lifecycle_epoch
+                             FROM speaker_handles
+                            WHERE tenant_id = %s
+                              AND audience_conversation_id = %s
+                              AND actor_id = ANY(%s)""",
+                        (
+                            tenant_id,
+                            audience_conversation_id,
+                            list(by_actor),
+                        ),
+                    ).fetchall() or ():
+                        existing = self._row_to_speaker_handle(erow)
+                        assigned[existing.actor_id] = existing
+                pending = sorted(
+                    (
+                        (actor, cand)
+                        for actor, cand in by_actor.items()
+                        if actor not in assigned
+                    ),
+                    key=lambda item: (
+                        float(item[1].first_seen_sort_key or 0.0),
+                        item[0],
+                    ),
+                )
+                now = utcnow_iso()
+                for actor, cand in pending:
+                    base = normalize_speaker_handle_base(cand.normalized_base)
+                    assignment = self._insert_speaker_handle(
+                        conn,
+                        tenant_id=tenant_id,
+                        audience_conversation_id=audience_conversation_id,
+                        actor_id=actor,
+                        base=base,
+                        first_seen_sort_key=float(
+                            cand.first_seen_sort_key or 0.0
+                        ),
+                        created_at=now,
+                        lifecycle_epoch=int(expected_lifecycle_epoch),
+                    )
+                    assigned[actor] = assignment
+        return sorted(
+            assigned.values(),
+            key=lambda a: (a.first_seen_sort_key, a.actor_id),
+        )
+
+    @staticmethod
+    def _insert_speaker_handle(
+        conn,
+        *,
+        tenant_id: str,
+        audience_conversation_id: str,
+        actor_id: str,
+        base: str,
+        first_seen_sort_key: float,
+        created_at: str,
+        lifecycle_epoch: int,
+    ) -> SpeakerHandleAssignment:
+        """Insert one assignment, advancing suffixes on handle collision.
+
+        ``ON CONFLICT`` targets only the handle unique key: a taken handle
+        advances to the next deterministic suffix without aborting the
+        transaction, while an actor-key conflict (which the caller's
+        in-transaction read already excluded) stays a loud UniqueViolation
+        rather than a silent repoint.
+        """
+        rank = 1
+        while rank <= 100000:
+            handle = speaker_handle_for_rank(base, rank)
+            if (
+                not is_valid_speaker_handle(handle)
+                or handle in RESERVED_SPEAKER_HANDLES
+            ):
+                raise ValueError(
+                    "derived speaker handle violates the handle grammar"
+                )
+            inserted = conn.execute(
+                """INSERT INTO speaker_handles
+                       (tenant_id, audience_conversation_id, actor_id, handle,
+                        normalized_base, first_seen_sort_key, created_at,
+                        lifecycle_epoch)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                   ON CONFLICT (tenant_id, audience_conversation_id, handle)
+                   DO NOTHING
+                   RETURNING handle""",
+                (
+                    tenant_id, audience_conversation_id, actor_id, handle,
+                    base, first_seen_sort_key, created_at, lifecycle_epoch,
+                ),
+            ).fetchone()
+            if inserted is not None:
+                return SpeakerHandleAssignment(
+                    tenant_id=tenant_id,
+                    audience_conversation_id=audience_conversation_id,
+                    actor_id=actor_id,
+                    handle=handle,
+                    normalized_base=base,
+                    first_seen_sort_key=first_seen_sort_key,
+                    created_at=created_at,
+                    lifecycle_epoch=lifecycle_epoch,
+                )
+            rank += 1
+        raise RuntimeError("could not allocate a unique speaker handle")
+
+    def delete_speaker_handles_for_audience(
+        self,
+        tenant_id: str,
+        audience_conversation_id: str,
+    ) -> int:
+        """Remove one audience's assignments; returns rows removed."""
+        if not tenant_id or not audience_conversation_id:
+            return 0
+        with self.pool.connection() as conn:
+            result = conn.execute(
+                """DELETE FROM speaker_handles
+                    WHERE tenant_id = %s
+                      AND audience_conversation_id = %s""",
+                (tenant_id, audience_conversation_id),
+            )
         return int(result.rowcount or 0)
 
     def search_facts(self, query: str, limit: int = 10, conversation_id: str | None = None) -> list[Fact]:

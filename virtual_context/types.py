@@ -1174,6 +1174,113 @@ class ActorRoster:
 
 
 # ---------------------------------------------------------------------------
+# Speaker roster handles
+# ---------------------------------------------------------------------------
+
+# The handle grammar and maximum length are configuration-independent protocol
+# constants: a handle is bounded ASCII with no controls or whitespace, so a
+# display name can never smuggle wrapper text, schema syntax, or instructions
+# through a roster entry. A handle is a lowercase-letter-led run of
+# ``[a-z0-9_]`` with an optional numeric collision suffix such as ``alex.2``.
+SPEAKER_HANDLE_MAX_LENGTH = 32
+# Base names leave headroom for a collision suffix so suffixing never has to
+# truncate an already-emitted handle differently between allocations.
+SPEAKER_HANDLE_BASE_MAX_LENGTH = 24
+# Deterministic base when a display name normalizes to nothing usable or to a
+# reserved engine identity.
+SPEAKER_HANDLE_FALLBACK_BASE = "user"
+# Engine-owned identities that may never be allocated to a human actor.
+RESERVED_SPEAKER_HANDLES: tuple[str, ...] = ("assistant",)
+
+_SPEAKER_HANDLE_RE = re.compile(r"^[a-z][a-z0-9_]*(?:\.[0-9]+)?$")
+
+
+def is_valid_speaker_handle(handle: object) -> bool:
+    """Grammar check only: bounded ASCII, no controls, no whitespace.
+
+    Reservation is a separate policy: the reserved ``assistant`` identity is
+    grammatically a handle (it can appear in a snapshot as the engine's own
+    entry) but is never allocatable to a human. Callers that mint handles must
+    also exclude ``RESERVED_SPEAKER_HANDLES``.
+    """
+    if not isinstance(handle, str):
+        return False
+    if not handle or len(handle) > SPEAKER_HANDLE_MAX_LENGTH:
+        return False
+    return _SPEAKER_HANDLE_RE.match(handle) is not None
+
+
+def normalize_speaker_handle_base(name: str) -> str:
+    """Deterministically derive a valid, non-reserved handle base from a name.
+
+    Display names are presentation data; this mapping is one-way and lossy on
+    purpose. Characters outside the grammar are dropped, separator runs
+    collapse to one ``_``, the result must start with a letter, and anything
+    empty or reserved falls back to ``SPEAKER_HANDLE_FALLBACK_BASE``. A rename
+    never changes an existing handle — this base participates only in first
+    allocation.
+    """
+    out: list[str] = []
+    for ch in (name or "").strip().casefold():
+        if "a" <= ch <= "z" or "0" <= ch <= "9":
+            out.append(ch)
+        elif ch in " -_." and out and out[-1] != "_":
+            out.append("_")
+    base = "".join(out).lstrip("0123456789_").rstrip("_")
+    base = base[:SPEAKER_HANDLE_BASE_MAX_LENGTH].rstrip("_")
+    if not base or base in RESERVED_SPEAKER_HANDLES:
+        return SPEAKER_HANDLE_FALLBACK_BASE
+    return base
+
+
+def speaker_handle_for_rank(base: str, rank: int) -> str:
+    """The deterministic handle for the *rank*-th holder of one base.
+
+    Rank 1 is the bare base; later ranks get ``.<rank>`` suffixes such as
+    ``alex.2``. The base is truncated so the suffixed handle always fits the
+    protocol maximum length.
+    """
+    if rank <= 1:
+        return base[:SPEAKER_HANDLE_MAX_LENGTH]
+    suffix = f".{rank}"
+    return base[: SPEAKER_HANDLE_MAX_LENGTH - len(suffix)] + suffix
+
+
+@dataclass(frozen=True)
+class SpeakerHandleCandidate:
+    """One eligible, already policy-derived actor awaiting a durable handle.
+
+    Built only from admissible physical rows — never from the assignment
+    table, tool input, or a display label. ``actor_id`` is internal
+    provenance and excluded from ``repr`` so the candidate can never leak
+    identity through generic logging or exception formatting.
+    """
+    actor_id: str = field(default="", repr=False)
+    normalized_base: str = ""
+    first_seen_sort_key: float = 0.0
+
+
+@dataclass(frozen=True)
+class SpeakerHandleAssignment:
+    """One immutable durable handle row.
+
+    Keyed ``(tenant_id, audience_conversation_id, actor_id)`` — per validated
+    pre-alias audience, not per alias-resolved owner, so a DM and a guild that
+    share a VCMERGE owner keep separate handle namespaces. An assignment is
+    never updated or repointed within an audience lifecycle; renames change
+    later presentation only. ``actor_id`` is excluded from ``repr``.
+    """
+    tenant_id: str = ""
+    audience_conversation_id: str = ""
+    actor_id: str = field(default="", repr=False)
+    handle: str = ""
+    normalized_base: str = ""
+    first_seen_sort_key: float = 0.0
+    created_at: str = ""
+    lifecycle_epoch: int = 0
+
+
+# ---------------------------------------------------------------------------
 # Person cards
 # ---------------------------------------------------------------------------
 
