@@ -18,6 +18,7 @@ from ..types import (
     LinkedFact,
     Message,
     QuoteResult,
+    SpeakerRetrievalContext,
     StoredSegment,
     StoredSummary,
     TagStats,
@@ -802,7 +803,17 @@ class CompositeStore:
     def search_full_text(self, *args, **kwargs) -> list[QuoteResult]:
         return self._search.search_full_text(*args, **kwargs)
 
-    def search_canonical_turn_text(self, *args, **kwargs) -> list[QuoteResult]:
+    def search_canonical_turn_text(
+        self,
+        *args,
+        speaker_context: "SpeakerRetrievalContext | None" = None,
+        **kwargs,
+    ) -> list[QuoteResult]:
+        # ``speaker_context`` is forwarded only when supplied, so a search
+        # backend predating the argument keeps working unchanged and the
+        # legacy call shape stays byte-identical.
+        if speaker_context is not None:
+            kwargs["speaker_context"] = speaker_context
         return self._search.search_canonical_turn_text(*args, **kwargs)
 
     def store_chunk_embeddings(

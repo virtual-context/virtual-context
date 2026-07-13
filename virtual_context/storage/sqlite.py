@@ -34,7 +34,7 @@ from ..core.progress_snapshot import (
     ProgressSnapshot,
 )
 from ..core.store import ContextStore
-from ..types import ChunkEmbedding, ConversationStats, DepthLevel, EngineStateSnapshot, Fact, FactLink, FactSignal, CanonicalTurnChunkEmbedding, CanonicalTurnRow, LinkedFact, QuoteResult, SegmentMetadata, StoredSegment, StoredSummary, TagStats, TagSummary, TemporalStatus, TurnTagEntry, WorkingSetEntry, channel_excerpt_prefix, strip_channel_hash
+from ..types import ChunkEmbedding, ConversationStats, DepthLevel, EngineStateSnapshot, Fact, FactLink, FactSignal, CanonicalTurnChunkEmbedding, CanonicalTurnRow, LinkedFact, QuoteResult, SegmentMetadata, SourceProvenance, SpeakerRetrievalContext, StoredSegment, StoredSummary, TagStats, TagSummary, TemporalStatus, TurnTagEntry, WorkingSetEntry, channel_excerpt_prefix, strip_channel_hash
 from ..types import (
     CARD_CROSS_CONTEXT_KINDS,
     CARD_KINDS,
@@ -2955,7 +2955,16 @@ CREATE TABLE IF NOT EXISTS request_captures (
         limit: int = 5,
         conversation_id: str | None = None,
         channel: str = "",
+        *,
+        speaker_context: SpeakerRetrievalContext | None = None,
     ) -> list[QuoteResult]:
+        # ``speaker_context`` opts in to the physical role-local projection.
+        # ``None`` — every existing caller — takes the legacy branch below,
+        # byte-for-byte unchanged.
+        if speaker_context is not None:
+            return self._search_canonical_turn_text_speaker(
+                query, limit, conversation_id, channel, speaker_context,
+            )
         conn = self._get_conn()
         pattern = f"%{query}%"
         sender_pattern = f"%{_escape_like(query)}%"
@@ -3038,6 +3047,221 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 turn_number=turn,
                 matched_side=matched_side,
             ))
+        return results
+
+    def _search_canonical_turn_text_speaker(
+        self,
+        query: str,
+        limit: int,
+        conversation_id: str | None,
+        channel: str,
+        speaker_context: SpeakerRetrievalContext,
+    ) -> list[QuoteResult]:
+        """Physical role-local candidate projection for speaker-aware search.
+
+        Reached only when the caller supplies a ``speaker_context``; nothing
+        on the legacy path routes here. Two lane-local queries run, each with
+        its own predicates, excerpting, and its own ``LIMIT``:
+
+        * The turn lane matches ``user_content``/``assistant_content``/
+          ``sender`` and emits requester and assistant role-local candidates.
+          A row matching on both halves is split into one requester and one
+          assistant candidate before any dedupe or ranking; the two share the
+          physical ``segment_ref`` for later display dedupe. A row whose
+          match side cannot be located gets a combined excerpt with
+          ``source_role="mixed"`` and no human actor.
+        * The subject lane matches ``reply_target_body`` only and emits
+          ``source_role="subject"`` candidates carrying only that row's
+          ``reply_subject_actor_id``. Reply text is never concatenated into
+          requester text; the raw stored reply label rides along only as an
+          unverified claim.
+
+        Every candidate carries ``SourceProvenance`` projected from the exact
+        physical row that matched, before dedupe, merging, or reranking.
+        """
+        conn = self._get_conn()
+        _sc = getattr(self, "search_config", None)
+        _ctx_chars = _sc.excerpt_context_chars if _sc else 200
+        pattern = f"%{query}%"
+        wanted_channel = (channel or "").strip()
+
+        def _channel_filter() -> tuple[str, list[object]]:
+            if not wanted_channel:
+                return "", []
+            sql = " AND (origin_channel_id = ?"
+            params: list[object] = [wanted_channel]
+            wanted_label = strip_channel_hash(wanted_channel).lower()
+            if wanted_label:
+                sql += """ OR LOWER(CASE
+                                   WHEN origin_channel_label LIKE '#%'
+                                   THEN SUBSTR(origin_channel_label, 2)
+                                   ELSE origin_channel_label
+                               END) = ?"""
+                params.append(wanted_label)
+            sql += ")"
+            return sql, params
+
+        def _prefix(row: sqlite3.Row) -> str:
+            if not wanted_channel:
+                return ""
+            return channel_excerpt_prefix(
+                row["origin_channel_id"] or "",
+                row["origin_channel_label"] or "",
+            )
+
+        def _tags(row: sqlite3.Row) -> list[str]:
+            try:
+                return list(json.loads(row["tags_json"] or "[]") or [])
+            except Exception:
+                return []
+
+        def _provenance(
+            row: sqlite3.Row,
+            source_role: str,
+            actor_id: str,
+            claimed_subject_label: str = "",
+        ) -> SourceProvenance:
+            return SourceProvenance(
+                conversation_id=row["conversation_id"] or "",
+                canonical_turn_id=row["canonical_turn_id"] or "",
+                source_role=source_role,
+                actor_id=actor_id or "",
+                audience_conversation_id=row["audience_conversation_id"] or "",
+                audience_attribution_version=int(
+                    row["audience_attribution_version"] or 0
+                ),
+                origin_channel_id=row["origin_channel_id"] or "",
+                claimed_subject_label=claimed_subject_label or "",
+            )
+
+        results: list[QuoteResult] = []
+
+        # --- Turn lane: requester / assistant role-local candidates -------
+        sender_pattern = f"%{_escape_like(query)}%"
+        sql = """SELECT canonical_turn_id, conversation_id, turn_number,
+                        user_content, assistant_content, primary_tag,
+                        tags_json, session_date, sender, origin_channel_id,
+                        origin_channel_label, sender_actor_id,
+                        audience_conversation_id, audience_attribution_version
+                 FROM canonical_turns_ordinal
+                 WHERE (user_content LIKE ?
+                        OR assistant_content LIKE ?
+                        OR (sender LIKE ? ESCAPE '\\'
+                            AND TRIM(COALESCE(user_content, '')) <> ''))"""
+        params: list[object] = [pattern, pattern, sender_pattern]
+        if conversation_id is not None:
+            sql += " AND conversation_id = ?"
+            params.append(conversation_id)
+        chan_sql, chan_params = _channel_filter()
+        sql += chan_sql
+        params.extend(chan_params)
+        sql += " ORDER BY turn_number DESC LIMIT ?"
+        params.append(limit)
+        for row in conn.execute(sql, params).fetchall():
+            turn = row["turn_number"]
+            u = row["user_content"] or ""
+            a = row["assistant_content"] or ""
+            sender = row["sender"] or ""
+            matched_side = _matched_turn_side(query, u, a, sender)
+            prefix = _prefix(row)
+            common = dict(
+                tag=row["primary_tag"] or "_general",
+                segment_ref=f"canonical_turn_{row['canonical_turn_id'] or turn}",
+                tags=_tags(row),
+                match_type="full_text_search",
+                session_date=row["session_date"] or "",
+                source_scope="turn",
+                turn_number=turn,
+            )
+            if matched_side == "both":
+                # Split into role-local halves: a two-sided match is not
+                # proof of one author. Each half carries only its own
+                # lane's excerpt and actor.
+                results.append(QuoteResult(
+                    text=prefix + _build_turn_excerpt(
+                        query, u, a, "user",
+                        context_chars=_ctx_chars, sender=sender,
+                    ),
+                    matched_side="user",
+                    provenance=_provenance(
+                        row, "requester", row["sender_actor_id"] or "",
+                    ),
+                    **common,
+                ))
+                results.append(QuoteResult(
+                    text=prefix + _build_turn_excerpt(
+                        query, u, a, "assistant",
+                        context_chars=_ctx_chars, sender=sender,
+                    ),
+                    matched_side="assistant",
+                    provenance=_provenance(row, "assistant", ""),
+                    **common,
+                ))
+                continue
+            excerpt = prefix + _build_turn_excerpt(
+                query, u, a, matched_side,
+                context_chars=_ctx_chars, sender=sender,
+            )
+            if matched_side == "user":
+                role, actor = "requester", row["sender_actor_id"] or ""
+            elif matched_side == "assistant":
+                role, actor = "assistant", ""
+            else:
+                # Unlocatable match side: the excerpt combines both lanes,
+                # so it never receives a singular human speaker.
+                role, actor = "mixed", ""
+            results.append(QuoteResult(
+                text=excerpt,
+                matched_side=matched_side,
+                provenance=_provenance(row, role, actor),
+                **common,
+            ))
+
+        # --- Subject lane: copied reply-target text -----------------------
+        # A distinct lexical source with lane-local predicates and its own
+        # limit. It carries ONLY the row's ``reply_subject_actor_id`` —
+        # never the containing requester's actor or sender label — and its
+        # excerpt is built from ``reply_target_body`` alone.
+        sql = """SELECT canonical_turn_id, conversation_id, turn_number,
+                        reply_target_body, reply_subject_actor_id,
+                        reply_subject_label, primary_tag, tags_json,
+                        session_date, origin_channel_id, origin_channel_label,
+                        audience_conversation_id, audience_attribution_version
+                 FROM canonical_turns_ordinal
+                 WHERE reply_target_body LIKE ?
+                   AND TRIM(COALESCE(reply_target_body, '')) <> ''"""
+        params = [pattern]
+        if conversation_id is not None:
+            sql += " AND conversation_id = ?"
+            params.append(conversation_id)
+        chan_sql, chan_params = _channel_filter()
+        sql += chan_sql
+        params.extend(chan_params)
+        sql += " ORDER BY turn_number DESC LIMIT ?"
+        params.append(limit)
+        for row in conn.execute(sql, params).fetchall():
+            turn = row["turn_number"]
+            body = row["reply_target_body"] or ""
+            results.append(QuoteResult(
+                text=_prefix(row) + _extract_excerpt(
+                    body, query, context_chars=_ctx_chars,
+                ),
+                tag=row["primary_tag"] or "_general",
+                segment_ref=f"canonical_turn_{row['canonical_turn_id'] or turn}",
+                tags=_tags(row),
+                match_type="full_text_search",
+                session_date=row["session_date"] or "",
+                source_scope="turn",
+                turn_number=turn,
+                matched_side="",
+                provenance=_provenance(
+                    row,
+                    "subject",
+                    row["reply_subject_actor_id"] or "",
+                    claimed_subject_label=row["reply_subject_label"] or "",
+                ),
+            ))
+
         return results
 
     def get_all_tags(self, conversation_id: str | None = None) -> list[TagStats]:

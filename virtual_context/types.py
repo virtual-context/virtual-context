@@ -1373,6 +1373,41 @@ class StoredSummary:
     end_timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
+@dataclass(frozen=True)
+class SourceProvenance:
+    """Physical, role-local provenance of one quote-like candidate.
+
+    Captured at candidate construction, before deduplication, excerpting,
+    merging, source limits, reranking, or counts, from the exact physical
+    row that matched. Neither the owner conversation nor a logical turn
+    number may hydrate these fields later: duplicate message ids, physical
+    sibling half-rows, logical merging, and conversation merges make that
+    lookup ambiguous.
+
+    ``source_role`` is one of ``"requester"``, ``"subject"``,
+    ``"assistant"``, ``"mixed"``, or ``"unattributed"``. ``actor_id`` is the
+    role-local durable actor: ``sender_actor_id`` for a requester lane,
+    ``reply_subject_actor_id`` for a subject lane, and always empty for
+    assistant, mixed, or unattributed text. Actor ids are internal
+    provenance only — the field is excluded from ``repr`` and must never
+    reach prompts, tool schemas, model-visible output, logs, or telemetry.
+
+    ``claimed_subject_label`` carries the raw stored reply label on a
+    subject lane. It is a claim, not verified identity: it may surface only
+    as an explicitly unverified audit field and never contributes to
+    membership, ranking, filtering, or asserted attribution.
+    """
+
+    conversation_id: str = ""
+    canonical_turn_id: str = ""
+    source_role: str = "unattributed"
+    actor_id: str = field(default="", repr=False)
+    audience_conversation_id: str = ""
+    audience_attribution_version: int = 0
+    origin_channel_id: str = ""
+    claimed_subject_label: str = ""
+
+
 @dataclass
 class QuoteResult:
     """A passage found by full-text search."""
@@ -1387,6 +1422,10 @@ class QuoteResult:
     source_scope: str = "segment"  # "turn", "segment", or "tool_output"
     turn_number: int | None = None
     matched_side: str = ""   # "user", "assistant", "both", or "unknown"
+    # Physical role-local source provenance. Populated only by the
+    # speaker-aware search branch; the legacy branch leaves it ``None``.
+    # Excluded from ``repr`` because it carries an internal actor id.
+    provenance: SourceProvenance | None = field(default=None, repr=False)
 
 
 @dataclass
