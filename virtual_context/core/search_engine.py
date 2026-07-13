@@ -16,7 +16,12 @@ from .turn_tag_index import TurnTagIndex
 
 if TYPE_CHECKING:
     from .semantic_search import SemanticSearchManager
-    from ..types import Message, SegmentMetadata, VirtualContextConfig
+    from ..types import (
+        Message,
+        SegmentMetadata,
+        SpeakerRetrievalContext,
+        VirtualContextConfig,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -51,9 +56,21 @@ class SearchEngine:
         session_filter: str = "",
         mode: str = "lookup",
         channel: str = "",
+        *,
+        speaker_context: SpeakerRetrievalContext | None = None,
     ) -> dict:
+        """Turn-first quote search over stored canonical history.
+
+        ``speaker_context`` is the request-owned retrieval authority.
+        This is the gate router: unless ``speaker_annotations_enabled``
+        is on AND the context proved its audience, the context is
+        normalized to ``None`` before candidate generation, which selects
+        the complete legacy retrieval branch byte-for-byte. An ineligible
+        context is never repaired to the resolved owner.
+        """
         if max_results is None:
             max_results = self._config.search.find_quote_default_results
+        speaker_context = self._route_speaker_context(speaker_context)
         return _find_quote(
             self._store,
             self._semantic,
@@ -64,7 +81,29 @@ class SearchEngine:
             mode=mode,
             conversation_id=self._config.conversation_id,
             channel=channel,
+            speaker_context=speaker_context,
         )
+
+    def _route_speaker_context(
+        self,
+        speaker_context: SpeakerRetrievalContext | None,
+    ) -> SpeakerRetrievalContext | None:
+        """Select the retrieval branch for a supplied speaker context.
+
+        Returns the context unchanged only when the activation gate is on
+        and the context proved a pre-alias audience; otherwise ``None``,
+        which every store and candidate seam treats as the untouched
+        legacy branch.
+        """
+        if speaker_context is None:
+            return None
+        search_config = getattr(self._config, "search", None)
+        enabled = bool(
+            getattr(search_config, "speaker_annotations_enabled", False)
+        )
+        if not enabled or not getattr(speaker_context, "eligible", False):
+            return None
+        return speaker_context
 
     def get_turns_by_tag(
         self,

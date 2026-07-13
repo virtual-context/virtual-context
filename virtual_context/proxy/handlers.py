@@ -2281,10 +2281,12 @@ def _handle_vcrecall(
     """Search for content and promote matching tags to working set.
 
     ``speaker_context`` is the request-owned retrieval authority derived
-    before command dispatch. The raw ``find_quote`` call below does not
-    consume it yet; it is accepted here so the command path already carries
-    the context this search will require once the context-bearing search
-    entrypoint exists. An ineligible context never falls back to the owner.
+    before command dispatch. It is forwarded into the engine's search
+    entrypoint, whose gate router selects the untouched legacy branch
+    unless speaker annotations are active and the context proved its
+    audience. An ineligible context never falls back to the owner, and
+    command dispatch emits no roster, so this path has no explicit
+    speaker input or requester conditioning.
     """
     if not query:
         return "Usage: VCRECALL <query>"
@@ -2292,14 +2294,12 @@ def _handle_vcrecall(
         return "No active conversation."
 
     engine = state.engine
-    store = engine._store
 
-    # Search across all sources
-    from ..core.quote_search import find_quote
-    semantic = getattr(engine, "_semantic", None)
-    results = find_quote(
-        store, semantic, query, max_results=10,
-        conversation_id=engine.config.conversation_id,
+    # Search across all sources through the context-bearing entrypoint.
+    results = engine.find_quote(
+        query,
+        max_results=10,
+        speaker_context=speaker_context,
     )
 
     if not results.get("found"):
