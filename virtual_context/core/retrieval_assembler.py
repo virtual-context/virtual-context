@@ -147,6 +147,7 @@ class RetrievalAssembler:
         max_context_tokens: int | None = None,
         *,
         request_roles=None,
+        speaker_context=None,
     ) -> AssembledContext:
         """Before sending to LLM: tag, retrieve, assemble enriched context.
 
@@ -155,6 +156,10 @@ class RetrievalAssembler:
         making card selection depend on an incidental history append is a
         silent-failure shape, and a "latest row" lookup is not request-stable
         under overlap or concurrency.
+
+        *speaker_context* is the request's trusted retrieval authority,
+        forwarded to assembly for the speaker roster. Like the roles it is
+        never reconstructed here; ``None`` simply builds no roster.
         """
         _started = time.monotonic()
         _breakdown: dict[str, float] = {}
@@ -398,6 +403,7 @@ class RetrievalAssembler:
             full_segments=full_segments_param,
             max_context_tokens=max_context_tokens,
             request_roles=request_roles,
+            speaker_context=speaker_context,
         )
         _note("assemble_primary", _assemble_stage)
 
@@ -454,6 +460,7 @@ class RetrievalAssembler:
                         # The retry must not lose requester, subject, or
                         # audience.
                         request_roles=request_roles,
+                        speaker_context=speaker_context,
                     )
                     _note("assemble_retry", _retry_assemble_stage)
 

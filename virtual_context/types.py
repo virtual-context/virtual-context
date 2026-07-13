@@ -653,6 +653,51 @@ class SpeakerRetrievalContext:
         )
 
 
+# ---------------------------------------------------------------------------
+# Speaker roster
+# ---------------------------------------------------------------------------
+# The handle grammar, reservation policy, and normalization helpers are
+# defined once beside the durable handle types further down this module
+# (``is_valid_speaker_handle``, ``normalize_speaker_handle_base``,
+# ``RESERVED_SPEAKER_HANDLES``). Roster presentation reuses those; it never
+# defines a second grammar.
+
+@dataclass(frozen=True)
+class SpeakerRosterEntry:
+    """One audience-admissible participant in a request's roster snapshot.
+
+    ``handle`` is the durable, model-visible selection token; ``name`` is the
+    audience-scoped display label (possibly empty — a missing scoped label is
+    honest, never repaired from a tenant-global profile). The internal actor
+    id is provenance only: it is excluded from ``repr`` and must never be
+    serialized into prompts, schemas, tool results, logs, or telemetry.
+    """
+
+    handle: str = ""
+    name: str = ""
+    actor_id: str = field(default="", repr=False)
+
+
+@dataclass(frozen=True)
+class SpeakerRosterSnapshot:
+    """Immutable per-request roster snapshot.
+
+    Created exactly once per eligible request; ``snapshot_id`` never changes
+    afterwards. Budget eviction produces a replacement snapshot with the SAME
+    id and a suffix-truncated entry tuple, so the rendered roster and any
+    schema built from it can never disagree. ``entries`` is ordered most
+    recent first; ``truncated`` records only the boolean fact that eligible
+    actors were dropped, never who or how many.
+    """
+
+    snapshot_id: str = ""
+    entries: tuple[SpeakerRosterEntry, ...] = ()
+    truncated: bool = False
+    tenant_id: str = ""
+    audience_conversation_id: str = ""
+    lifecycle_epoch: int = 0
+
+
 @dataclass
 class RequestRoles:
     """Who is asking, whose statement is analyzed, and where it may surface.
@@ -1824,6 +1869,20 @@ class AssembledContext:
     # Rendered requester person card, influence-only. Surfaced so its cost is
     # measurable rather than inferred. Empty with the gate off.
     actor_card_text: str = ""
+    # Rendered speaker roster block and the surviving immutable snapshot after
+    # every hard-cap rebuild. Empty/None with the roster gate off, with an
+    # ineligible request, or when the wrapper alone cannot fit — in which case
+    # no dynamic speaker parameter may be emitted either.
+    speaker_roster_text: str = ""
+    speaker_roster_snapshot: SpeakerRosterSnapshot | None = field(
+        default=None, repr=False,
+    )
+    # The request's SpeakerRetrievalContext with ``roster_snapshot_id``
+    # assigned at the roster's single construction point. None when no roster
+    # was emitted; callers then keep their original context unchanged.
+    speaker_context: SpeakerRetrievalContext | None = field(
+        default=None, repr=False,
+    )
     matched_tags: list[str] = field(default_factory=list)
     context_hint: str = ""  # Topic list injected post-compaction
     temporal: bool = False  # True when query references a time position
@@ -2020,6 +2079,13 @@ class AssemblerConfig:
     # and how many entries it may emit per kind.
     actor_card_fact_limit: int = 60
     actor_card_entries_per_kind: int = 3
+    # Speaker roster. Independent of the actor card and SHIPS DARK: with the
+    # gate off, no roster or handle-assignment read is performed, no budget
+    # key is added, and rendered output and tool schemas are byte-identical.
+    # YAML keys: assembly.speaker_roster_enabled,
+    # assembly.speaker_roster_max_tokens (wrapper-inclusive token cap).
+    speaker_roster_enabled: bool = False
+    speaker_roster_max_tokens: int = 300
 
     def __post_init__(self):
         if self.context_injection_max_tokens < 0:
