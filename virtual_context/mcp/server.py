@@ -8,6 +8,11 @@ import os
 
 from mcp.server.fastmcp import FastMCP
 
+from ..core.speaker_labels import (
+    annotate_aggregate_entry,
+    strip_to_structural_speaker_fields,
+)
+
 logger = logging.getLogger(__name__)
 
 mcp = FastMCP(
@@ -26,6 +31,26 @@ def _get_engine():
         config_path = os.environ.get("VIRTUAL_CONTEXT_CONFIG")
         _engine = VirtualContextEngine(config_path=config_path)
     return _engine
+
+
+def _speaker_annotations_enabled(engine) -> bool:
+    search_config = getattr(getattr(engine, "config", None), "search", None)
+    return bool(getattr(search_config, "speaker_annotations_enabled", False))
+
+
+def _stateless_speaker_exposure(engine, result):
+    """Restrict speaker annotation to the structural subset for MCP.
+
+    Stateless MCP calls carry no validated request audience, so they may
+    expose only structural attribution — ``source_role``, ``speaker_scope``,
+    and fact attribution version/basis. Human ``speaker_label`` and
+    ``speaker_handle`` stay empty, claims and membership flags are removed,
+    and MCP advertises no speaker input and runs no requester conditioning.
+    With the annotation gate off the result passes through byte-identical.
+    """
+    if not _speaker_annotations_enabled(engine):
+        return result
+    return strip_to_structural_speaker_fields(result)
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +149,16 @@ def expand_topic(
             cr.get("tokens_freed", 0) for cr in collapse_results
         )
 
+    if (
+        _speaker_annotations_enabled(engine)
+        and isinstance(result, dict)
+        and "error" not in result
+    ):
+        # An expanded topic aggregates whole conversations — no singular
+        # speaker; structural scope only on this stateless surface.
+        annotate_aggregate_entry(result)
+        strip_to_structural_speaker_fields(result)
+
     return json.dumps(result)
 
 
@@ -136,6 +171,10 @@ def recall_all() -> str:
     """
     engine = _get_engine()
     result = engine.recall_all()
+    if _speaker_annotations_enabled(engine) and isinstance(result, dict):
+        for summary_entry in result.get("summaries") or []:
+            annotate_aggregate_entry(summary_entry)
+        strip_to_structural_speaker_fields(result)
     return json.dumps(result)
 
 
@@ -152,6 +191,7 @@ def remember_when(query: str, time_range: dict, max_results: int = 12, mode: str
         max_results=max_results,
         mode=mode,
     )
+    result = _stateless_speaker_exposure(engine, result)
     return json.dumps(result)
 
 
@@ -178,7 +218,10 @@ def find_quote(query: str, mode: str = "lookup", channel: str = "") -> str:
     """
     engine = _get_engine()
     # Keep MCP behavior aligned with proxy tool loop: always return top 20.
+    # No speaker context is supplied: stateless MCP has no validated
+    # audience, so retrieval stays on the unconditioned path.
     result = engine.find_quote(query, max_results=20, mode=mode, channel=channel)
+    result = _stateless_speaker_exposure(engine, result)
     return json.dumps(result)
 
 
@@ -191,6 +234,7 @@ def search_summaries(query: str, mode: str = "lookup") -> str:
     """
     engine = _get_engine()
     result = engine.search_summaries(query, max_results=20, mode=mode)
+    result = _stateless_speaker_exposure(engine, result)
     return json.dumps(result)
 
 
