@@ -46,6 +46,7 @@ class ToolQueryRunner:
         extended_thinking: bool = False,
         tool_runtime=None,
         speaker_context: SpeakerRetrievalContext | None = None,
+        roster_snapshot=None,
     ) -> ToolLoopResult:
         """Send a query to an LLM with VC tool support.
 
@@ -89,6 +90,14 @@ class ToolQueryRunner:
             Request-owned retrieval authority derived by the caller from
             trusted request state, never from tool input. Forwarded to the
             tool loop so every VC tool execution receives it.
+        roster_snapshot : SpeakerRosterSnapshot | None
+            The request's immutable roster snapshot. It reaches the tool
+            catalogue only while ``search.speaker_selection_enabled`` is on,
+            because execution consumes a ``speaker`` argument behind that
+            same gate: a schema may never advertise a selection the release
+            would not validate and execute. It is forwarded to the loop
+            regardless, since result annotation resolves handles against the
+            snapshot bound into this request's context.
 
         Returns
         -------
@@ -115,9 +124,24 @@ class ToolQueryRunner:
         inject_vc = force_tools or (
             self._config.paging.enabled and self._engine._engine_state.flushed_prefix_messages > 0
         )
+        # The speaker enum is advertised only while the selection gate is on:
+        # execution consumes a ``speaker`` argument behind that same gate, so
+        # a catalogue that offers the selection is always paired with a
+        # release that validates it against this snapshot. Gate off (or no
+        # snapshot) leaves the catalogue byte-identical.
+        _search_config = getattr(self._config, "search", None)
+        _schema_snapshot = (
+            roster_snapshot
+            if getattr(_search_config, "speaker_selection_enabled", False) is True
+            else None
+        )
         all_tools: list[dict] = []
         if inject_vc:
-            all_tools.extend(vc_tool_definitions_for_runtime(tool_runtime))
+            all_tools.extend(
+                vc_tool_definitions_for_runtime(
+                    tool_runtime, roster_snapshot=_schema_snapshot,
+                )
+            )
         if tools:
             all_tools.extend(tools)
 
@@ -217,6 +241,7 @@ class ToolQueryRunner:
                 extra_headers=_extra_hdrs or None,
                 tool_runtime=tool_runtime,
                 speaker_context=speaker_context,
+                roster_snapshot=roster_snapshot,
             )
             # Prepend the initial request to raw_requests
             loop_result.raw_requests.insert(0, body)

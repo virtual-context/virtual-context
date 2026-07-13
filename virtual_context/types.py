@@ -2250,6 +2250,15 @@ class PreparedPayload:
     speaker_context: SpeakerRetrievalContext = field(
         default_factory=SpeakerRetrievalContext.ineligible,
     )
+    # The immutable roster snapshot that survived assembly's final hard-cap
+    # rebuild, carried so tool execution validates a selection and resolves
+    # annotation handles against the exact snapshot whose id is bound into
+    # ``speaker_context``. None whenever no roster was emitted (gate off,
+    # ineligible request, passthrough, or a wrapper that could not fit), and
+    # a rendered roster and an emitted enum can therefore never disagree.
+    speaker_roster_snapshot: SpeakerRosterSnapshot | None = field(
+        default=None, repr=False,
+    )
 
 
 @dataclass
