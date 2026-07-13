@@ -3756,6 +3756,154 @@ class VirtualContextEngine:
         )
         return report
 
+    def reindex_canonical_turn_embeddings(
+        self,
+        conversation_id: str,
+        *,
+        dry_run: bool = True,
+        limit: int | None = None,
+    ) -> dict:
+        """Backfill reply-subject turn chunks and repair orphaned turn chunks.
+
+        Idempotent admin repair for the canonical turn embedding index. Two
+        defects are covered: physical rows whose ``reply_target_body`` lane
+        has no current ``subject`` chunks (missing or stale), and chunks whose
+        physical canonical row no longer exists (orphans), which live search
+        skips rather than hydrates. Requester and assistant chunks are never
+        rewritten here: their text feeds the shipped retrieval branch, so
+        touching them is not behavior-preserving. ``dry_run`` (the default)
+        reports without writing; a re-run after a live pass converges to
+        all-current counts and zero writes.
+        """
+        if not conversation_id:
+            raise ValueError(
+                "reindex_canonical_turn_embeddings requires a non-empty conversation_id"
+            )
+        orphan_fn = getattr(
+            self._store, "get_orphan_canonical_turn_chunk_embeddings", None,
+        )
+        if not callable(orphan_fn):
+            raise RuntimeError(
+                "the configured store cannot enumerate orphan canonical turn chunks"
+            )
+
+        from .core.semantic_search import chunk_turn_text
+        from .types import CanonicalTurnChunkEmbedding
+
+        report = {
+            "subject_ok": 0, "subject_missing": 0, "subject_stale": 0,
+            "subject_created": 0, "subject_replaced": 0,
+            "orphan_chunks": 0, "orphan_rows": 0, "orphan_deleted": 0,
+            "skipped_no_canonical_id": 0, "skipped_no_embedder": 0,
+            "failed": 0, "dry_run": bool(dry_run),
+        }
+
+        existing_subject: dict[tuple[str, str], list] = {}
+        for chunk in self._store.get_all_canonical_turn_chunk_embeddings(
+            conversation_id=conversation_id,
+        ):
+            if chunk.side != "subject":
+                continue
+            key = (
+                chunk.conversation_id or conversation_id,
+                chunk.canonical_turn_id or "",
+            )
+            existing_subject.setdefault(key, []).append(chunk)
+
+        embed_fn = None if dry_run else self._semantic.get_embed_fn()
+        repairs = 0
+        for row in self._store.get_all_canonical_turns(conversation_id):
+            if not (row.reply_target_body or "").strip():
+                continue
+            if not row.canonical_turn_id:
+                report["skipped_no_canonical_id"] += 1
+                continue
+            if limit is not None and repairs >= limit:
+                break
+            expected = chunk_turn_text(row.reply_target_body)
+            row_conversation_id = row.conversation_id or conversation_id
+            current = sorted(
+                existing_subject.get(
+                    (row_conversation_id, row.canonical_turn_id), [],
+                ),
+                key=lambda chunk: chunk.chunk_index,
+            )
+            if current and [chunk.text for chunk in current] == expected:
+                report["subject_ok"] += 1
+                continue
+            state = "subject_stale" if current else "subject_missing"
+            report[state] += 1
+            repairs += 1
+            if dry_run:
+                continue
+            if embed_fn is None:
+                report["skipped_no_embedder"] += 1
+                continue
+            try:
+                vectors = embed_fn(expected)
+                chunks = [
+                    CanonicalTurnChunkEmbedding(
+                        conversation_id=row_conversation_id,
+                        canonical_turn_id=row.canonical_turn_id,
+                        turn_number=row.turn_number,
+                        side="subject",
+                        chunk_index=i,
+                        text=text,
+                        embedding=vec,
+                    )
+                    for i, (text, vec) in enumerate(zip(expected, vectors))
+                ]
+                self._store.store_canonical_turn_chunk_embeddings(
+                    row_conversation_id,
+                    row.turn_number,
+                    "subject",
+                    chunks,
+                    canonical_turn_id=row.canonical_turn_id,
+                )
+            except Exception:
+                report["failed"] += 1
+                continue
+            report[
+                "subject_created" if state == "subject_missing" else "subject_replaced"
+            ] += 1
+
+        orphans = orphan_fn(conversation_id)
+        report["orphan_chunks"] = len(orphans)
+        orphan_keys: set[tuple[str, str]] = set()
+        for chunk in orphans:
+            if not (chunk.canonical_turn_id or ""):
+                continue
+            orphan_keys.add(
+                (chunk.conversation_id or conversation_id, chunk.canonical_turn_id)
+            )
+        report["orphan_rows"] = len(orphan_keys)
+        if not dry_run:
+            for orphan_conversation_id, canonical_turn_id in sorted(orphan_keys):
+                try:
+                    report["orphan_deleted"] += int(
+                        self._store.delete_canonical_turn_chunk_embeddings(
+                            orphan_conversation_id,
+                            canonical_turn_id=canonical_turn_id,
+                        )
+                    )
+                except Exception:
+                    report["failed"] += 1
+
+        logger.info(
+            "reindex_canonical_turn_embeddings: done conv=%s subject_ok=%d "
+            "subject_missing=%d subject_stale=%d subject_created=%d "
+            "subject_replaced=%d orphan_chunks=%d orphan_rows=%d "
+            "orphan_deleted=%d skipped_no_canonical_id=%d "
+            "skipped_no_embedder=%d failed=%d dry_run=%s",
+            conversation_id[:12], report["subject_ok"],
+            report["subject_missing"], report["subject_stale"],
+            report["subject_created"], report["subject_replaced"],
+            report["orphan_chunks"], report["orphan_rows"],
+            report["orphan_deleted"], report["skipped_no_canonical_id"],
+            report["skipped_no_embedder"], report["failed"], dry_run,
+        )
+        return report
+
     def ingest_history(
         self,
         history_messages: list[Message],
