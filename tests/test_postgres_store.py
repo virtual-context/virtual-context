@@ -3,13 +3,29 @@
 from __future__ import annotations
 
 def _fact_embeddings_catalog_result(sql: str):
-    """Truthy catalog rows for the constructor's required-DDL assertion.
+    """Truthy catalog rows for the constructor's required-DDL assertions.
 
-    ``PostgresStore.__init__`` now asserts ``fact_embeddings`` + its index
-    + FK exist after schema bootstrap, so the fake DB doubles must model a
-    present catalog for those probes or every store construction raises.
-    Returns a truthy result for those queries, else ``None``.
+    ``PostgresStore.__init__`` asserts ``fact_embeddings`` + its index + FK
+    and the full ``speaker_handles`` relation (table, columns, unique keys)
+    exist after schema bootstrap, so the fake DB doubles must model a present
+    catalog for those probes or every store construction raises. Returns a
+    truthy result for those queries, else ``None``.
     """
+    from virtual_context.storage.postgres import (
+        SPEAKER_HANDLE_COLUMNS,
+        SPEAKER_HANDLE_UNIQUE_KEYS,
+    )
+
+    if "to_regclass('public.speaker_handles')" in sql:
+        return _FakeRowsResult([{"reg": "speaker_handles"}])
+    if "information_schema.columns" in sql and "speaker_handles" in sql:
+        return _FakeRowsResult(
+            [{"column_name": c} for c in SPEAKER_HANDLE_COLUMNS]
+        )
+    if "indisunique" in sql and "speaker_handles" in sql:
+        return _FakeRowsResult(
+            [{"cols": list(key)} for key in SPEAKER_HANDLE_UNIQUE_KEYS]
+        )
     if (
         "fact_embeddings" in sql
         or "idx_fact_embeddings_conv_model" in sql
