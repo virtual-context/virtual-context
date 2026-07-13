@@ -229,6 +229,10 @@ def _build_config(raw: dict[str, Any], *, validate: bool = True) -> VirtualConte
         semantic_search_max_results=search_raw.get("semantic_search_max_results", _sch_defaults.semantic_search_max_results),
         query_facts_default_limit=search_raw.get("query_facts_default_limit", _sch_defaults.query_facts_default_limit),
         search_facts_max_results=search_raw.get("search_facts_max_results", _sch_defaults.search_facts_max_results),
+        tool_guard_enabled=search_raw.get("tool_guard_enabled", _sch_defaults.tool_guard_enabled),
+        tool_guard_window_seconds=search_raw.get("tool_guard_window_seconds", _sch_defaults.tool_guard_window_seconds),
+        tool_guard_threshold=search_raw.get("tool_guard_threshold", _sch_defaults.tool_guard_threshold),
+        speaker_annotations_enabled=search_raw.get("speaker_annotations_enabled", _sch_defaults.speaker_annotations_enabled),
     )
 
     # Facts
