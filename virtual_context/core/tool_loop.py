@@ -19,6 +19,13 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 import httpx
 
 from ..types import SpeakerRetrievalContext, ToolCallRecord, ToolLoopResult
+from .speaker_labels import (
+    annotate_aggregate_entry,
+    annotation_speaker_context,
+    collect_fact_author_actor_ids,
+    project_fact_speaker_fields,
+    resolve_speaker_labels,
+)
 from .tool_guard import guard_tool_execution
 
 # Re-exported for existing importers
@@ -609,11 +616,20 @@ def _tool_result_has_dates_or_numeric_values(raw_result: str) -> bool:
 def _attach_related_facts(
     engine: VirtualContextEngine, result: object, query: str,
     presented_fact_ids: set[str] | None = None,
+    *,
+    annotation_context: SpeakerRetrievalContext | None = None,
 ) -> object:
     """Search facts by the find_quote query and attach matching ones.
 
     Uses FTS on the facts table to find only facts relevant to the
     specific query, not all facts for matched tags.
+
+    ``annotation_context`` is the already-routed annotation authority
+    (gate on AND proved audience) or ``None``. When present, each related
+    fact discloses its attribution version/basis and, for role-local
+    facts, the audience-scoped speaker fields; fact-backed segment
+    excerpts are marked with an honest aggregate speaker scope. ``None``
+    leaves the serialization byte-identical.
 
     TODO: session_date is currently resolved via a JOIN from
     fact.segment_ref → segments.metadata_json at query time.  This is
@@ -662,9 +678,17 @@ def _attach_related_facts(
     except Exception:
         pass  # non-critical enrichment
 
+    speaker_labels_map: dict[str, str] = {}
+    if annotation_context is not None:
+        speaker_labels_map = resolve_speaker_labels(
+            engine._store,
+            collect_fact_author_actor_ids(facts),
+            speaker_context=annotation_context,
+        )
+
     fact_entries = []
     for f in facts:
-        entry: dict[str, str] = {}
+        entry: dict[str, object] = {}
         if f.session_date:
             entry["session_date"] = f.session_date
         if f.subject:
@@ -693,6 +717,8 @@ def _attach_related_facts(
                     seen_objects.add(key)
                     unique_old.append(of)
             entry["replaces_older_facts"] = unique_old
+        if annotation_context is not None:
+            entry.update(project_fact_speaker_fields(f, speaker_labels_map))
         fact_entries.append(entry)
 
     result["related_facts"] = fact_entries
@@ -725,12 +751,17 @@ def _attach_related_facts(
             text = seg.full_text
             if len(text) > 800:
                 text = text[:800] + "..."
-            existing_results.append({
+            segment_entry: dict[str, object] = {
                 "excerpt": text,
                 "topic": seg.primary_tag,
                 "session": session_label,
                 "source": "fact_segment",
-            })
+            }
+            if annotation_context is not None:
+                # Segment text spans sources with no per-speaker
+                # provenance; disclose the scope instead of guessing.
+                annotate_aggregate_entry(segment_entry)
+            existing_results.append(segment_entry)
             existing_session_topics.add((session_label, seg.primary_tag))
     except Exception:
         pass  # non-critical enrichment
@@ -827,6 +858,14 @@ def execute_vc_tool(
     if guarded is not None:
         return guarded
 
+    # Annotation authority for this execution: the exact request context
+    # only when the annotation gate is on AND the request proved its
+    # audience, else None. With None every serializer below is
+    # byte-identical to the legacy output.
+    annotation_ctx = annotation_speaker_context(
+        getattr(engine, "config", None), speaker_context,
+    )
+
     def _trim_find_quote_payload(raw: object) -> object:
         """Return only model-relevant find_quote fields for tool output."""
         if not isinstance(raw, dict):
@@ -865,6 +904,15 @@ def execute_vc_tool(
                             f"To view full text, call vc_find_session with "
                             f"session=\"{session}\".]"
                         )
+                # Segment- and tool-output-backed excerpts span sources
+                # with no per-speaker provenance: disclose an honest
+                # aggregate scope. Turn-backed results carry role-local
+                # projection from the search boundary and are left alone.
+                if (
+                    annotation_ctx is not None
+                    and clean_item.get("source_scope", "segment") != "turn"
+                ):
+                    annotate_aggregate_entry(clean_item)
                 sanitized_results.append(clean_item)
             else:
                 sanitized_results.append(item)
@@ -1096,6 +1144,15 @@ def execute_vc_tool(
                         _expand_tag, exc_info=True,
                     )
 
+            # An expanded topic aggregates whole conversations; it never
+            # has one speaker.
+            if (
+                annotation_ctx is not None
+                and isinstance(result, dict)
+                and "error" not in result
+            ):
+                annotate_aggregate_entry(result)
+
         elif name == "vc_find_quote":
             fq_query = tool_input.get("query", "")
             fq_mode = tool_input.get("mode", "lookup")
@@ -1117,7 +1174,10 @@ def execute_vc_tool(
             )
             result = _suppress_presented_segments(result, presented_segment_refs)
             result = _trim_find_quote_payload(result)
-            result = _attach_related_facts(engine, result, fq_query, presented_fact_ids)
+            result = _attach_related_facts(
+                engine, result, fq_query, presented_fact_ids,
+                annotation_context=annotation_ctx,
+            )
         elif name == "vc_search_summaries":
             fq_query = tool_input.get("query", "")
             fq_mode = tool_input.get("mode", "lookup")
@@ -1130,7 +1190,10 @@ def execute_vc_tool(
             )
             result = _suppress_presented_segments(result, presented_segment_refs)
             result = _trim_find_quote_payload(result)
-            result = _attach_related_facts(engine, result, fq_query, presented_fact_ids)
+            result = _attach_related_facts(
+                engine, result, fq_query, presented_fact_ids,
+                annotation_context=annotation_ctx,
+            )
         elif name == "vc_find_session":
             _fq_max = engine.config.search.find_quote_max_results
             result = engine.search_summaries(
@@ -1144,6 +1207,11 @@ def execute_vc_tool(
             result = _trim_find_quote_payload(result)
         elif name == "vc_recall_all":
             result = engine.recall_all()
+            # Every recall-all topic is a cross-source rollup; none has a
+            # singular speaker.
+            if annotation_ctx is not None and isinstance(result, dict):
+                for _summary_entry in result.get("summaries") or []:
+                    annotate_aggregate_entry(_summary_entry)
         elif name == "vc_query_facts":
             meta = engine.query_facts(
                 subject=tool_input.get("subject"),
@@ -1155,25 +1223,38 @@ def execute_vc_tool(
                 _intent_context=intent_context,
             )
             facts = meta["facts"]
+            fact_entries: list[dict] = [
+                {
+                    "subject": f.subject,
+                    "verb": f.verb,
+                    "object": f.object,
+                    "status": f.status,
+                    "fact_type": f.fact_type,
+                    "what": f.what,
+                    "who": f.who,
+                    "when": f.when_date,
+                    "where": f.where,
+                    "why": f.why,
+                    "conversation_id": f.conversation_id,
+                    "tags": f.tags,
+                }
+                for f in facts
+            ]
+            _fact_labels: dict[str, str] = {}
+            if annotation_ctx is not None:
+                _linked = meta.get("linked_facts") or []
+                _fact_labels = resolve_speaker_labels(
+                    engine._store,
+                    collect_fact_author_actor_ids(
+                        list(facts) + [lf.fact for lf in _linked],
+                    ),
+                    speaker_context=annotation_ctx,
+                )
+                for f, _entry in zip(facts, fact_entries):
+                    _entry.update(project_fact_speaker_fields(f, _fact_labels))
             result = {
                 "count": len(facts),
-                "facts": [
-                    {
-                        "subject": f.subject,
-                        "verb": f.verb,
-                        "object": f.object,
-                        "status": f.status,
-                        "fact_type": f.fact_type,
-                        "what": f.what,
-                        "who": f.who,
-                        "when": f.when_date,
-                        "where": f.where,
-                        "why": f.why,
-                        "conversation_id": f.conversation_id,
-                        "tags": f.tags,
-                    }
-                    for f in facts
-                ],
+                "facts": fact_entries,
             }
             # Status breakdown from the filtered results
             status_counts: dict[str, int] = {}
@@ -1198,7 +1279,7 @@ def execute_vc_tool(
                 result["search_notes"] = "; ".join(notes)
             # Include linked facts when graph_links is enabled
             if meta.get("linked_facts"):
-                result["linked_facts"] = [
+                linked_entries: list[dict] = [
                     {
                         "subject": lf.fact.subject,
                         "verb": lf.fact.verb,
@@ -1210,6 +1291,12 @@ def execute_vc_tool(
                     }
                     for lf in meta["linked_facts"]
                 ]
+                if annotation_ctx is not None:
+                    for lf, _entry in zip(meta["linked_facts"], linked_entries):
+                        _entry.update(
+                            project_fact_speaker_fields(lf.fact, _fact_labels),
+                        )
+                result["linked_facts"] = linked_entries
         elif name == "vc_remember_when":
             max_results = tool_input.get("max_results")
             result = engine.remember_when(
