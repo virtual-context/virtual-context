@@ -15,6 +15,8 @@ from ..types import (
     CanonicalTurnRow,
     CanonicalTurnChunkEmbedding,
     QuoteResult,
+    SourceProvenance,
+    SpeakerRetrievalContext,
     StoredSegment,
     VirtualContextConfig,
     channel_excerpt_prefix,
@@ -247,6 +249,7 @@ class SemanticSearchManager:
         assistant_text: str = "",
         user_raw_content: str | None = None,
         assistant_raw_content: str | None = None,
+        reply_target_body: str = "",
     ) -> None:
         embed_fn = self.get_embed_fn()
         if embed_fn is None:
@@ -258,9 +261,13 @@ class SemanticSearchManager:
             canonical_turn_id=canonical_turn_id,
         )
 
+        # ``subject`` indexes the reply-target lane under the same physical
+        # row. It is a separate side, never concatenated into requester text,
+        # and the shipped search branch explicitly ignores it.
         sides = [
             ("user", (user_raw_content or user_text or "")),
             ("assistant", (assistant_raw_content or assistant_text or "")),
+            ("subject", (reply_target_body or "")),
         ]
         for side, text in sides:
             chunks = chunk_turn_text(text)
@@ -333,14 +340,31 @@ class SemanticSearchManager:
         max_results: int = 5,
         conversation_id: str | None = None,
         channel: str = "",
+        speaker_context: SpeakerRetrievalContext | None = None,
     ) -> list[QuoteResult]:
         """Run semantic retrieval over canonical turn chunks.
+
+        ``speaker_context`` is the branch selector. ``None`` runs the shipped
+        legacy branch unchanged: legacy chunk enumeration, logical hydration
+        on the unscoped path, and no ``subject``-side consumption. A non-None
+        context selects the physical role-local branch, which threads the
+        same immutable context through candidate enumeration and one batched
+        physical-row hydration.
 
         A non-empty ``channel`` filters scored chunks post-score but
         PRE-acceptance-limit: scanning continues down the ranking until
         ``max_results`` in-channel results are accepted, so a global top hit
         outside the channel cannot starve a lower-ranked in-channel one.
         """
+        if speaker_context is not None:
+            return self._speaker_semantic_turn_search(
+                query,
+                max_results=max_results,
+                conversation_id=conversation_id,
+                channel=channel,
+                speaker_context=speaker_context,
+            )
+
         embed_fn = self.get_embed_fn()
         if embed_fn is None:
             return []
@@ -348,6 +372,9 @@ class SemanticSearchManager:
         all_chunks = self._store.get_all_canonical_turn_chunk_embeddings(
             conversation_id=conversation_id,
         )
+        # The reply-target lane is shadow data for the physical branch only:
+        # the legacy branch must not let it surface or shift ranking.
+        all_chunks = [chunk for chunk in all_chunks if chunk.side != "subject"]
         if not all_chunks:
             return []
 
@@ -514,6 +541,188 @@ class SemanticSearchManager:
                 )
             )
         return results
+
+    def _speaker_semantic_turn_search(
+        self,
+        query: str,
+        *,
+        max_results: int,
+        conversation_id: str | None,
+        channel: str,
+        speaker_context: SpeakerRetrievalContext,
+    ) -> list[QuoteResult]:
+        """Physical, role-local semantic retrieval.
+
+        Candidate enumeration and hydration both receive the same immutable
+        request context; the store proves scope before anything is scored or
+        limited here. Hydration is ONE batched physical lookup by
+        ``(conversation_id, canonical_turn_id)`` on both the scoped and
+        unscoped paths — never the logical seam, which merges sibling rows
+        and can transfer provenance across them. A chunk whose physical row
+        is missing or inadmissible proves nothing: it is skipped and
+        reported, and the admin reindex owns the repair.
+        """
+        embed_fn = self.get_embed_fn()
+        if embed_fn is None:
+            return []
+
+        all_chunks = self._store.get_all_canonical_turn_chunk_embeddings(
+            conversation_id=conversation_id,
+            speaker_context=speaker_context,
+        )
+        if not all_chunks:
+            return []
+
+        try:
+            query_vec = embed_fn([query])[0]
+        except Exception:
+            logger.debug("Failed to embed query for semantic turn search")
+            return []
+
+        scored: list[tuple[float, CanonicalTurnChunkEmbedding]] = []
+        for chunk in all_chunks:
+            sim = cosine_similarity(query_vec, chunk.embedding)
+            if sim >= 0.25:
+                scored.append((sim, chunk))
+        scored.sort(key=lambda item: item[0], reverse=True)
+        if not scored:
+            return []
+
+        # Best chunk per physical identity and side; the ranking order above
+        # makes the first occurrence the winning one.
+        deduped: list[tuple[float, CanonicalTurnChunkEmbedding]] = []
+        seen: set[tuple[str, str, str]] = set()
+        for sim, chunk in scored:
+            chunk_conversation_id = chunk.conversation_id or conversation_id or ""
+            identity = (
+                chunk_conversation_id,
+                chunk.canonical_turn_id or "",
+                chunk.side,
+            )
+            if identity in seen:
+                continue
+            seen.add(identity)
+            deduped.append((sim, chunk))
+
+        keys: list[tuple[str, str]] = []
+        keys_seen: set[tuple[str, str]] = set()
+        for _sim, chunk in deduped:
+            chunk_conversation_id = chunk.conversation_id or conversation_id or ""
+            key = (chunk_conversation_id, chunk.canonical_turn_id or "")
+            if not key[0] or not key[1] or key in keys_seen:
+                continue
+            keys_seen.add(key)
+            keys.append(key)
+        physical: dict[tuple[str, str], CanonicalTurnRow] = {}
+        if keys:
+            physical = self._store.get_canonical_turn_rows_by_id(
+                keys, speaker_context=speaker_context,
+            )
+
+        wanted_channel = (channel or "").strip()
+        results: list[QuoteResult] = []
+        skipped_no_row = 0
+        for sim, chunk in deduped:
+            if len(results) >= max_results:
+                break
+            chunk_conversation_id = chunk.conversation_id or conversation_id or ""
+            row = physical.get((chunk_conversation_id, chunk.canonical_turn_id or ""))
+            if row is None:
+                skipped_no_row += 1
+                continue
+            if wanted_channel and not channel_matches(
+                wanted_channel, row.origin_channel_id, row.origin_channel_label,
+            ):
+                continue
+            results.append(
+                self._format_physical_semantic_result(
+                    sim, chunk, row, channel=wanted_channel,
+                )
+            )
+        if skipped_no_row:
+            logger.warning(
+                "SEMANTIC_CHUNK_NO_PHYSICAL_ROW conv=%s skipped=%d",
+                (conversation_id or "")[:12],
+                skipped_no_row,
+            )
+        return results
+
+    def _format_physical_semantic_result(
+        self,
+        sim: float,
+        chunk: CanonicalTurnChunkEmbedding,
+        row: CanonicalTurnRow,
+        *,
+        channel: str,
+    ) -> QuoteResult:
+        """Format one candidate from its exact physical row.
+
+        Attribution is role-local: the requester lane carries only the row's
+        ``sender_actor_id``, the subject lane only ``reply_subject_actor_id``,
+        and the assistant lane never a human actor. A subject excerpt is the
+        copied reply text alone, with no ``User:`` label that would misassign
+        the quote, and the raw stored reply label rides along only as an
+        unverified claim. An unrecognized side is honestly unattributed
+        rather than guessed.
+        """
+        user_text = row.user_content or ""
+        assistant_text = row.assistant_content or ""
+        claimed_subject_label = ""
+        if chunk.side == "user":
+            excerpt = f"User: {user_text}".strip()
+            matched_side = "user"
+            source_role = "requester"
+            actor_id = row.sender_actor_id or ""
+        elif chunk.side == "assistant":
+            excerpt = f"Assistant: {assistant_text}".strip()
+            matched_side = "assistant"
+            source_role = "assistant"
+            actor_id = ""
+        elif chunk.side == "subject":
+            excerpt = (row.reply_target_body or "").strip()
+            matched_side = ""
+            source_role = "subject"
+            actor_id = row.reply_subject_actor_id or ""
+            claimed_subject_label = row.reply_subject_label or ""
+        else:
+            excerpt = (
+                f"User: {user_text}\n\nAssistant: {assistant_text}"
+            ).strip()
+            matched_side = "unknown"
+            source_role = "unattributed"
+            actor_id = ""
+        if channel:
+            excerpt = channel_excerpt_prefix(
+                row.origin_channel_id, row.origin_channel_label,
+            ) + excerpt
+        turn_number = (
+            row.turn_number if row.turn_number >= 0 else chunk.turn_number
+        )
+        canonical_turn_id = chunk.canonical_turn_id or row.canonical_turn_id or ""
+        return QuoteResult(
+            text=excerpt,
+            tag=row.primary_tag,
+            segment_ref=f"canonical_turn_{canonical_turn_id or turn_number}",
+            tags=list(row.tags or []),
+            match_type="full_text_semantic",
+            similarity=round(sim, 3),
+            session_date=row.session_date,
+            source_scope="turn",
+            turn_number=turn_number,
+            matched_side=matched_side,
+            provenance=SourceProvenance(
+                conversation_id=row.conversation_id or chunk.conversation_id or "",
+                canonical_turn_id=canonical_turn_id,
+                source_role=source_role,
+                actor_id=actor_id,
+                audience_conversation_id=row.audience_conversation_id or "",
+                audience_attribution_version=int(
+                    row.audience_attribution_version or 0
+                ),
+                origin_channel_id=row.origin_channel_id or "",
+                claimed_subject_label=claimed_subject_label,
+            ),
+        )
 
     def semantic_search(
         self, query: str, max_results: int = 5,
