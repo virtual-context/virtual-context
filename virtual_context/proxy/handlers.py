@@ -1887,13 +1887,25 @@ async def _handle_vcattach(
             status_code=503,
         )
 
+    def _evict_and_close(cid):
+        # A popped state's engine still holds its store pool; without a
+        # shutdown the pool leaks for the life of the worker.
+        popped = registry.remove_conversation(cid)
+        if popped is not None:
+            try:
+                popped.shutdown(wait=True, cancel_futures=True)
+            except Exception:
+                logger.warning(
+                    "VCATTACH: shutdown of evicted state failed for %s", cid[:12],
+                )
+
     execute_attach(
         old_id=result.conversation_id,
         target_id=target_id,
         store=_inner,
         # Core proxy: local eviction only. Cloud path: per-request Redis hydration
         # ensures all workers see the reset state on next request.
-        registry_invalidate=registry.remove_conversation if registry else None,
+        registry_invalidate=_evict_and_close if registry else None,
     )
 
     text = f"Conversation attached to {target_label} ({target_id}). History restored."
