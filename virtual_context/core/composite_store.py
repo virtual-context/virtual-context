@@ -551,6 +551,22 @@ class CompositeStore:
             return []
         return list_by_target(target_id)
 
+    def search_canonical_turns_by_actor(
+        self,
+        actor_id: str,
+        limit: int,
+        conversation_id: str | None,
+        *,
+        speaker_context,
+    ):
+        fn = getattr(self._segments, "search_canonical_turns_by_actor", None)
+        if callable(fn):
+            return fn(
+                actor_id, limit, conversation_id,
+                speaker_context=speaker_context,
+            )
+        return []
+
     def resolve_request_audience(
         self,
         tenant_id: str,

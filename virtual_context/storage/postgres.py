@@ -26,6 +26,7 @@ from ..core.progress_snapshot import (
     ProgressSnapshot,
 )
 from ..types import (
+    AUDIENCE_ATTRIBUTION_VERSION,
     ChunkEmbedding,
     ConversationStats,
     DepthLevel,
@@ -7322,6 +7323,103 @@ class PostgresStore(ContextStore):
                 (alias_id,),
             ).fetchone()
             return row["target_id"] if row else None
+
+    def search_canonical_turns_by_actor(
+        self,
+        actor_id: str,
+        limit: int,
+        conversation_id: str | None,
+        *,
+        speaker_context: SpeakerRetrievalContext,
+    ) -> list[QuoteResult]:
+        """One participant's own statements, most recent first.
+
+        Person-first retrieval, the inverse of every other search here. The
+        text searches answer "what was said about X" — they rank content
+        against a query and can then narrow the survivors to one speaker. They
+        cannot answer "what has this person said", because that question
+        carries no query to rank against: the person IS the query. Asking a
+        text search for it (an empty pattern) returns rows whose matched lane
+        is undefined, and a lane is what makes an actor role-local — so the
+        provenance the speaker contract depends on collapses, and DM rows the
+        audience filter should have excluded ride along.
+
+        Here the lane is not inferred, it is chosen: only user halves are
+        selected, only for this actor, and every candidate is a requester
+        candidate carrying that actor. The audience predicate is the same one
+        the roster admits members under, so a participant's statements in one
+        audience can never surface in another.
+        """
+        actor = (actor_id or "").strip()
+        if not actor or limit <= 0:
+            return []
+        audience = (speaker_context.audience_conversation_id or "").strip()
+        if not audience:
+            return []
+
+        _sc = getattr(self, "search_config", None)
+        _ctx_chars = _sc.excerpt_context_chars if _sc else 200
+
+        sql = """SELECT canonical_turn_id, conversation_id, turn_number,
+                        user_content, assistant_content, primary_tag,
+                        tags_json, session_date, sender, origin_channel_id,
+                        origin_channel_label, sender_actor_id,
+                        audience_conversation_id, audience_attribution_version
+                 FROM canonical_turns_ordinal
+                 WHERE sender_actor_id = %s
+                   AND TRIM(COALESCE(user_content, '')) <> ''
+                   AND audience_conversation_id = %s
+                   AND audience_attribution_version = %s"""
+        params: list[object] = [
+            actor, audience, AUDIENCE_ATTRIBUTION_VERSION,
+        ]
+        if conversation_id:
+            sql += " AND conversation_id = %s"
+            params.append(conversation_id)
+        sql += " ORDER BY sort_key DESC LIMIT %s"
+        params.append(int(limit))
+
+        results: list[QuoteResult] = []
+        with self.pool.connection() as conn:
+            for row in conn.execute(sql, params).fetchall():
+                try:
+                    tags = list(json.loads(row["tags_json"] or "[]") or [])
+                except Exception:
+                    tags = []
+                user_text = row["user_content"] or ""
+                results.append(QuoteResult(
+                    # No query to centre an excerpt on: the statement itself is
+                    # the answer, so it is shown from the start.
+                    text=_build_turn_excerpt(
+                        "", user_text, "", "user",
+                        context_chars=_ctx_chars,
+                        sender=row["sender"] or "",
+                    ),
+                    tag=row["primary_tag"] or "",
+                    segment_ref=row["canonical_turn_id"] or "",
+                    tags=tags,
+                    score=0.0,
+                    match_type="speaker_recall",
+                    session_date=row["session_date"] or "",
+                    source_scope="turn",
+                    turn_number=row["turn_number"],
+                    matched_side="user",
+                    provenance=SourceProvenance(
+                        conversation_id=row["conversation_id"] or "",
+                        canonical_turn_id=row["canonical_turn_id"] or "",
+                        source_role="requester",
+                        actor_id=row["sender_actor_id"] or "",
+                        audience_conversation_id=(
+                            row["audience_conversation_id"] or ""
+                        ),
+                        audience_attribution_version=int(
+                            row["audience_attribution_version"] or 0
+                        ),
+                        origin_channel_id=row["origin_channel_id"] or "",
+                        claimed_subject_label="",
+                    ),
+                ))
+        return results
 
     def resolve_request_audience(
         self,

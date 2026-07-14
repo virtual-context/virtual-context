@@ -206,6 +206,49 @@ def test_speaker_only_returns_the_members_rows_with_labels_and_counts(rig):
     assert "actor:telegram" not in raw
 
 
+def test_speaker_only_answers_what_do_you_know_about_this_person(rig):
+    """The question a speaker selection exists for.
+
+    "What do you know about X" carries no topic to match on. Every retrieval
+    source ranks by the query first and applies the actor predicate to what
+    survives its own relevance threshold, so a topicless question surfaced
+    nothing about anything, the predicate filtered an empty list, and the
+    reader was told there was nothing on record — while the speaker's own
+    statements sat in storage, unreached. The speaker IS the query here, so
+    their statements are what must come back.
+    """
+    got = _find_quote(
+        rig,
+        {
+            "query": "what do you know about this person",
+            "speaker": "sania",
+            "speaker_only": True,
+        },
+    )
+
+    assert got["found"] is True, (
+        "a selected speaker with statements on record must never answer "
+        f"'nothing': {got}"
+    )
+    assert got["filter_applied"] is True
+    assert got["conditioning_source"] == "explicit_roster"
+
+    # Her statements, and only hers — same labels and provenance as any
+    # other speaker-conditioned path.
+    excerpts = " || ".join(entry["excerpt"] for entry in got["results"])
+    assert "boston" in excerpts
+    assert "packing list" in excerpts
+    for entry in got["results"]:
+        assert entry["speaker_label"] == "Sania"
+        assert entry["speaker_verified"] is True
+
+    # The audience boundary still holds: no DM content, no actor ids.
+    raw = json.dumps(got)
+    assert "secret trip plans" not in raw
+    assert "dm trip note" not in raw
+    assert "actor:telegram" not in raw
+
+
 def test_unfiltered_probe_annotates_every_guild_speaker(rig):
     got = _find_quote(rig, {"query": "trip"})
     assert got["found"] is True
