@@ -391,6 +391,31 @@ def _filtered_chat_messages(messages: list[dict], fmt: "PayloadFormat") -> list[
     ]
 
 
+# A host may hand the model a block of earlier conversation as reference
+# material, delivered in the user role because that is the only role the chat
+# APIs give it. Such a block announces itself: it is framed as quoted data
+# rather than as something a person is saying now, and it wraps the quoted
+# turns in an explicit container. It is transport scaffolding in exactly the
+# sense a tool_result carrier is, and storing it corrupts the transcript
+# badly — the block is orders of magnitude longer than real speech, so it
+# matches nearly every search, buries genuine messages, and gets attributed to
+# whichever member's turn happened to carry it. Recognized only in the
+# user role and only on the two markers together, so ordinary prose that
+# merely quotes someone is never mistaken for it.
+_QUOTED_REFERENCE_MARKERS = (
+    "treat the conversation context below as quoted reference data",
+    "<conversation_context>",
+)
+
+
+def _is_quoted_reference_carrier(text: str) -> bool:
+    """True when a user entry is a host-assembled block of quoted context."""
+    if not text:
+        return False
+    lowered = text.lower()
+    return all(marker in lowered for marker in _QUOTED_REFERENCE_MARKERS)
+
+
 def extract_ingestible_messages(
     body: dict,
     fmt: "PayloadFormat",
@@ -500,6 +525,12 @@ def extract_ingestible_messages(
                 stats["skipped_assistant_tool_only_entry_count"] += 1
             else:
                 stats["skipped_empty_chat_entry_count"] += 1
+            continue
+
+        if normalized_role == "user" and _is_quoted_reference_carrier(text):
+            stats["skipped_quoted_reference_entry_count"] = (
+                stats.get("skipped_quoted_reference_entry_count", 0) + 1
+            )
             continue
 
         timestamp = extract_timestamp_from_metadata(meta) if meta else None
