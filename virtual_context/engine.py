@@ -3276,7 +3276,30 @@ class VirtualContextEngine:
                 report["skipped_existing"] += 1
                 continue
             if not (row.user_raw_content or "").strip():
-                report["skipped_no_raw"] += 1
+                # No retained raw text means no reply edge can be recovered,
+                # but the AUDIENCE is route-level, not content-level: the
+                # row's recorded origin route (or the conversation itself)
+                # is proved through the same tenant-scoped resolver. Without
+                # this, a row persisted without raw content stays invisible
+                # to audience-scoped policy forever.
+                if int(row.audience_attribution_version or 0) > 0:
+                    report["skipped_no_raw"] += 1
+                    continue
+                _origin = (row.origin_conversation_id or "").strip()
+                _inbound = _origin or conversation_id
+                _audience = (
+                    resolver(tenant_id, _inbound, conversation_id)
+                    if callable(resolver) else ""
+                )
+                if not _audience:
+                    report["skipped_no_raw"] += 1
+                    continue
+                if row.canonical_turn_id:
+                    report["audience_only"] = report.get("audience_only", 0) + 1
+                    updates[row.canonical_turn_id] = {
+                        "audience_conversation_id": _audience,
+                        "audience_attribution_version": 1,
+                    }
                 continue
             report["eligible"] += 1
             try:
