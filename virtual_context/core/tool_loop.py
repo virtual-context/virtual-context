@@ -30,6 +30,7 @@ from .speaker_labels import (
     annotate_aggregate_entry,
     annotation_speaker_context,
     collect_fact_author_actor_ids,
+    fact_author_actor_id,
     project_fact_speaker_fields,
     resolve_speaker_labels,
 )
@@ -426,7 +427,21 @@ _SPEAKER_PROPERTY_DESCRIPTION = (
 # must never reach a tool whose execution would silently ignore it.
 _SPEAKER_ONLY_TOOLS: frozenset[str] = frozenset({
     "vc_find_quote",
+    "vc_query_facts",
 })
+
+# Fixed prose for a fact selection that cannot be honored. A fact carries a
+# usable author only when its attribution is role-local; a model-assisted or
+# unattributed fact has no verifiable speaker. Saying so explicitly is what
+# stops a reader from presenting everyone's facts as the selected
+# participant's — silence here reads as confirmation.
+_FACTS_UNATTRIBUTED_NOTE = (
+    "A speaker was selected, but the facts below carry no verifiable "
+    "authorship, so NO speaker filter was applied and these facts are NOT "
+    "attributable to that participant. Do not present them as that "
+    "participant's statements; use find_quote with a speaker selection for "
+    "verifiable per-speaker statements."
+)
 
 _SPEAKER_ONLY_PROPERTY_DESCRIPTION = (
     "Optional exact-attribution mode. Set true together with a selected "
@@ -1564,6 +1579,50 @@ def execute_vc_tool(
                 _intent_context=intent_context,
             )
             facts = meta["facts"]
+            # Speaker selection is resolved with the SAME validated helper the
+            # quote path uses, so a handle can only ever name an actor this
+            # request's roster snapshot proved. Selection was previously
+            # advertised on this tool and dropped at execution, which returned
+            # every participant's facts to a reader that had asked for one
+            # participant's — attribution was then invented downstream.
+            _qf_conditioning = _resolve_speaker_conditioning(
+                engine, tool_input, speaker_context, roster_snapshot,
+            )
+            _qf_actor = (
+                getattr(_qf_conditioning, "conditioning_actor_id", "")
+                if _qf_conditioning is not None
+                else ""
+            )
+            _qf_note = ""
+            _qf_excluded = 0
+            if _qf_conditioning is not None and _qf_actor:
+                # A fact exposes an author only when its attribution is
+                # role-local; a model-assisted guess deliberately does not.
+                _qf_attributable = [
+                    f for f in facts if fact_author_actor_id(f)
+                ]
+                if not _qf_attributable:
+                    # Nothing to filter ON. Fail open on the results (the
+                    # unconditioned set the reader would have received anyway)
+                    # but never silently: the note is the whole point.
+                    _qf_note = _FACTS_UNATTRIBUTED_NOTE
+                else:
+                    _qf_matching = [
+                        f for f in facts
+                        if fact_author_actor_id(f) == _qf_actor
+                    ]
+                    if getattr(_qf_conditioning, "filter_active", False):
+                        _qf_excluded = len(facts) - len(_qf_matching)
+                        facts = _qf_matching
+                    else:
+                        # Hint, not filter: the selected speaker's facts lead,
+                        # the rest survive in their existing order.
+                        _qf_rest = [
+                            f for f in facts
+                            if fact_author_actor_id(f) != _qf_actor
+                        ]
+                        facts = _qf_matching + _qf_rest
+                meta["facts"] = facts
             fact_entries: list[dict] = [
                 {
                     "subject": f.subject,
@@ -1597,6 +1656,25 @@ def execute_vc_tool(
                 "count": len(facts),
                 "facts": fact_entries,
             }
+            # Disclose the selection outcome whenever one was attempted, so a
+            # filter that could not be applied is visible rather than implied.
+            if _qf_conditioning is not None and (
+                _qf_conditioning.hint_arrived or _qf_actor
+            ):
+                result["conditioning_source"] = (
+                    _qf_conditioning.conditioning_source
+                )
+                result["filter_applied"] = bool(
+                    _qf_actor
+                    and _qf_conditioning.filter_active
+                    and not _qf_note
+                )
+                if _qf_excluded:
+                    result["excluded_other_speakers"] = _qf_excluded
+                if _qf_conditioning.hint_unresolved:
+                    result["speaker_hint"] = "unresolved"
+                if _qf_note:
+                    result["speaker_selection_note"] = _qf_note
             # Status breakdown from the filtered results
             status_counts: dict[str, int] = {}
             for f in facts:
