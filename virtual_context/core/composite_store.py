@@ -970,6 +970,24 @@ class CompositeStore:
             ))
         return 0
 
+    def update_canonical_turn_senders_if_matches(
+        self,
+        conversation_id: str,
+        updates: dict[str, tuple[str, str]],
+        *,
+        expected_lifecycle_epoch: int | None = None,
+    ) -> int:
+        fn = getattr(
+            self._segments, "update_canonical_turn_senders_if_matches", None,
+        )
+        if callable(fn):
+            return int(fn(
+                conversation_id,
+                updates,
+                expected_lifecycle_epoch=expected_lifecycle_epoch,
+            ))
+        return 0
+
     def update_canonical_turn_channels_if_empty(
         self,
         conversation_id: str,

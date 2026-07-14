@@ -7462,6 +7462,68 @@ CREATE TABLE IF NOT EXISTS request_captures (
         conn.commit()
         return updated
 
+    def update_canonical_turn_senders_if_matches(
+        self,
+        conversation_id: str,
+        updates: dict[str, tuple[str, str]],
+        *,
+        expected_lifecycle_epoch: int | None = None,
+    ) -> int:
+        """Compare-and-swap ``sender`` on rows holding a specific wrong value.
+
+        Each update is ``canonical_turn_id -> (expected_current, new)``: the
+        UPDATE fires only while the stored trimmed sender still equals the
+        expected current value, so a concurrent correction or a legitimate
+        newer attribution is never overwritten and a re-run is a no-op. The
+        optional epoch predicate makes the write fail closed when the
+        conversation was resurrected under a new ``lifecycle_epoch``.
+        """
+        updates = {
+            ct_id: ((old or "").strip(), (new or "").strip())
+            for ct_id, (old, new) in (updates or {}).items()
+            if ct_id and (old or "").strip() and (new or "").strip()
+        }
+        if not updates:
+            return 0
+        conn = self._get_conn()
+        updated = 0
+        now = utcnow_iso()
+        for canonical_turn_id, (old, new) in updates.items():
+            if expected_lifecycle_epoch is None:
+                cursor = conn.execute(
+                    """UPDATE canonical_turns
+                          SET sender = ?, updated_at = ?
+                        WHERE conversation_id = ?
+                          AND canonical_turn_id = ?
+                          AND COALESCE(TRIM(sender), '') = ?""",
+                    (new, now, conversation_id, canonical_turn_id, old),
+                )
+            else:
+                cursor = conn.execute(
+                    """UPDATE canonical_turns
+                          SET sender = ?, updated_at = ?
+                        WHERE conversation_id = ?
+                          AND canonical_turn_id = ?
+                          AND COALESCE(TRIM(sender), '') = ?
+                          AND EXISTS (
+                              SELECT 1
+                                FROM conversations c
+                               WHERE c.conversation_id = canonical_turns.conversation_id
+                                 AND c.lifecycle_epoch = ?
+                          )""",
+                    (
+                        new,
+                        now,
+                        conversation_id,
+                        canonical_turn_id,
+                        old,
+                        expected_lifecycle_epoch,
+                    ),
+                )
+            updated += int(cursor.rowcount or 0)
+        conn.commit()
+        return updated
+
     def update_canonical_turn_channels_if_empty(
         self,
         conversation_id: str,

@@ -3252,7 +3252,8 @@ class VirtualContextEngine:
         if not callable(cas):
             raise RuntimeError("the configured store has no physical reply CAS")
         report = {
-            "eligible": 0, "updated": 0, "skipped_existing": 0,
+            "eligible": 0, "updated": 0, "audience_only": 0,
+            "skipped_existing": 0,
             "skipped_no_raw": 0, "skipped_no_reply": 0,
             "resolved_by_message_id": 0, "resolved_by_target_sender_id": 0,
             "resolved_by_unique_label": 0, "unresolved_label": 0,
@@ -3574,8 +3575,22 @@ class VirtualContextEngine:
         compare-and-set keyed by ``canonical_turn_id`` — never a full-row
         rewrite from a possibly-stale payload — so a re-run is a no-op.
 
-        Returns ``{eligible, updated, skipped_existing, skipped_no_raw,
-        skipped_no_sender, failed, dry_run}``.
+        Two additional recoveries run against the durable per-actor profile
+        store, which holds each actor's identity-envelope display name:
+
+        * A user row with an actor id, no stored sender, and no raw text
+          fills from its OWN actor's profile name (``profile_filled``).
+        * A user row whose stored sender contradicts its own actor's profile
+          name AND exactly equals a DIFFERENT participant's profile name is
+          a legacy logical-turn smear — one member's name written onto
+          another member's row. It is corrected to the row's own actor's
+          name through a value-matched compare-and-swap
+          (``smear_corrected``). A sender that merely differs (an older
+          display name) is never touched.
+
+        Returns ``{eligible, updated, profile_filled, smear_corrected,
+        skipped_existing, skipped_no_raw, skipped_no_sender, failed,
+        dry_run}``.
         """
         if not conversation_id:
             raise ValueError("backfill_senders requires a non-empty conversation_id")
@@ -3583,6 +3598,8 @@ class VirtualContextEngine:
         report = {
             "eligible": 0,
             "updated": 0,
+            "profile_filled": 0,
+            "smear_corrected": 0,
             "skipped_existing": 0,
             "skipped_no_raw": 0,
             "skipped_no_sender": 0,
@@ -3591,18 +3608,61 @@ class VirtualContextEngine:
         }
 
         rows = self._store.get_all_canonical_turns(conversation_id)
+
+        # Durable per-actor display names for every participant seen in this
+        # conversation. Only the profile store is consulted — never another
+        # row's sender column, which is exactly the value being repaired.
+        tenant_id = self.config.tenant_id if isinstance(self.config.tenant_id, str) else ""
+        get_profile = getattr(self._store, "get_actor_profile", None)
+        profile_names: dict[str, str] = {}
+        if callable(get_profile):
+            for actor in {
+                (row.sender_actor_id or "").strip()
+                for row in rows
+                if (row.sender_actor_id or "").strip()
+            }:
+                try:
+                    profile = get_profile(tenant_id, actor)
+                except Exception:
+                    continue
+                name = (getattr(profile, "display_name", "") or "").strip()
+                if name:
+                    profile_names[actor] = name
+
         upgrades: dict[str, str] = {}
+        corrections: dict[str, tuple[str, str]] = {}
         for row in rows:
-            if limit is not None and len(upgrades) >= limit:
+            if limit is not None and len(upgrades) + len(corrections) >= limit:
                 break
-            if (row.sender or "").strip():
-                report["skipped_existing"] += 1
+            actor = (row.sender_actor_id or "").strip()
+            stored = (row.sender or "").strip()
+            own_name = profile_names.get(actor, "")
+            if stored:
+                if (
+                    actor
+                    and own_name
+                    and row.canonical_turn_id
+                    and (row.user_content or "").strip()
+                    and stored.lower() != own_name.lower()
+                    and any(
+                        stored.lower() == other.lower()
+                        for other_actor, other in profile_names.items()
+                        if other_actor != actor
+                    )
+                ):
+                    corrections[row.canonical_turn_id] = (stored, own_name)
+                else:
+                    report["skipped_existing"] += 1
                 continue
             if not (row.user_content or "").strip():
                 # Assistant-only row: no human speaker to recover.
                 continue
             if not (row.user_raw_content or "").strip():
-                report["skipped_no_raw"] += 1
+                if actor and own_name and row.canonical_turn_id:
+                    report["profile_filled"] += 1
+                    upgrades[row.canonical_turn_id] = own_name
+                else:
+                    report["skipped_no_raw"] += 1
                 continue
             report["eligible"] += 1
             try:
@@ -3611,28 +3671,44 @@ class VirtualContextEngine:
                 report["failed"] += 1
                 continue
             if not sender:
-                report["skipped_no_sender"] += 1
+                if actor and own_name and row.canonical_turn_id:
+                    report["profile_filled"] += 1
+                    upgrades[row.canonical_turn_id] = own_name
+                else:
+                    report["skipped_no_sender"] += 1
                 continue
             if row.canonical_turn_id:
                 upgrades[row.canonical_turn_id] = sender
 
         if dry_run:
             report["updated"] = len(upgrades)
+            report["smear_corrected"] = len(corrections)
             return report
 
-        if upgrades:
+        if upgrades or corrections:
             epoch = None
             try:
                 epoch = self._store.get_lifecycle_epoch(conversation_id)
             except Exception:
                 epoch = None
-            report["updated"] = int(
-                self._store.update_canonical_turn_senders_if_empty(
-                    conversation_id,
-                    upgrades,
-                    expected_lifecycle_epoch=epoch,
+            if upgrades:
+                report["updated"] = int(
+                    self._store.update_canonical_turn_senders_if_empty(
+                        conversation_id,
+                        upgrades,
+                        expected_lifecycle_epoch=epoch,
+                    )
                 )
-            )
+            if corrections:
+                swap = getattr(
+                    self._store, "update_canonical_turn_senders_if_matches", None,
+                )
+                if callable(swap):
+                    report["smear_corrected"] = int(swap(
+                        conversation_id,
+                        corrections,
+                        expected_lifecycle_epoch=epoch,
+                    ))
 
         logger.info(
             "backfill_senders: done conv=%s eligible=%d updated=%d "

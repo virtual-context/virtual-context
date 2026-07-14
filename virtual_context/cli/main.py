@@ -1720,6 +1720,8 @@ def cmd_admin_backfill_senders(args):
         totals = {
             "eligible": 0,
             "updated": 0,
+            "profile_filled": 0,
+            "smear_corrected": 0,
             "skipped_existing": 0,
             "skipped_no_raw": 0,
             "skipped_no_sender": 0,
@@ -1983,8 +1985,8 @@ def cmd_admin_backfill_actors(args):
 
 def cmd_admin_backfill_reply_roles(args):
     _cmd_admin_actor_operation(args, "backfill_reply_roles", (
-        "eligible", "updated", "skipped_existing", "skipped_no_raw",
-        "skipped_no_reply", "resolved_by_message_id",
+        "eligible", "updated", "audience_only", "skipped_existing",
+        "skipped_no_raw", "skipped_no_reply", "resolved_by_message_id",
         "resolved_by_target_sender_id", "resolved_by_unique_label",
         "unresolved_label", "conflicting_signals", "failed",
     ))
