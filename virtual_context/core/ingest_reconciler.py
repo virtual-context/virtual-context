@@ -139,10 +139,23 @@ class IngestReconciler:
         # row exactly as the shipped single ``sender`` argument does below.
         user_sender_actor_id: str = "",
         assistant_sender_actor_id: str = "",
+        # The user half's durable reply edge (reply lanes + proved audience),
+        # derived by the caller from the live message metadata. Role-local:
+        # the assistant row never receives one. None degrades to the empty
+        # edge, so a caller that cannot prove provenance writes exactly what
+        # this path always wrote.
+        user_reply_edge: dict | None = None,
         fact_signals: list[FactSignal] | None = None,
         code_refs: list[dict] | None = None,
         expected_lifecycle_epoch: int | None = None,
         ) -> CanonicalIngestResult:
+        edge = dict(_EMPTY_REPLY_EDGE)
+        if user_reply_edge:
+            edge.update({
+                name: user_reply_edge[name]
+                for name in _REPLY_EDGE_FIELDS
+                if name in user_reply_edge
+            })
         with self._conversation_merge_lock(conversation_id):
             existing = self._store.get_all_canonical_turns(conversation_id)
             prepared = [
@@ -160,6 +173,7 @@ class IngestReconciler:
                     sender_actor_id=user_sender_actor_id,
                     fact_signals=fact_signals,
                     code_refs=code_refs,
+                    **edge,
                 ),
                 self._prepare_message_row(
                     conversation_id,
@@ -177,6 +191,12 @@ class IngestReconciler:
                     code_refs=code_refs,
                 ),
             ]
+            # Same resolution the batch path runs: a reply target named by the
+            # edge may resolve to a subject actor already stored in this
+            # conversation. Rows without a target skip in O(1), so the empty
+            # edge costs nothing here.
+            if _has_reply_edge(edge):
+                self._resolve_reply_subjects(conversation_id, prepared)
             if len(existing) >= len(prepared):
                 recent_window = existing[-min(5, len(existing)):]
                 for window_start in range(0, len(recent_window) - len(prepared) + 1):

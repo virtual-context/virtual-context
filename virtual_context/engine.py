@@ -2121,8 +2121,20 @@ class VirtualContextEngine:
             },
         }
 
-    def persist_completed_turn(self, conversation_history: list[Message]) -> None:
-        """Durably record the latest completed user/assistant pair before indexing catches up."""
+    def persist_completed_turn(
+        self,
+        conversation_history: list[Message],
+        *,
+        source_audience_conversation_id: str = "",
+    ) -> None:
+        """Durably record the latest completed user/assistant pair before indexing catches up.
+
+        ``source_audience_conversation_id`` is the request's PROVED audience —
+        already validated by the caller against the tenant-scoped resolver,
+        never taken from payload metadata. Empty means unproved: the user row
+        is written without audience attribution, exactly as this path always
+        wrote it.
+        """
         grouped = pair_messages_into_turns(list(conversation_history))
         if not grouped:
             return
@@ -2178,6 +2190,13 @@ class VirtualContextEngine:
         # Only the user half. An assistant row is never newly labeled with a
         # human actor, even though it may legitimately own a channel.
         user_actor_id = get_actor_id(user_msg.metadata, _actor_key)
+        # The user half's durable reply edge, derived exactly as the payload
+        # reconcile derives it. The audience inside it is the caller's proved
+        # value; an empty one versions to 0 so an unproved route stays
+        # policy-ineligible rather than inheriting the resolved owner.
+        user_reply_edge = IngestReconciler._derive_reply_edge(
+            user_msg, _actor_key, source_audience_conversation_id,
+        )
         try:
             result = IngestReconciler(
                 self._store,
@@ -2197,6 +2216,7 @@ class VirtualContextEngine:
                 assistant_origin_channel_id=asst_channel_id,
                 assistant_origin_channel_label=asst_channel_label,
                 user_sender_actor_id=user_actor_id,
+                user_reply_edge=user_reply_edge,
                 fact_signals=list(entry.fact_signals or []) if entry else [],
                 code_refs=list(entry.code_refs or []) if entry else [],
                 expected_lifecycle_epoch=self._engine_state.lifecycle_epoch,
