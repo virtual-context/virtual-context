@@ -5,7 +5,17 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 
-def dt_to_str(dt: datetime) -> str:
+def dt_to_str(dt: datetime | str | None) -> str:
+    """ISO string for a datetime, passing through values already stored as text.
+
+    Several tables store timestamps in TEXT columns, so a row read hands back
+    a ``str`` on some backends and a ``datetime`` on others depending on the
+    column type and driver. Normalizing here keeps every reader agnostic.
+    """
+    if dt is None:
+        return ""
+    if isinstance(dt, str):
+        return dt
     return dt.isoformat()
 
 
