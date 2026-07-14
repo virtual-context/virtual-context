@@ -132,6 +132,13 @@ class SegmentStore(Protocol):
         *,
         expected_lifecycle_epoch: int | None = None,
     ) -> int: ...
+    def update_canonical_turn_senders_if_matches(
+        self,
+        conversation_id: str,
+        updates: dict[str, tuple[str, str]],
+        *,
+        expected_lifecycle_epoch: int | None = None,
+    ) -> int: ...
     def update_canonical_turn_channels_if_empty(
         self,
         conversation_id: str,
