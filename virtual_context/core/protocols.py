@@ -125,6 +125,14 @@ class SegmentStore(Protocol):
         audience_conversation_id: str = "",
         audience_attribution_version: int = 0,
     ) -> None: ...
+    def search_canonical_turns_by_actor(
+        self,
+        actor_id: str,
+        limit: int,
+        conversation_id: str | None,
+        *,
+        speaker_context,
+    ) -> list: ...
     def update_canonical_turn_senders_if_empty(
         self,
         conversation_id: str,

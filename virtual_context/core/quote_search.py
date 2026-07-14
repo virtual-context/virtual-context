@@ -1404,6 +1404,52 @@ def _search_find_quote_candidates(
             )[:semantic_limit]
         results.extend(semantic_results)
 
+    # "What do you know about X?" — the question a speaker selection is FOR.
+    #
+    # Every source above ranks content against the query and applies the actor
+    # predicate to whatever clears its own relevance threshold. That answers
+    # "what did X say about Y". It cannot answer "what has X said", because
+    # that question carries no topic to rank against: the person IS the query.
+    # The sources return nothing about anything, the predicate filters an empty
+    # list, and the reader is told there is nothing on record — while the
+    # speaker's statements sit in storage, unreached. "Nothing" is a wrong
+    # answer to a question whose subject is the speaker.
+    #
+    # So when a speaker was selected exactly and the ranked sources surfaced
+    # none of their statements, fetch the statements directly: an actor-indexed
+    # read where the user lane and the actor are chosen, not inferred from a
+    # text match. This can only add results where there were none — a search
+    # that already found the speaker's words is untouched.
+    if filtering and not results:
+        by_actor = getattr(store, "search_canonical_turns_by_actor", None)
+        if callable(by_actor):
+            try:
+                recalled = by_actor(
+                    speaker_conditioning.conditioning_actor_id,
+                    limit,
+                    conversation_id,
+                    speaker_context=speaker_context,
+                )
+            except Exception:
+                logger.debug(
+                    "speaker recall failed; leaving the empty result",
+                    exc_info=True,
+                )
+                recalled = []
+            # Same classification pass as every source, so the exclusion counts
+            # stay disjoint and the actor predicate is applied identically.
+            # ``counted_identities`` carries over, so nothing is counted twice.
+            if recalled:
+                results.extend(
+                    _filter_speaker_only_candidates(
+                        recalled,
+                        speaker_conditioning,
+                        speaker_context,
+                        exclusion_counts,
+                        counted_identities,
+                    )[:limit]
+                )
+
     deduped: list[QuoteResult] = []
     seen: set[tuple[object, ...]] = set()
     speaker_aware = speaker_context is not None
