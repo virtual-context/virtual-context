@@ -152,6 +152,36 @@ def test_completed_turn_persist_threads_reply_lanes(tmp_path):
         engine.close()
 
 
+def test_backfill_stamps_audience_on_rows_without_raw_content(tmp_path):
+    """A row persisted without retained raw text can never recover a reply
+    edge, but its audience is route-level: the recorded origin route (or the
+    conversation itself) is proved through the resolver and stamped, so the
+    row becomes visible to audience-scoped policy."""
+    engine = _make_engine(tmp_path)
+    try:
+        history = [
+            Message(role="user", content="legacy unstamped question"),
+            Message(role="assistant", content="legacy unstamped answer"),
+        ]
+        # Legacy shape: persisted with no proved audience and no raw content.
+        engine.persist_completed_turn(history)
+        before = _audience_rows(tmp_path)
+        assert all(r["version"] == 0 for r in before)
+
+        upsert = getattr(engine._store, "upsert_conversation", None)
+        if callable(upsert):
+            upsert(tenant_id="", conversation_id="c")
+        report = engine.backfill_reply_roles("c")
+        assert report.get("audience_only", 0) >= 1, report
+
+        rows = _audience_rows(tmp_path)
+        user_row = next(r for r in rows if r["user"])
+        assert user_row["audience"] == "c"
+        assert user_row["version"] == 1
+    finally:
+        engine.close()
+
+
 def test_prepare_stamped_row_survives_completed_turn_resend(tmp_path):
     """A user row the payload reconcile already stamped keeps its stamp when
     the completed pair arrives with no proved audience (the tail-anchor path
