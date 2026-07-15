@@ -3416,11 +3416,31 @@ class VirtualContextEngine:
             conversation_id=conversation_id,
             limit=limit,
         )
+        from .types import AUTHOR_VERSION_REPLY_LANE
+
+        def _author_settled(fact) -> bool:
+            """A fact re-attribution can no longer improve.
+
+            A reply-lane fact is structural — its author comes from the row
+            edge, not a model label, and an assistant lane legitimately has no
+            human author — so it is settled regardless of the actor field. A
+            sole-actor (version 1) fact is settled only once it actually
+            resolved to an actor: a version-1 fact with an EMPTY author is not
+            "already attributed", it is an attribution that FAILED because the
+            physical rows carried no actor ids when it ran. Those are exactly
+            the facts a later actor backfill makes resolvable, so re-running
+            must reconsider them rather than skip them as done.
+            """
+            version = int(getattr(fact, "author_attribution_version", 0) or 0)
+            if version >= AUTHOR_VERSION_REPLY_LANE:
+                return True
+            return version >= 1 and bool(
+                (getattr(fact, "author_actor_id", "") or "").strip()
+            )
+
         for stored in segments:
             old_facts = self._store.get_facts_by_segment(stored.ref)
-            if old_facts and all(
-                int(f.author_attribution_version or 0) > 0 for f in old_facts
-            ):
+            if old_facts and all(_author_settled(f) for f in old_facts):
                 report["skipped_existing"] += 1
                 continue
             ids = list(stored.metadata.canonical_turn_ids or [])
