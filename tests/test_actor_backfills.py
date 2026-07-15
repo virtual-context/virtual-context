@@ -169,6 +169,110 @@ def test_backfill_fact_authors_redistills_with_closed_roster(tmp_path):
     engine.close()
 
 
+def test_version_one_with_empty_author_is_reattempted_not_skipped(tmp_path):
+    """A failed attribution must not masquerade as a finished one.
+
+    A sole-actor (version 1) fact is stamped whether or not the model's
+    speaker label resolved to an actor; when the physical rows carried no
+    actor ids at distill time it resolves to nothing and the fact keeps
+    version 1 with an EMPTY author. That is not "already attributed" — it is
+    an attribution that failed and can now succeed once the rows gain actor
+    ids. The backfill must reconsider it, not skip it as existing.
+    """
+    engine = _engine(tmp_path)
+    now = datetime.now(timezone.utc)
+    engine._store.save_canonical_turn(
+        GUILD, -1, "I prefer terse answers", "noted",
+        canonical_turn_id="ct-empty", sort_key=1, turn_hash="ct-empty",
+        sender="Optics", sender_actor_id=OPTICS,
+        audience_conversation_id=GUILD, audience_attribution_version=1,
+    )
+    engine._store.store_segment(StoredSegment(
+        ref="seg-empty", conversation_id=GUILD, primary_tag="prefs",
+        tags=["prefs"], summary="s", full_text="f", messages=[],
+        metadata=SegmentMetadata(
+            canonical_turn_ids=["ct-empty"], source_mapping_complete=True,
+            turn_count=1,
+        ),
+        created_at=now, start_timestamp=now, end_timestamp=now,
+    ))
+    # version 1, but the author never resolved — the failure case.
+    engine._store.store_facts([Fact(
+        id="unresolved", subject="user", verb="prefers",
+        object="terse answers", segment_ref="seg-empty",
+        conversation_id=GUILD,
+        author_actor_id="", author_attribution_version=1,
+        author_source_role="unattributed",
+    )])
+
+    class LLM:
+        def complete(self, **_kwargs):
+            return json.dumps({
+                "summary": "Optics prefers terse answers.",
+                "entities": [], "key_decisions": [], "action_items": [],
+                "date_references": [], "refined_tags": ["prefs"],
+                "facts": [{
+                    "subject": "Optics", "verb": "prefers",
+                    "object": "terse answers", "status": "active",
+                    "fact_type": "personal",
+                    "what": "Optics prefers terse answers.",
+                    "speaker": "Optics",
+                }],
+            }), {}
+
+    engine._compactor = DomainCompactor(LLM(), engine.config.compactor)
+    engine._compaction._compactor = engine._compactor
+    report = engine.backfill_fact_authors(GUILD)
+
+    assert report["skipped_existing"] == 0, (
+        "a version-1 fact with no author was wrongly treated as attributed"
+    )
+    assert report["updated"] == 1
+    facts = engine._store.get_facts_by_segment("seg-empty")
+    assert facts[0].author_actor_id == OPTICS
+    engine.close()
+
+
+def test_reply_lane_facts_are_settled_and_skipped(tmp_path):
+    """A version-2 reply-lane fact is done — even an empty author is correct
+    for an assistant lane — so re-running must not re-spend on it."""
+    engine = _engine(tmp_path)
+    now = datetime.now(timezone.utc)
+    engine._store.save_canonical_turn(
+        GUILD, -1, "the whey is 30g", "noted",
+        canonical_turn_id="ct-settled", sort_key=1, turn_hash="ct-settled",
+        sender="BigTex", sender_actor_id=BIGTEX,
+        audience_conversation_id=GUILD, audience_attribution_version=1,
+    )
+    engine._store.store_segment(StoredSegment(
+        ref="seg-settled", conversation_id=GUILD, primary_tag="macros",
+        tags=["macros"], summary="s", full_text="f", messages=[],
+        metadata=SegmentMetadata(
+            canonical_turn_ids=["ct-settled"], source_mapping_complete=True,
+            turn_count=1,
+        ),
+        created_at=now, start_timestamp=now, end_timestamp=now,
+    ))
+    engine._store.store_facts([Fact(
+        id="settled", subject="whey", verb="is", object="30g",
+        segment_ref="seg-settled", conversation_id=GUILD,
+        author_actor_id=BIGTEX, author_attribution_version=2,
+        author_source_role="requester",
+    )])
+
+    class LLM:
+        def complete(self, **_kwargs):
+            raise AssertionError("re-distill must not run for a settled fact")
+
+    engine._compactor = DomainCompactor(LLM(), engine.config.compactor)
+    engine._compaction._compactor = engine._compactor
+    report = engine.backfill_fact_authors(GUILD)
+
+    assert report["skipped_existing"] == 1
+    assert report["updated"] == 0
+    engine.close()
+
+
 def test_rebuild_actor_cards_runs_while_read_gate_is_dark(tmp_path):
     engine = _engine(tmp_path)
     now = datetime.now(timezone.utc)
