@@ -2057,6 +2057,10 @@ def _cmd_admin_guarded_conversation_repair(args, method_name: str):
                 dry_run=dry_run,
                 limit=getattr(args, "limit", None),
             )
+        elif method_name == "resequence_canonical_turns":
+            result = engine.resequence_canonical_turns(
+                engine.config.conversation_id, dry_run=dry_run,
+            )
         else:
             result = engine.rebuild_derived_data(
                 engine.config.conversation_id, dry_run=dry_run,
@@ -2086,6 +2090,10 @@ def cmd_admin_reattribute_audience(args):
 
 def cmd_admin_rebuild_derived_data(args):
     _cmd_admin_guarded_conversation_repair(args, "rebuild_derived_data")
+
+
+def cmd_admin_resequence_canonical_turns(args):
+    _cmd_admin_guarded_conversation_repair(args, "resequence_canonical_turns")
 
 
 def cmd_admin_reindex_canonical_turn_embeddings(args):
@@ -2883,6 +2891,25 @@ def main():
     rebuild_derived_parser.add_argument("--postgres-dsn")
     rebuild_derived_parser.add_argument("--sqlite-path")
 
+    resequence_parser = admin_sub.add_parser(
+        "resequence-canonical-turns",
+        help=(
+            "Repair source-local turn-group collisions and globally order "
+            "canonical turns by durable timestamps"
+        ),
+    )
+    resequence_parser.add_argument("conversation_id")
+    resequence_parser.add_argument("--tenant-id", required=True)
+    resequence_parser.add_argument(
+        "--apply", action="store_true",
+        help="Write the repair; the default is a dry-run report",
+    )
+    resequence_parser.add_argument(
+        "--storage-backend", choices=("sqlite", "postgres"),
+    )
+    resequence_parser.add_argument("--postgres-dsn")
+    resequence_parser.add_argument("--sqlite-path")
+
     # ------------------------------------------------------------------
     # admin reindex-canonical-turn-embeddings
     # ------------------------------------------------------------------
@@ -3116,6 +3143,8 @@ def main():
             cmd_admin_reattribute_audience(args)
         elif args.admin_command == "rebuild-derived-data":
             cmd_admin_rebuild_derived_data(args)
+        elif args.admin_command == "resequence-canonical-turns":
+            cmd_admin_resequence_canonical_turns(args)
         elif args.admin_command == "reindex-canonical-turn-embeddings":
             cmd_admin_reindex_canonical_turn_embeddings(args)
         elif args.admin_command == "backfill-session-state-markers":
@@ -3129,6 +3158,7 @@ def main():
                 "  virtual-context admin backfill-channels [<conversation_id>] [--tenant-id <id>] [--all-convs-for-tenant] [--dry-run] [--limit N]\n"
                 "  virtual-context admin reattribute-audience <conversation_id> <from_audience> <to_audience> --tenant-id <id> [--apply] [--limit N]\n"
                 "  virtual-context admin rebuild-derived-data <conversation_id> --tenant-id <id> [--apply]\n"
+                "  virtual-context admin resequence-canonical-turns <conversation_id> --tenant-id <id> [--apply]\n"
                 "  virtual-context admin reindex-canonical-turn-embeddings [<conversation_id>] [--tenant-id <id>] [--all-convs-for-tenant] [--apply] [--limit N]\n"
                 "  virtual-context admin backfill-session-state-markers [<conversation_id>] [--tenant-id <id>] [--all-convs-for-tenant] [--dry-run] [--limit N] [--redis-url <url>]"
             )

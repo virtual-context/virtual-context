@@ -12,6 +12,7 @@ import logging
 import math
 import time
 from collections.abc import Callable
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 from .engine_utils import extract_turn_pairs
@@ -558,14 +559,32 @@ class CompactionPipeline:
                 assistant_metadata = {
                     SOURCE_CANONICAL_TURN_IDS_KEY: list(assistant_ids)
                 }
+            timestamp = None
+            for raw_timestamp in (
+                row.first_seen_at,
+                row.last_seen_at,
+                row.created_at,
+                row.updated_at,
+            ):
+                if not raw_timestamp:
+                    continue
+                try:
+                    timestamp = datetime.fromisoformat(
+                        str(raw_timestamp).replace("Z", "+00:00")
+                    )
+                    break
+                except (TypeError, ValueError):
+                    continue
             messages.append(Message(
                 role="user",
                 content=row.user_content,
+                timestamp=timestamp,
                 metadata=user_metadata,
             ))
             messages.append(Message(
                 role="assistant",
                 content=row.assistant_content,
+                timestamp=timestamp,
                 metadata=assistant_metadata,
             ))
         return rows, messages

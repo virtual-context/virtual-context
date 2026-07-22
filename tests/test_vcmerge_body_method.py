@@ -2030,10 +2030,10 @@ def _seed_media_output(conn, conv: str, ref: str):
     )
 
 
-def test_body_dedups_conflicting_turn_tool_outputs(tmp_path):
+def test_body_preserves_same_number_turn_tool_outputs_in_distinct_namespaces(tmp_path):
     """Source and target carrying an IDENTICAL (turn_number,
-    tool_output_ref) row must merge cleanly: target's row wins, the
-    source's duplicate is dropped and counted, non-conflicting rows move.
+    tool_output_ref) row must merge cleanly: the source turn namespace is
+    shifted so both provenance-distinct links survive.
     """
     store = _store(tmp_path)
     conn = store._get_conn()
@@ -2055,13 +2055,108 @@ def test_body_dedups_conflicting_turn_tool_outputs(tmp_path):
         "SELECT turn_number, tool_output_ref FROM turn_tool_outputs "
         "WHERE conversation_id = 'tgt' ORDER BY turn_number",
     ).fetchall()
-    assert [(r[0], r[1]) for r in rows] == [(0, "tool_dup"), (5, "tool_only_src")]
+    assert [(r[0], r[1]) for r in rows] == [
+        (0, "tool_dup"), (1, "tool_dup"), (6, "tool_only_src"),
+    ]
     src_left = conn.execute(
         "SELECT COUNT(*) FROM turn_tool_outputs WHERE conversation_id = 'src'",
     ).fetchone()[0]
     assert src_left == 0
-    assert stats.rows_moved.get("turn_tool_outputs") == 1
-    assert stats.rows_moved.get("turn_tool_outputs__conflicts_deleted") == 1
+    assert stats.rows_moved.get("turn_tool_outputs") == 2
+    assert stats.rows_moved.get("turn_tool_outputs__conflicts_deleted") == 0
+
+
+def test_body_offsets_logical_groups_and_turn_scoped_artifacts(tmp_path):
+    store = _store(tmp_path)
+    conn = store._get_conn()
+    _seed_conversation(conn, "tA", "src")
+    _seed_conversation(conn, "tA", "tgt")
+    for conv, prefix, base in (("tgt", "target", 1000), ("src", "source", 1000)):
+        _seed_canonical_turn(conn, conv, f"{prefix}-u", base)
+        _seed_canonical_turn(conn, conv, f"{prefix}-a", base + 1)
+        conn.execute(
+            "UPDATE canonical_turns SET turn_group_number = 0, user_content = 'q' "
+            "WHERE canonical_turn_id = ?",
+            (f"{prefix}-u",),
+        )
+        conn.execute(
+            "UPDATE canonical_turns SET turn_group_number = 0, assistant_content = 'a' "
+            "WHERE canonical_turn_id = ?",
+            (f"{prefix}-a",),
+        )
+    conn.execute(
+        "INSERT INTO turn_tool_outputs (conversation_id, turn_number, tool_output_ref) "
+        "VALUES ('src', 0, 'source-tool')",
+    )
+    conn.execute(
+        """INSERT INTO chain_snapshots
+           (ref, conversation_id, turn_number, chain_json, message_count)
+           VALUES ('source-chain', 'src', 0, '{}', 1)""",
+    )
+    conn.commit()
+
+    merge_id = _reserve(store)
+    store.merge_conversation_data(
+        merge_id=merge_id, tenant_id="tA",
+        source_conversation_id="src", target_conversation_id="tgt",
+        expected_target_lifecycle_epoch=1, source_label_at_merge="lbl",
+    )
+
+    groups = conn.execute(
+        """SELECT canonical_turn_id, turn_group_number
+             FROM canonical_turns WHERE conversation_id = 'tgt'
+             ORDER BY sort_key""",
+    ).fetchall()
+    assert [(row[0], row[1]) for row in groups] == [
+        ("target-u", 0), ("target-a", 0),
+        ("source-u", 1), ("source-a", 1),
+    ]
+    assert conn.execute(
+        "SELECT turn_number FROM turn_tool_outputs WHERE tool_output_ref = 'source-tool'",
+    ).fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT turn_number FROM chain_snapshots WHERE ref = 'source-chain'",
+    ).fetchone()[0] == 1
+
+
+def test_chained_merge_preserves_existing_origin_group_boundaries(tmp_path):
+    store = _store(tmp_path)
+    conn = store._get_conn()
+    for conversation_id in ("src-a", "src-b", "tgt-c"):
+        _seed_conversation(conn, "tA", conversation_id)
+        _seed_canonical_turn(
+            conn, conversation_id, f"turn-{conversation_id}", 1000,
+        )
+        conn.execute(
+            """UPDATE canonical_turns
+                  SET turn_group_number = 0,
+                      user_content = 'question', assistant_content = 'answer'
+                WHERE canonical_turn_id = ?""",
+            (f"turn-{conversation_id}",),
+        )
+    conn.commit()
+
+    merge_ab = _reserve(store, source="src-a", target="src-b")
+    store.merge_conversation_data(
+        merge_id=merge_ab, tenant_id="tA",
+        source_conversation_id="src-a", target_conversation_id="src-b",
+        expected_target_lifecycle_epoch=1, source_label_at_merge="a",
+    )
+    merge_bc = _reserve(store, source="src-b", target="tgt-c")
+    store.merge_conversation_data(
+        merge_id=merge_bc, tenant_id="tA",
+        source_conversation_id="src-b", target_conversation_id="tgt-c",
+        expected_target_lifecycle_epoch=1, source_label_at_merge="b",
+    )
+
+    rows = conn.execute(
+        """SELECT canonical_turn_id, turn_group_number
+             FROM canonical_turns WHERE conversation_id = 'tgt-c'
+             ORDER BY turn_group_number""",
+    ).fetchall()
+    assert [(row[0], row[1]) for row in rows] == [
+        ("turn-tgt-c", 0), ("turn-src-b", 1), ("turn-src-a", 2),
+    ]
 
 
 def test_body_dedups_conflicting_media_outputs(tmp_path):

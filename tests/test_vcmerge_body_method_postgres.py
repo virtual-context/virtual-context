@@ -525,10 +525,10 @@ def test_pg_concurrent_save_request_context_serializes_with_body(pg_store):
         sub_conn.close()
 
 
-def test_pg_body_dedups_conflicting_turn_tool_outputs(pg_store):
+def test_pg_body_preserves_same_number_turn_tool_outputs_by_namespace(pg_store):
     """Identical (turn_number, tool_output_ref) in source AND target —
-    the overlapping-re-ingest shape — must dedup (target wins), not
-    abort the merge on the composite primary key."""
+    the overlapping-re-ingest shape — must both survive after the source
+    turn namespace is shifted."""
     conv_src = f"pgsmoke-src-{uuid.uuid4().hex[:8]}"
     conv_tgt = f"pgsmoke-tgt-{uuid.uuid4().hex[:8]}"
     conn = pg_test_conn()
@@ -557,7 +557,7 @@ def test_pg_body_dedups_conflicting_turn_tool_outputs(pg_store):
         (conv_tgt,),
     ).fetchall()
     assert [(r["turn_number"], r["tool_output_ref"]) for r in rows] == [
-        (0, "tool_dup"), (5, "tool_only_src"),
+        (0, "tool_dup"), (1, "tool_dup"), (6, "tool_only_src"),
     ]
-    assert stats.rows_moved.get("turn_tool_outputs") == 1
-    assert stats.rows_moved.get("turn_tool_outputs__conflicts_deleted") == 1
+    assert stats.rows_moved.get("turn_tool_outputs") == 2
+    assert stats.rows_moved.get("turn_tool_outputs__conflicts_deleted") == 0

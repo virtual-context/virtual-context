@@ -675,6 +675,44 @@ class DomainCompactor:
             duration_ms = (time.time() - t0) * 1000
             self._log_usage("segment_summarize", duration_ms=duration_ms, usage=usage)
             parsed = self._parse_response(response_text)
+            if self._is_degenerate_summary(parsed.get("summary", "")):
+                logger.warning(
+                    "Degenerate LLM summary for segment %s; retrying once",
+                    segment.id,
+                )
+                retry_started = time.time()
+                response_text, usage = self.llm.complete(
+                    system=(
+                        system
+                        + " Your previous response was incomplete. Return one complete "
+                          "JSON object with a non-empty plain-text summary."
+                    ),
+                    user=prompt,
+                    max_tokens=(
+                        self.config.max_summary_tokens
+                        + self.config.llm_token_overhead
+                    ),
+                )
+                self._log_usage(
+                    "segment_summarize_retry",
+                    duration_ms=(time.time() - retry_started) * 1000,
+                    usage=usage,
+                )
+                parsed = self._parse_response(response_text)
+                if self._is_degenerate_summary(parsed.get("summary", "")):
+                    logger.warning(
+                        "Degenerate LLM summary persisted after retry for segment %s; "
+                        "using bounded source-text fallback",
+                        segment.id,
+                    )
+                    parsed = {
+                        "summary": conversation_text[:target_tokens * 4],
+                        "entities": [],
+                        "key_decisions": [],
+                        "action_items": [],
+                        "date_references": [],
+                        "refined_tags": segment.tags,
+                    }
         except Exception as e:
             logger.warning(f"LLM summarization failed for segment {segment.id}: {e}")
             parsed = {
@@ -1118,6 +1156,27 @@ class DomainCompactor:
             "refined_tags": [],
             "code_refs": [],
         }
+
+    @staticmethod
+    def _is_degenerate_summary(summary: object) -> bool:
+        """Reject incomplete JSON/fence fragments before they become memory."""
+        if not isinstance(summary, str):
+            return True
+        text = summary.strip()
+        if not text:
+            return True
+        lowered = text.lower()
+        if lowered.startswith("```"):
+            return True
+        if text in {"{", "}", "[", "]"}:
+            return True
+        if text.startswith("{") and (
+            '"summary"' in lowered
+            or '"entities"' in lowered
+            or '"key_decisions"' in lowered
+        ):
+            return True
+        return False
 
     def compact_tag_summaries(
         self,
