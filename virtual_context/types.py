@@ -519,6 +519,89 @@ def get_actor_id(
     return ""
 
 
+def build_user_turn_metadata(
+    *,
+    sender_name: str = "",
+    sender_actor_id: str = "",
+    source_message_id: str = "",
+    origin_channel_id: str = "",
+    origin_channel_label: str = "",
+    reply_target_message_id: str = "",
+    source_conversation_key: str = "",
+) -> dict:
+    """Build normalized ``Message.metadata`` from adapter-supplied fields.
+
+    Transport adapters can observe provenance before they remove their host
+    envelope from conversational text.  This helper gives those adapters a
+    structured admission path without making them reproduce the engine's
+    reserved metadata layout.  The returned object is accepted by the same
+    sender, actor, channel, and reply helpers used for parsed envelopes.
+
+    ``sender_actor_id`` is accepted only in the durable
+    ``actor:<platform>:<user-id>`` form.  Invalid values are ignored rather
+    than being persisted as identities.  All other fields follow the existing
+    envelope contract: non-string or control-bearing values become empty.
+    """
+
+    def _clean(value: object) -> str:
+        return _actor_clean_str(value)
+
+    sender_name = _clean(sender_name)
+    source_message_id = _clean(source_message_id)
+    origin_channel_id = _clean(origin_channel_id)
+    origin_channel_label = _clean(origin_channel_label)
+    reply_target_message_id = _clean(reply_target_message_id)
+    source_conversation_key = _clean(source_conversation_key)
+
+    actor_value: dict[str, str] | None = None
+    actor_text = _clean(sender_actor_id)
+    if actor_text.startswith("actor:"):
+        parts = actor_text.split(":", 2)
+        if len(parts) == 3:
+            normalized = _normalize_actor_id(parts[1], parts[2])
+            if normalized == actor_text:
+                actor_value = {
+                    "platform": parts[1],
+                    "user_id": parts[2],
+                }
+                if sender_name:
+                    actor_value["display_name"] = sender_name
+
+    current: dict[str, object] = {}
+    if source_message_id:
+        current["message_id"] = source_message_id
+    if reply_target_message_id:
+        current["reply_to_id"] = reply_target_message_id
+    if origin_channel_id:
+        current["chat_id"] = f"channel:{origin_channel_id}"
+    if origin_channel_label:
+        current["group_channel"] = origin_channel_label
+
+    sender: dict[str, str] = {}
+    if actor_value is not None:
+        sender["id"] = actor_value["user_id"]
+    if sender_name:
+        sender["name"] = sender_name
+    if sender:
+        current["sender"] = sender
+
+    metadata: dict[str, object] = {}
+    if current:
+        metadata["conversation info"] = dict(current)
+        metadata[CURRENT_CONVERSATION_KEY] = dict(current)
+    if sender_name:
+        metadata["sender"] = {"name": sender_name}
+    if actor_value is not None:
+        metadata["actor"] = dict(actor_value)
+        metadata[ACTOR_IDENTITY_KEY] = {
+            "source": "actor",
+            "value": dict(actor_value),
+        }
+    if source_conversation_key:
+        metadata[SOURCE_CONVERSATION_KEY] = source_conversation_key
+    return metadata
+
+
 def get_actor_display_name(metadata: dict | None) -> str:
     """Presentation name preferred from the winning identity block.
 

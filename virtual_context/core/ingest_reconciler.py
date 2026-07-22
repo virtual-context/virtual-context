@@ -130,6 +130,8 @@ class IngestReconciler:
         tags: list[str] | None = None,
         session_date: str = "",
         sender: str = "",
+        user_sender: str | None = None,
+        assistant_sender: str | None = None,
         user_origin_channel_id: str = "",
         user_origin_channel_label: str = "",
         assistant_origin_channel_id: str = "",
@@ -149,6 +151,12 @@ class IngestReconciler:
         code_refs: list[dict] | None = None,
         expected_lifecycle_epoch: int | None = None,
         ) -> CanonicalIngestResult:
+        # ``sender`` is the legacy logical-turn argument and remains the
+        # fallback for existing callers. New callers can preserve the physical
+        # row contract by supplying role-local values; a human sender must not
+        # be newly stamped onto the assistant half.
+        resolved_user_sender = sender if user_sender is None else user_sender
+        resolved_assistant_sender = sender if assistant_sender is None else assistant_sender
         edge = dict(_EMPTY_REPLY_EDGE)
         if user_reply_edge:
             edge.update({
@@ -167,7 +175,7 @@ class IngestReconciler:
                     primary_tag=primary_tag,
                     tags=tags,
                     session_date=session_date,
-                    sender=sender,
+                    sender=resolved_user_sender,
                     origin_channel_id=user_origin_channel_id,
                     origin_channel_label=user_origin_channel_label,
                     sender_actor_id=user_sender_actor_id,
@@ -183,7 +191,7 @@ class IngestReconciler:
                     primary_tag=primary_tag,
                     tags=tags,
                     session_date=session_date,
-                    sender=sender,
+                    sender=resolved_assistant_sender,
                     origin_channel_id=assistant_origin_channel_id,
                     origin_channel_label=assistant_origin_channel_label,
                     sender_actor_id=assistant_sender_actor_id,
@@ -276,6 +284,18 @@ class IngestReconciler:
                             },
                             expected_lifecycle_epoch=expected_lifecycle_epoch,
                         )
+                    tail_candidate_sender = (user_row.sender or "").strip()
+                    if (
+                        tail.canonical_turn_id
+                        and tail_candidate_sender
+                        and not (tail.sender or "").strip()
+                        and (tail.user_content or "").strip()
+                    ):
+                        self._upgrade_empty_senders(
+                            conversation_id,
+                            {tail.canonical_turn_id: tail_candidate_sender},
+                            expected_lifecycle_epoch=expected_lifecycle_epoch,
+                        )
                     # Same reasoning for the actor id, but with the sender role
                     # rule: the tail row here is the USER half, so it may carry
                     # one. The caller's entry epoch fences it for the same
@@ -290,6 +310,16 @@ class IngestReconciler:
                         self._upgrade_empty_actors(
                             conversation_id,
                             {tail.canonical_turn_id: tail_candidate_actor},
+                            expected_lifecycle_epoch=expected_lifecycle_epoch,
+                        )
+                    tail_candidate_edge = {
+                        name: getattr(user_row, name)
+                        for name in _REPLY_EDGE_FIELDS
+                    }
+                    if tail.canonical_turn_id and _has_reply_edge(tail_candidate_edge):
+                        self._upgrade_empty_reply_roles(
+                            conversation_id,
+                            {tail.canonical_turn_id: tail_candidate_edge},
                             expected_lifecycle_epoch=expected_lifecycle_epoch,
                         )
                     self._preserve_existing_enrichment(user_row, tail)
@@ -352,10 +382,16 @@ class IngestReconciler:
         expected_lifecycle_epoch: int,
         source_conversation_key: str = "",
         source_audience_conversation_id: str = "",
+        current_user_metadata: dict | None = None,
     ) -> CanonicalIngestResult:
         from ..proxy.formats import extract_ingestible_messages
 
-        entries, _stats = extract_ingestible_messages(body, fmt, mode="ingest")
+        entries, _stats = extract_ingestible_messages(
+            body,
+            fmt,
+            mode="ingest",
+            current_user_metadata=current_user_metadata,
+        )
         # The platform segment of an actor id lives only in the RAW caller key.
         # ``conversation_id`` here is already alias-resolved, so after VCATTACH
         # it can be a UUID that names no platform. A caller that supplied a raw

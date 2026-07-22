@@ -1129,6 +1129,7 @@ class ProxyState:
         payload_accounting: dict,
         source_conversation_key: str = "",
         source_audience_conversation_id: str = "",
+        current_user_metadata: dict | None = None,
     ) -> PhaseDecision:
         """Run the ingestion flow (, steps 1-8) for one inbound request.
 
@@ -1208,6 +1209,7 @@ class ProxyState:
                     source_audience_conversation_id=(
                         source_audience_conversation_id
                     ),
+                    current_user_metadata=current_user_metadata,
                 )
             except AttributeError:
                 # No reconciler configured on engine — acceptable for

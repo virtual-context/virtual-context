@@ -95,9 +95,15 @@ def _extract_ingestible_messages(
     body: dict,
     *,
     mode: str = "ingest",
+    current_user_metadata: dict | None = None,
 ) -> list[Message]:
     fmt = detect_format(body)
-    messages, _ = extract_ingestible_messages(body, fmt, mode=mode)
+    messages, _ = extract_ingestible_messages(
+        body,
+        fmt,
+        mode=mode,
+        current_user_metadata=current_user_metadata,
+    )
     return messages
 
 
