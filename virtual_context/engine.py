@@ -907,7 +907,7 @@ class VirtualContextEngine:
                 "on the same SQLite or Postgres delegate"
             )
 
-    def _require_actor_sql_store(self, *, cards: bool = False) -> None:
+    def _require_actor_sql_store(self, *, cards: bool = False):
         """Refuse actor migrations on stores without physical SQL rows."""
         from .core.composite_store import CompositeStore
 
@@ -924,6 +924,7 @@ class VirtualContextEngine:
             raise RuntimeError(
                 "actor administration requires co-located SQLite or Postgres storage"
             )
+        return segments
 
     def _init_store_view(self, raw_store) -> None:
         """Activate the conversation generation and install the store view.
@@ -3122,6 +3123,72 @@ class VirtualContextEngine:
             return ""
         match = _STABLE_CHANNEL_KEY_RE.match(key.strip())
         return match.group(1) if match else ""
+
+    def reattribute_audience(
+        self,
+        conversation_id: str,
+        from_audience: str,
+        to_audience: str,
+        *,
+        dry_run: bool = True,
+        limit: int | None = None,
+    ) -> dict:
+        """Collapse one verified merged channel audience into its owner.
+
+        There is deliberately no wildcard or tenant-wide mode: the operator
+        must enumerate each independently verified source alias.
+        """
+        owner = (conversation_id or "").strip()
+        if not owner:
+            raise ValueError("reattribute_audience requires a conversation_id")
+        if owner != self.config.conversation_id:
+            raise ValueError("reattribute_audience must target the engine-bound owner")
+        tenant_id = (self.config.tenant_id or "").strip()
+        if not tenant_id:
+            raise ValueError("reattribute_audience requires a tenant_id")
+        sql_store = self._require_actor_sql_store(cards=True)
+        repair = getattr(sql_store, "reattribute_canonical_turn_audience", None)
+        if not callable(repair):
+            raise RuntimeError("storage backend does not support audience reattribution")
+        epoch = int(sql_store.get_lifecycle_epoch(owner) or 0)
+        if epoch <= 0:
+            raise ValueError("owner conversation has no active lifecycle epoch")
+        return repair(
+            owner, from_audience, to_audience,
+            tenant_id=tenant_id,
+            expected_lifecycle_epoch=epoch,
+            dry_run=bool(dry_run),
+            limit=limit,
+        )
+
+    def rebuild_derived_data(
+        self,
+        conversation_id: str,
+        *,
+        dry_run: bool = True,
+    ) -> dict:
+        """Reset rebuildable summaries/facts for one canonical conversation."""
+        owner = (conversation_id or "").strip()
+        if not owner:
+            raise ValueError("rebuild_derived_data requires a conversation_id")
+        if owner != self.config.conversation_id:
+            raise ValueError("rebuild_derived_data must target the engine-bound owner")
+        tenant_id = (self.config.tenant_id or "").strip()
+        if not tenant_id:
+            raise ValueError("rebuild_derived_data requires a tenant_id")
+        sql_store = self._require_actor_sql_store(cards=True)
+        reset = getattr(sql_store, "reset_conversation_derived_data", None)
+        if not callable(reset):
+            raise RuntimeError("storage backend does not support derived-data rebuild")
+        epoch = int(sql_store.get_lifecycle_epoch(owner) or 0)
+        if epoch <= 0:
+            raise ValueError("conversation has no active lifecycle epoch")
+        return reset(
+            owner,
+            tenant_id=tenant_id,
+            expected_lifecycle_epoch=epoch,
+            dry_run=bool(dry_run),
+        )
 
     @staticmethod
     def _effective_raw_text(raw_content: str | None) -> str:

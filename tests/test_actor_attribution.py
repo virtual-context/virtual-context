@@ -35,7 +35,7 @@ from virtual_context.core.tagging_pipeline import TaggingPipeline
 from virtual_context.proxy._envelope import _extract_envelope_metadata
 from virtual_context.proxy.server import _roles_for_active_user
 from virtual_context.storage.sqlite import SQLiteStore
-from virtual_context.types import CanonicalTurnRow, Message
+from virtual_context.types import CanonicalTurnRow, Message, SearchConfig
 
 GUILD_KEY = "sk:agent:bast:discord:channel:15249"
 OPTICS = "1111111111111111111"
@@ -618,6 +618,68 @@ def test_proxy_roles_come_from_the_active_entry_and_validated_audience(tmp_path)
     assert roles.reply_target_message_id == "m1"
     assert roles.audience_conversation_id == GUILD_KEY
     assert roles.audience_channel_id == "15249"
+
+
+def test_proxy_roles_can_scope_speaker_reads_to_the_conversation(tmp_path):
+    store = SQLiteStore(tmp_path / "conversation-scope-roles.db")
+    store.upsert_conversation(tenant_id="t1", conversation_id=GUILD_KEY)
+    raw = _conv_info(
+        OPTICS, message_id="m2", group_channel="#p3ptides",
+    ) + "thoughts?"
+    text, metadata = _extract_envelope_metadata(raw)
+    active = Message(role="user", content=text, metadata=metadata)
+    engine = SimpleNamespace(
+        config=SimpleNamespace(
+            conversation_id=GUILD_KEY,
+            tenant_id="t1",
+            search=SearchConfig(speaker_audience_scope="conversation"),
+        ),
+        _store=store,
+    )
+    engine._ingest_reconciler = _reconciler(store)
+
+    roles = _roles_for_active_user(
+        SimpleNamespace(engine=engine), active, "thoughts?",
+        inbound_conversation_id=GUILD_KEY,
+        audience_conversation_id=GUILD_KEY,
+    )
+
+    assert roles.audience_conversation_id == GUILD_KEY
+    assert roles.audience_channel_id == ""
+    assert roles.audience_channel_label == "#p3ptides"
+
+
+def test_conversation_scope_resolves_a_unique_reply_label_across_channels(tmp_path):
+    store = SQLiteStore(tmp_path / "conversation-scope-label.db")
+    store.upsert_conversation(tenant_id="t1", conversation_id=GUILD_KEY)
+    store.search_config = SearchConfig(speaker_audience_scope="conversation")
+    store.save_canonical_turn(
+        GUILD_KEY, 0, "older claim", "", canonical_turn_id="target",
+        turn_hash="target-hash", sort_key=1.0, sender="BigTex",
+        sender_actor_id=BIGTEX_ACTOR, source_message_id="m1",
+        audience_conversation_id=GUILD_KEY, audience_attribution_version=1,
+        origin_channel_id="channel-a",
+    )
+    raw = (
+        _conv_info(OPTICS, message_id="m2", chat_id="channel-b")
+        + "what did they mean?"
+        + _reply_block(sender_label="BigTex", body="older claim")
+    )
+    text, metadata = _extract_envelope_metadata(raw)
+    incoming = Message(role="user", content=text, metadata=metadata)
+    reconciler = _reconciler(store)
+    edge = reconciler._derive_reply_edge(incoming, "discord", GUILD_KEY)
+    prepared = reconciler._prepare_message_row(
+        GUILD_KEY, role="user", content="what did they mean?",
+        raw_content=raw, primary_tag="chat", tags=["chat"],
+        session_date="", sender="Optics", origin_channel_id="channel-b",
+        origin_channel_label="#other", sender_actor_id=OPTICS_ACTOR,
+        **edge,
+    )
+
+    reconciler._resolve_reply_subjects(GUILD_KEY, [prepared])
+
+    assert prepared.reply_subject_actor_id == BIGTEX_ACTOR
 
 
 def test_proxy_role_selection_mismatch_fails_closed(tmp_path):

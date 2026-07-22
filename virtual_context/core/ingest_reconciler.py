@@ -632,9 +632,16 @@ class IngestReconciler:
             label = (row.reply_subject_label or "").strip()
             if not label:
                 continue
+            search_config = getattr(self._store, "search_config", None)
+            label_channel_id = (
+                ""
+                if getattr(search_config, "speaker_audience_scope", "channel")
+                == "conversation"
+                else row.origin_channel_id
+            )
             matches = self._find_actor_ids_by_label(
                 conversation_id, label, row.audience_conversation_id,
-                row.origin_channel_id,
+                label_channel_id,
             )
             # Exactly one durable same-audience actor, or nothing. A label that
             # names two members is not an identity, and "most recent" would be

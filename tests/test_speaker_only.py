@@ -305,6 +305,24 @@ class TestRoleLocalPredicatesAndDisjointCounts:
         assert result["excluded_other_speakers"] == 0
         assert result["excluded_unknown_speaker"] == 0
 
+    def test_conversation_scope_matches_the_selected_speaker_across_channels(self):
+        corpus = [
+            _qr("bea channel one peptide", 9, actor=BEA, channel="chan-1"),
+            _qr("bea channel two peptide", 8, actor=BEA, channel="chan-2"),
+        ]
+
+        result = find_quote(
+            LimitStore(corpus), SemanticStub(), "peptide",
+            max_results=5, conversation_id=OWNER,
+            speaker_context=_ctx(audience_channel_id=""),
+            speaker_conditioning=_bea_only_conditioning(),
+        )
+
+        assert [r["excerpt"] for r in result["results"]] == [
+            "bea channel one peptide", "bea channel two peptide",
+        ]
+        assert result["pre_filter_matching_count"] == 2
+
     def test_zero_matches_still_reports_filter_and_counts(self):
         corpus = [
             _qr("alex peptide note", 5, actor=ALEX),

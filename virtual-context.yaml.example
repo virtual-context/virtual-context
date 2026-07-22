@@ -244,6 +244,10 @@ storage:
 # =====================================================================================
 
 search:
+  # Speaker-aware memory normally stays within the origin channel. Use
+  # "conversation" only when multiple channels intentionally share one
+  # audience conversation (for example, one Discord guild conversation).
+  speaker_audience_scope: "channel"       # "channel" | "conversation"
   # Excerpt/snippet lengths
   excerpt_context_chars: 200              # chars of context around a LIKE/manual match
   fts_snippet_chars: 500                  # FTS5 snippet max chars for segment search
