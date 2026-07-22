@@ -94,6 +94,30 @@ def chunk_turn_text(text: str, max_words: int = 180, min_words: int = 3) -> list
     return [stripped] if stripped else []
 
 
+_HOST_SCAFFOLD_MARKERS = (
+    "Conversation info (untrusted metadata):",
+    "OpenClaw assembled context for this turn:",
+    "Conversation context (untrusted, chronological, selected for current message):",
+)
+
+
+def _user_embedding_text(user_text: str, user_raw_content: str | None) -> str:
+    """Choose the user lane without re-admitting host wrapper scaffolding.
+
+    Canonical text is the admitted representation and therefore wins whenever
+    it is non-empty.  Raw content remains the fallback for attachment-only
+    messages, except when it contains a known host wrapper: an empty canonical
+    value in that case means there is no admitted user text to index.
+    """
+    canonical = user_text or ""
+    if canonical.strip():
+        return canonical
+    raw = user_raw_content or ""
+    if any(marker in raw for marker in _HOST_SCAFFOLD_MARKERS):
+        return canonical
+    return raw
+
+
 class SemanticSearchManager:
     """Manages embedding model loading, chunk storage, and semantic search."""
 
@@ -265,7 +289,7 @@ class SemanticSearchManager:
         # row. It is a separate side, never concatenated into requester text,
         # and the shipped search branch explicitly ignores it.
         sides = [
-            ("user", (user_raw_content or user_text or "")),
+            ("user", _user_embedding_text(user_text, user_raw_content)),
             ("assistant", (assistant_raw_content or assistant_text or "")),
             ("subject", (reply_target_body or "")),
         ]
