@@ -5,6 +5,7 @@ from __future__ import annotations
 import fnmatch
 import json
 import logging
+import re
 import time
 from typing import Callable
 
@@ -123,6 +124,11 @@ Never round, approximate, or paraphrase a number (e.g. "2 hours" must stay "2 ho
 When the user states what they are doing, have done, or where they keep/store something,
 preserve that as a direct assertion, not as a plan or intention. Conversely, when the conversation
 is about a future activity the summary must clearly indicate this is planning/discussion, not a completed activity.
+
+Preserve polarity, negation, intent, and causal rationale exactly. Never turn "does not want",
+"wants to remain infertile", "did not happen", or similar negative statements into their
+positive opposites. If the segment is only a greeting, acknowledgement, or short reply, summarize
+only that content; do not infer or import the topic, recommendation, or outcome from nearby context.
 
 Capture the tone and texture of the conversation — was it casual/playful, urgent/stressed,
 analytical/technical, emotional/vulnerable, collaborative/brainstorming? Preserve the user's
@@ -657,7 +663,8 @@ class DomainCompactor:
 
         system = (
             "You are a conversation summarizer. Output valid JSON only. "
-            "No markdown fences, no extra text."
+            "No markdown fences, no extra text. Preserve negation and intent exactly. "
+            "Every summary claim must be grounded in the segment being summarized."
         )
         if prev_context:
             system += (
@@ -675,34 +682,21 @@ class DomainCompactor:
             duration_ms = (time.time() - t0) * 1000
             self._log_usage("segment_summarize", duration_ms=duration_ms, usage=usage)
             parsed = self._parse_response(response_text)
-            if self._is_degenerate_summary(parsed.get("summary", "")):
-                logger.warning(
-                    "Degenerate LLM summary for segment %s; retrying once",
-                    segment.id,
-                )
-                retry_started = time.time()
-                response_text, usage = self.llm.complete(
-                    system=(
-                        system
-                        + " Your previous response was incomplete. Return one complete "
-                          "JSON object with a non-empty plain-text summary."
-                    ),
-                    user=prompt,
-                    max_tokens=(
-                        self.config.max_summary_tokens
-                        + self.config.llm_token_overhead
-                    ),
-                )
-                self._log_usage(
-                    "segment_summarize_retry",
-                    duration_ms=(time.time() - retry_started) * 1000,
-                    usage=usage,
-                )
-                parsed = self._parse_response(response_text)
-                if self._is_degenerate_summary(parsed.get("summary", "")):
+            if self._is_unusable_summary(
+                parsed.get("summary", ""), conversation_text,
+            ):
+                # A tiny acknowledgement whose generated "summary" is longer
+                # than its full transcript is the production signature of
+                # preceding-context leakage.  There is no value in spending a
+                # second call: preserve the exact source immediately.
+                if (
+                    len(conversation_text.strip()) < 256
+                    and self._summary_overshoots_source(
+                        parsed.get("summary", ""), conversation_text,
+                    )
+                ):
                     logger.warning(
-                        "Degenerate LLM summary persisted after retry for segment %s; "
-                        "using bounded source-text fallback",
+                        "Oversized summary for short segment %s; using source-text fallback",
                         segment.id,
                     )
                     parsed = {
@@ -713,6 +707,50 @@ class DomainCompactor:
                         "date_references": [],
                         "refined_tags": segment.tags,
                     }
+                else:
+                    logger.warning(
+                        "Degenerate or ungrounded LLM summary for segment %s; retrying once",
+                        segment.id,
+                    )
+                    retry_started = time.time()
+                    response_text, usage = self.llm.complete(
+                        system=(
+                            system
+                            + " Your previous response was incomplete or ungrounded. Return one "
+                              "complete JSON object with a non-empty plain-text summary. Summarize "
+                              "ONLY the content inside <segment_to_summarize> when those tags are "
+                              "present; otherwise summarize only the supplied conversation. Do not "
+                              "import prior context, invert negation or intent, or make the summary "
+                              "longer than the source segment."
+                        ),
+                        user=prompt,
+                        max_tokens=(
+                            self.config.max_summary_tokens
+                            + self.config.llm_token_overhead
+                        ),
+                    )
+                    self._log_usage(
+                        "segment_summarize_retry",
+                        duration_ms=(time.time() - retry_started) * 1000,
+                        usage=usage,
+                    )
+                    parsed = self._parse_response(response_text)
+                    if self._is_unusable_summary(
+                        parsed.get("summary", ""), conversation_text,
+                    ):
+                        logger.warning(
+                            "Degenerate or ungrounded LLM summary persisted after retry for segment %s; "
+                            "using bounded source-text fallback",
+                            segment.id,
+                        )
+                        parsed = {
+                            "summary": conversation_text[:target_tokens * 4],
+                            "entities": [],
+                            "key_decisions": [],
+                            "action_items": [],
+                            "date_references": [],
+                            "refined_tags": segment.tags,
+                        }
         except Exception as e:
             logger.warning(f"LLM summarization failed for segment {segment.id}: {e}")
             parsed = {
@@ -1176,6 +1214,78 @@ class DomainCompactor:
             or '"key_decisions"' in lowered
         ):
             return True
+        return False
+
+    @classmethod
+    def _is_unusable_summary(cls, summary: object, source_text: str) -> bool:
+        """Reject malformed summaries and obvious context-import overshoot.
+
+        A summary longer than its complete source transcript is not compression.
+        In practice this is also a strong, deterministic signal that preceding
+        pronoun-resolution context leaked into a tiny acknowledgement segment.
+        The retry is still bounded and falls back to source text if the model
+        repeats the mistake.
+        """
+        if cls._is_degenerate_summary(summary):
+            return True
+        assert isinstance(summary, str)  # narrowed by _is_degenerate_summary
+        return (
+            cls._summary_overshoots_source(summary, source_text)
+            or cls._drops_material_negation(summary, source_text)
+        )
+
+    @staticmethod
+    def _summary_overshoots_source(summary: object, source_text: str) -> bool:
+        if not isinstance(summary, str):
+            return False
+        source = source_text.strip()
+        return bool(source) and len(summary.strip()) > len(source)
+
+    @staticmethod
+    def _drops_material_negation(summary: object, source_text: str) -> bool:
+        """Detect a concise summary that appears to invert a negative claim.
+
+        This is deliberately conservative rather than pretending to be full
+        natural-language inference.  If the summary has no negative marker but
+        reuses at least two material terms from a source sentence containing a
+        negative marker, retry/fallback is safer than storing a polarity flip.
+        """
+        if not isinstance(summary, str):
+            return False
+        negative = re.compile(
+            r"\b(?:not|never|without|cannot|can't|won't|don't|doesn't|didn't|"
+            r"isn't|aren't|wasn't|weren't|shouldn't|wouldn't|couldn't)\b|"
+            r"\b(?:remain|stays?|stayed|keep|keeps|kept)\s+infertil\w*",
+            re.IGNORECASE,
+        )
+        if negative.search(summary):
+            return False
+        stop = {
+            "about", "after", "again", "also", "and", "assistant", "before",
+            "being", "conversation", "from", "have", "into", "just", "more",
+            "that", "their", "them", "then", "there", "they", "this", "user",
+            "want", "wants", "wanted", "were", "what", "when", "where", "which",
+            "with", "would", "your",
+        }
+
+        def _terms(text: str) -> set[str]:
+            terms = set()
+            for token in re.findall(r"[a-z0-9]+", text.lower()):
+                if len(token) < 3 or token in stop:
+                    continue
+                for suffix in ("ing", "ed", "es", "s"):
+                    if token.endswith(suffix) and len(token) - len(suffix) >= 4:
+                        token = token[:-len(suffix)]
+                        break
+                terms.add(token)
+            return terms
+
+        summary_terms = _terms(summary)
+        for sentence in re.split(r"[.!?\n]+", source_text):
+            if not negative.search(sentence):
+                continue
+            if len(_terms(sentence) & summary_terms) >= 2:
+                return True
         return False
 
     def compact_tag_summaries(

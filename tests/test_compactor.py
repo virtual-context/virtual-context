@@ -182,6 +182,130 @@ def test_compact_uses_source_fallback_after_two_degenerate_summaries(legal_segme
     assert not result.summary.startswith("```")
 
 
+def test_compact_retries_summary_longer_than_long_source(legal_segment):
+    class ContextPollutingProvider:
+        def __init__(self):
+            self.calls = []
+
+        def complete(self, system: str, user: str, max_tokens: int):
+            self.calls.append((system, user))
+            if len(self.calls) == 1:
+                imported = (
+                    "The user accepted an installation recommendation from the previous "
+                    "conversation and the assistant completed a detailed deployment. " * 10
+                )
+                return json.dumps({"summary": imported, "refined_tags": []}), {}
+            return '{"summary":"They discussed a court deadline.","refined_tags":[]}', {}
+
+    import json
+
+    provider = ContextPollutingProvider()
+    legal_segment.messages[0].content += " " + ("filing detail " * 40)
+    compactor = DomainCompactor(
+        llm_provider=provider,
+        config=CompactorConfig(
+            summary_ratio=0.15,
+            min_summary_tokens=50,
+            max_summary_tokens=500,
+        ),
+        model_name="test-model",
+    )
+
+    result = compactor._compact_one(
+        legal_segment,
+        prev_context="A long unrelated discussion about software installation.",
+    )
+
+    assert len(provider.calls) == 2
+    assert result.summary == "They discussed a court deadline."
+    retry_system = provider.calls[1][0]
+    assert "Do not import prior context" in retry_system
+    assert "invert negation or intent" in retry_system
+
+
+def test_compact_short_source_immediately_falls_back_for_oversized_summary(
+    legal_segment,
+):
+    class PollutingProvider:
+        def __init__(self):
+            self.calls = 0
+
+        def complete(self, system: str, user: str, max_tokens: int):
+            self.calls += 1
+            return json.dumps({"summary": "unrelated history " * 100}), {}
+
+    import json
+
+    provider = PollutingProvider()
+    compactor = DomainCompactor(
+        llm_provider=provider,
+        config=CompactorConfig(
+            summary_ratio=0.15,
+            min_summary_tokens=50,
+            max_summary_tokens=500,
+        ),
+        model_name="test-model",
+    )
+
+    result = compactor.compact([legal_segment])[0]
+
+    assert provider.calls == 1
+    assert result.summary in compactor._format_conversation(legal_segment.messages)
+    assert len(result.summary) <= len(compactor._format_conversation(legal_segment.messages))
+
+
+def test_default_prompt_requires_preserving_negation_and_intent():
+    from virtual_context.core.compactor import DEFAULT_SUMMARY_PROMPT
+
+    assert "Preserve polarity, negation, intent" in DEFAULT_SUMMARY_PROMPT
+    assert '"wants to remain infertile"' in DEFAULT_SUMMARY_PROMPT
+
+
+def test_compact_retries_obvious_negation_inversion(ts):
+    class InvertingProvider:
+        def __init__(self):
+            self.calls = 0
+
+        def complete(self, system: str, user: str, max_tokens: int):
+            self.calls += 1
+            if self.calls == 1:
+                return (
+                    '{"summary":"Reshi considered HCG because he wants fertility '
+                    'and a stronger climax.","refined_tags":[]}', {}
+                )
+            return (
+                '{"summary":"Reshi wants to remain infertile and considered HCG '
+                'for a stronger climax.","refined_tags":[]}', {}
+            )
+
+    segment = TaggedSegment(
+        primary_tag="hgh", tags=["hgh"],
+        messages=[Message(
+            role="user",
+            content=(
+                "I want to remain infertile and considered HCG for a stronger climax."
+            ),
+            timestamp=ts,
+            metadata={"sender": {"name": "Reshi"}},
+        )],
+        token_count=20, start_timestamp=ts, end_timestamp=ts, turn_count=1,
+    )
+    provider = InvertingProvider()
+    compactor = DomainCompactor(
+        llm_provider=provider,
+        config=CompactorConfig(
+            summary_ratio=0.15,
+            min_summary_tokens=50,
+            max_summary_tokens=500,
+        ),
+    )
+
+    result = compactor.compact([segment])[0]
+
+    assert provider.calls == 2
+    assert "remain infertile" in result.summary
+
+
 def test_custom_prompt_from_tag_rules():
     """Custom summary prompt should be used when tag matches a rule."""
     rules = [

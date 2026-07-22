@@ -232,10 +232,16 @@ class TopicSegmenter:
         # If a turn matches an existing segment, it's appended there. Otherwise, a new
         # segment is created. This handles A-B-A-B topic interleaving correctly.
         #
-        # Segment library: list of (group, group_session, group_tags, group_tokens)
+        # Segment library: list of (group, group_session, anchor_tags, group_tokens)
         # where group is the accumulating list of (TurnPair, TagResult) pairs.
+        # ``anchor_tags`` deliberately stays fixed to the first turn.  Growing
+        # it with every appended turn allows bridge tags to walk a segment
+        # across unrelated topics (A↔B, then B↔C, even when A and C have no
+        # relationship).  The final segment still unions every turn's tags in
+        # ``_build_segment``; the fixed set is only the admission boundary.
         segment_library: list[tuple[list[tuple[TurnPair, TagResult]], str, set[str], int]] = []
         running_session: str = ""
+        last_assigned_seg_idx = -1
         max_seg_tokens = self.config.max_segment_turns * 200 if self.config.max_segment_turns > 0 else 999_999
         # Use the configured max_segment_tokens from compactor if available, else estimate
         threshold = self.config.tag_overlap_threshold
@@ -267,7 +273,7 @@ class TopicSegmenter:
             best_reason = ""
             candidate_total = max(len(segment_library), 1)
 
-            for seg_idx, (group, group_session, group_tags, group_tokens) in enumerate(segment_library):
+            for seg_idx, (group, group_session, anchor_tags, group_tokens) in enumerate(segment_library):
                 _emit_progress(
                     grouped_turns,
                     total_group_turns,
@@ -301,15 +307,26 @@ class TopicSegmenter:
                 if group and self._has_temporal_gap(group[-1][0], pair):
                     continue
 
-                meaningful_group = {t for t in group_tags if t != "_general"}
-                if not meaningful_group or not meaningful_curr:
-                    # General-only: score as 1.0 (merge with anything)
+                meaningful_group = {t for t in anchor_tags if t != "_general"}
+                if not meaningful_curr:
+                    # A general acknowledgement belongs only to the segment
+                    # that received the immediately preceding turn.  Treating
+                    # it as a match for every library entry deterministically
+                    # attached it to the first eligible segment, regardless of
+                    # the conversation it was acknowledging.
+                    if seg_idx != last_assigned_seg_idx:
+                        continue
                     score = 1.0
-                    reason = "general"
-                elif result.primary == group[-1][1].primary:
-                    # Same primary tag = strong match
+                    reason = "general-previous"
+                elif not meaningful_group:
+                    # Do not use a general-only segment as a semantic bridge
+                    # into the next substantive topic.
+                    continue
+                elif result.primary == group[0][1].primary:
+                    # Same anchor primary tag = strong match.  Comparing with
+                    # the last appended turn would reintroduce topic walking.
                     score = 1.0
-                    reason = "same-primary"
+                    reason = "same-anchor-primary"
                 else:
                     # Compute relatedness
                     group_text = " ".join(m.content for p, _ in group[-2:] for m in p.messages)
@@ -331,8 +348,8 @@ class TopicSegmenter:
                 # Append to existing segment
                 group, group_session, group_tags, group_tokens = segment_library[best_seg_idx]
                 group.append((pair, result))
-                group_tags.update(meaningful_curr)
                 segment_library[best_seg_idx] = (group, group_session, group_tags, group_tokens + turn_tokens)
+                last_assigned_seg_idx = best_seg_idx
                 logger.debug(
                     "SEGMENT turn=%d APPEND to seg#%d (%s, %d turns, %s)",
                     turn_offset + turn_idx, best_seg_idx,
@@ -347,6 +364,7 @@ class TopicSegmenter:
                     new_tags,
                     turn_tokens,
                 ))
+                last_assigned_seg_idx = len(segment_library) - 1
                 logger.debug(
                     "SEGMENT turn=%d NEW seg#%d primary=%s tags=%s (%dt)",
                     turn_offset + turn_idx, len(segment_library) - 1,

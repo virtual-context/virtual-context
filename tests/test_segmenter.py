@@ -354,14 +354,13 @@ def test_threshold_one_splits_unless_identical():
     assert len(segments) == 2
 
 
-def test_gradual_topic_drift_merges():
-    """Consecutive turns with overlap merge even if first and last share no tags.
+def test_gradual_topic_drift_stops_at_anchor_boundary():
+    """Bridge tags cannot walk a segment away from its anchor topic.
 
     A=[alpha, beta], B=[beta, gamma], C=[gamma, delta]
     A→B overlap: {beta}/min(2,2) = 0.5 → merge
-    B→C overlap: {gamma}/min(2,2) = 0.5 → merge
-    A and C share nothing, but they're in the same segment because each
-    consecutive pair passes the threshold. max_segment_turns is the mitigation.
+    A→C overlap: none → split.  The accumulated B tag must not turn the
+    segment into a semantic grab bag.
     """
     gen = MockTagGenerator()
     gen.set_override("turn-a", TagResult(
@@ -387,8 +386,99 @@ def test_gradual_topic_drift_merges():
         Message(role="assistant", content="turn-c answer"),
     ]
     segments = segmenter.segment(messages)
-    assert len(segments) == 1
-    assert segments[0].turn_count == 3
+    assert len(segments) == 2
+    assert segments[0].turn_count == 2
+    assert segments[1].turn_count == 1
+
+
+def test_general_turn_attaches_to_immediately_preceding_topic():
+    """A general acknowledgement cannot jump to the first library entry."""
+    gen = MockTagGenerator()
+    gen.set_override("pricing", TagResult(
+        tags=["pricing"], primary="pricing", source="mock",
+    ))
+    gen.set_override("doctor", TagResult(
+        tags=["medical"], primary="medical", source="mock",
+    ))
+    gen.set_override("ok", TagResult(
+        tags=["_general"], primary="_general", source="mock",
+    ))
+    segmenter = TopicSegmenter(
+        tag_generator=gen,
+        config=SegmenterConfig(tag_overlap_threshold=0.5),
+    )
+    messages = [
+        Message(role="user", content="pricing question"),
+        Message(role="assistant", content="pricing answer"),
+        Message(role="user", content="doctor question"),
+        Message(role="assistant", content="medical answer"),
+        Message(role="user", content="ok"),
+        Message(role="assistant", content="sure"),
+    ]
+
+    segments = segmenter.segment(messages)
+
+    assert len(segments) == 2
+    assert segments[0].primary_tag == "pricing"
+    assert segments[0].turn_count == 1
+    assert segments[1].primary_tag == "medical"
+    assert segments[1].turn_count == 2
+
+
+def test_initial_general_turn_cannot_anchor_following_substantive_topic():
+    """A greeting remains isolated instead of becoming the topic anchor."""
+    gen = MockTagGenerator()
+    gen.set_override("hello", TagResult(
+        tags=["_general"], primary="_general", source="mock",
+    ))
+    gen.set_override("medical", TagResult(
+        tags=["medical"], primary="medical", source="mock",
+    ))
+    segmenter = TopicSegmenter(
+        tag_generator=gen,
+        config=SegmenterConfig(tag_overlap_threshold=0.5),
+    )
+    messages = [
+        Message(role="user", content="hello"),
+        Message(role="assistant", content="hi"),
+        Message(role="user", content="medical question"),
+        Message(role="assistant", content="medical answer"),
+    ]
+
+    segments = segmenter.segment(messages)
+
+    assert [segment.primary_tag for segment in segments] == ["_general", "medical"]
+    assert [segment.turn_count for segment in segments] == [1, 1]
+
+
+def test_last_appended_primary_cannot_move_segment_anchor():
+    """A bridge turn's primary tag does not become the segment identity."""
+    gen = MockTagGenerator()
+    gen.set_override("turn-a", TagResult(
+        tags=["alpha", "beta"], primary="alpha", source="mock",
+    ))
+    gen.set_override("turn-b", TagResult(
+        tags=["beta", "gamma"], primary="beta", source="mock",
+    ))
+    gen.set_override("turn-c", TagResult(
+        tags=["gamma", "delta"], primary="beta", source="mock",
+    ))
+    segmenter = TopicSegmenter(
+        tag_generator=gen,
+        config=SegmenterConfig(tag_overlap_threshold=0.5, max_segment_turns=0),
+    )
+    messages = [
+        Message(role="user", content="turn-a question"),
+        Message(role="assistant", content="turn-a answer"),
+        Message(role="user", content="turn-b question"),
+        Message(role="assistant", content="turn-b answer"),
+        Message(role="user", content="turn-c question"),
+        Message(role="assistant", content="turn-c answer"),
+    ]
+
+    segments = segmenter.segment(messages)
+
+    assert [segment.turn_count for segment in segments] == [2, 1]
 
 
 def test_gradual_drift_capped_by_max_segment_turns():
