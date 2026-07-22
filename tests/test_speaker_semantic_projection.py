@@ -360,6 +360,48 @@ class _WriteStore:
 
 
 class TestSubjectChunkIngest:
+    def test_user_embedding_prefers_admitted_text_over_polluted_raw_lane(self):
+        store = _WriteStore()
+        manager = _semantic(store)
+        manager.embed_and_store_turn(
+            "c", 0,
+            canonical_turn_id="ct-1",
+            user_text="the admitted request",
+            user_raw_content=(
+                "Conversation info (untrusted metadata):\n"
+                "```json\n{\"message_id\":\"m1\"}\n```\n\n"
+                "the admitted request"
+            ),
+        )
+        assert store.writes[0][3] == ["the admitted request"]
+
+    def test_user_embedding_rejects_scaffold_only_raw_fallback(self):
+        store = _WriteStore()
+        manager = _semantic(store)
+        manager.embed_and_store_turn(
+            "c", 0,
+            canonical_turn_id="ct-1",
+            user_text="",
+            user_raw_content=(
+                "OpenClaw assembled context for this turn:\n"
+                "<conversation_context>quoted history</conversation_context>"
+            ),
+        )
+        assert store.writes == []
+
+    def test_user_embedding_keeps_non_scaffold_raw_fallback(self):
+        store = _WriteStore()
+        manager = _semantic(store)
+        manager.embed_and_store_turn(
+            "c", 0,
+            canonical_turn_id="ct-1",
+            user_text="",
+            user_raw_content='[{"type":"image","source":"attachment"}]',
+        )
+        assert store.writes[0][3] == [
+            '[{"type":"image","source":"attachment"}]',
+        ]
+
     def test_reply_target_body_is_indexed_as_a_subject_side(self):
         store = _WriteStore()
         manager = _semantic(store)
