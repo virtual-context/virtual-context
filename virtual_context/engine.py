@@ -3221,6 +3221,41 @@ class VirtualContextEngine:
             dry_run=bool(dry_run),
         )
 
+    def normalize_canonical_actor_ids(
+        self,
+        conversation_id: str,
+        *,
+        platform: str,
+        dry_run: bool = True,
+    ) -> dict:
+        """Canonicalize legacy platform-local actor ids for one owner."""
+        owner = (conversation_id or "").strip()
+        if not owner:
+            raise ValueError("normalize_canonical_actor_ids requires a conversation_id")
+        if owner != self.config.conversation_id:
+            raise ValueError(
+                "normalize_canonical_actor_ids must target the engine-bound owner"
+            )
+        tenant_id = (self.config.tenant_id or "").strip()
+        if not tenant_id:
+            raise ValueError("normalize_canonical_actor_ids requires a tenant_id")
+        sql_store = self._require_actor_sql_store(cards=True)
+        normalize = getattr(sql_store, "normalize_canonical_actor_ids", None)
+        if not callable(normalize):
+            raise RuntimeError(
+                "storage backend does not support canonical actor-id normalization"
+            )
+        epoch = int(sql_store.get_lifecycle_epoch(owner) or 0)
+        if epoch <= 0:
+            raise ValueError("conversation has no active lifecycle epoch")
+        return normalize(
+            owner,
+            tenant_id=tenant_id,
+            expected_lifecycle_epoch=epoch,
+            platform=platform,
+            dry_run=bool(dry_run),
+        )
+
     @staticmethod
     def _effective_raw_text(raw_content: str | None) -> str:
         """Select the one provider-effective text block retained on a row."""

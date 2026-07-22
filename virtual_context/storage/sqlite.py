@@ -8408,6 +8408,239 @@ CREATE TABLE IF NOT EXISTS request_captures (
             conn.rollback()
             raise
 
+    def normalize_canonical_actor_ids(
+        self,
+        conversation_id: str,
+        *,
+        tenant_id: str,
+        expected_lifecycle_epoch: int,
+        platform: str,
+        dry_run: bool = True,
+    ) -> dict:
+        """SQLite mirror of guarded legacy numeric actor-id normalization."""
+        import re
+
+        owner = (conversation_id or "").strip()
+        tenant = (tenant_id or "").strip()
+        platform_name = (platform or "").strip().lower()
+        if not owner or not tenant:
+            raise ValueError("conversation and tenant are required")
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", platform_name):
+            raise ValueError("platform must be a lowercase stable identifier")
+        from ..types import get_platform_from_conversation_key
+
+        owner_platform = get_platform_from_conversation_key(owner)
+        if owner_platform != platform_name:
+            raise ValueError(
+                "platform must match the owner stable conversation key"
+            )
+        prefix = f"actor:{platform_name}:"
+        conn = self._get_conn()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            lock = conn.execute(
+                "SELECT 1 FROM conversation_lifecycle WHERE conversation_id = ?",
+                (owner,),
+            ).fetchone()
+            row = conn.execute(
+                """SELECT tenant_id, lifecycle_epoch, phase, deleted_at,
+                          pending_raw_payload_entries
+                     FROM conversations WHERE conversation_id = ?""",
+                (owner,),
+            ).fetchone()
+            if lock is None or row is None:
+                raise ValueError("conversation does not exist")
+            if (
+                row["tenant_id"] != tenant
+                or int(row["lifecycle_epoch"]) != int(expected_lifecycle_epoch)
+            ):
+                raise ValueError("tenant or lifecycle epoch mismatch")
+            if row["phase"] != "active" or row["deleted_at"] is not None:
+                raise ValueError("conversation must be active")
+            if int(row["pending_raw_payload_entries"] or 0) != 0:
+                raise RuntimeError("conversation still has pending raw ingestion")
+            active = conn.execute(
+                """SELECT 1 FROM compaction_operation
+                    WHERE conversation_id = ? AND lifecycle_epoch = ?
+                      AND status IN ('queued','running') LIMIT 1""",
+                (owner, int(expected_lifecycle_epoch)),
+            ).fetchone()
+            if active is not None:
+                raise RuntimeError("conversation has an active compaction operation")
+            ingesting = conn.execute(
+                """SELECT 1 FROM ingestion_episode
+                    WHERE conversation_id = ? AND lifecycle_epoch = ?
+                      AND status = 'running' LIMIT 1""",
+                (owner, int(expected_lifecycle_epoch)),
+            ).fetchone()
+            if ingesting is not None:
+                raise RuntimeError("conversation has an active ingestion episode")
+            merging = conn.execute(
+                """SELECT 1 FROM merge_audit
+                    WHERE tenant_id = ? AND status = 'in_progress'
+                      AND (target_conversation_id = ?
+                           OR source_conversation_id = ?)
+                    LIMIT 1""",
+                (tenant, owner, owner),
+            ).fetchone()
+            if merging is not None:
+                raise RuntimeError("conversation has an active merge")
+
+            def _count(sql: str, params: tuple = ()) -> int:
+                return int(conn.execute(sql, params).fetchone()[0])
+
+            def _numeric(column: str) -> str:
+                return (
+                    f"COALESCE(TRIM({column}), '') <> '' AND "
+                    f"TRIM({column}) NOT GLOB '*[^0-9]*'"
+                )
+
+            sender_rows = _count(
+                f"SELECT COUNT(*) FROM canonical_turns WHERE conversation_id = ? AND {_numeric('sender_actor_id')}",
+                (owner,),
+            )
+            reply_rows = _count(
+                f"SELECT COUNT(*) FROM canonical_turns WHERE conversation_id = ? AND {_numeric('reply_subject_actor_id')}",
+                (owner,),
+            )
+            selected_rows = _count(
+                f"""SELECT COUNT(*) FROM canonical_turns
+                      WHERE conversation_id = ? AND (
+                        ({_numeric('sender_actor_id')}) OR
+                        ({_numeric('reply_subject_actor_id')}))""",
+                (owner,),
+            )
+            distinct_ids = _count(
+                f"""SELECT COUNT(DISTINCT actor_id) FROM (
+                      SELECT TRIM(sender_actor_id) AS actor_id
+                        FROM canonical_turns WHERE conversation_id = ?
+                          AND {_numeric('sender_actor_id')}
+                      UNION
+                      SELECT TRIM(reply_subject_actor_id) AS actor_id
+                        FROM canonical_turns WHERE conversation_id = ?
+                          AND {_numeric('reply_subject_actor_id')})""",
+                (owner, owner),
+            )
+            bare_profiles = _count(
+                f"""SELECT COUNT(*) FROM actor_profiles p
+                     WHERE p.tenant_id = ?
+                       AND COALESCE(TRIM(p.actor_id), '') <> ''
+                       AND TRIM(p.actor_id) NOT GLOB '*[^0-9]*'
+                       AND EXISTS (
+                         SELECT 1 FROM canonical_turns ct
+                          WHERE ct.conversation_id = ? AND (
+                            (({_numeric('ct.sender_actor_id')})
+                             AND TRIM(ct.sender_actor_id) = p.actor_id) OR
+                            (({_numeric('ct.reply_subject_actor_id')})
+                             AND TRIM(ct.reply_subject_actor_id) = p.actor_id)))""",
+                (tenant, owner),
+            )
+            provenance_rows = conn.execute(
+                """SELECT alias_id AS provenance_key
+                     FROM conversation_aliases WHERE target_id = ?
+                   UNION
+                   SELECT origin_conversation_id AS provenance_key
+                     FROM canonical_turns WHERE conversation_id = ?
+                   UNION
+                   SELECT source_conversation_id AS provenance_key
+                     FROM merge_audit WHERE target_conversation_id = ?""",
+                (owner, owner, owner),
+            ).fetchall()
+            platform_mismatch_sources = sorted({
+                str(item["provenance_key"])
+                for item in provenance_rows
+                if get_platform_from_conversation_key(
+                    str(item["provenance_key"] or "")
+                ) not in {"", platform_name}
+            })
+            derived_counts = {
+                table: _count(
+                    f"SELECT COUNT(*) FROM {table} WHERE conversation_id = ?",
+                    (owner,),
+                )
+                for table in ("segments", "facts", "tag_summaries")
+            }
+            derived_counts["actor_card_sources"] = _count(
+                """SELECT COUNT(*) FROM actor_card_entry_sources
+                    WHERE owner_conversation_id = ?
+                       OR audience_conversation_id = ?""",
+                (owner, owner),
+            )
+            report = {
+                "platform": platform_name,
+                "sender_rows_to_normalize": sender_rows,
+                "reply_subject_rows_to_normalize": reply_rows,
+                "selected_rows": selected_rows,
+                "distinct_actor_ids": distinct_ids,
+                "bare_actor_profiles": bare_profiles,
+                "platform_mismatch_sources": platform_mismatch_sources,
+                "derived_rows": derived_counts,
+                "updated_rows": 0,
+                "dry_run": bool(dry_run),
+            }
+            if dry_run:
+                conn.rollback()
+                return report
+            if any(derived_counts.values()):
+                raise RuntimeError(
+                    "derived data must be reset before actor-id normalization"
+                )
+            if bare_profiles:
+                raise RuntimeError(
+                    "bare actor profiles require an explicit profile merge"
+                )
+            if platform_mismatch_sources:
+                raise RuntimeError(
+                    "historical provenance includes another platform"
+                )
+            if not selected_rows:
+                conn.commit()
+                return report
+            cursor = conn.execute(
+                f"""UPDATE canonical_turns
+                       SET sender_actor_id = CASE
+                             WHEN {_numeric('sender_actor_id')}
+                             THEN ? || TRIM(sender_actor_id)
+                             ELSE sender_actor_id END,
+                           reply_subject_actor_id = CASE
+                             WHEN {_numeric('reply_subject_actor_id')}
+                             THEN ? || TRIM(reply_subject_actor_id)
+                             ELSE reply_subject_actor_id END,
+                           updated_at = ?
+                     WHERE conversation_id = ? AND (
+                       ({_numeric('sender_actor_id')}) OR
+                       ({_numeric('reply_subject_actor_id')}))
+                       AND EXISTS (
+                         SELECT 1 FROM conversations c
+                          WHERE c.conversation_id = canonical_turns.conversation_id
+                            AND c.tenant_id = ? AND c.lifecycle_epoch = ?
+                            AND c.phase = 'active' AND c.deleted_at IS NULL)""",
+                (
+                    prefix, prefix, utcnow_iso(), owner, tenant,
+                    int(expected_lifecycle_epoch),
+                ),
+            )
+            report["updated_rows"] = int(cursor.rowcount or 0)
+            if report["updated_rows"] != selected_rows:
+                raise RuntimeError(
+                    "actor-id normalization lost its lifecycle compare-and-set"
+                )
+            conn.execute(
+                """UPDATE actor_profiles SET card_dirty = 1, card_input_hash = ''
+                    WHERE tenant_id = ? AND actor_id IN (
+                      SELECT DISTINCT sender_actor_id FROM canonical_turns
+                       WHERE conversation_id = ?
+                      UNION
+                      SELECT DISTINCT reply_subject_actor_id FROM canonical_turns
+                       WHERE conversation_id = ?)""",
+                (tenant, owner, owner),
+            )
+            conn.commit()
+            return report
+        except Exception:
+            conn.rollback()
+            raise
+
     def resequence_canonical_turns(
         self,
         conversation_id: str,

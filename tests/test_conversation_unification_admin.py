@@ -320,6 +320,140 @@ def test_derived_reset_refuses_an_untagged_canonical_backlog(tmp_path):
     assert len(store.get_all_canonical_turns(TARGET)) == 1
 
 
+def test_actor_id_normalization_is_guarded_dry_run_and_idempotent(tmp_path):
+    store = SQLiteStore(tmp_path / "normalize-actors.db")
+    _conversation(store, TARGET)
+    now = _now()
+    store.save_canonical_turn(
+        TARGET, -1, "legacy sender", "",
+        canonical_turn_id="legacy-sender", sort_key=1000.0,
+        turn_hash="hash-legacy-sender", sender_actor_id=" 42 ",
+        primary_tag="chat", tags=["chat"], tagged_at=now,
+        audience_conversation_id=TARGET, audience_attribution_version=1,
+        origin_channel_id="111",
+    )
+    store.save_canonical_turn(
+        TARGET, -1, "replying", "",
+        canonical_turn_id="legacy-reply", sort_key=2000.0,
+        turn_hash="hash-legacy-reply", sender_actor_id="actor:discord:99",
+        reply_subject_actor_id="42", primary_tag="chat", tags=["chat"],
+        tagged_at=now, audience_conversation_id=TARGET,
+        audience_attribution_version=1, origin_channel_id="111",
+    )
+
+    preview = store.normalize_canonical_actor_ids(
+        TARGET, tenant_id=TENANT, expected_lifecycle_epoch=1,
+        platform="discord",
+    )
+    assert preview["sender_rows_to_normalize"] == 1
+    assert preview["reply_subject_rows_to_normalize"] == 1
+    assert preview["selected_rows"] == 2
+    assert preview["distinct_actor_ids"] == 1
+    assert preview["updated_rows"] == 0
+    before = {row.canonical_turn_id: row for row in store.get_all_canonical_turns(TARGET)}
+    assert before["legacy-sender"].sender_actor_id.strip() == "42"
+
+    applied = store.normalize_canonical_actor_ids(
+        TARGET, tenant_id=TENANT, expected_lifecycle_epoch=1,
+        platform="discord", dry_run=False,
+    )
+    assert applied["updated_rows"] == 2
+    rows = {row.canonical_turn_id: row for row in store.get_all_canonical_turns(TARGET)}
+    assert rows["legacy-sender"].sender_actor_id == "actor:discord:42"
+    assert rows["legacy-reply"].reply_subject_actor_id == "actor:discord:42"
+    assert rows["legacy-reply"].sender_actor_id == "actor:discord:99"
+
+    replay = store.normalize_canonical_actor_ids(
+        TARGET, tenant_id=TENANT, expected_lifecycle_epoch=1,
+        platform="discord", dry_run=False,
+    )
+    assert replay["selected_rows"] == replay["updated_rows"] == 0
+
+
+def test_actor_id_normalization_refuses_derived_rows_and_bare_profiles(tmp_path):
+    store = SQLiteStore(tmp_path / "normalize-actor-guards.db")
+    _conversation(store, TARGET)
+    now = _now()
+    store.save_canonical_turn(
+        TARGET, -1, "legacy sender", "",
+        canonical_turn_id="legacy", sort_key=1000.0,
+        turn_hash="hash-legacy", sender_actor_id="42",
+        primary_tag="chat", tags=["chat"], tagged_at=now,
+        audience_conversation_id=TARGET, audience_attribution_version=1,
+        origin_channel_id="111",
+    )
+    conn = store._get_conn()
+    conn.execute(
+        """INSERT INTO actor_profiles
+           (tenant_id, actor_id, platform, display_name, first_seen_at, last_seen_at)
+           VALUES (?, '42', 'discord', 'Legacy', ?, ?)""",
+        (TENANT, now, now),
+    )
+    conn.commit()
+    with pytest.raises(RuntimeError, match="explicit profile merge"):
+        store.normalize_canonical_actor_ids(
+            TARGET, tenant_id=TENANT, expected_lifecycle_epoch=1,
+            platform="discord", dry_run=False,
+        )
+
+    conn.execute("DELETE FROM actor_profiles WHERE actor_id = '42'")
+    conn.execute(
+        """INSERT INTO segments
+           (ref, conversation_id, primary_tag, summary, full_text,
+            messages_json, metadata_json, created_at,
+            start_timestamp, end_timestamp)
+           VALUES ('seg-derived', ?, 'chat', 'summary', 'text', '[]', '{}', ?, ?, ?)""",
+        (TARGET, now, now, now),
+    )
+    conn.commit()
+    with pytest.raises(RuntimeError, match="derived data must be reset"):
+        store.normalize_canonical_actor_ids(
+            TARGET, tenant_id=TENANT, expected_lifecycle_epoch=1,
+            platform="discord", dry_run=False,
+        )
+
+
+def test_actor_id_normalization_refuses_cross_platform_provenance(tmp_path):
+    store = SQLiteStore(tmp_path / "normalize-cross-platform.db")
+    _conversation(store, TARGET)
+    now = _now()
+    store.save_canonical_turn(
+        TARGET, -1, "legacy sender", "",
+        canonical_turn_id="legacy", sort_key=1000.0,
+        turn_hash="hash-legacy", sender_actor_id="42",
+        primary_tag="chat", tags=["chat"], tagged_at=now,
+        audience_conversation_id=TARGET, audience_attribution_version=1,
+        origin_channel_id="111",
+    )
+    store.save_conversation_alias(
+        "sk:agent:vast:telegram:group:other", TARGET,
+    )
+
+    preview = store.normalize_canonical_actor_ids(
+        TARGET, tenant_id=TENANT, expected_lifecycle_epoch=1,
+        platform="discord",
+    )
+    assert preview["platform_mismatch_sources"] == [
+        "sk:agent:vast:telegram:group:other",
+    ]
+    with pytest.raises(RuntimeError, match="another platform"):
+        store.normalize_canonical_actor_ids(
+            TARGET, tenant_id=TENANT, expected_lifecycle_epoch=1,
+            platform="discord", dry_run=False,
+        )
+
+
+def test_actor_id_normalization_requires_owner_platform_match(tmp_path):
+    store = SQLiteStore(tmp_path / "normalize-platform-match.db")
+    _conversation(store, TARGET)
+
+    with pytest.raises(ValueError, match="owner stable conversation key"):
+        store.normalize_canonical_actor_ids(
+            TARGET, tenant_id=TENANT, expected_lifecycle_epoch=1,
+            platform="telegram",
+        )
+
+
 def test_derived_reset_only_touches_rows_with_compaction_state(tmp_path):
     store = SQLiteStore(tmp_path / "selective-reset.db")
     _conversation(store, TARGET)

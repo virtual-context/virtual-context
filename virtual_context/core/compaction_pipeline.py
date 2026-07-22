@@ -821,6 +821,39 @@ class CompactionPipeline:
         except Exception:
             pass  # non-critical
 
+    def _propagate_tool_output_links_for_turns(
+        self, segment_ref: str, turn_numbers,
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+    ) -> None:
+        """Copy tool links for an exact, potentially noncontiguous turn set.
+
+        Topic segmentation deliberately supports A-B-A interleaving, so a
+        segment's turns are not necessarily a positional slice or a numeric
+        range.  Callers that have canonical source provenance must use this
+        exact form; the range helper remains for legacy call sites whose input
+        is genuinely contiguous.
+        """
+        from ..types import CompactionLeaseLost
+        try:
+            for turn_number in sorted({int(turn) for turn in turn_numbers}):
+                refs = self._store.get_tool_outputs_for_turn(
+                    self._config.conversation_id, turn_number,
+                )
+                for ref in refs:
+                    self._store.link_segment_tool_output(
+                        self._config.conversation_id, segment_ref, ref,
+                        operation_id=operation_id,
+                        owner_worker_id=owner_worker_id,
+                        lifecycle_epoch=lifecycle_epoch,
+                    )
+        except CompactionLeaseLost:
+            raise
+        except Exception:
+            pass  # non-critical
+
     def _run_compaction(
         self,
         conversation_history: list[Message],
@@ -1336,27 +1369,46 @@ class CompactionPipeline:
             )
 
         # D1: Gather fact signals from TurnTagIndex scoped per segment.
-        # Also record the contributing turn range per segment for tool-output linkage.
-        seg_cursor = 0
+        # Topic segments may be noncontiguous (A-B-A interleaving), so the
+        # segment's own canonical source ids are the only safe mapping back to
+        # logical turns.  A positional cursor here previously attached fact
+        # signals, range metadata, and tool outputs from unrelated segments.
+        logical_rows_by_turn = {
+            int(row.turn_number): row
+            for row in compact_rows
+            if getattr(row, "turn_number", None) is not None
+            and int(row.turn_number) >= 0
+        }
         segment_signals: dict[str, list[FactSignal]] = {}
         segment_code_refs: dict[str, list[dict]] = {}
         segment_turn_ranges: dict[str, tuple[int, int]] = {}  # seg.id -> (start, end_exclusive)
+        segment_turn_numbers: dict[str, list[int]] = {}
         segment_canonical_turn_ids: dict[str, list[str]] = {}
         merged_existing_exact_ranges: dict[str, tuple[int, int] | None] = {}
         for seg in segments:
-            seg_turn_count = getattr(seg, "turn_count", 0) or (len(seg.messages) // 2)
-            seg_rows = compact_rows[seg_cursor:seg_cursor + seg_turn_count]
-            if seg_rows:
+            exact_ids, _mapping_complete = self._segment_source_ids(seg)
+            exact_turns = sorted({
+                int(getattr(physical_by_id[cid], "turn_group_number", -1))
+                for cid in exact_ids
+                if cid in physical_by_id
+                and getattr(physical_by_id[cid], "turn_group_number", None)
+                is not None
+                and int(getattr(
+                    physical_by_id[cid], "turn_group_number", -1,
+                )) >= 0
+            })
+            seg_rows = [
+                logical_rows_by_turn[turn]
+                for turn in exact_turns
+                if turn in logical_rows_by_turn
+            ]
+            segment_turn_numbers[seg.id] = list(exact_turns)
+            segment_canonical_turn_ids[seg.id] = list(exact_ids)
+            if exact_turns:
                 segment_turn_ranges[seg.id] = (
-                    seg_rows[0].turn_number,
-                    seg_rows[-1].turn_number + 1,
+                    exact_turns[0],
+                    exact_turns[-1] + 1,
                 )
-                segment_canonical_turn_ids[seg.id] = [
-                    row.canonical_turn_id for row in seg_rows if row.canonical_turn_id
-                ]
-            else:
-                segment_turn_ranges[seg.id] = (seg_cursor, seg_cursor + seg_turn_count)
-                segment_canonical_turn_ids[seg.id] = []
             signals: list[FactSignal] = []
             code_refs: list[dict] = []
             for row in seg_rows:
@@ -1382,7 +1434,6 @@ class CompactionPipeline:
                 segment_signals[seg.id] = signals
             if code_refs:
                 segment_code_refs[seg.id] = code_refs
-            seg_cursor += seg_turn_count
 
         merge_lookback = self._config.compactor.merge_lookback
         max_seg_tokens = self._config.compactor.max_segment_tokens
@@ -1463,18 +1514,18 @@ class CompactionPipeline:
                     metadata=result.metadata,
                     compaction_model="passthrough",
                     compression_ratio=1.0,
-                    start_timestamp=result.timestamp,
-                    end_timestamp=result.timestamp,
+                    start_timestamp=seg.start_timestamp,
+                    end_timestamp=seg.end_timestamp,
                 )
                 self._store.store_segment(
                     stored,
                     **self._compaction_guard_kwargs(operation_id),
                 )
                 # Propagate turn -> segment tool output links
-                turn_range = segment_turn_ranges.get(seg.id)
-                if turn_range:
-                    self._propagate_tool_output_links(
-                        stored.ref, *turn_range,
+                turn_numbers = segment_turn_numbers.get(seg.id, [])
+                if turn_numbers:
+                    self._propagate_tool_output_links_for_turns(
+                        stored.ref, turn_numbers,
                         **self._compaction_guard_kwargs(operation_id),
                     )
                 all_results.append(result)
@@ -1577,7 +1628,22 @@ class CompactionPipeline:
                     seg.messages = candidate_messages + list(seg.messages)
                     seg.merge_ref = best_candidate.ref
                     seg.token_count += best_candidate.full_tokens
-                    seg.start_timestamp = best_candidate.start_timestamp
+                    start_candidates = [
+                        value for value in (
+                            best_candidate.start_timestamp,
+                            seg.start_timestamp,
+                        ) if value is not None
+                    ]
+                    end_candidates = [
+                        value for value in (
+                            best_candidate.end_timestamp,
+                            seg.end_timestamp,
+                        ) if value is not None
+                    ]
+                    if start_candidates:
+                        seg.start_timestamp = min(start_candidates)
+                    if end_candidates:
+                        seg.end_timestamp = max(end_candidates)
                     old_tc = best_candidate.metadata.turn_count if best_candidate.metadata else len(best_candidate.messages) // 2
                     seg.turn_count += old_tc
                     seg.tags = list(set(best_candidate.tags) | seg_tags)
@@ -1679,10 +1745,9 @@ class CompactionPipeline:
             result.metadata.start_turn_number = exact_start
             result.metadata.end_turn_number = exact_end
             result.metadata.generated_by_turn_id = generated_by_turn_id
-            # Prefer the exact per-message provenance. Fall back to the cursor
-            # map only when the segment carried no source ids at all (a legacy
-            # or synthesized segment), and mark that mapping incomplete so no
-            # fact author is derived from it.
+            # Prefer the exact per-message provenance. A legacy or synthesized
+            # segment with no source ids remains incomplete; it must not borrow
+            # a positional row mapping from an unrelated topic segment.
             exact_ids, mapping_complete = exact_source_ids.get(seg.id, ([], False))
             mapping_complete = bool(
                 mapping_complete
@@ -1718,7 +1783,7 @@ class CompactionPipeline:
                     compaction_model=self._compactor.model_name,
                     compression_ratio=result.compression_ratio,
                     start_timestamp=seg.start_timestamp,
-                    end_timestamp=result.timestamp,
+                    end_timestamp=seg.end_timestamp,
                 )
                 self._store.update_segment(
                     stored,
@@ -1753,8 +1818,8 @@ class CompactionPipeline:
                     metadata=result.metadata,
                     compaction_model=self._compactor.model_name,
                     compression_ratio=result.compression_ratio,
-                    start_timestamp=result.timestamp,
-                    end_timestamp=result.timestamp,
+                    start_timestamp=seg.start_timestamp,
+                    end_timestamp=seg.end_timestamp,
                 )
                 self._store.store_segment(
                     stored,
@@ -1776,10 +1841,10 @@ class CompactionPipeline:
                 )
 
             # Propagate turn -> segment tool output links
-            turn_range = segment_turn_ranges.get(seg.id)
-            if turn_range:
-                self._propagate_tool_output_links(
-                    stored.ref, *turn_range,
+            turn_numbers = segment_turn_numbers.get(seg.id, [])
+            if turn_numbers:
+                self._propagate_tool_output_links_for_turns(
+                    stored.ref, turn_numbers,
                     **self._compaction_guard_kwargs(operation_id),
                 )
 

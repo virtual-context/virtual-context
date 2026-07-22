@@ -2061,6 +2061,12 @@ def _cmd_admin_guarded_conversation_repair(args, method_name: str):
             result = engine.resequence_canonical_turns(
                 engine.config.conversation_id, dry_run=dry_run,
             )
+        elif method_name == "normalize_canonical_actor_ids":
+            result = engine.normalize_canonical_actor_ids(
+                engine.config.conversation_id,
+                platform=args.platform,
+                dry_run=dry_run,
+            )
         else:
             result = engine.rebuild_derived_data(
                 engine.config.conversation_id, dry_run=dry_run,
@@ -2094,6 +2100,12 @@ def cmd_admin_rebuild_derived_data(args):
 
 def cmd_admin_resequence_canonical_turns(args):
     _cmd_admin_guarded_conversation_repair(args, "resequence_canonical_turns")
+
+
+def cmd_admin_normalize_canonical_actor_ids(args):
+    _cmd_admin_guarded_conversation_repair(
+        args, "normalize_canonical_actor_ids",
+    )
 
 
 def cmd_admin_reindex_canonical_turn_embeddings(args):
@@ -2910,6 +2922,23 @@ def main():
     resequence_parser.add_argument("--postgres-dsn")
     resequence_parser.add_argument("--sqlite-path")
 
+    normalize_actor_ids_parser = admin_sub.add_parser(
+        "normalize-canonical-actor-ids",
+        help="Prefix legacy numeric canonical actor ids for one platform",
+    )
+    normalize_actor_ids_parser.add_argument("conversation_id")
+    normalize_actor_ids_parser.add_argument("--tenant-id", required=True)
+    normalize_actor_ids_parser.add_argument("--platform", required=True)
+    normalize_actor_ids_parser.add_argument(
+        "--apply", action="store_true",
+        help="Write the repair; the default is a dry-run report",
+    )
+    normalize_actor_ids_parser.add_argument(
+        "--storage-backend", choices=("sqlite", "postgres"),
+    )
+    normalize_actor_ids_parser.add_argument("--postgres-dsn")
+    normalize_actor_ids_parser.add_argument("--sqlite-path")
+
     # ------------------------------------------------------------------
     # admin reindex-canonical-turn-embeddings
     # ------------------------------------------------------------------
@@ -3145,6 +3174,8 @@ def main():
             cmd_admin_rebuild_derived_data(args)
         elif args.admin_command == "resequence-canonical-turns":
             cmd_admin_resequence_canonical_turns(args)
+        elif args.admin_command == "normalize-canonical-actor-ids":
+            cmd_admin_normalize_canonical_actor_ids(args)
         elif args.admin_command == "reindex-canonical-turn-embeddings":
             cmd_admin_reindex_canonical_turn_embeddings(args)
         elif args.admin_command == "backfill-session-state-markers":
@@ -3159,6 +3190,7 @@ def main():
                 "  virtual-context admin reattribute-audience <conversation_id> <from_audience> <to_audience> --tenant-id <id> [--apply] [--limit N]\n"
                 "  virtual-context admin rebuild-derived-data <conversation_id> --tenant-id <id> [--apply]\n"
                 "  virtual-context admin resequence-canonical-turns <conversation_id> --tenant-id <id> [--apply]\n"
+                "  virtual-context admin normalize-canonical-actor-ids <conversation_id> --tenant-id <id> --platform <platform> [--apply]\n"
                 "  virtual-context admin reindex-canonical-turn-embeddings [<conversation_id>] [--tenant-id <id>] [--all-convs-for-tenant] [--apply] [--limit N]\n"
                 "  virtual-context admin backfill-session-state-markers [<conversation_id>] [--tenant-id <id>] [--all-convs-for-tenant] [--dry-run] [--limit N] [--redis-url <url>]"
             )
