@@ -416,6 +416,38 @@ def _is_quoted_reference_carrier(text: str) -> bool:
     return all(marker in lowered for marker in _QUOTED_REFERENCE_MARKERS)
 
 
+_QUOTED_REFERENCE_CLOSE = "</conversation_context>"
+_CURRENT_REQUEST_LABEL = "Current user request:"
+
+
+def strip_quoted_reference_carrier(text: str) -> str | None:
+    """Return the user's own message bundled inside a host-assembled carrier.
+
+    ``None`` means the carrier holds no message of the user's, in which case
+    the entry is pure scaffolding and the real message arrives as its own
+    entry. Dropping it then loses nothing.
+
+    When the carrier does bundle a request it is labelled, so the message is
+    whatever follows the label. The search anchors on the last close of the
+    quoted container rather than on the header, because a quoted turn can
+    itself contain the label and anchoring earlier would keep the remainder of
+    the quote.
+
+    The distinction matters because the two shapes fail in opposite
+    directions: discarding a bundled request leaves the assistant half
+    unpaired and costs the whole turn, while keeping an unbundled carrier
+    stores scaffolding as speech.
+    """
+    if not text:
+        return None
+    close_at = text.rfind(_QUOTED_REFERENCE_CLOSE)
+    search_from = close_at + len(_QUOTED_REFERENCE_CLOSE) if close_at >= 0 else 0
+    label_at = text.find(_CURRENT_REQUEST_LABEL, search_from)
+    if label_at < 0:
+        return None
+    return text[label_at + len(_CURRENT_REQUEST_LABEL):].strip() or None
+
+
 def extract_ingestible_messages(
     body: dict,
     fmt: "PayloadFormat",
@@ -528,10 +560,21 @@ def extract_ingestible_messages(
             continue
 
         if normalized_role == "user" and _is_quoted_reference_carrier(text):
+            # When the carrier bundles the current request, keep that request
+            # rather than discarding the entry: dropping it left the assistant
+            # half unpaired and the whole turn was rejected as a fragment.
+            # A carrier with no bundled request is pure scaffolding and is
+            # skipped as before.
+            stripped = strip_quoted_reference_carrier(text)
             stats["skipped_quoted_reference_entry_count"] = (
                 stats.get("skipped_quoted_reference_entry_count", 0) + 1
             )
-            continue
+            if stripped is None:
+                continue
+            stats["recovered_quoted_reference_request_count"] = (
+                stats.get("recovered_quoted_reference_request_count", 0) + 1
+            )
+            text = stripped
 
         timestamp = extract_timestamp_from_metadata(meta) if meta else None
         raw_content = content if isinstance(content, list) else None
