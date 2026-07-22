@@ -363,3 +363,107 @@ def test_derived_reset_only_touches_rows_with_compaction_state(tmp_path):
     ).fetchone()[0]
     assert plain == before_plain
     assert orphan is None
+
+
+def test_resequence_interleaves_origins_and_remaps_turn_artifacts(tmp_path):
+    store = SQLiteStore(tmp_path / "resequence.db")
+    _conversation(store, TARGET)
+    source = SOURCE
+
+    def save(
+        turn_id: str, *, origin: str, sort_key: float, group: int,
+        timestamp: str, user: str = "", assistant: str = "",
+    ) -> None:
+        store.save_canonical_turn(
+            TARGET, -1, user, assistant,
+            canonical_turn_id=turn_id,
+            sort_key=sort_key,
+            turn_hash=f"hash-{turn_id}",
+            turn_group_number=group,
+            first_seen_at=timestamp,
+            last_seen_at=timestamp,
+            created_at=timestamp,
+            updated_at=timestamp,
+            tagged_at=timestamp,
+            audience_conversation_id=TARGET,
+            audience_attribution_version=1,
+        )
+        if origin:
+            store._get_conn().execute(
+                "UPDATE canonical_turns SET origin_conversation_id = ? "
+                "WHERE canonical_turn_id = ?",
+                (origin, turn_id),
+            )
+
+    save(
+        "target-u", origin="", sort_key=1000, group=0,
+        timestamp="2026-07-20T12:00:00+00:00", user="later",
+    )
+    save(
+        "target-a", origin="", sort_key=2000, group=0,
+        timestamp="2026-07-20T12:00:01+00:00", assistant="later reply",
+    )
+    save(
+        "source-u", origin=f" {source} ", sort_key=3000, group=0,
+        timestamp="2026-07-19T12:00:00+00:00", user="earlier",
+    )
+    save(
+        "source-a", origin=f" {source} ", sort_key=4000, group=0,
+        timestamp="2026-07-19T12:00:01+00:00", assistant="earlier reply",
+    )
+    conn = store._get_conn()
+    conn.execute(
+        """INSERT INTO turn_tool_outputs
+           (conversation_id, turn_number, tool_output_ref, origin_conversation_id)
+           VALUES (?, 0, 'tool-source', ?)""",
+        (TARGET, f" {source} "),
+    )
+    conn.execute(
+        """INSERT INTO chain_snapshots
+           (ref, conversation_id, turn_number, chain_json, message_count,
+            origin_conversation_id)
+           VALUES ('chain-target', ?, 0, '{}', 1, '')""",
+        (TARGET,),
+    )
+    conn.execute(
+        """INSERT INTO chain_snapshots
+           (ref, conversation_id, turn_number, chain_json, message_count,
+            origin_conversation_id)
+           VALUES ('chain-sentinel', ?, -3000000, '{}', 0, '')""",
+        (TARGET,),
+    )
+    conn.commit()
+
+    preview = store.resequence_canonical_turns(
+        TARGET, tenant_id=TENANT, expected_lifecycle_epoch=1,
+    )
+    assert preview["canonical_rows"] == 4
+    assert preview["logical_turns"] == 2
+    assert preview["turn_tool_output_unmapped"] == 0
+    assert preview["chain_snapshot_unmapped"] == 0
+    assert conn.execute(
+        "SELECT sort_key FROM canonical_turns WHERE canonical_turn_id = 'target-u'",
+    ).fetchone()[0] == 1000
+
+    applied = store.resequence_canonical_turns(
+        TARGET, tenant_id=TENANT, expected_lifecycle_epoch=1, dry_run=False,
+    )
+    assert applied["changed_group_rows"] > 0
+    rows = conn.execute(
+        """SELECT canonical_turn_id, turn_group_number, sort_key
+             FROM canonical_turns WHERE conversation_id = ? ORDER BY sort_key""",
+        (TARGET,),
+    ).fetchall()
+    assert [(row[0], row[1]) for row in rows] == [
+        ("source-u", 0), ("source-a", 0),
+        ("target-u", 1), ("target-a", 1),
+    ]
+    assert conn.execute(
+        "SELECT turn_number FROM turn_tool_outputs WHERE tool_output_ref = 'tool-source'",
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT turn_number FROM chain_snapshots WHERE ref = 'chain-target'",
+    ).fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT turn_number FROM chain_snapshots WHERE ref = 'chain-sentinel'",
+    ).fetchone()[0] == -3_000_000

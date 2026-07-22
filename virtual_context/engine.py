@@ -3190,6 +3190,37 @@ class VirtualContextEngine:
             dry_run=bool(dry_run),
         )
 
+    def resequence_canonical_turns(
+        self,
+        conversation_id: str,
+        *,
+        dry_run: bool = True,
+    ) -> dict:
+        """Rebuild one merged conversation's logical groups and chronology."""
+        owner = (conversation_id or "").strip()
+        if not owner:
+            raise ValueError("resequence_canonical_turns requires a conversation_id")
+        if owner != self.config.conversation_id:
+            raise ValueError(
+                "resequence_canonical_turns must target the engine-bound owner"
+            )
+        tenant_id = (self.config.tenant_id or "").strip()
+        if not tenant_id:
+            raise ValueError("resequence_canonical_turns requires a tenant_id")
+        sql_store = self._require_actor_sql_store(cards=True)
+        resequence = getattr(sql_store, "resequence_canonical_turns", None)
+        if not callable(resequence):
+            raise RuntimeError("storage backend does not support canonical resequencing")
+        epoch = int(sql_store.get_lifecycle_epoch(owner) or 0)
+        if epoch <= 0:
+            raise ValueError("conversation has no active lifecycle epoch")
+        return resequence(
+            owner,
+            tenant_id=tenant_id,
+            expected_lifecycle_epoch=epoch,
+            dry_run=bool(dry_run),
+        )
+
     @staticmethod
     def _effective_raw_text(raw_content: str | None) -> str:
         """Select the one provider-effective text block retained on a row."""

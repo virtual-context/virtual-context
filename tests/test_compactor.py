@@ -127,6 +127,61 @@ def test_parse_response_fallback(compactor):
     assert result["summary"] == "Just plain text summary"
 
 
+def test_compact_retries_incomplete_json_summary(legal_segment):
+    class RetryProvider:
+        def __init__(self):
+            self.calls = 0
+
+        def complete(self, system: str, user: str, max_tokens: int):
+            self.calls += 1
+            if self.calls == 1:
+                return "```json\n{", {}
+            return '{"summary":"Recovered summary","refined_tags":[]}', {}
+
+    provider = RetryProvider()
+    compactor = DomainCompactor(
+        llm_provider=provider,
+        config=CompactorConfig(
+            summary_ratio=0.15,
+            min_summary_tokens=50,
+            max_summary_tokens=500,
+        ),
+        model_name="test-model",
+    )
+
+    result = compactor.compact([legal_segment])[0]
+
+    assert provider.calls == 2
+    assert result.summary == "Recovered summary"
+
+
+def test_compact_uses_source_fallback_after_two_degenerate_summaries(legal_segment):
+    class BrokenProvider:
+        def __init__(self):
+            self.calls = 0
+
+        def complete(self, system: str, user: str, max_tokens: int):
+            self.calls += 1
+            return "```json\n{", {}
+
+    provider = BrokenProvider()
+    compactor = DomainCompactor(
+        llm_provider=provider,
+        config=CompactorConfig(
+            summary_ratio=0.15,
+            min_summary_tokens=50,
+            max_summary_tokens=500,
+        ),
+        model_name="test-model",
+    )
+
+    result = compactor.compact([legal_segment])[0]
+
+    assert provider.calls == 2
+    assert "User" in result.summary
+    assert not result.summary.startswith("```")
+
+
 def test_custom_prompt_from_tag_rules():
     """Custom summary prompt should be used when tag matches a rule."""
     rules = [

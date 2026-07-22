@@ -4055,9 +4055,8 @@ class PostgresStore(ContextStore):
           (b) tag_summaries + tag_summary_embeddings on conflict resolution
               (target wins);
           (c) tag_aliases on conflict resolution (target wins);
-          (d) turn_tool_outputs + media_outputs source rows whose natural
-              key already exists at target (target wins — sibling
-              conversations can carry identical join/content-hash rows);
+          (d) media_outputs source rows whose natural key already exists at
+              target (target wins for identical content hashes);
         i.e. NEVER against segments/canonical_turns/facts/etc. Move
         semantics is UPDATE conversation_id, not DELETE FROM <table>.
         """
@@ -4081,7 +4080,7 @@ class PostgresStore(ContextStore):
             TABLES_SIMPLE = (
                 "segments", "canonical_turn_anchors", "canonical_turn_chunks",
                 "ingest_batches", "facts", "fact_embeddings",
-                "segment_tool_outputs", "chain_snapshots",
+                "segment_tool_outputs",
             )
             # Tables whose natural key can legitimately collide across
             # sibling conversations (overlapping re-ingest produces
@@ -4089,7 +4088,6 @@ class PostgresStore(ContextStore):
             # mirrors the tag tables: target wins, the source's
             # conflicting rows are DELETEd and counted, the rest moves.
             TABLES_NATURAL_KEY_CONFLICT = (
-                ("turn_tool_outputs", ("turn_number", "tool_output_ref")),
                 ("media_outputs", ("ref",)),
             )
             TABLES_OFFSET_SORT_KEY = (
@@ -4344,6 +4342,229 @@ class PostgresStore(ContextStore):
                 request_turn_offset = max(int(request_turn_offset or 0),
                                           recomputed_request_turn_offset)
 
+                # ``turn_group_number`` is local to a conversation. Normalize
+                # the source while it is still isolated, then shift it past
+                # the target's maximum. Moving only ``sort_key`` would make
+                # source group 0 collide with target group 0, causing logical
+                # row assembly to pair unrelated channel messages.
+                source_group_rows = conn.execute(
+                    """SELECT canonical_turn_id, turn_group_number,
+                              user_content, assistant_content,
+                              origin_conversation_id
+                         FROM canonical_turns
+                        WHERE conversation_id = %s
+                        ORDER BY sort_key, canonical_turn_id""",
+                    (source_conversation_id,),
+                ).fetchall()
+                group_assignments: list[tuple[int, int, str]] = []
+                old_group_candidates: dict[int, set[int]] = {}
+                source_namespaces = {
+                    str(item["origin_conversation_id"] or "").strip()
+                    or source_conversation_id
+                    for item in source_group_rows
+                }
+                if len(source_namespaces) > 1:
+                    # A previously merged source already owns a global group
+                    # namespace. Preserve it only if it is collision-free;
+                    # flattening its physical rows again could pair different
+                    # origin conversations in a chained merge.
+                    group_origins: dict[int, set[str]] = {}
+                    group_roles: dict[int, list[int]] = {}
+                    for source_group_row in source_group_rows:
+                        old_group = int(source_group_row["turn_group_number"])
+                        namespace = (
+                            str(source_group_row["origin_conversation_id"] or "").strip()
+                            or source_conversation_id
+                        )
+                        group_origins.setdefault(old_group, set()).add(namespace)
+                        roles = group_roles.setdefault(old_group, [0, 0])
+                        roles[0] += int(bool(str(
+                            source_group_row["user_content"] or ""
+                        ).strip()))
+                        roles[1] += int(bool(str(
+                            source_group_row["assistant_content"] or ""
+                        ).strip()))
+                        old_group_candidates.setdefault(old_group, set()).add(
+                            old_group
+                        )
+                        group_assignments.append((
+                            old_group, old_group,
+                            str(source_group_row["canonical_turn_id"]),
+                        ))
+                    if any(len(origins) > 1 for origins in group_origins.values()) or any(
+                        users > 1 or assistants > 1
+                        for users, assistants in group_roles.values()
+                    ):
+                        raise RuntimeError(
+                            "chained source has colliding logical turn groups; "
+                            "resequence it before merging"
+                        )
+                else:
+                    current_group = -1
+                    pending_user_group = -1
+                    pending_old_group = -1
+                    for source_group_row in source_group_rows:
+                        old_group = int(source_group_row["turn_group_number"])
+                        has_user = bool(str(
+                            source_group_row["user_content"] or ""
+                        ).strip())
+                        has_assistant = bool(str(
+                            source_group_row["assistant_content"] or ""
+                        ).strip())
+                        if has_user and has_assistant:
+                            current_group += 1
+                            pending_user_group = -1
+                            pending_old_group = -1
+                        elif has_user:
+                            current_group += 1
+                            pending_user_group = current_group
+                            pending_old_group = old_group
+                        elif has_assistant and pending_user_group >= 0:
+                            if (
+                                pending_old_group >= 0
+                                and old_group >= 0
+                                and pending_old_group != old_group
+                            ):
+                                current_group += 1
+                            else:
+                                current_group = pending_user_group
+                            pending_user_group = -1
+                            pending_old_group = -1
+                        elif (
+                            not has_user
+                            and not has_assistant
+                            and pending_user_group >= 0
+                            and (
+                                pending_old_group < 0
+                                or old_group < 0
+                                or pending_old_group == old_group
+                            )
+                        ):
+                            current_group = pending_user_group
+                        else:
+                            current_group += 1
+                            pending_user_group = -1
+                            pending_old_group = -1
+                        old_group_candidates.setdefault(old_group, set()).add(
+                            current_group
+                        )
+                        group_assignments.append((
+                            current_group, old_group,
+                            str(source_group_row["canonical_turn_id"]),
+                        ))
+
+                artifact_turn_rows = conn.execute(
+                    """SELECT turn_number FROM turn_tool_outputs
+                        WHERE conversation_id = %s AND turn_number >= 0
+                        UNION
+                        SELECT turn_number FROM chain_snapshots
+                        WHERE conversation_id = %s AND turn_number >= 0""",
+                    (source_conversation_id, source_conversation_id),
+                ).fetchall()
+                artifact_group_mapping: dict[int, int] = {}
+                for artifact_turn_row in artifact_turn_rows:
+                    old_group = int(artifact_turn_row["turn_number"])
+                    candidates = old_group_candidates.get(old_group, set())
+                    if len(candidates) > 1:
+                        raise RuntimeError(
+                            "source turn-scoped artifact has an ambiguous "
+                            f"canonical group: {old_group}"
+                        )
+                    artifact_group_mapping[old_group] = (
+                        next(iter(candidates)) if candidates else old_group
+                    )
+
+                for normalized_group, _old_group, canonical_turn_id in group_assignments:
+                    conn.execute(
+                        """UPDATE canonical_turns SET turn_group_number = %s
+                             WHERE conversation_id = %s
+                               AND canonical_turn_id = %s""",
+                        (
+                            normalized_group,
+                            source_conversation_id,
+                            canonical_turn_id,
+                        ),
+                    )
+                target_group_row = conn.execute(
+                    """SELECT GREATEST(
+                           COALESCE((SELECT MAX(turn_group_number)
+                              FROM canonical_turns WHERE conversation_id = %s), -1),
+                           COALESCE((SELECT MAX(turn_number)
+                              FROM turn_tool_outputs WHERE conversation_id = %s), -1),
+                           COALESCE((SELECT MAX(turn_number)
+                              FROM chain_snapshots
+                             WHERE conversation_id = %s AND turn_number >= 0), -1)
+                       ) AS m""",
+                    (
+                        target_conversation_id, target_conversation_id,
+                        target_conversation_id,
+                    ),
+                ).fetchone()
+                turn_group_offset = int(
+                    target_group_row["m"] if target_group_row is not None else -1
+                ) + 1
+
+                # These preserved artifacts use logical turn numbers rather
+                # than request-turn numbers. First stage every positive source
+                # number out of the way, then apply its normalized and offset
+                # group. Negative chain turn numbers are sentinels.
+                staged_artifact_groups: list[tuple[int, int]] = []
+                for index, (old_group, normalized_group) in enumerate(
+                    sorted(artifact_group_mapping.items())
+                ):
+                    staged_group = -2_000_000 - index
+                    conn.execute(
+                        """UPDATE turn_tool_outputs SET turn_number = %s
+                            WHERE conversation_id = %s AND turn_number = %s""",
+                        (staged_group, source_conversation_id, old_group),
+                    )
+                    conn.execute(
+                        """UPDATE chain_snapshots SET turn_number = %s
+                            WHERE conversation_id = %s AND turn_number = %s""",
+                        (staged_group, source_conversation_id, old_group),
+                    )
+                    staged_artifact_groups.append((
+                        staged_group, normalized_group + turn_group_offset,
+                    ))
+                for staged_group, shifted_group in staged_artifact_groups:
+                    conn.execute(
+                        """UPDATE turn_tool_outputs SET turn_number = %s
+                            WHERE conversation_id = %s AND turn_number = %s""",
+                        (shifted_group, source_conversation_id, staged_group),
+                    )
+                    conn.execute(
+                        """UPDATE chain_snapshots SET turn_number = %s
+                            WHERE conversation_id = %s AND turn_number = %s""",
+                        (shifted_group, source_conversation_id, staged_group),
+                    )
+
+                chain_cursor = conn.execute(
+                    """UPDATE chain_snapshots
+                          SET conversation_id = %s,
+                              origin_conversation_id = COALESCE(
+                                  NULLIF(origin_conversation_id, ''), %s)
+                        WHERE conversation_id = %s""",
+                    (
+                        target_conversation_id, source_conversation_id,
+                        source_conversation_id,
+                    ),
+                )
+                rows_moved["chain_snapshots"] = chain_cursor.rowcount
+
+                tool_cursor = conn.execute(
+                    """UPDATE turn_tool_outputs
+                          SET conversation_id = %s,
+                              origin_conversation_id = COALESCE(
+                                  NULLIF(origin_conversation_id, ''), %s)
+                        WHERE conversation_id = %s""",
+                    (
+                        target_conversation_id, source_conversation_id,
+                        source_conversation_id,
+                    ),
+                )
+                rows_moved["turn_tool_outputs"] = tool_cursor.rowcount
+                rows_moved["turn_tool_outputs__conflicts_deleted"] = 0
+
                 # Step 5: per-table moves.
                 for tbl in TABLES_SIMPLE:
                     cur = conn.execute(
@@ -4399,13 +4620,14 @@ class PostgresStore(ContextStore):
                         f"UPDATE {tbl} "
                         f"   SET conversation_id = %s, "
                         f"       origin_conversation_id = COALESCE(NULLIF(origin_conversation_id, ''), %s), "
-                        f"       audience_conversation_id = COALESCE(NULLIF(audience_conversation_id, ''), %s), "
-                        f"       {col} = {col} + %s, "
-                        f"       compacted_at = NULL "
-                        f" WHERE conversation_id = %s",
-                        (target_conversation_id, source_conversation_id,
-                         source_conversation_id, sort_key_offset,
-                         source_conversation_id),
+                         f"       audience_conversation_id = COALESCE(NULLIF(audience_conversation_id, ''), %s), "
+                         f"       {col} = {col} + %s, "
+                         f"       turn_group_number = turn_group_number + %s, "
+                         f"       compacted_at = NULL "
+                         f" WHERE conversation_id = %s",
+                         (target_conversation_id, source_conversation_id,
+                          source_conversation_id, sort_key_offset, turn_group_offset,
+                          source_conversation_id),
                     )
                     rows_moved[tbl] = cur.rowcount
 
@@ -8381,6 +8603,270 @@ class PostgresStore(ContextStore):
                 )
                 if int(cursor.rowcount or 0) != report["canonical_rows_to_reset"]:
                     raise RuntimeError("derived reset lost its lifecycle compare-and-set")
+                return report
+
+    def resequence_canonical_turns(
+        self,
+        conversation_id: str,
+        *,
+        tenant_id: str,
+        expected_lifecycle_epoch: int,
+        dry_run: bool = True,
+    ) -> dict:
+        """Repair merged source-local turn groups into one timestamp order."""
+        from ..core.canonical_resequence import plan_canonical_resequence
+
+        owner = (conversation_id or "").strip()
+        tenant = (tenant_id or "").strip()
+        if not owner or not tenant:
+            raise ValueError("conversation and tenant are required")
+
+        with self.pool.connection() as conn:
+            with conn.transaction():
+                lock = conn.execute(
+                    "SELECT 1 FROM conversation_lifecycle "
+                    "WHERE conversation_id = %s FOR UPDATE",
+                    (owner,),
+                ).fetchone()
+                row = conn.execute(
+                    """SELECT tenant_id, lifecycle_epoch, phase, deleted_at,
+                              pending_raw_payload_entries
+                         FROM conversations WHERE conversation_id = %s""",
+                    (owner,),
+                ).fetchone()
+                if lock is None or row is None:
+                    raise ValueError("conversation does not exist")
+                if (
+                    row["tenant_id"] != tenant
+                    or int(row["lifecycle_epoch"]) != int(expected_lifecycle_epoch)
+                ):
+                    raise ValueError("tenant or lifecycle epoch mismatch")
+                if row["phase"] != "active" or row["deleted_at"] is not None:
+                    raise ValueError("conversation must be active")
+                if int(row["pending_raw_payload_entries"] or 0) != 0:
+                    raise RuntimeError("conversation still has pending raw ingestion")
+                active = conn.execute(
+                    """SELECT 1 FROM compaction_operation
+                        WHERE conversation_id = %s AND lifecycle_epoch = %s
+                          AND status IN ('queued','running') LIMIT 1""",
+                    (owner, int(expected_lifecycle_epoch)),
+                ).fetchone()
+                if active is not None:
+                    raise RuntimeError("conversation has an active compaction operation")
+                ingesting = conn.execute(
+                    """SELECT 1 FROM ingestion_episode
+                        WHERE conversation_id = %s AND lifecycle_epoch = %s
+                          AND status = 'running' LIMIT 1""",
+                    (owner, int(expected_lifecycle_epoch)),
+                ).fetchone()
+                if ingesting is not None:
+                    raise RuntimeError("conversation has an active ingestion episode")
+                merging = conn.execute(
+                    """SELECT 1 FROM merge_audit
+                        WHERE tenant_id = %s AND status = 'in_progress'
+                          AND (target_conversation_id = %s
+                               OR source_conversation_id = %s)
+                        LIMIT 1""",
+                    (tenant, owner, owner),
+                ).fetchone()
+                if merging is not None:
+                    raise RuntimeError("conversation has an active merge")
+
+                derived_counts = {
+                    table: int(conn.execute(
+                        f"SELECT COUNT(*) AS n FROM {table} WHERE conversation_id = %s",
+                        (owner,),
+                    ).fetchone()["n"])
+                    for table in ("segments", "facts", "tag_summaries")
+                }
+                rows = conn.execute(
+                    """SELECT canonical_turn_id, origin_conversation_id,
+                              sort_key, turn_group_number, user_content,
+                              assistant_content, first_seen_at, last_seen_at,
+                              created_at, updated_at
+                         FROM canonical_turns
+                        WHERE conversation_id = %s
+                        ORDER BY sort_key, canonical_turn_id""",
+                    (owner,),
+                ).fetchall()
+                assignments, artifact_turn_mapping = plan_canonical_resequence(
+                    list(rows), owner_conversation_id=owner,
+                )
+                # ``assignments`` are globally chronological, while ``rows``
+                # are in the old order. Compare by id, not list position.
+                old_by_id = {
+                    str(item["canonical_turn_id"]): item for item in rows
+                }
+                changed_groups = sum(
+                    int(old_by_id[item.canonical_turn_id]["turn_group_number"])
+                    != item.turn_group_number
+                    for item in assignments
+                )
+                changed_sort_keys = sum(
+                    float(old_by_id[item.canonical_turn_id]["sort_key"])
+                    != item.sort_key
+                    for item in assignments
+                )
+
+                def _artifact_plan(table: str):
+                    artifact_rows = conn.execute(
+                        f"""SELECT origin_conversation_id, turn_number
+                              FROM {table} WHERE conversation_id = %s
+                               AND turn_number >= 0""",
+                        (owner,),
+                    ).fetchall()
+                    mapped: dict[tuple[str, int], int] = {}
+                    missing = 0
+                    for artifact in artifact_rows:
+                        namespace = (
+                            str(artifact["origin_conversation_id"] or "").strip()
+                            or owner
+                        )
+                        key = (namespace, int(artifact["turn_number"]))
+                        if key not in artifact_turn_mapping:
+                            missing += 1
+                            continue
+                        mapped[key] = artifact_turn_mapping[key]
+                    return artifact_rows, mapped, missing
+
+                tool_rows, tool_mapping, tool_missing = _artifact_plan(
+                    "turn_tool_outputs"
+                )
+                chain_rows, chain_mapping, chain_missing = _artifact_plan(
+                    "chain_snapshots"
+                )
+                report = {
+                    "canonical_rows": len(rows),
+                    "logical_turns": len({
+                        item.turn_group_number for item in assignments
+                    }),
+                    "changed_group_rows": changed_groups,
+                    "changed_sort_key_rows": changed_sort_keys,
+                    "turn_tool_output_rows": len(tool_rows),
+                    "turn_tool_output_unmapped": tool_missing,
+                    "chain_snapshot_rows": len(chain_rows),
+                    "chain_snapshot_unmapped": chain_missing,
+                    "derived_rows": derived_counts,
+                    "dry_run": bool(dry_run),
+                }
+                if dry_run:
+                    return report
+                if any(derived_counts.values()):
+                    raise RuntimeError(
+                        "derived data must be reset before canonical resequencing"
+                    )
+                if tool_missing or chain_missing:
+                    raise RuntimeError(
+                        "turn-scoped artifacts could not be mapped safely"
+                    )
+
+                if assignments:
+                    stage_base = min(
+                        float(item["sort_key"]) for item in rows
+                    ) - (len(assignments) + 1) * 1000.0
+                    for index, assignment in enumerate(assignments):
+                        conn.execute(
+                            """UPDATE canonical_turns SET sort_key = %s
+                                WHERE conversation_id = %s
+                                  AND canonical_turn_id = %s""",
+                            (
+                                stage_base - index * 1000.0,
+                                owner,
+                                assignment.canonical_turn_id,
+                            ),
+                        )
+                now = utcnow_iso()
+                for assignment in assignments:
+                    conn.execute(
+                        """UPDATE canonical_turns
+                              SET turn_group_number = %s, sort_key = %s,
+                                  updated_at = %s
+                            WHERE conversation_id = %s
+                              AND canonical_turn_id = %s""",
+                        (
+                            assignment.turn_group_number, assignment.sort_key,
+                            now, owner, assignment.canonical_turn_id,
+                        ),
+                    )
+
+                tool_min_row = conn.execute(
+                    "SELECT COALESCE(MIN(turn_number), 0) AS m "
+                    "FROM turn_tool_outputs WHERE conversation_id = %s",
+                    (owner,),
+                ).fetchone()
+                staging_turn = min(
+                    -1_000_000,
+                    int(tool_min_row["m"] or 0) - len(tool_mapping) - 1,
+                )
+                staged_tools: list[tuple[int, int]] = []
+                staged_tool_rows = 0
+                for index, ((namespace, old_turn), new_turn) in enumerate(
+                    sorted(tool_mapping.items())
+                ):
+                    staged = staging_turn - index
+                    cursor = conn.execute(
+                        """UPDATE turn_tool_outputs SET turn_number = %s
+                            WHERE conversation_id = %s
+                              AND COALESCE(NULLIF(BTRIM(origin_conversation_id), ''), %s) = %s
+                              AND turn_number = %s""",
+                        (staged, owner, owner, namespace, old_turn),
+                    )
+                    staged_tool_rows += int(cursor.rowcount or 0)
+                    staged_tools.append((staged, new_turn))
+                if staged_tool_rows != len(tool_rows):
+                    raise RuntimeError(
+                        "turn-tool staging lost its origin/turn compare-and-set"
+                    )
+                finalized_tool_rows = 0
+                for staged, new_turn in staged_tools:
+                    cursor = conn.execute(
+                        """UPDATE turn_tool_outputs SET turn_number = %s
+                            WHERE conversation_id = %s AND turn_number = %s""",
+                        (new_turn, owner, staged),
+                    )
+                    finalized_tool_rows += int(cursor.rowcount or 0)
+                if finalized_tool_rows != len(tool_rows):
+                    raise RuntimeError("turn-tool finalization lost staged rows")
+
+                chain_min_row = conn.execute(
+                    "SELECT COALESCE(MIN(turn_number), 0) AS m "
+                    "FROM chain_snapshots WHERE conversation_id = %s",
+                    (owner,),
+                ).fetchone()
+                chain_stage_base = min(
+                    -2_000_000,
+                    int(chain_min_row["m"] or 0) - len(chain_mapping) - 1,
+                )
+                staged_chains: list[tuple[int, int]] = []
+                staged_chain_rows = 0
+                for index, ((namespace, old_turn), new_turn) in enumerate(
+                    sorted(chain_mapping.items())
+                ):
+                    staged = chain_stage_base - index
+                    cursor = conn.execute(
+                        """UPDATE chain_snapshots SET turn_number = %s
+                            WHERE conversation_id = %s
+                              AND COALESCE(NULLIF(BTRIM(origin_conversation_id), ''), %s) = %s
+                              AND turn_number = %s""",
+                        (staged, owner, owner, namespace, old_turn),
+                    )
+                    staged_chain_rows += int(cursor.rowcount or 0)
+                    staged_chains.append((staged, new_turn))
+                if staged_chain_rows != len(chain_rows):
+                    raise RuntimeError(
+                        "chain staging lost its origin/turn compare-and-set"
+                    )
+                finalized_chain_rows = 0
+                for staged, new_turn in staged_chains:
+                    cursor = conn.execute(
+                        """UPDATE chain_snapshots SET turn_number = %s
+                            WHERE conversation_id = %s AND turn_number = %s""",
+                        (new_turn, owner, staged),
+                    )
+                    finalized_chain_rows += int(cursor.rowcount or 0)
+                if finalized_chain_rows != len(chain_rows):
+                    raise RuntimeError("chain finalization lost staged rows")
+                conn.execute("DELETE FROM engine_state WHERE conversation_id = %s", (owner,))
                 return report
 
     def find_canonical_turn_by_source_message_id(
