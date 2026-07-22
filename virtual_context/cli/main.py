@@ -2006,6 +2006,88 @@ def cmd_admin_rebuild_actor_cards(args):
     ))
 
 
+def _cmd_admin_guarded_conversation_repair(args, method_name: str):
+    """Single-conversation shell for destructive, dry-run-default repairs."""
+    from virtual_context.engine import VirtualContextEngine
+
+    conversation_id = (getattr(args, "conversation_id", "") or "").strip()
+    tenant_id = (getattr(args, "tenant_id", "") or "").strip()
+    if not conversation_id or not tenant_id:
+        print(json.dumps({
+            "status": "error", "stage": "args",
+            "error": "<conversation_id> and --tenant-id are required",
+        }))
+        sys.exit(2)
+    try:
+        config = load_config(args.config)
+        config.conversation_id = conversation_id
+        config.tenant_id = tenant_id
+        _apply_storage_overrides(config, args)
+        if config.storage.backend not in {"sqlite", "postgres"}:
+            raise ValueError(f"{method_name.replace('_', '-')} requires SQLite or Postgres")
+    except Exception as exc:  # noqa: BLE001
+        print(json.dumps({
+            "status": "error", "stage": "load_config", "error": repr(exc),
+        }))
+        sys.exit(1)
+
+    class _NoopEmbeddingProvider:
+        @staticmethod
+        def get_embed_fn():
+            return None
+
+    config.retriever.inbound_tagger_type = "disabled"
+    try:
+        engine = VirtualContextEngine(
+            config=config, embedding_provider=_NoopEmbeddingProvider(),
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(json.dumps({
+            "status": "error", "stage": "engine_construct", "error": repr(exc),
+        }))
+        sys.exit(1)
+
+    try:
+        dry_run = not bool(getattr(args, "apply", False))
+        if method_name == "reattribute_audience":
+            result = engine.reattribute_audience(
+                engine.config.conversation_id,
+                args.from_audience,
+                args.to_audience,
+                dry_run=dry_run,
+                limit=getattr(args, "limit", None),
+            )
+        else:
+            result = engine.rebuild_derived_data(
+                engine.config.conversation_id, dry_run=dry_run,
+            )
+        print(json.dumps({
+            "status": "ok",
+            "tenant_id": tenant_id,
+            "conversation_id": engine.config.conversation_id,
+            "storage_backend": config.storage.backend,
+            **result,
+        }))
+    except Exception as exc:  # noqa: BLE001
+        print(json.dumps({
+            "status": "error", "stage": method_name, "error": repr(exc),
+        }))
+        sys.exit(1)
+    finally:
+        try:
+            engine.close()
+        except Exception:
+            pass
+
+
+def cmd_admin_reattribute_audience(args):
+    _cmd_admin_guarded_conversation_repair(args, "reattribute_audience")
+
+
+def cmd_admin_rebuild_derived_data(args):
+    _cmd_admin_guarded_conversation_repair(args, "rebuild_derived_data")
+
+
 def cmd_admin_reindex_canonical_turn_embeddings(args):
     """Backfill reply-subject turn chunks and repair orphaned turn chunks.
 
@@ -2766,6 +2848,41 @@ def main():
         actor_parser.add_argument("--postgres-dsn")
         actor_parser.add_argument("--sqlite-path")
 
+    reattribute_parser = admin_sub.add_parser(
+        "reattribute-audience",
+        help="Rewrite one verified merged audience into its active owner",
+    )
+    reattribute_parser.add_argument("conversation_id", help="Active owner conversation id")
+    reattribute_parser.add_argument("from_audience", help="Retained merged source alias")
+    reattribute_parser.add_argument("to_audience", help="Target audience; must equal the owner")
+    reattribute_parser.add_argument("--tenant-id", required=True)
+    reattribute_parser.add_argument(
+        "--apply", action="store_true",
+        help="Write the repair; the default is a dry-run report",
+    )
+    reattribute_parser.add_argument("--limit", type=int, default=None)
+    reattribute_parser.add_argument(
+        "--storage-backend", choices=("sqlite", "postgres"),
+    )
+    reattribute_parser.add_argument("--postgres-dsn")
+    reattribute_parser.add_argument("--sqlite-path")
+
+    rebuild_derived_parser = admin_sub.add_parser(
+        "rebuild-derived-data",
+        help="Discard derived summaries and facts so canonical turns rebuild cleanly",
+    )
+    rebuild_derived_parser.add_argument("conversation_id")
+    rebuild_derived_parser.add_argument("--tenant-id", required=True)
+    rebuild_derived_parser.add_argument(
+        "--apply", action="store_true",
+        help="Delete rebuildable data; the default is a dry-run report",
+    )
+    rebuild_derived_parser.add_argument(
+        "--storage-backend", choices=("sqlite", "postgres"),
+    )
+    rebuild_derived_parser.add_argument("--postgres-dsn")
+    rebuild_derived_parser.add_argument("--sqlite-path")
+
     # ------------------------------------------------------------------
     # admin reindex-canonical-turn-embeddings
     # ------------------------------------------------------------------
@@ -2995,6 +3112,10 @@ def main():
             cmd_admin_backfill_fact_authors(args)
         elif args.admin_command == "rebuild-actor-cards":
             cmd_admin_rebuild_actor_cards(args)
+        elif args.admin_command == "reattribute-audience":
+            cmd_admin_reattribute_audience(args)
+        elif args.admin_command == "rebuild-derived-data":
+            cmd_admin_rebuild_derived_data(args)
         elif args.admin_command == "reindex-canonical-turn-embeddings":
             cmd_admin_reindex_canonical_turn_embeddings(args)
         elif args.admin_command == "backfill-session-state-markers":
@@ -3006,6 +3127,8 @@ def main():
                 "  virtual-context admin backfill-fact-embeddings <conversation_id> [--tenant-id <id>] [--since <ts>] [--until <ts>] [--force-rebuild]\n"
                 "  virtual-context admin backfill-senders [<conversation_id>] [--tenant-id <id>] [--all-convs-for-tenant] [--dry-run] [--limit N]\n"
                 "  virtual-context admin backfill-channels [<conversation_id>] [--tenant-id <id>] [--all-convs-for-tenant] [--dry-run] [--limit N]\n"
+                "  virtual-context admin reattribute-audience <conversation_id> <from_audience> <to_audience> --tenant-id <id> [--apply] [--limit N]\n"
+                "  virtual-context admin rebuild-derived-data <conversation_id> --tenant-id <id> [--apply]\n"
                 "  virtual-context admin reindex-canonical-turn-embeddings [<conversation_id>] [--tenant-id <id>] [--all-convs-for-tenant] [--apply] [--limit N]\n"
                 "  virtual-context admin backfill-session-state-markers [<conversation_id>] [--tenant-id <id>] [--all-convs-for-tenant] [--dry-run] [--limit N] [--redis-url <url>]"
             )

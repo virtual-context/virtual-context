@@ -234,6 +234,9 @@ def _build_config(raw: dict[str, Any], *, validate: bool = True) -> VirtualConte
         tool_guard_threshold=search_raw.get("tool_guard_threshold", _sch_defaults.tool_guard_threshold),
         speaker_annotations_enabled=search_raw.get("speaker_annotations_enabled", _sch_defaults.speaker_annotations_enabled),
         speaker_selection_enabled=search_raw.get("speaker_selection_enabled", _sch_defaults.speaker_selection_enabled),
+        speaker_audience_scope=search_raw.get(
+            "speaker_audience_scope", _sch_defaults.speaker_audience_scope,
+        ),
     )
 
     # Facts
@@ -460,6 +463,14 @@ def _build_config(raw: dict[str, Any], *, validate: bool = True) -> VirtualConte
 def validate_config(config: VirtualContextConfig) -> list[str]:
     """Validate a config. Returns list of error strings (empty = valid)."""
     errors: list[str] = []
+
+    _valid_speaker_audience_scopes = {"channel", "conversation"}
+    if config.search.speaker_audience_scope not in _valid_speaker_audience_scopes:
+        errors.append(
+            "search.speaker_audience_scope must be one of "
+            f"{_valid_speaker_audience_scopes}, got "
+            f"'{config.search.speaker_audience_scope}'"
+        )
 
     # Tag generator validation
     if config.tag_generator.type not in ("llm", "keyword"):

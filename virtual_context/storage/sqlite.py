@@ -7842,6 +7842,358 @@ CREATE TABLE IF NOT EXISTS request_captures (
         conn.commit()
         return updated
 
+    def reattribute_canonical_turn_audience(
+        self,
+        conversation_id: str,
+        from_audience: str,
+        to_audience: str,
+        *,
+        tenant_id: str,
+        expected_lifecycle_epoch: int,
+        dry_run: bool = True,
+        limit: int | None = None,
+    ) -> dict:
+        """Guardedly collapse one retained merge audience into its owner.
+
+        This is intentionally narrower than a general UPDATE surface. The
+        source must be a retained, merged alias of the active owner; physical
+        rows must still name that source in ``origin_conversation_id``, carry
+        current audience attribution, and preserve a non-empty channel id.
+        The required same-agent ``channel`` to ``guild`` key shape plus those
+        predicates prevent a DM audience from being swept into a server
+        conversation by an over-broad repair.
+        """
+        owner = (conversation_id or "").strip()
+        source = (from_audience or "").strip()
+        target = (to_audience or "").strip()
+        tenant = (tenant_id or "").strip()
+        if not owner or not source or not target or not tenant:
+            raise ValueError("conversation, source audience, target audience, and tenant are required")
+        if target != owner or source == target:
+            raise ValueError("target audience must be the active owner and differ from source")
+        source_parts = source.removeprefix("sk:").split(":")
+        target_parts = target.removeprefix("sk:").split(":")
+        if (
+            len(source_parts) != 5
+            or len(target_parts) != 5
+            or source_parts[:3] != target_parts[:3]
+            or source_parts[0] != "agent"
+            or source_parts[3] != "channel"
+            or target_parts[3] != "guild"
+            or not source_parts[4]
+            or not target_parts[4]
+        ):
+            raise ValueError("audience repair requires a same-agent channel source and guild owner")
+        max_rows = None if limit is None else int(limit)
+        if max_rows is not None and max_rows <= 0:
+            raise ValueError("limit must be greater than zero")
+        conn = self._get_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            lock = conn.execute(
+                "SELECT 1 FROM conversation_lifecycle WHERE conversation_id = ?",
+                (owner,),
+            ).fetchone()
+            row = conn.execute(
+                """SELECT tenant_id, lifecycle_epoch, phase, deleted_at
+                     FROM conversations WHERE conversation_id = ?""",
+                (owner,),
+            ).fetchone()
+            if lock is None or row is None:
+                raise ValueError("owner conversation does not exist")
+            if row["tenant_id"] != tenant or int(row["lifecycle_epoch"]) != int(expected_lifecycle_epoch):
+                raise ValueError("tenant or lifecycle epoch mismatch")
+            if row["phase"] != "active" or row["deleted_at"] is not None:
+                raise ValueError("owner conversation must be active")
+            source_row = conn.execute(
+                """SELECT tenant_id, phase, deleted_at FROM conversations
+                    WHERE conversation_id = ?""",
+                (source,),
+            ).fetchone()
+            alias_row = conn.execute(
+                "SELECT target_id FROM conversation_aliases WHERE alias_id = ?",
+                (source,),
+            ).fetchone()
+            if (
+                source_row is None
+                or source_row["tenant_id"] != tenant
+                or source_row["phase"] != "merged"
+                or source_row["deleted_at"] is not None
+                or alias_row is None
+                or self._resolve_owner(conn, source) != owner
+            ):
+                raise ValueError("source audience is not a retained merged alias of the owner")
+            active = conn.execute(
+                """SELECT 1 FROM compaction_operation
+                    WHERE conversation_id = ? AND lifecycle_epoch = ?
+                      AND status IN ('queued','running') LIMIT 1""",
+                (owner, int(expected_lifecycle_epoch)),
+            ).fetchone()
+            if active is not None:
+                raise RuntimeError("owner conversation has an active compaction operation")
+            ingesting = conn.execute(
+                """SELECT 1 FROM ingestion_episode
+                    WHERE conversation_id = ? AND lifecycle_epoch = ?
+                      AND status = 'running' LIMIT 1""",
+                (owner, int(expected_lifecycle_epoch)),
+            ).fetchone()
+            if ingesting is not None:
+                raise RuntimeError("owner conversation has an active ingestion episode")
+            merging = conn.execute(
+                """SELECT 1 FROM merge_audit
+                    WHERE tenant_id = ? AND status = 'in_progress'
+                      AND (target_conversation_id IN (?, ?)
+                           OR source_conversation_id IN (?, ?))
+                    LIMIT 1""",
+                (tenant, owner, source, owner, source),
+            ).fetchone()
+            if merging is not None:
+                raise RuntimeError("source or owner has an active merge")
+
+            base_where = """conversation_id = ?
+                AND audience_conversation_id = ?
+                AND origin_conversation_id = ?"""
+            total = int(conn.execute(
+                f"SELECT COUNT(*) FROM canonical_turns WHERE {base_where}",
+                (owner, source, source),
+            ).fetchone()[0])
+            stale = int(conn.execute(
+                f"""SELECT COUNT(*) FROM canonical_turns WHERE {base_where}
+                    AND audience_attribution_version <> ?""",
+                (owner, source, source, AUDIENCE_ATTRIBUTION_VERSION),
+            ).fetchone()[0])
+            no_channel = int(conn.execute(
+                f"""SELECT COUNT(*) FROM canonical_turns WHERE {base_where}
+                    AND audience_attribution_version = ?
+                    AND COALESCE(TRIM(origin_channel_id), '') = ''""",
+                (owner, source, source, AUDIENCE_ATTRIBUTION_VERSION),
+            ).fetchone()[0])
+            eligible_where = base_where + """
+                AND audience_attribution_version = ?
+                AND COALESCE(TRIM(origin_channel_id), '') <> ''"""
+            eligible = int(conn.execute(
+                f"SELECT COUNT(*) FROM canonical_turns WHERE {eligible_where}",
+                (owner, source, source, AUDIENCE_ATTRIBUTION_VERSION),
+            ).fetchone()[0])
+            selected = eligible if max_rows is None else min(eligible, max_rows)
+            report = {
+                "matched_source": total,
+                "eligible": eligible,
+                "selected": selected,
+                "updated": 0,
+                "skipped_stale_version": stale,
+                "skipped_no_channel": no_channel,
+                "cards_invalidated": 0,
+                "dry_run": bool(dry_run),
+            }
+            if dry_run or selected == 0:
+                conn.rollback()
+                return report
+
+            params: list[object] = [owner, source, source, AUDIENCE_ATTRIBUTION_VERSION]
+            select_sql = (
+                f"SELECT canonical_turn_id FROM canonical_turns WHERE {eligible_where} "
+                "ORDER BY sort_key, canonical_turn_id"
+            )
+            if max_rows is not None:
+                select_sql += " LIMIT ?"
+                params.append(max_rows)
+            ids = [r[0] for r in conn.execute(select_sql, params).fetchall()]
+            now = utcnow_iso()
+            updated = 0
+            # Keep well below both legacy SQLite's 999-variable limit and
+            # modern builds' higher limit. The BEGIN IMMEDIATE transaction
+            # makes every batch one atomic repair.
+            for start in range(0, len(ids), 500):
+                batch = ids[start:start + 500]
+                placeholders = ",".join("?" for _ in batch)
+                cursor = conn.execute(
+                    f"""UPDATE canonical_turns
+                           SET audience_conversation_id = ?, updated_at = ?
+                         WHERE canonical_turn_id IN ({placeholders})
+                           AND conversation_id = ?
+                           AND audience_conversation_id = ?
+                           AND origin_conversation_id = ?
+                           AND audience_attribution_version = ?
+                           AND COALESCE(TRIM(origin_channel_id), '') <> ''
+                           AND EXISTS (
+                               SELECT 1 FROM conversations c
+                                WHERE c.conversation_id = canonical_turns.conversation_id
+                                  AND c.tenant_id = ? AND c.lifecycle_epoch = ?
+                                  AND c.phase = 'active' AND c.deleted_at IS NULL
+                           )""",
+                    (
+                        target, now, *batch, owner, source, source,
+                        AUDIENCE_ATTRIBUTION_VERSION, tenant,
+                        int(expected_lifecycle_epoch),
+                    ),
+                )
+                updated += int(cursor.rowcount or 0)
+            report["updated"] = updated
+            if report["updated"] != len(ids):
+                raise RuntimeError("audience reattribution lost its lifecycle compare-and-set")
+            report["cards_invalidated"] = self._invalidate_actor_cards(conn, owner)
+            conn.commit()
+            return report
+        except Exception:
+            conn.rollback()
+            raise
+
+    def reset_conversation_derived_data(
+        self,
+        conversation_id: str,
+        *,
+        tenant_id: str,
+        expected_lifecycle_epoch: int,
+        dry_run: bool = True,
+    ) -> dict:
+        """Atomically discard rebuildable memory while preserving canonical turns."""
+        owner = (conversation_id or "").strip()
+        tenant = (tenant_id or "").strip()
+        if not owner or not tenant:
+            raise ValueError("conversation and tenant are required")
+        conn = self._get_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            lock = conn.execute(
+                "SELECT 1 FROM conversation_lifecycle WHERE conversation_id = ?",
+                (owner,),
+            ).fetchone()
+            row = conn.execute(
+                """SELECT tenant_id, lifecycle_epoch, phase, deleted_at,
+                          pending_raw_payload_entries
+                     FROM conversations WHERE conversation_id = ?""",
+                (owner,),
+            ).fetchone()
+            if lock is None or row is None:
+                raise ValueError("conversation does not exist")
+            if row["tenant_id"] != tenant or int(row["lifecycle_epoch"]) != int(expected_lifecycle_epoch):
+                raise ValueError("tenant or lifecycle epoch mismatch")
+            if row["phase"] != "active" or row["deleted_at"] is not None:
+                raise ValueError("conversation must be active")
+            if int(row["pending_raw_payload_entries"] or 0) != 0:
+                raise RuntimeError("conversation still has pending raw ingestion")
+            active = conn.execute(
+                """SELECT 1 FROM compaction_operation
+                    WHERE conversation_id = ? AND lifecycle_epoch = ?
+                      AND status IN ('queued','running') LIMIT 1""",
+                (owner, int(expected_lifecycle_epoch)),
+            ).fetchone()
+            if active is not None:
+                raise RuntimeError("conversation has an active compaction operation")
+            ingesting = conn.execute(
+                """SELECT 1 FROM ingestion_episode
+                    WHERE conversation_id = ? AND lifecycle_epoch = ?
+                      AND status = 'running' LIMIT 1""",
+                (owner, int(expected_lifecycle_epoch)),
+            ).fetchone()
+            if ingesting is not None:
+                raise RuntimeError("conversation has an active ingestion episode")
+            merging = conn.execute(
+                """SELECT 1 FROM merge_audit
+                    WHERE tenant_id = ? AND status = 'in_progress'
+                      AND (target_conversation_id = ? OR source_conversation_id = ?)
+                    LIMIT 1""",
+                (tenant, owner, owner),
+            ).fetchone()
+            if merging is not None:
+                raise RuntimeError("conversation has an active merge")
+
+            def _count(sql: str, params: tuple = ()) -> int:
+                return int(conn.execute(sql, params).fetchone()[0])
+
+            report = {
+                "canonical_rows": _count(
+                    "SELECT COUNT(*) FROM canonical_turns WHERE conversation_id = ?", (owner,),
+                ),
+                "canonical_rows_to_reset": _count(
+                    """SELECT COUNT(*) FROM canonical_turns
+                        WHERE conversation_id = ?
+                          AND (compacted_at IS NOT NULL
+                               OR compaction_operation_id IS NOT NULL)""", (owner,),
+                ),
+                "untagged_rows": _count(
+                    """SELECT COUNT(*) FROM canonical_turns
+                        WHERE conversation_id = ? AND tagged_at IS NULL""", (owner,),
+                ),
+                "segments": _count(
+                    "SELECT COUNT(*) FROM segments WHERE conversation_id = ?", (owner,),
+                ),
+                "facts": _count(
+                    "SELECT COUNT(*) FROM facts WHERE conversation_id = ?", (owner,),
+                ),
+                "tag_summaries": _count(
+                    "SELECT COUNT(*) FROM tag_summaries WHERE conversation_id = ?", (owner,),
+                ),
+                "cards_invalidated": 0,
+                "dry_run": bool(dry_run),
+            }
+            if dry_run:
+                conn.rollback()
+                return report
+            if report["untagged_rows"]:
+                raise RuntimeError("canonical rows must be tagged before derived-data reset")
+
+            report["cards_invalidated"] = self._invalidate_actor_cards(conn, owner)
+            conn.execute(
+                """UPDATE actor_profiles SET card_dirty = 1, card_input_hash = ''
+                    WHERE tenant_id = ? AND actor_id IN (
+                        SELECT DISTINCT sender_actor_id FROM canonical_turns
+                         WHERE conversation_id = ?
+                           AND COALESCE(TRIM(sender_actor_id), '') <> ''
+                    )""",
+                (tenant, owner),
+            )
+            conn.execute(
+                """DELETE FROM fact_links WHERE source_fact_id IN
+                       (SELECT id FROM facts WHERE conversation_id = ?)
+                    OR target_fact_id IN
+                       (SELECT id FROM facts WHERE conversation_id = ?)""",
+                (owner, owner),
+            )
+            conn.execute(
+                "DELETE FROM fact_tags WHERE fact_id IN (SELECT id FROM facts WHERE conversation_id = ?)",
+                (owner,),
+            )
+            conn.execute("DELETE FROM fact_embeddings WHERE conversation_id = ?", (owner,))
+            conn.execute("DELETE FROM facts WHERE conversation_id = ?", (owner,))
+            conn.execute("DELETE FROM segment_tool_outputs WHERE conversation_id = ?", (owner,))
+            conn.execute(
+                "DELETE FROM segment_chunks WHERE segment_ref IN (SELECT ref FROM segments WHERE conversation_id = ?)",
+                (owner,),
+            )
+            conn.execute(
+                "DELETE FROM segment_tags WHERE segment_ref IN (SELECT ref FROM segments WHERE conversation_id = ?)",
+                (owner,),
+            )
+            conn.execute("DELETE FROM segments WHERE conversation_id = ?", (owner,))
+            conn.execute("DELETE FROM tag_summary_embeddings WHERE conversation_id = ?", (owner,))
+            conn.execute("DELETE FROM tag_summaries WHERE conversation_id = ?", (owner,))
+            conn.execute("DELETE FROM engine_state WHERE conversation_id = ?", (owner,))
+            cursor = conn.execute(
+                """UPDATE canonical_turns
+                       SET compacted_at = NULL,
+                           compaction_operation_id = NULL,
+                           updated_at = ?
+                     WHERE conversation_id = ?
+                       AND (compacted_at IS NOT NULL
+                            OR compaction_operation_id IS NOT NULL)
+                       AND EXISTS (
+                           SELECT 1 FROM conversations c
+                            WHERE c.conversation_id = canonical_turns.conversation_id
+                              AND c.tenant_id = ? AND c.lifecycle_epoch = ?
+                              AND c.phase = 'active' AND c.deleted_at IS NULL
+                       )""",
+                (utcnow_iso(), owner, tenant, int(expected_lifecycle_epoch)),
+            )
+            if int(cursor.rowcount or 0) != report["canonical_rows_to_reset"]:
+                raise RuntimeError("derived reset lost its lifecycle compare-and-set")
+            conn.commit()
+            return report
+        except Exception:
+            conn.rollback()
+            raise
+
     def find_canonical_turn_by_source_message_id(
         self,
         conversation_id: str,

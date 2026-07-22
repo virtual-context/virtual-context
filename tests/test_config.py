@@ -369,12 +369,14 @@ class TestSearchKnobPlumbing:
                 "tool_guard_window_seconds": 60,
                 "tool_guard_threshold": 3,
                 "speaker_annotations_enabled": True,
+                "speaker_audience_scope": "conversation",
             },
         }, validate=False)
         assert config.search.tool_guard_enabled is False
         assert config.search.tool_guard_window_seconds == 60
         assert config.search.tool_guard_threshold == 3
         assert config.search.speaker_annotations_enabled is True
+        assert config.search.speaker_audience_scope == "conversation"
 
     def test_defaults_keep_the_guard_on_and_annotations_dark(self):
         config = load_config(config_dict={}, validate=False)
@@ -382,3 +384,13 @@ class TestSearchKnobPlumbing:
         assert config.search.tool_guard_window_seconds == 120
         assert config.search.tool_guard_threshold == 10
         assert config.search.speaker_annotations_enabled is False
+        assert config.search.speaker_audience_scope == "channel"
+
+    def test_invalid_speaker_audience_scope_is_rejected(self):
+        config = load_config(config_dict={
+            "search": {"speaker_audience_scope": "guild"},
+        }, validate=False)
+
+        errors = validate_config(config)
+
+        assert any("speaker_audience_scope" in error for error in errors)

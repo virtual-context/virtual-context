@@ -396,6 +396,14 @@ def _roles_for_active_user(
     channel_id, channel_label = (
         get_origin_channel({"conversation info": current}) if current else ("", "")
     )
+    search_config = getattr(getattr(state, "engine", None), "config", None)
+    search_config = getattr(search_config, "search", None)
+    speaker_audience_scope = getattr(
+        search_config, "speaker_audience_scope", "channel",
+    )
+    speaker_channel_id = (
+        "" if speaker_audience_scope == "conversation" else channel_id
+    )
 
     from ..core.ingest_reconciler import IngestReconciler
 
@@ -430,7 +438,7 @@ def _roles_for_active_user(
         reply_target_body=probe.reply_target_body,
         owner_conversation_id=owner,
         audience_conversation_id=audience_conversation_id,
-        audience_channel_id=channel_id,
+        audience_channel_id=speaker_channel_id,
         audience_channel_label=channel_label,
     )
 

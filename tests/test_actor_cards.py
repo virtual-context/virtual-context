@@ -16,6 +16,7 @@ from virtual_context.storage.sqlite import SQLiteStore
 from virtual_context.types import (
     CARD_KIND_ACTIVE_GOAL,
     CARD_KIND_COMMUNICATION_PREF,
+    CARD_KIND_INTERACTION_STYLE,
     CARD_SCOPE_CROSS_CONTEXT,
     CARD_SCOPE_SAME_CONVERSATION,
     CARD_SENSITIVITY_HIGH,
@@ -377,6 +378,54 @@ def test_dm_entry_is_not_served_in_the_guild(store):
     )
     assert _bodies(in_guild) == ["prefers terse answers"]
     assert "private DM goal" not in (_bodies(in_guild) or [])
+
+
+def test_interaction_style_crosses_dm_and_guild_for_the_same_actor(store):
+    _dm_and_guild(store)
+    style = _entry(
+        "e-style", CARD_KIND_INTERACTION_STYLE, "likes a playful tone",
+        scope=CARD_SCOPE_CROSS_CONTEXT,
+    )
+    store.replace_actor_card(
+        "t1", OPTICS,
+        [(style, [_source("e-style", "dm", "dm", "f-dm", "chan-dm")])],
+        input_hash="h-style", expected_source_epochs={"dm": 1},
+    )
+
+    card = store.get_actor_card(
+        "t1", OPTICS, owner_conversation_id="guild",
+        audience_conversation_id="guild", audience_channel_id="chan-guild",
+    )
+
+    assert _bodies(card) == ["likes a playful tone"]
+
+
+def test_conversation_scope_admits_same_conversation_entries_from_all_channels(store):
+    _conversation(store, "guild")
+    _turn(store, "ct-a", "guild", OPTICS, "guild", "chan-a")
+    _turn(store, "ct-b", "guild", OPTICS, "guild", "chan-b")
+    _segment(store, "seg-a", "guild", ["ct-a"])
+    _segment(store, "seg-b", "guild", ["ct-b"])
+    _fact(store, "f-a", "guild", "seg-a", OPTICS)
+    _fact(store, "f-b", "guild", "seg-b", OPTICS)
+    store.upsert_actor_profile_from_turn("guild", OPTICS, "Optics", seen_at=_now())
+    store.replace_actor_card(
+        "t1", OPTICS,
+        [
+            (_entry("e-a", CARD_KIND_ACTIVE_GOAL, "goal from channel a"),
+             [_source("e-a", "guild", "guild", "f-a", "chan-a")]),
+            (_entry("e-b", CARD_KIND_ACTIVE_GOAL, "goal from channel b"),
+             [_source("e-b", "guild", "guild", "f-b", "chan-b")]),
+        ],
+        input_hash="h-guild", expected_source_epochs={"guild": 1},
+    )
+
+    card = store.get_actor_card(
+        "t1", OPTICS, owner_conversation_id="guild",
+        audience_conversation_id="guild", audience_channel_id="",
+    )
+
+    assert _bodies(card) == ["goal from channel a", "goal from channel b"]
 
 
 def test_channel_mismatch_fails_closed(store):

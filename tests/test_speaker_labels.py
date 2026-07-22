@@ -157,6 +157,18 @@ class TestResolveSpeakerLabels:
         )
         assert labels == {ACTOR: "Right"}
 
+    def test_conversation_scope_uses_the_latest_label_across_channels(self):
+        store = _RowStore([
+            _row(sender="Older Name", sort_key=1000.0, ctid="ct-a", channel="chan-1"),
+            _row(sender="Current Name", sort_key=3000.0, ctid="ct-b", channel="chan-2"),
+        ])
+
+        labels = resolve_speaker_labels(
+            store, {ACTOR}, speaker_context=_ctx(channel=""),
+        )
+
+        assert labels == {ACTOR: "Current Name"}
+
     def test_assistant_lane_rows_never_supply_labels(self):
         store = _RowStore([
             _row(sender="Ghost", user="", sort_key=9000.0, ctid="ct-a"),
