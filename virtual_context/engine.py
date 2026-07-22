@@ -2126,6 +2126,7 @@ class VirtualContextEngine:
         conversation_history: list[Message],
         *,
         source_audience_conversation_id: str = "",
+        user_turn_metadata: dict | None = None,
     ) -> None:
         """Durably record the latest completed user/assistant pair before indexing catches up.
 
@@ -2133,7 +2134,9 @@ class VirtualContextEngine:
         already validated by the caller against the tenant-scoped resolver,
         never taken from payload metadata. Empty means unproved: the user row
         is written without audience attribution, exactly as this path always
-        wrote it.
+        wrote it. ``user_turn_metadata`` carries adapter provenance outside
+        conversational text and is merged onto the latest user half before
+        the same attribution helpers used by batch ingestion run.
         """
         grouped = pair_messages_into_turns(list(conversation_history))
         if not grouped:
@@ -2151,6 +2154,10 @@ class VirtualContextEngine:
             metadata=user_messages[-1].metadata if user_messages else None,
             raw_content=user_messages[-1].raw_content if user_messages else None,
         )
+        if user_turn_metadata:
+            merged_metadata = dict(user_msg.metadata or {})
+            merged_metadata.update(user_turn_metadata)
+            user_msg.metadata = merged_metadata
         assistant_msg = Message(
             role="assistant",
             content="\n".join(msg.content for msg in assistant_messages),
@@ -2175,10 +2182,15 @@ class VirtualContextEngine:
             SOURCE_CONVERSATION_KEY,
             get_actor_id,
             get_origin_channel,
+            get_sender_name,
         )
 
         user_channel_id, user_channel_label = get_origin_channel(user_msg.metadata)
         asst_channel_id, asst_channel_label = get_origin_channel(assistant_msg.metadata)
+        user_sender = (
+            get_sender_name(user_msg.metadata)
+            or (entry.sender if entry else "")
+        )
         # The actor's platform lives in the RAW caller key, which the proxy
         # stamps onto every inbound message. ``config.conversation_id`` is
         # already alias-resolved and can be a UUID that names no platform.
@@ -2210,7 +2222,8 @@ class VirtualContextEngine:
                 primary_tag=entry.primary_tag if entry else "_general",
                 tags=list(entry.tags or []) if entry else [],
                 session_date=entry.session_date if entry else "",
-                sender=entry.sender if entry else "",
+                user_sender=user_sender,
+                assistant_sender="",
                 user_origin_channel_id=user_channel_id,
                 user_origin_channel_label=user_channel_label,
                 assistant_origin_channel_id=asst_channel_id,

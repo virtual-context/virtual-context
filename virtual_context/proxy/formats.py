@@ -453,6 +453,7 @@ def extract_ingestible_messages(
     fmt: "PayloadFormat",
     *,
     mode: str = "ingest",
+    current_user_metadata: dict | None = None,
 ) -> tuple[list["Message"], dict[str, int]]:
     """Return the normalized chat entries that should become canonical rows.
 
@@ -587,6 +588,19 @@ def extract_ingestible_messages(
                 raw_content=raw_content,
             )
         )
+
+    if current_user_metadata:
+        active_user = next(
+            (message for message in reversed(ingestible) if message.role == "user"),
+            None,
+        )
+        if active_user is not None:
+            merged = dict(active_user.metadata or {})
+            # Structured adapter provenance is outside conversational text and
+            # therefore wins over any metadata-like block a user typed into
+            # the message itself.
+            merged.update(current_user_metadata)
+            active_user.metadata = merged
 
     stats["ingestible_entry_count"] = len(ingestible)
     return ingestible, stats

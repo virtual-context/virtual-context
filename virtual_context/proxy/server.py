@@ -442,6 +442,7 @@ async def prepare_payload(
     *,
     body_bytes: bytes = b"",
     inbound_conversation_id: str = "",
+    current_user_metadata: dict | None = None,
     log_dir: Path | None = None,
     log_prefix: str = "",
 ) -> PreparedPayload:
@@ -790,7 +791,10 @@ async def prepare_payload(
         stamping only the tail would leave every alias-routed conversation's
         history actor-blind.
         """
-        messages = _extract_ingestible_messages_raw(payload)
+        messages = _extract_ingestible_messages_raw(
+            payload,
+            current_user_metadata=current_user_metadata,
+        )
         raw_key = (inbound_conversation_id or "").strip()
         if raw_key:
             for message in messages:
@@ -973,6 +977,7 @@ async def prepare_payload(
                 # the platform segment out of every actor id.
                 source_conversation_key=inbound_conversation_id or "",
                 source_audience_conversation_id=_audience_conversation_id,
+                current_user_metadata=current_user_metadata,
             )
         except _LE_MISMATCH:
             raise
