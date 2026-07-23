@@ -298,6 +298,92 @@ def test_tier3_compass_tail_is_model_visible_but_absent_from_returned_roles(tmp_
     ]
 
 
+@pytest.mark.regression("BUG-044")
+def test_tier3_db_pair_survives_payload_compaction_offset(tmp_path):
+    """BUG-044: payload watermarks must not split a recovered DB turn group.
+
+    This pins the live Discord shape: seven stamped channel-local messages,
+    one trailing active request, and a two-row cross-channel DB group. The
+    flushed watermark equals the payload-owned message count. Applying that
+    offset to the post-merge list discards the recovered user instruction at
+    index 7 while leaving its assistant acknowledgement at index 8.
+    """
+    eng = _make_participant_engine(tmp_path)
+    assembler = eng._retrieval
+    fake_provider = MagicMock()
+    fake_provider.get_marker.return_value = None
+    assembler._session_state_provider = fake_provider
+    fake_store = MagicMock(wraps=eng._store)
+    fake_store.get_recent_canonical_turns.return_value = [
+        CanonicalTurnRow(
+            conversation_id="target-1",
+            canonical_turn_id="pref-user",
+            turn_number=8,
+            turn_group_number=4,
+            sort_key=8.0,
+            user_content='For future replies, begin with "test3:".',
+            sender="optics",
+            sender_actor_id="actor:discord:42",
+            source_message_id="discord-pref",
+            origin_channel_id="chan-a",
+            origin_channel_label="#alpha",
+            audience_conversation_id="source-a",
+        ),
+        CanonicalTurnRow(
+            conversation_id="target-1",
+            canonical_turn_id="pref-assistant",
+            turn_number=9,
+            turn_group_number=4,
+            sort_key=9.0,
+            assistant_content="test3: Understood.",
+        ),
+    ]
+    assembler._store = fake_store
+    eng._engine_state.flushed_prefix_messages = 8
+
+    history = [
+        _stamped(
+            "user" if index % 2 == 0 else "assistant",
+            f"old local message {index}",
+            canonical_turn_id=f"local-{index}",
+            turn_number=index,
+        )
+        for index in range(7)
+    ]
+    active = Message(role="user", content="How are you?")
+    history.append(active)
+    roles = RequestRoles(
+        requester_actor_id="actor:discord:42",
+        owner_conversation_id="target-1",
+        audience_conversation_id="source-b",
+        origin_channel_id="chan-b",
+    )
+
+    assembled = eng.on_message_inbound(
+        active.content,
+        history,
+        request_roles=roles,
+    )
+
+    recent = assembled.recent_conversation_text
+    assert 'For future replies, begin with \\"test3:\\".' in recent
+    assert "test3: Understood." in recent
+    assert '"authority":"current_requester_user"' in recent
+    assert recent.index("For future replies") < recent.index("test3: Understood.")
+    assert [(m.role, m.content) for m in assembled.conversation_history] == [
+        ("user", "How are you?"),
+    ]
+    assert all(
+        (m.metadata or {}).get("source") != "db_recent"
+        for m in assembled.conversation_history
+    )
+    reassembled = eng._retrieval.reassemble_context()
+    assert 'For future replies, begin with \\"test3:\\".' in reassembled
+    assert reassembled.index("For future replies") < reassembled.index(
+        "test3: Understood."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Race-window self-heal
 # ---------------------------------------------------------------------------

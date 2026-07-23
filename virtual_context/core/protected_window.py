@@ -1,6 +1,6 @@
 """Helpers for the cross-channel-mirror protected window.
 
-This module hosts three pure helpers that participate in the three-tier
+This module hosts pure helpers that participate in the three-tier
 gate documented in ``docs/specs/cross-channel-mirror-engine-spec.md``:
 
 * ``_stamp_canonical_turn_ids`` — runs at ingest time, propagates the
@@ -14,6 +14,9 @@ gate documented in ``docs/specs/cross-channel-mirror-engine-spec.md``:
   and the most-recent-N rows fetched from canonical_turns. Dedups by
   ``canonical_turn_id`` first, falls back to ``turn_hash``. Token-budget
   enforcement is deferred to the downstream context-builder.
+* ``_slice_payload_prefix_preserving_db_recent`` — applies the payload-owned
+  compaction watermark after Tier 3 without consuming recovered DB rows or
+  the trailing active-user block.
 
 None of these helpers carry an engine, store, or proxy-state dependency.
 They are unit-testable in isolation.
@@ -158,6 +161,70 @@ def _is_ingestible_role(message: Message) -> bool:
         return False
     content = getattr(message, "content", "") or ""
     return bool(content)
+
+
+# ---------------------------------------------------------------------------
+# Compaction-aware merged-history view
+# ---------------------------------------------------------------------------
+
+
+def _is_db_recent(message: Message) -> bool:
+    metadata = message.metadata if isinstance(message.metadata, dict) else {}
+    return metadata.get("source") == "db_recent"
+
+
+def _is_trailing_unstamped_user(message: Message) -> bool:
+    metadata = message.metadata if isinstance(message.metadata, dict) else {}
+    return (
+        message.role == "user"
+        and not metadata.get("canonical_turn_id")
+        and metadata.get("source") != "db_recent"
+    )
+
+
+def _slice_payload_prefix_preserving_db_recent(
+    merged_history: list[Message],
+    payload_offset: int,
+) -> list[Message]:
+    """Apply a payload watermark without consuming recovered DB rows.
+
+    ``EngineState.history_offset`` describes payload-owned history. Tier 3
+    inserts ``source=db_recent`` messages into that list before assembly, so a
+    positional slice can split a recovered logical turn. Consume the offset
+    from payload-owned rows only.
+
+    The trailing unstamped-user block is the active request tail used by the
+    Tier 3 insertion rule. It is never eligible for removal: unified guild
+    watermarks are conversation-scoped while the payload is channel-local, so
+    the requested offset can legitimately equal or exceed the local payload
+    length.
+    """
+    if not merged_history:
+        return []
+
+    active_start = len(merged_history)
+    while (
+        active_start > 0
+        and _is_trailing_unstamped_user(merged_history[active_start - 1])
+    ):
+        active_start -= 1
+
+    eligible_payload = sum(
+        1
+        for message in merged_history[:active_start]
+        if not _is_db_recent(message)
+    )
+    remaining = min(max(0, int(payload_offset)), eligible_payload)
+    view: list[Message] = []
+    for index, message in enumerate(merged_history):
+        if index >= active_start or _is_db_recent(message):
+            view.append(message)
+            continue
+        if remaining > 0:
+            remaining -= 1
+            continue
+        view.append(message)
+    return view
 
 
 # ---------------------------------------------------------------------------
@@ -363,12 +430,7 @@ def _merge_protected_window(
     insert_at = len(payload_history)
     while insert_at > 0:
         tail = payload_history[insert_at - 1]
-        tail_meta = tail.metadata if isinstance(tail.metadata, dict) else {}
-        if (
-            tail.role == "user"
-            and not tail_meta.get("canonical_turn_id")
-            and tail_meta.get("source") != "db_recent"
-        ):
+        if _is_trailing_unstamped_user(tail):
             insert_at -= 1
             continue
         break
@@ -402,6 +464,7 @@ __all__ = [
     "_stamp_canonical_turn_ids",
     "_last_already_canonical_turn_number",
     "_merge_protected_window",
+    "_slice_payload_prefix_preserving_db_recent",
 ]
 
 

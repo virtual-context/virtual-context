@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 
 from .engine_utils import get_recent_context
 from .hint_builder import build_autonomous_hint, build_supervised_hint, build_default_hint
+from .protected_window import _slice_payload_prefix_preserving_db_recent
 from .store import ContextStore
 from .turn_tag_index import TurnTagIndex
 
@@ -92,6 +93,8 @@ class RetrievalAssembler:
         self._last_retrieval_result: RetrievalResult | None = None
         self._last_conversation_history: list[Message] | None = None
         self._last_model_name: str = ""
+        self._last_request_roles = None
+        self._last_speaker_context = None
         self._presented_segment_refs: set[str] = set()
         self._context_hint_cache_key: str = ""
         self._context_hint_cache_value: str = ""
@@ -318,13 +321,23 @@ class RetrievalAssembler:
         # calculation from earlier-in-method reads.
         _snapshot_stage = time.monotonic()
         _total_turns = _tti_count_at_entry
+        _payload_history_len = sum(
+            1
+            for history_message in conversation_history
+            if not (
+                isinstance(history_message.metadata, dict)
+                and history_message.metadata.get("source") == "db_recent"
+            )
+        )
         _offset = self._engine_state.history_offset(
-            len(conversation_history), total_turns_indexed=_total_turns,
+            _payload_history_len, total_turns_indexed=_total_turns,
             watermark=_ft,
         )
-        snapshot = self._monitor.build_snapshot(
-            conversation_history[_offset:]
+        uncompacted = _slice_payload_prefix_preserving_db_recent(
+            conversation_history,
+            _offset,
         )
+        snapshot = self._monitor.build_snapshot(uncompacted)
         utilization = snapshot.total_tokens / snapshot.budget_tokens if snapshot.budget_tokens > 0 else 0.0
         _note("history_snapshot", _snapshot_stage)
 
@@ -390,8 +403,8 @@ class RetrievalAssembler:
                 if tag in query_tags:
                     entry.last_accessed_turn = _tti_count_at_entry
 
-        # Assemble enriched context -- only pass uncompacted messages
-        uncompacted = conversation_history[_offset:]
+        # Assemble enriched context -- only pass uncompacted payload messages,
+        # while retaining the complete DB-recovered protected window.
         _assemble_stage = time.monotonic()
         assembled = self._assembler.assemble(
             core_context=core_context,
@@ -571,6 +584,8 @@ class RetrievalAssembler:
         self._last_retrieval_result = retrieval_result
         self._last_conversation_history = conversation_history
         self._last_model_name = model_name
+        self._last_request_roles = request_roles
+        self._last_speaker_context = speaker_context
         self._presented_segment_refs = set(assembled.presented_segment_refs)
 
         return assembled
@@ -603,7 +618,22 @@ class RetrievalAssembler:
 
         _hist = history or []
         _tti = len(self._turn_tag_index.entries) if self._turn_tag_index else None
-        uncompacted = _hist[self._engine_state.history_offset(len(_hist), total_turns_indexed=_tti):]
+        _payload_history_len = sum(
+            1
+            for history_message in _hist
+            if not (
+                isinstance(history_message.metadata, dict)
+                and history_message.metadata.get("source") == "db_recent"
+            )
+        )
+        _offset = self._engine_state.history_offset(
+            _payload_history_len,
+            total_turns_indexed=_tti,
+        )
+        uncompacted = _slice_payload_prefix_preserving_db_recent(
+            _hist,
+            _offset,
+        )
         assembled = self._assembler.assemble(
             core_context=core_context,
             retrieval_result=rr,
@@ -612,6 +642,8 @@ class RetrievalAssembler:
             context_hint=context_hint,
             working_set=ws_param,
             full_segments=full_segments_param,
+            request_roles=self._last_request_roles,
+            speaker_context=self._last_speaker_context,
         )
         return assembled.prepend_text
 
