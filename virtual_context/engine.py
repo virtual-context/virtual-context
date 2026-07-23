@@ -2128,6 +2128,8 @@ class VirtualContextEngine:
         *,
         source_audience_conversation_id: str = "",
         user_turn_metadata: dict | None = None,
+        completed_user_message: Message | None = None,
+        completed_assistant_message: Message | None = None,
     ) -> None:
         """Durably record the latest completed user/assistant pair before indexing catches up.
 
@@ -2138,15 +2140,44 @@ class VirtualContextEngine:
         wrote it. ``user_turn_metadata`` carries adapter provenance outside
         conversational text and is merged onto the latest user half before
         the same attribution helpers used by batch ingestion run.
+
+        REST prepare and ingest may be served by different workers, while
+        server-scoped conversations deliberately share one state object across
+        channels.  A caller that still owns the request therefore may supply
+        ``completed_user_message`` and ``completed_assistant_message``.  That
+        exact pair is persisted instead of guessing it from a mutable shared
+        history tail.  The full history remains the source of the logical turn
+        number and checkpoint state.
         """
         grouped = pair_messages_into_turns(list(conversation_history))
         if not grouped:
             return
         latest_turn = grouped[-1]
-        assistant_messages = [msg for msg in latest_turn.messages if msg.role == "assistant"]
+        explicit_pair = (
+            completed_user_message is not None
+            or completed_assistant_message is not None
+        )
+        if explicit_pair:
+            if (
+                completed_user_message is None
+                or completed_assistant_message is None
+                or completed_user_message.role != "user"
+                or completed_assistant_message.role != "assistant"
+            ):
+                raise ValueError(
+                    "completed turn override requires one user and one assistant message"
+                )
+            user_messages = [completed_user_message]
+            assistant_messages = [completed_assistant_message]
+        else:
+            user_messages = [
+                msg for msg in latest_turn.messages if msg.role == "user"
+            ]
+            assistant_messages = [
+                msg for msg in latest_turn.messages if msg.role == "assistant"
+            ]
         if not assistant_messages:
             return
-        user_messages = [msg for msg in latest_turn.messages if msg.role == "user"]
         turn_number = len(grouped) - 1
         user_msg = Message(
             role="user",
