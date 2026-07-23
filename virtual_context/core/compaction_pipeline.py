@@ -13,7 +13,6 @@ import math
 import time
 from collections import Counter
 from collections.abc import Callable
-from dataclasses import replace
 from datetime import datetime
 from typing import TYPE_CHECKING
 
@@ -278,8 +277,6 @@ class CompactionPipeline:
             CARD_KINDS,
             CARD_SCOPE_CROSS_CONTEXT,
             CARD_SCOPE_SAME_CONVERSATION,
-            CARD_SENSITIVITIES,
-            CARD_SENSITIVITY_HIGH,
             CARD_SENSITIVITY_NORMAL,
             ActorCardEntry,
             ActorCardEntrySource,
@@ -365,7 +362,7 @@ class CompactionPipeline:
             )
             digest = hashlib.sha256(json.dumps(
                 {
-                    "policy": 9,
+                    "policy": 10,
                     "curation_model": curation_model,
                     "admission_model": admission_model,
                     "admission_fallback_model": admission_fallback_model,
@@ -532,7 +529,6 @@ class CompactionPipeline:
                 continue
             kind = item.get("kind")
             body = item.get("body")
-            sensitivity = item.get("sensitivity", CARD_SENSITIVITY_NORMAL)
             confidence = item.get("confidence")
             fact_ids = item.get("fact_ids")
             turn_ids = item.get("turn_ids")
@@ -540,7 +536,6 @@ class CompactionPipeline:
                 "kind",
                 "body",
                 "confidence",
-                "sensitivity",
                 "fact_ids",
                 "turn_ids",
             }:
@@ -548,9 +543,6 @@ class CompactionPipeline:
                 continue
             if kind not in CARD_KINDS:
                 rejected["invalid_kind"] += 1
-                continue
-            if sensitivity not in CARD_SENSITIVITIES:
-                rejected["invalid_sensitivity"] += 1
                 continue
             quota_key = (audience_id, kind)
             if not isinstance(body, str) or not body.strip():
@@ -657,8 +649,7 @@ class CompactionPipeline:
 
             scope = (
                 CARD_SCOPE_CROSS_CONTEXT
-                if sensitivity == CARD_SENSITIVITY_NORMAL
-                and kind in CARD_CROSS_CONTEXT_KINDS
+                if kind in CARD_CROSS_CONTEXT_KINDS
                 else CARD_SCOPE_SAME_CONVERSATION
             )
             digest = hashlib.sha256(json.dumps(
@@ -668,7 +659,9 @@ class CompactionPipeline:
             entry = ActorCardEntry(
                 id=f"card-{digest}", tenant_id=tenant_id, actor_id=actor_id,
                 kind=kind, body=body, confidence=confidence,
-                sensitivity=sensitivity, audience_scope=scope,
+                # Retained only for schema compatibility. Sensitivity is not
+                # part of curation, admission, scoping, or serving policy.
+                sensitivity=CARD_SENSITIVITY_NORMAL, audience_scope=scope,
                 created_at=now, updated_at=now,
             )
             semantic_key = (
@@ -681,20 +674,11 @@ class CompactionPipeline:
             existing_entry = normalized_entries_by_key.get(semantic_key)
             if existing_entry is not None:
                 # Duplicate model candidates are one immutable claim. Keep the
-                # most conservative sensitivity and strongest confidence
-                # regardless of curator output order.
+                # strongest confidence regardless of curator output order.
                 existing_entry.confidence = max(
                     existing_entry.confidence,
                     entry.confidence,
                 )
-                if (
-                    existing_entry.sensitivity == CARD_SENSITIVITY_HIGH
-                    or entry.sensitivity == CARD_SENSITIVITY_HIGH
-                ):
-                    existing_entry.sensitivity = CARD_SENSITIVITY_HIGH
-                    existing_entry.audience_scope = (
-                        CARD_SCOPE_SAME_CONVERSATION
-                    )
                 rejected["duplicate_entry"] += 1
                 continue
             if per_audience_kind.get(quota_key, 0) >= int(
@@ -789,11 +773,22 @@ class CompactionPipeline:
                         independently_substantive
                         or partition_substantive
                     )
+                    privacy_only_rejection = bool(
+                        normalized_by_audience.get(audience_id)
+                    ) and (
+                        admission_rejections.get(
+                            "semantic_explicit_privacy_request",
+                            0,
+                        )
+                        == len(normalized_by_audience[audience_id])
+                        == sum(admission_rejections.values())
+                    )
                     coverage_gap = (
                         coverage_gap
                         or (
                             partition_substantive
                             and not partition_admitted
+                            and not privacy_only_rejection
                         )
                     )
                 normalized = admitted_entries
@@ -1043,12 +1038,10 @@ class CompactionPipeline:
             "\"substantive\" exactly when substantive is true. entries must "
             "be an array. A substantive actor must receive at least one entry; "
             "a non-substantive actor must receive none. Each entry must contain "
-            "exactly kind, body, confidence, sensitivity, fact_ids, and "
-            "turn_ids. kind must be exactly one of \"communication_pref\", "
-            "\"active_goal\", \"relevant_history\", or "
-            "\"interaction_style\". sensitivity must be exactly the string "
-            "\"normal\" or \"high\"; never use null, \"none\", booleans, or "
-            "numbers. confidence must be a number from 0 through 1. fact_ids "
+            "exactly kind, body, confidence, fact_ids, and turn_ids. kind must "
+            "be exactly one of \"communication_pref\", \"active_goal\", "
+            "\"relevant_history\", or \"interaction_style\". confidence must "
+            "be a number from 0 through 1. fact_ids "
             "and turn_ids must be arrays, may individually be empty, and "
             "together must cite at least one provided id that fully supports "
             f"the body. Use at most {_ACTOR_CARD_CITATION_LIMIT} citation ids "
@@ -1078,11 +1071,14 @@ class CompactionPipeline:
             "when no narrower durable preference or goal is justified. "
             "An isolated, underspecified follow-up whose missing referent "
             "cannot be recovered from the supplied evidence is insufficient "
-            "for relevant_history, even if it sounds medical or important. "
-            "Medical, sexual, financial, precise-location, credential, or "
-            "similarly private personal material must be sensitivity \"high\". "
-            "Ordinary non-private communication and interaction style may be "
-            "\"normal\"."
+            "for relevant_history, even if it sounds important. Subject matter "
+            "must never determine admission: medical, sexual, financial, "
+            "location, credential, and other topics are evaluated by the same "
+            "durability and evidence rules as every other topic. Do not omit "
+            "or soften a candidate because of its subject. If the actor "
+            "explicitly and unambiguously asks that particular information "
+            "not be retained or reused, do not propose it for the card. Do not "
+            "infer such a request from the topic, from a DM, or from context."
         )
         user = json.dumps({
             "facts": prompt_facts,
@@ -1346,13 +1342,6 @@ class CompactionPipeline:
         bool,
     ]:
         """Independently check coverage and admit immutable candidates."""
-        from ..types import (
-            CARD_CROSS_CONTEXT_KINDS,
-            CARD_SCOPE_CROSS_CONTEXT,
-            CARD_SCOPE_SAME_CONVERSATION,
-            CARD_SENSITIVITIES,
-            CARD_SENSITIVITY_NORMAL,
-        )
 
         provider = self._actor_card_admission_provider()
         if provider is None:
@@ -1424,7 +1413,6 @@ class CompactionPipeline:
                 "kind": entry.kind,
                 "body": entry.body,
                 "proposed_confidence": entry.confidence,
-                "proposed_sensitivity": entry.sensitivity,
                 "fact_ids": fact_ids,
                 "turn_ids": turn_ids,
                 "source_segments": [
@@ -1447,8 +1435,8 @@ class CompactionPipeline:
         system = (
             "You are the conservative semantic admission gate for a person "
             "card. Candidate bodies are immutable: you may admit or reject "
-            "them and correct sensitivity, but you may not invent, rewrite, "
-            "or merge candidates. Use only actor-authored facts and source "
+            "them, but you may not invent, rewrite, or merge candidates. Use "
+            "only actor-authored facts and source "
             "messages. All bounded actor turns and compact facts are supplied "
             "so later evidence can revoke or replace a candidate. "
             "Independently decide whether this actor contributed substantive "
@@ -1467,15 +1455,13 @@ class CompactionPipeline:
             "\"no_durable_context\", or \"insufficient_evidence\", and must "
             "be \"substantive\" exactly when substantive is true. "
             "Return exactly one decision for every candidate, with "
-            "exactly candidate_id, admit, sensitivity, and reason. admit must "
-            "be a boolean and sensitivity must be exactly \"normal\" or "
-            "\"high\". You may raise sensitivity from normal to high, but "
-            "must never lower high to normal. reason must be exactly one of "
+            "exactly candidate_id, admit, and reason. admit must be a boolean. "
+            "reason must be exactly one of "
             "\"durable\", \"temporary\", \"test_probe\", "
             "\"stopped_or_replaced\", \"completed\", \"contradicted\", "
-            "\"insufficient_evidence\", \"not_durable\", or "
-            "\"not_person_card\". Use reason \"durable\" if and only if admit "
-            "is true. "
+            "\"insufficient_evidence\", \"not_durable\", "
+            "\"not_person_card\", or \"explicit_privacy_request\". Use reason "
+            "\"durable\" if and only if admit is true. "
             "Reject temporary, test/probe, one-turn, session-only, "
             "channel-only, stopped, replaced, completed, or contradicted "
             "material. Later source messages revoke or replace earlier "
@@ -1501,9 +1487,15 @@ class CompactionPipeline:
             "entail the unqualified body \"has good blood pressure.\" "
             "Reject with not_person_card when a body exposes internal "
             "ontology/tag language or serializes a machine fact triple rather "
-            "than stating a natural person fact. Medical, sexual, financial, "
-            "precise-location, credential, or similarly private material must "
-            "be high sensitivity. A visibly truncated turn cannot prove a "
+            "than stating a natural person fact. Subject matter must never "
+            "determine admission: medical, sexual, financial, location, "
+            "credential, and other topics are evaluated by the same durability "
+            "and evidence rules as every other topic. Do not omit, soften, or "
+            "reject a candidate because of its subject. Use "
+            "explicit_privacy_request only when actor-authored evidence "
+            "explicitly and unambiguously asks that the cited information not "
+            "be retained or reused; never infer privacy from the topic, from a "
+            "DM, or from context. A visibly truncated turn cannot prove a "
             "claim whose qualifier may be in omitted text. When uncertain, "
             "reject."
         )
@@ -1567,15 +1559,14 @@ class CompactionPipeline:
             "insufficient_evidence",
             "not_durable",
             "not_person_card",
+            "explicit_privacy_request",
         }
         for decision in parsed["decisions"]:
             if (
                 not isinstance(decision, dict)
-                or set(decision)
-                != {"candidate_id", "admit", "sensitivity", "reason"}
+                or set(decision) != {"candidate_id", "admit", "reason"}
                 or not isinstance(decision.get("candidate_id"), str)
                 or not isinstance(decision.get("admit"), bool)
-                or decision.get("sensitivity") not in CARD_SENSITIVITIES
                 or decision.get("reason") not in valid_reasons
                 or (
                     bool(decision.get("admit"))
@@ -1609,29 +1600,7 @@ class CompactionPipeline:
                     f"semantic_{decision['reason']}"
                 ] += 1
                 continue
-            sensitivity = decision["sensitivity"]
-            if (
-                entry.sensitivity != CARD_SENSITIVITY_NORMAL
-                and sensitivity == CARD_SENSITIVITY_NORMAL
-            ):
-                raise _ActorCardAdmissionError(
-                    "actor-card admission attempted to lower sensitivity",
-                    response_text,
-                )
-            scope = (
-                CARD_SCOPE_CROSS_CONTEXT
-                if sensitivity == CARD_SENSITIVITY_NORMAL
-                and entry.kind in CARD_CROSS_CONTEXT_KINDS
-                else CARD_SCOPE_SAME_CONVERSATION
-            )
-            admitted.append((
-                replace(
-                    entry,
-                    sensitivity=sensitivity,
-                    audience_scope=scope,
-                ),
-                entry_sources,
-            ))
+            admitted.append((entry, entry_sources))
         if not independently_substantive and admitted:
             raise _ActorCardAdmissionError(
                 "non-substantive actor cannot have an admitted card entry",

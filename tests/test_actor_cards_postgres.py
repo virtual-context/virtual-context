@@ -132,10 +132,17 @@ class World:
         )
 
 
-def _entry(entry_id, kind, body, *, scope=CARD_SCOPE_SAME_CONVERSATION):
+def _entry(
+    entry_id,
+    kind,
+    body,
+    *,
+    scope=CARD_SCOPE_SAME_CONVERSATION,
+    sensitivity="normal",
+):
     return ActorCardEntry(
         id=entry_id, kind=kind, body=body, confidence=0.9,
-        sensitivity="normal", audience_scope=scope,
+        sensitivity=sensitivity, audience_scope=scope,
     )
 
 
@@ -344,14 +351,50 @@ def test_pg_cross_tenant_card_read_is_refused(store):
     ) is None
 
 
-def test_pg_channel_mismatch_fails_closed(store):
+def test_pg_channels_share_same_conversation_card(store):
     w = World(store)
     _build(w)
     card = store.get_actor_card(
         w.tenant, w.optics, owner_conversation_id=w.dm,
         audience_conversation_id=w.dm, audience_channel_id="chan-other",
     )
-    assert "private DM goal" not in (_bodies(card) or [])
+    assert "private DM goal" in (_bodies(card) or [])
+
+
+def test_pg_legacy_high_sensitivity_metadata_does_not_hide_card(store):
+    w = World(store)
+    entry_id = _uid("legacy-high")
+    assert w.store.replace_actor_card(
+        w.tenant,
+        w.optics,
+        [(
+            _entry(
+                entry_id,
+                CARD_KIND_ACTIVE_GOAL,
+                "medical goal",
+                sensitivity="high",
+            ),
+            [_source(
+                entry_id,
+                w.tenant,
+                w.guild,
+                w.guild,
+                w.f_guild,
+                "chan-guild",
+            )],
+        )],
+        input_hash="legacy-high",
+        expected_source_epochs={w.guild: 1},
+    ) == 1
+
+    card = w.store.get_actor_card(
+        w.tenant,
+        w.optics,
+        owner_conversation_id=w.guild,
+        audience_conversation_id=w.guild,
+        audience_channel_id="chan-other",
+    )
+    assert _bodies(card) == ["medical goal"]
 
 
 def test_pg_delete_conversation_removes_its_contribution(store):

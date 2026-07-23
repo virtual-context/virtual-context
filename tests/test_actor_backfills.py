@@ -308,11 +308,10 @@ def test_rebuild_actor_cards_runs_while_read_gate_is_dark(tmp_path):
                 "substantive": True,
                 "coverage_reason": "substantive",
                 "entries": [{
-                    "kind": "communication_pref",
-                    "body": "prefers terse answers",
-                    "confidence": 0.9,
-                    "sensitivity": "normal",
-                    "fact_ids": ["fact-card"],
+                        "kind": "communication_pref",
+                        "body": "prefers terse answers",
+                        "confidence": 0.9,
+                        "fact_ids": ["fact-card"],
                     "turn_ids": [],
                 }],
             }), {}
@@ -324,10 +323,9 @@ def test_rebuild_actor_cards_runs_while_read_gate_is_dark(tmp_path):
                 "substantive": True,
                 "coverage_reason": "substantive",
                 "decisions": [{
-                    "candidate_id": candidate["candidate_id"],
-                    "admit": True,
-                    "sensitivity": candidate["proposed_sensitivity"],
-                    "reason": "durable",
+                        "candidate_id": candidate["candidate_id"],
+                        "admit": True,
+                        "reason": "durable",
                 }],
             }), {}
 

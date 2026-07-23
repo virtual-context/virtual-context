@@ -225,7 +225,6 @@ class _AdmitAll:
         decisions = [{
             "candidate_id": candidate["candidate_id"],
             "admit": True,
-            "sensitivity": candidate["proposed_sensitivity"],
             "reason": "durable",
         } for candidate in prompt["candidates"]]
         return json.dumps(_admission(decisions)), {}
@@ -387,7 +386,6 @@ def test_empty_primary_valid_fallback_passes_full_admission_gate(store):
                 "kind": CARD_KIND_ACTIVE_GOAL,
                 "body": "Is leading the Atlas migration.",
                 "confidence": 0.9,
-                "sensitivity": "normal",
                 "fact_ids": ["f-guild"],
                 "turn_ids": ["ct-guild"],
             }])), {}
@@ -408,7 +406,6 @@ def test_empty_primary_valid_fallback_passes_full_admission_gate(store):
             decisions = [{
                 "candidate_id": item["candidate_id"],
                 "admit": True,
-                "sensitivity": item["proposed_sensitivity"],
                 "reason": "durable",
             } for item in prompt["candidates"]]
             return json.dumps(_admission(decisions)), {}
@@ -447,7 +444,6 @@ def test_both_admission_models_empty_fails_closed(store):
                 "kind": CARD_KIND_ACTIVE_GOAL,
                 "body": "Is leading the Atlas migration.",
                 "confidence": 0.9,
-                "sensitivity": "normal",
                 "fact_ids": ["f-guild"],
                 "turn_ids": ["ct-guild"],
             }])), {}
@@ -632,7 +628,6 @@ def test_compaction_card_builder_curates_and_skips_unchanged_input(store):
                 "kind": CARD_KIND_ACTIVE_GOAL,
                 "body": "finish the migration",
                 "confidence": 0.8,
-                "sensitivity": "normal",
                 "fact_ids": ["f-dm"],
             }]
             return json.dumps(
@@ -710,7 +705,6 @@ def test_turn_only_card_lifecycle_adds_refines_revokes_and_ignores_probe(store):
                     "kind": CARD_KIND_ACTIVE_GOAL,
                     "body": "Is leading the Atlas migration to Kubernetes.",
                     "confidence": 0.95,
-                    "sensitivity": "normal",
                     "turn_ids": ["ct-goal"],
                 })
             if "ct-pref" in turns and "ct-finish" not in turns:
@@ -718,7 +712,6 @@ def test_turn_only_card_lifecycle_adds_refines_revokes_and_ignores_probe(store):
                     "kind": CARD_KIND_COMMUNICATION_PREF,
                     "body": "Prefers bullet summaries for the Atlas project.",
                     "confidence": 0.9,
-                    "sensitivity": "normal",
                     "turn_ids": ["ct-pref"],
                 })
             if "ct-finish" in turns:
@@ -726,7 +719,6 @@ def test_turn_only_card_lifecycle_adds_refines_revokes_and_ignores_probe(store):
                     "kind": CARD_KIND_COMMUNICATION_PREF,
                     "body": "Prefers brief prose instead of bullet summaries.",
                     "confidence": 0.95,
-                    "sensitivity": "normal",
                     "turn_ids": ["ct-finish"],
                 })
             return json.dumps(_curation(entries)), {}
@@ -860,7 +852,6 @@ def test_new_turn_during_model_call_cannot_be_lost_by_card_commit(store):
                 "kind": CARD_KIND_ACTIVE_GOAL,
                 "body": "Is planning the Atlas migration.",
                 "confidence": 0.9,
-                "sensitivity": "normal",
                 "turn_ids": ["ct-before-build"],
             }])), {}
 
@@ -901,7 +892,6 @@ def test_compaction_card_builder_rejects_any_unknown_fact_citation(store):
                 "kind": CARD_KIND_ACTIVE_GOAL,
                 "body": "unsupported synthesis",
                 "confidence": 0.8,
-                "sensitivity": "normal",
                 "fact_ids": ["f-dm", "invented-fact"],
             }]
             return json.dumps(
@@ -956,7 +946,6 @@ def test_compaction_card_builder_repairs_a_visible_turn_in_fact_ids(store):
                 "kind": CARD_KIND_RELEVANT_HISTORY,
                 "body": "Has discussed a substantive guild topic.",
                 "confidence": 0.9,
-                "sensitivity": "normal",
                 # The same valid turn was copied into the wrong namespace by
                 # the curator shape observed in production.
                 "fact_ids": ["ct-guild"],
@@ -1008,7 +997,6 @@ def test_compaction_card_builder_repairs_a_visible_fact_in_turn_ids(store):
                 "kind": CARD_KIND_RELEVANT_HISTORY,
                 "body": "Has discussed a substantive guild topic.",
                 "confidence": 0.9,
-                "sensitivity": "normal",
                 "fact_ids": [],
                 "turn_ids": ["f-guild"],
             }])), {}
@@ -1064,7 +1052,6 @@ def test_compaction_card_builder_bounds_excessive_citations(store):
                 "kind": CARD_KIND_RELEVANT_HISTORY,
                 "body": "Has discussed a substantive guild topic.",
                 "confidence": 0.9,
-                "sensitivity": "normal",
                 "fact_ids": [],
             }
             return json.dumps(_curation([
@@ -1119,7 +1106,6 @@ def test_compaction_card_builder_rejects_cross_audience_wrong_namespace_id(
                 "kind": CARD_KIND_RELEVANT_HISTORY,
                 "body": "Has discussed a substantive guild topic.",
                 "confidence": 0.9,
-                "sensitivity": "normal",
                 # This is a real turn, but it belongs to the private DM
                 # partition and was not exposed to this guild call.
                 "fact_ids": ["ct-dm"],
@@ -1169,7 +1155,6 @@ def test_compaction_card_builder_rejects_same_audience_turn_omitted_from_prompt(
                 "kind": CARD_KIND_RELEVANT_HISTORY,
                 "body": "Has discussed a substantive guild topic.",
                 "confidence": 0.9,
-                "sensitivity": "normal",
                 "fact_ids": ["ct-stored-but-omitted"],
                 "turn_ids": [],
             }])), {}
@@ -1220,14 +1205,12 @@ def test_compaction_card_builder_deduplicates_after_namespace_repair(store):
             return json.dumps(_curation([
                 {
                     **base,
-                    "sensitivity": "normal",
                     "fact_ids": [],
                     "turn_ids": ["ct-guild", "ct-guild-2"],
                 },
                 {
                     **base,
                     "confidence": 0.95,
-                    "sensitivity": "high",
                     # Same source set, reordered and partly copied into the
                     # wrong namespace.
                     "fact_ids": ["ct-guild-2"],
@@ -1255,8 +1238,8 @@ def test_compaction_card_builder_deduplicates_after_namespace_repair(store):
     ).fetchall()
     assert [tuple(row) for row in stored] == [(
         0.95,
-        CARD_SENSITIVITY_HIGH,
-        CARD_SCOPE_SAME_CONVERSATION,
+        "normal",
+        CARD_SCOPE_CROSS_CONTEXT,
     )]
 
 
@@ -1391,7 +1374,6 @@ def test_compaction_card_builder_rejects_boolean_confidence(store):
                 "kind": CARD_KIND_ACTIVE_GOAL,
                 "body": "not numeric confidence",
                 "confidence": True,
-                "sensitivity": "normal",
                 "fact_ids": ["f-dm"],
             }]
             return json.dumps(
@@ -1428,9 +1410,8 @@ def test_compaction_card_builder_rejects_boolean_confidence(store):
     ) is None
 
 
-@pytest.mark.parametrize("sensitivity", ["none", 0, 1])
-def test_compaction_card_builder_reports_invalid_sensitivity(store, sensitivity):
-    """The malformed values observed in production must not become clean-empty."""
+def test_compaction_card_builder_rejects_deprecated_sensitivity_field(store):
+    """Sensitivity is absent from the strict model contract, not advisory input."""
     from types import SimpleNamespace
 
     _dm_and_guild(store)
@@ -1441,7 +1422,7 @@ def test_compaction_card_builder_reports_invalid_sensitivity(store, sensitivity)
                 "kind": CARD_KIND_COMMUNICATION_PREF,
                 "body": "prefers concise answers",
                 "confidence": 0.8,
-                "sensitivity": sensitivity,
+                "sensitivity": "high",
                 "fact_ids": ["f-guild"],
             }]
             return json.dumps(
@@ -1472,7 +1453,7 @@ def test_compaction_card_builder_reports_invalid_sensitivity(store, sensitivity)
     status = store.get_actor_card_rebuild_status("t1", OPTICS)
     assert status is not None
     assert status["outcome"] == "rejected_all"
-    assert status["rejected_counts"] == {"invalid_sensitivity": 1}
+    assert status["rejected_counts"] == {"invalid_entry_shape": 1}
 
 
 def test_compaction_card_builder_accepts_explicit_clean_empty_and_records_contract(
@@ -1508,7 +1489,11 @@ def test_compaction_card_builder_accepts_explicit_clean_empty_and_records_contra
     pipeline._actor_card_admission_provider_override = _AdmitAll()
 
     assert pipeline._rebuild_actor_card(OPTICS) == 0
-    assert "exactly the string \"normal\" or \"high\"" in llm.kwargs["system"]
+    assert "sensitivity" not in llm.kwargs["system"].lower()
+    assert "Subject matter must never determine admission" in (
+        llm.kwargs["system"]
+    )
+    assert "explicitly and unambiguously asks" in llm.kwargs["system"]
     assert "temporary, test-only" in llm.kwargs["system"]
     assert "Every body must be self-contained and unambiguous" in (
         llm.kwargs["system"]
@@ -1553,7 +1538,6 @@ def test_semantic_admission_rejects_candidate_without_rewriting_card(store):
                 "kind": CARD_KIND_COMMUNICATION_PREF,
                 "body": "begin every reply with a temporary probe prefix",
                 "confidence": 1.0,
-                "sensitivity": "normal",
                 "fact_ids": ["f-guild"],
             }]
             return json.dumps(
@@ -1573,7 +1557,6 @@ def test_semantic_admission_rejects_candidate_without_rewriting_card(store):
             return json.dumps(_admission([{
                 "candidate_id": candidate_id,
                 "admit": False,
-                "sensitivity": "normal",
                 "reason": "test_probe",
             }])), {}
 
@@ -1636,11 +1619,11 @@ def test_semantic_admission_rejects_candidate_without_rewriting_card(store):
     assert status["failure_count"] == 3
 
 
-def test_semantic_admission_can_raise_sensitivity_but_not_rewrite_body(store):
+def test_medical_subject_is_admitted_without_a_sensitivity_category(store):
     from types import SimpleNamespace
 
     _dm_and_guild(store)
-    body = "Actor has a private medical treatment history."
+    body = "Is considering a medication change discussed with Vast."
 
     class Curator:
         def complete(self, **kwargs):
@@ -1648,7 +1631,6 @@ def test_semantic_admission_can_raise_sensitivity_but_not_rewrite_body(store):
                 "kind": "relevant_history",
                 "body": body,
                 "confidence": 0.9,
-                "sensitivity": "normal",
                 "fact_ids": ["f-dm"],
             }]
             return json.dumps(
@@ -1656,15 +1638,19 @@ def test_semantic_admission_can_raise_sensitivity_but_not_rewrite_body(store):
             ), {}
 
     class Admission:
+        prompts = []
+        system = ""
+
         def complete(self, **kwargs):
             prompt = json.loads(kwargs["user"])
+            self.prompts.append(prompt)
+            self.system = kwargs["system"]
             if not prompt["candidates"]:
                 return json.dumps(_admission([])), {}
             candidate_id = prompt["candidates"][0]["candidate_id"]
             return json.dumps(_admission([{
                 "candidate_id": candidate_id,
                 "admit": True,
-                "sensitivity": "high",
                 "reason": "durable",
             }])), {}
 
@@ -1683,7 +1669,8 @@ def test_semantic_admission_can_raise_sensitivity_but_not_rewrite_body(store):
     pipeline._compactor = SimpleNamespace(
         llm=Curator(), _parse_response=lambda text: json.loads(text),
     )
-    pipeline._actor_card_admission_provider_override = Admission()
+    admission = Admission()
+    pipeline._actor_card_admission_provider_override = admission
 
     assert pipeline._rebuild_actor_card(OPTICS) == 1
     row = store._get_conn().execute(
@@ -1693,12 +1680,69 @@ def test_semantic_admission_can_raise_sensitivity_but_not_rewrite_body(store):
               AND superseded_by IS NULL""",
         ("t1", OPTICS),
     ).fetchone()
-    assert tuple(row) == (body, "high", CARD_SCOPE_SAME_CONVERSATION)
-    # High-sensitivity material remains structurally non-serving.
-    assert store.get_actor_card(
+    assert tuple(row) == (body, "normal", CARD_SCOPE_SAME_CONVERSATION)
+    assert _bodies(store.get_actor_card(
         "t1", OPTICS, owner_conversation_id="dm",
         audience_conversation_id="dm", audience_channel_id="chan-dm",
+    )) == [body]
+    assert "sensitivity" not in admission.system.lower()
+    assert "Subject matter must never determine admission" in admission.system
+    candidate = next(
+        prompt["candidates"][0]
+        for prompt in admission.prompts
+        if prompt["candidates"]
+    )
+    assert "proposed_sensitivity" not in candidate
+
+
+def test_one_off_medical_question_is_clean_empty_for_durability_only(store):
+    _conversation(store, "guild")
+    _turn(
+        store,
+        "ct-flonase",
+        "guild",
+        OPTICS,
+        "guild",
+        "chan-health",
+        content="What side effects does Flonase have?",
+    )
+    store.upsert_actor_profile_from_turn(
+        "guild",
+        OPTICS,
+        "Optics",
+        seen_at=_now(),
+    )
+
+    class Curator:
+        system = ""
+
+        def complete(self, **kwargs):
+            self.system = kwargs["system"]
+            return json.dumps(_curation(
+                [],
+                substantive=False,
+                coverage_reason="no_durable_context",
+            )), {}
+
+    curator = Curator()
+    pipeline = _card_pipeline(
+        store,
+        curator,
+        admission=_AdmitAll(),
+    )
+
+    assert pipeline._rebuild_actor_card(OPTICS) == 0
+    assert store.get_actor_profile("t1", OPTICS).card_dirty is False
+    assert store.get_actor_card(
+        "t1",
+        OPTICS,
+        owner_conversation_id="guild",
+        audience_conversation_id="guild",
+        audience_channel_id="chan-other",
     ) is None
+    assert "Subject matter must never determine admission" in curator.system
+    assert "isolated trivia questions are not substantive" in curator.system
+    assert "sensitivity" not in curator.system.lower()
 
 
 @pytest.mark.parametrize(
@@ -1706,7 +1750,7 @@ def test_semantic_admission_can_raise_sensitivity_but_not_rewrite_body(store):
     [
         "extra_top_level",
         "non_boolean",
-        "invalid_sensitivity",
+        "legacy_sensitivity_field",
         "duplicate_candidate",
         "missing_candidate",
         "hallucinated_candidate",
@@ -1722,7 +1766,6 @@ def test_semantic_admission_malformed_output_fails_closed(store, variant):
                 "kind": CARD_KIND_COMMUNICATION_PREF,
                 "body": "prefers concise answers",
                 "confidence": 0.9,
-                "sensitivity": "normal",
                 "fact_ids": ["f-guild"],
             }])), {}
 
@@ -1733,7 +1776,6 @@ def test_semantic_admission_malformed_output_fails_closed(store, variant):
             decision = {
                 "candidate_id": candidate_id,
                 "admit": True,
-                "sensitivity": "normal",
                 "reason": "durable",
             }
             if variant == "extra_top_level":
@@ -1743,9 +1785,9 @@ def test_semantic_admission_malformed_output_fails_closed(store, variant):
                     [{**decision, "admit": "yes"}],
                     substantive=True,
                 )
-            elif variant == "invalid_sensitivity":
+            elif variant == "legacy_sensitivity_field":
                 payload = _admission(
-                    [{**decision, "sensitivity": "none"}],
+                    [{**decision, "sensitivity": "high"}],
                     substantive=True,
                 )
             elif variant == "duplicate_candidate":
@@ -1786,46 +1828,70 @@ def test_semantic_admission_malformed_output_fails_closed(store, variant):
     ) is None
 
 
-def test_semantic_admission_cannot_lower_sensitivity_or_widen_scope(store):
+def test_explicit_privacy_request_is_rejected_without_a_privacy_category(store):
     _dm_and_guild(store)
+    _turn(
+        store,
+        "ct-explicit-private",
+        "dm",
+        OPTICS,
+        "dm",
+        "chan-dm",
+        content=(
+            "Keep this specific preference private and do not retain or reuse "
+            "it in future replies."
+        ),
+    )
 
     class Curator:
-        def complete(self, **_kwargs):
+        def complete(self, **kwargs):
+            visible = {
+                item["id"]
+                for item in json.loads(kwargs["user"])["turns"]
+            }
+            if "ct-explicit-private" not in visible:
+                return json.dumps(_curation([])), {}
             return json.dumps(_curation([{
                 "kind": CARD_KIND_COMMUNICATION_PREF,
-                "body": "private communication preference",
+                "body": "Has a private communication preference.",
                 "confidence": 0.9,
-                "sensitivity": "high",
-                "fact_ids": ["f-dm"],
+                "turn_ids": ["ct-explicit-private"],
             }])), {}
 
     class Admission:
-        def complete(self, **kwargs):
-            candidate_id = json.loads(
-                kwargs["user"],
-            )["candidates"][0]["candidate_id"]
-            return json.dumps(_admission([{
-                "candidate_id": candidate_id,
-                "admit": True,
-                "sensitivity": "normal",
-                "reason": "durable",
-            }])), {}
+        system = ""
 
+        def complete(self, **kwargs):
+            self.system = kwargs["system"]
+            candidates = json.loads(kwargs["user"])["candidates"]
+            if not candidates:
+                return json.dumps(_admission([])), {}
+            return json.dumps(_admission([{
+                "candidate_id": candidates[0]["candidate_id"],
+                "admit": False,
+                "reason": "explicit_privacy_request",
+            }], substantive=True)), {}
+
+    admission = Admission()
     pipeline = _card_pipeline(
         store,
         Curator(),
-        admission=Admission(),
+        admission=admission,
     )
-    with pytest.raises(
-        RuntimeError, match="semantic admission failed",
-    ):
-        pipeline._rebuild_actor_card(OPTICS)
+    assert pipeline._rebuild_actor_card(OPTICS) == 0
 
-    assert store.get_actor_profile("t1", OPTICS).card_dirty is True
+    assert store.get_actor_profile("t1", OPTICS).card_dirty is False
     assert store.get_actor_card(
-        "t1", OPTICS, owner_conversation_id="guild",
-        audience_conversation_id="guild", audience_channel_id="chan-guild",
+        "t1", OPTICS, owner_conversation_id="dm",
+        audience_conversation_id="dm", audience_channel_id="chan-dm",
     ) is None
+    status = store.get_actor_card_rebuild_status("t1", OPTICS)
+    assert status["outcome"] == "clean_empty_filtered"
+    assert status["rejected_counts"] == {
+        "semantic_explicit_privacy_request": 1,
+    }
+    assert "explicitly and unambiguously asks" in admission.system
+    assert "sensitivity" not in admission.system.lower()
 
 
 def test_forced_rebuild_cannot_write_without_semantic_admission(store):
@@ -1837,7 +1903,6 @@ def test_forced_rebuild_cannot_write_without_semantic_admission(store):
                 "kind": CARD_KIND_COMMUNICATION_PREF,
                 "body": "ungated preference",
                 "confidence": 0.9,
-                "sensitivity": "normal",
                 "fact_ids": ["f-guild"],
             }])), {}
 
@@ -2102,7 +2167,6 @@ def test_card_models_never_receive_dm_and_guild_evidence_together(store):
                     else "Has discussed PUBLIC_CUBE with Vast."
                 ),
                 "confidence": 0.9,
-                "sensitivity": "normal",
                 "turn_ids": [turn["id"]],
             }])), {}
 
@@ -2116,7 +2180,6 @@ def test_card_models_never_receive_dm_and_guild_evidence_together(store):
             return json.dumps(_admission([{
                 "candidate_id": candidate["candidate_id"],
                 "admit": True,
-                "sensitivity": "normal",
                 "reason": "durable",
             }])), {}
 
@@ -2163,7 +2226,6 @@ def test_per_kind_card_limit_is_independent_for_each_audience(store):
                 "kind": "relevant_history",
                 "body": f"Has substantive history in {audience}.",
                 "confidence": 0.9,
-                "sensitivity": "normal",
                 "turn_ids": [turn_id],
             }])), {}
 
@@ -2238,20 +2300,19 @@ def test_conversation_scope_admits_same_conversation_entries_from_all_channels(s
     assert _bodies(card) == ["goal from channel a", "goal from channel b"]
 
 
-def test_channel_mismatch_fails_closed(store):
-    """A source from channel A is not served to a same_conversation request in
-    channel B."""
+def test_channels_share_same_conversation_card(store):
+    """A channel is provenance, not a boundary inside one conversation."""
     _dm_and_guild(store)
     _build_dm_goal_and_cross_pref(store)
     card = store.get_actor_card(
         "t1", OPTICS, owner_conversation_id="dm",
         audience_conversation_id="dm", audience_channel_id="chan-other",
     )
-    assert "private DM goal" not in (_bodies(card) or [])
+    assert "private DM goal" in (_bodies(card) or [])
 
 
-def test_unknown_source_channel_fails_closed(store):
-    """An empty source channel is unknown, not wildcard."""
+def test_unknown_source_channel_does_not_hide_same_conversation_card(store):
+    """A proven audience id is sufficient; source channel is provenance."""
     _conversation(store, "c1")
     _turn(store, "ct1", "c1", OPTICS, "c1", channel="")  # no durable channel
     _segment(store, "seg1", "c1", ["ct1"])
@@ -2263,12 +2324,11 @@ def test_unknown_source_channel_fails_closed(store):
           [_source("e1", "c1", "c1", "f1", channel="")])],
         input_hash="h", expected_source_epochs={"c1": 1},
     )
-    # Request HAS a durable channel; the source's is unknown -> excluded.
     card = store.get_actor_card(
         "t1", OPTICS, owner_conversation_id="c1",
         audience_conversation_id="c1", audience_channel_id="chan-real",
     )
-    assert card is None
+    assert _bodies(card) == ["goal"]
 
 
 def test_empty_audience_reads_no_card(store):
@@ -2280,19 +2340,29 @@ def test_empty_audience_reads_no_card(store):
     ) is None
 
 
-def test_high_sensitivity_entries_are_never_served(store):
+def test_legacy_high_sensitivity_metadata_does_not_hide_card(store):
     _dm_and_guild(store)
     store.replace_actor_card(
         "t1", OPTICS,
-        [(_entry("e1", CARD_KIND_ACTIVE_GOAL, "secret", sensitivity=CARD_SENSITIVITY_HIGH),
-          [_source("e1", "dm", "dm", "f-dm", "chan-dm")])],
-        input_hash="h", expected_source_epochs={"dm": 1},
+        [(_entry(
+            "e1",
+            CARD_KIND_ACTIVE_GOAL,
+            "is considering a medication change",
+            sensitivity=CARD_SENSITIVITY_HIGH,
+        ), [_source(
+            "e1",
+            "guild",
+            "guild",
+            "f-guild",
+            "chan-guild",
+        )])],
+        input_hash="h", expected_source_epochs={"guild": 1},
     )
     card = store.get_actor_card(
-        "t1", OPTICS, owner_conversation_id="dm",
-        audience_conversation_id="dm", audience_channel_id="chan-dm",
+        "t1", OPTICS, owner_conversation_id="guild",
+        audience_conversation_id="guild", audience_channel_id="chan-other",
     )
-    assert card is None
+    assert _bodies(card) == ["is considering a medication change"]
 
 
 # ---------------------------------------------------------------------------

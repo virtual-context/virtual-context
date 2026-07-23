@@ -1428,6 +1428,10 @@ CARD_KINDS: tuple[str, ...] = (
     CARD_KIND_INTERACTION_STYLE,
 )
 
+# Legacy storage compatibility only. Sensitivity is not part of the person-card
+# model contract and does not affect admission, audience scope, or serving.
+# Existing databases may still contain ``high`` rows from policy <= 9, so both
+# values remain schema-valid until that column can be removed separately.
 CARD_SENSITIVITY_NORMAL = "normal"
 CARD_SENSITIVITY_HIGH = "high"
 CARD_SENSITIVITIES: tuple[str, ...] = (
@@ -1446,8 +1450,8 @@ CARD_SCOPES: tuple[str, ...] = (
     CARD_SCOPE_CROSS_CONTEXT,
 )
 
-# Only these kinds may ever be widened to cross_context, and only at normal
-# sensitivity. A goal or a piece of history never crosses contexts.
+# Only these kinds may ever be widened to cross_context. A goal or a piece of
+# history never crosses contexts.
 CARD_CROSS_CONTEXT_KINDS: tuple[str, ...] = (
     CARD_KIND_COMMUNICATION_PREF,
     CARD_KIND_INTERACTION_STYLE,
@@ -1490,6 +1494,7 @@ class ActorCardEntry:
     kind: str = CARD_KIND_COMMUNICATION_PREF
     body: str = ""
     confidence: float = 0.0
+    # Deprecated compatibility field; always ``normal`` for policy >= 10.
     sensitivity: str = CARD_SENSITIVITY_NORMAL
     audience_scope: str = CARD_SCOPE_SAME_CONVERSATION
     superseded_by: str | None = None
@@ -1517,7 +1522,8 @@ class ActorCardEntrySource:
     tenant_id: str = ""
     owner_conversation_id: str = ""
     audience_conversation_id: str = ""
-    audience_channel_id: str = ""   # "" means unknown, which fails closed
+    # Provenance only. The audience conversation id is the disclosure boundary.
+    audience_channel_id: str = ""
     fact_id: str = ""
     canonical_turn_id: str = ""
 
