@@ -122,7 +122,13 @@ def test_merge_dedups_by_canonical_turn_id() -> None:
     ]
     rows = [
         _row(canonical_turn_id="db-1", sort_key=1.0, user_content="db user dup", assistant_content="db asst dup"),
-        _row(canonical_turn_id="db-2", sort_key=2.0, user_content="new user", assistant_content="new asst"),
+        _row(
+            canonical_turn_id="db-2",
+            turn_number=6,
+            sort_key=2.0,
+            user_content="new user",
+            assistant_content="new asst",
+        ),
     ]
     merged = _merge_protected_window(payload, rows, mode="merge")
     contents = [m.content for m in merged]
@@ -274,6 +280,244 @@ def test_merge_dedups_same_request_race_by_source_message_id() -> None:
     assert [m.content for m in merged] == ["current request"]
 
 
+def test_merge_source_match_suppresses_entire_split_db_group() -> None:
+    payload = [
+        Message(
+            role="user",
+            content="remember this",
+            metadata=build_user_turn_metadata(
+                source_message_id="discord-123",
+            ),
+        ),
+        Message(role="assistant", content="acknowledged"),
+        Message(role="user", content="active request"),
+    ]
+    rows = [
+        _row(
+            canonical_turn_id="db-user",
+            turn_number=8,
+            turn_group_number=4,
+            sort_key=8.0,
+            source_message_id="discord-123",
+            user_content="remember this",
+        ),
+        _row(
+            canonical_turn_id="db-assistant",
+            turn_number=9,
+            turn_group_number=4,
+            sort_key=9.0,
+            assistant_content="acknowledged",
+        ),
+    ]
+
+    merged = _merge_protected_window(payload, rows, mode="merge")
+
+    assert [(message.role, message.content) for message in merged] == [
+        ("user", "remember this"),
+        ("assistant", "acknowledged"),
+        ("user", "active request"),
+    ]
+    assert all(
+        (message.metadata or {}).get("source") != "db_recent"
+        for message in merged
+    )
+
+
+def test_merge_replaces_incomplete_payload_fragment_with_canonical_pair() -> None:
+    payload = [
+        _msg(
+            "user",
+            "remember this",
+            canonical_turn_id="db-user",
+            turn_number=8,
+        ),
+        _msg("user", "active request"),
+    ]
+    rows = [
+        _row(
+            canonical_turn_id="db-user",
+            turn_number=8,
+            turn_group_number=4,
+            sort_key=8.0,
+            user_content="remember this",
+        ),
+        _row(
+            canonical_turn_id="db-assistant",
+            turn_number=9,
+            turn_group_number=4,
+            sort_key=9.0,
+            assistant_content="acknowledged",
+        ),
+    ]
+
+    merged = _merge_protected_window(payload, rows, mode="merge")
+
+    assert [(message.role, message.content) for message in merged] == [
+        ("user", "remember this"),
+        ("assistant", "acknowledged"),
+        ("user", "active request"),
+    ]
+    assert all(
+        (message.metadata or {}).get("source") == "db_recent"
+        for message in merged[:2]
+    )
+
+
+def test_merge_replacement_keeps_canonical_group_before_newer_payload() -> None:
+    payload = [
+        _msg(
+            "assistant",
+            "old acknowledgement fragment",
+            canonical_turn_id="old-assistant",
+            turn_number=1,
+        ),
+        _msg(
+            "user",
+            "newer user",
+            canonical_turn_id="new-user",
+            turn_number=2,
+        ),
+        _msg(
+            "assistant",
+            "newer assistant",
+            canonical_turn_id="new-assistant",
+            turn_number=3,
+        ),
+        _msg("user", "active request"),
+    ]
+    rows = [
+        _row(
+            canonical_turn_id="old-user",
+            turn_number=0,
+            turn_group_number=4,
+            sort_key=1.0,
+            user_content="old user",
+        ),
+        _row(
+            canonical_turn_id="old-assistant",
+            turn_number=1,
+            turn_group_number=4,
+            sort_key=2.0,
+            assistant_content="old acknowledgement fragment",
+        ),
+    ]
+
+    merged = _merge_protected_window(payload, rows, mode="merge")
+
+    assert [(message.role, message.content) for message in merged] == [
+        ("user", "old user"),
+        ("assistant", "old acknowledgement fragment"),
+        ("user", "newer user"),
+        ("assistant", "newer assistant"),
+        ("user", "active request"),
+    ]
+
+
+def test_merge_complete_payload_pair_can_span_tool_scaffolding() -> None:
+    payload = [
+        Message(
+            role="user",
+            content="remember this",
+            metadata=build_user_turn_metadata(
+                source_message_id="discord-123",
+            ),
+        ),
+        _msg("tool", "tool result"),
+        _msg("assistant", "acknowledged"),
+        _msg("user", "active request"),
+    ]
+    rows = [
+        _row(
+            canonical_turn_id="db-user",
+            turn_group_number=4,
+            sort_key=1.0,
+            source_message_id="discord-123",
+            user_content="remember this",
+        ),
+        _row(
+            canonical_turn_id="db-assistant",
+            turn_group_number=4,
+            sort_key=2.0,
+            assistant_content="acknowledged",
+        ),
+    ]
+
+    merged = _merge_protected_window(payload, rows, mode="merge")
+
+    assert [(message.role, message.content) for message in merged] == [
+        ("user", "remember this"),
+        ("tool", "tool result"),
+        ("assistant", "acknowledged"),
+        ("user", "active request"),
+    ]
+    assert all(
+        (message.metadata or {}).get("source") != "db_recent"
+        for message in merged
+    )
+
+
+def test_merge_dedup_does_not_conflate_reused_group_numbers() -> None:
+    payload = [
+        Message(
+            role="user",
+            content="old instruction",
+            metadata=build_user_turn_metadata(
+                source_message_id="discord-old",
+            ),
+        ),
+        Message(role="assistant", content="old acknowledgement"),
+        Message(role="user", content="active request"),
+    ]
+    rows = [
+        _row(
+            canonical_turn_id="old-user",
+            turn_group_number=7,
+            sort_key=1.0,
+            source_message_id="discord-old",
+            user_content="old instruction",
+        ),
+        _row(
+            canonical_turn_id="old-assistant",
+            turn_group_number=7,
+            sort_key=2.0,
+            assistant_content="old acknowledgement",
+        ),
+        _row(
+            canonical_turn_id="middle-user",
+            turn_group_number=8,
+            sort_key=3.0,
+            user_content="middle instruction",
+        ),
+        _row(
+            canonical_turn_id="middle-assistant",
+            turn_group_number=8,
+            sort_key=4.0,
+            assistant_content="middle acknowledgement",
+        ),
+        _row(
+            canonical_turn_id="fresh-user",
+            turn_group_number=7,
+            sort_key=5.0,
+            user_content="fresh instruction",
+        ),
+        _row(
+            canonical_turn_id="fresh-assistant",
+            turn_group_number=7,
+            sort_key=6.0,
+            assistant_content="fresh acknowledgement",
+        ),
+    ]
+
+    merged = _merge_protected_window(payload, rows, mode="merge")
+    contents = [message.content for message in merged]
+
+    assert contents.count("old instruction") == 1
+    assert contents.count("old acknowledgement") == 1
+    assert "fresh instruction" in contents
+    assert "fresh acknowledgement" in contents
+    assert contents[-1] == "active request"
+
+
 def test_merge_propagates_group_channel_to_separate_assistant_row() -> None:
     rows = [
         _row(
@@ -300,6 +544,33 @@ def test_merge_propagates_group_channel_to_separate_assistant_row() -> None:
     assert merged[1].metadata["audience_conversation_id"] == "guild-owner"
     assert merged[0].metadata["sender_actor_id"] == "actor:discord:1"
     assert "sender_actor_id" not in merged[1].metadata
+
+
+def test_merge_legacy_adjacency_does_not_inherit_channel_provenance() -> None:
+    rows = [
+        _row(
+            canonical_turn_id="legacy-user",
+            turn_group_number=-1,
+            sort_key=1.0,
+            user_content="legacy guild message",
+            origin_channel_id="chan-a",
+            origin_channel_label="#alpha",
+            audience_conversation_id="guild-owner",
+        ),
+        _row(
+            canonical_turn_id="legacy-assistant",
+            turn_group_number=-1,
+            sort_key=2.0,
+            assistant_content="ambiguous legacy reply",
+        ),
+    ]
+
+    merged = _merge_protected_window([], rows, mode="merge")
+
+    assert merged[0].metadata["origin_channel_id"] == "chan-a"
+    assert "origin_channel_id" not in merged[1].metadata
+    assert "origin_channel_label" not in merged[1].metadata
+    assert "audience_conversation_id" not in merged[1].metadata
 
 
 def test_merge_never_propagates_group_channel_to_unproved_user_row() -> None:

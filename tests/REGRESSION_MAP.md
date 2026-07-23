@@ -409,6 +409,46 @@ Use `pytest -m regression` to run all regression tests.
 - **Tests**:
   - `test_protected_window_gate.py::test_tier3_db_pair_survives_payload_compaction_offset`
 
+### BUG-045 — Payload dedup suppresses the canonical user before offset
+
+- **Symptom**: A guild-wide temporary reply preference is acknowledged in its
+  source Discord channel but ignored in another channel. Canonical storage
+  contains the correctly attributed user instruction and assistant
+  acknowledgement, yet the outbound `<recent-conversation>` contains only the
+  assistant acknowledgement.
+- **Root cause**: Tier 3 dedup ran before the channel-local payload watermark.
+  The payload user suppressed its canonical duplicate by
+  `source_message_id`, then `history_offset()` removed the payload copy. The
+  unkeyed canonical assistant half survived alone. Separately, the Tier 3
+  store query limited physical rows and could split a logical group at the
+  oldest window boundary.
+- **Fix**: Slice payload-owned history before canonical merge, force Tier 3
+  when a nonzero payload offset makes a Tier-2 equality skip unsafe, and cache
+  that exact merged view for paging reassembly. Dedup uses adjacency-scoped
+  logical groups so reused historical group numbers cannot suppress unrelated
+  turns; incomplete payload fragments are replaced by the complete canonical
+  group, then recovered groups are interleaved ahead of newer stamped payload
+  turns. Legacy adjacency is never accepted as channel/audience provenance
+  proof. A failed/empty canonical read preserves the unsliced payload. SQLite
+  and Postgres select the newest N logical groups and return every physical
+  row in each.
+- **Tests**:
+  - `test_protected_window_gate.py::test_tier3_payload_duplicate_cannot_suppress_db_user_before_offset`
+  - `test_protected_window_gate.py::test_tier2_equal_with_payload_offset_forces_canonical_replacement`
+  - `test_protected_window_gate.py::test_tier3_read_failure_preserves_unsliced_payload`
+  - `test_retrieval_assembler_protected_window_merge.py::test_merge_source_match_suppresses_entire_split_db_group`
+  - `test_retrieval_assembler_protected_window_merge.py::test_merge_replaces_incomplete_payload_fragment_with_canonical_pair`
+  - `test_retrieval_assembler_protected_window_merge.py::test_merge_replacement_keeps_canonical_group_before_newer_payload`
+  - `test_retrieval_assembler_protected_window_merge.py::test_merge_complete_payload_pair_can_span_tool_scaffolding`
+  - `test_retrieval_assembler_protected_window_merge.py::test_merge_dedup_does_not_conflate_reused_group_numbers`
+  - `test_retrieval_assembler_protected_window_merge.py::test_merge_legacy_adjacency_does_not_inherit_channel_provenance`
+  - `test_sqlite_mirror_store_methods.py::test_get_recent_limit_preserves_complete_split_groups`
+  - `test_sqlite_mirror_store_methods.py::test_get_recent_limit_does_not_conflate_reused_group_number`
+  - `test_postgres_mirror_store_methods.py::test_get_recent_limit_preserves_complete_split_groups`
+  - `test_postgres_mirror_store_methods.py::test_get_recent_limit_does_not_conflate_reused_group_number`
+  - `test_recent_conversation_assembly.py::test_budget_does_not_conflate_reused_raw_group_numbers`
+  - `test_recent_conversation_assembly.py::test_budget_legacy_fallback_evicts_only_leading_contiguous_group`
+
 ### BUG-043 — RRF's missing-signal penalty buries embedding-only candidates below the fused top-K
 
 - **Symptom**: On analog queries with no keyword overlap, the tag the embedding signal surfaces most strongly lands far outside the fused top-K (embedding candidates observed at fused rank 15-33 while the selection cut is 10), because RRF penalizes every candidate absent from the idf/bm25 signals. The context-augmented embedding signal (BUG-042) surfaces the right tag but fusion then discards it.
@@ -496,4 +536,7 @@ Use `pytest -m regression` to run all regression tests.
 | `test_tag_summary_materialization.py` | BUG-041 |
 | `test_embedding_context_guard.py` | BUG-042 |
 | `test_embedding_reserved_seats.py` | BUG-043 |
-| `test_protected_window_gate.py` | BUG-044 |
+| `test_protected_window_gate.py` | BUG-044, BUG-045 |
+| `test_retrieval_assembler_protected_window_merge.py` | BUG-045 |
+| `test_sqlite_mirror_store_methods.py` | BUG-045 |
+| `test_postgres_mirror_store_methods.py` | BUG-045 |

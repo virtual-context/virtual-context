@@ -26,6 +26,7 @@ from ..core.canonical_turns import (
     HASH_VERSION,
     compute_turn_hash_from_raw,
     generate_canonical_turn_id,
+    select_recent_logical_turn_rows,
     utcnow_iso,
 )
 from ..core.progress_snapshot import (
@@ -9188,15 +9189,20 @@ CREATE TABLE IF NOT EXISTS request_captures (
     ) -> list[CanonicalTurnRow]:
         """Tier 3 cross-channel-mirror lookup.
 
-        Single indexed query against ``canonical_turns_ordinal``
-        ordered by ``sort_key DESC`` with ``LIMIT``. No ``tagged_at``
-        filter — fresh peer-channel rows must surface even before the
-        tagger catches up. ``conversation_id`` is already indexed via
-        ``idx_canonical_turns_conv_order``.
+        Return the newest ``limit`` *logical turn groups*, preserving every
+        physical row in each selected group. Split user/assistant storage must
+        never let a row-level LIMIT strand one half at the window boundary.
+        Legacy rows without a group number count as singleton groups. No
+        ``tagged_at`` filter is applied — fresh peer-channel rows must surface
+        even before the tagger catches up.
         """
         if limit <= 0:
             return []
         conn = self._get_conn()
+        # One logical turn has at most two physical rows. Over-fetch by one
+        # additional row so a DESC boundary beginning on an assistant half is
+        # discarded rather than returned without its user half.
+        physical_limit = int(limit) * 2 + 1
         rows = conn.execute(
             """SELECT canonical_turn_id, conversation_id, turn_number, turn_group_number,
                       sort_key, turn_hash, hash_version,
@@ -9212,13 +9218,18 @@ CREATE TABLE IF NOT EXISTS request_captures (
                       tagged_at, compacted_at,
                       first_seen_at, last_seen_at,
                       source_batch_id, created_at, updated_at
-               FROM canonical_turns_ordinal
-               WHERE conversation_id = ?
-               ORDER BY sort_key DESC
-               LIMIT ?""",
-            (conversation_id, int(limit)),
+                 FROM canonical_turns_ordinal
+                WHERE conversation_id = ?
+               ORDER BY sort_key DESC, created_at DESC,
+                        canonical_turn_id DESC
+                LIMIT ?
+            """,
+            (conversation_id, physical_limit),
         ).fetchall()
-        return [_row_to_canonical_turn(row) for row in rows]
+        return select_recent_logical_turn_rows(
+            [_row_to_canonical_turn(row) for row in rows],
+            limit=int(limit),
+        )
 
     def has_any_alias(self, conversation_id: str) -> bool:
         """Tier 1 cross-channel-mirror lookup.
