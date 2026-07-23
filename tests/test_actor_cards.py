@@ -11,7 +11,10 @@ from datetime import datetime, timezone
 
 import pytest
 
-from virtual_context.core.compaction_pipeline import CompactionPipeline
+from virtual_context.core.compaction_pipeline import (
+    CompactionPipeline,
+    _EmptyResponseFallbackProvider,
+)
 from virtual_context.storage.sqlite import SQLiteStore
 from virtual_context.types import (
     CARD_KIND_ACTIVE_GOAL,
@@ -23,6 +26,7 @@ from virtual_context.types import (
     CARD_SENSITIVITY_HIGH,
     ActorCardEntry,
     ActorCardEntrySource,
+    LLMProviderError,
     SegmentMetadata,
     StoredSegment,
 )
@@ -256,6 +260,226 @@ def _card_pipeline(
     if admission is not None:
         pipeline._actor_card_admission_provider_override = admission
     return pipeline
+
+
+def test_actor_card_admission_fallback_only_runs_for_empty_primary():
+    class Provider:
+        def __init__(self, response):
+            self.response = response
+            self.calls = 0
+
+        def complete(self, **_kwargs):
+            self.calls += 1
+            return self.response, {"provider": self.response or "empty"}
+
+    primary = Provider('{"ok":true}')
+    fallback = Provider('{"fallback":true}')
+    provider = _EmptyResponseFallbackProvider(
+        primary,
+        fallback,
+        primary_model="primary",
+        fallback_model="fallback",
+    )
+
+    assert provider.complete(system="s", user="u", max_tokens=1) == (
+        '{"ok":true}',
+        {"provider": '{"ok":true}'},
+    )
+    assert primary.calls == 1
+    assert fallback.calls == 0
+
+    primary.response = " \n "
+    assert provider.complete(system="s", user="u", max_tokens=1) == (
+        '{"fallback":true}',
+        {"provider": '{"fallback":true}'},
+    )
+    assert primary.calls == 2
+    assert fallback.calls == 1
+
+    class ProviderError:
+        calls = 0
+
+        def complete(self, **_kwargs):
+            self.calls += 1
+            raise LLMProviderError(
+                "content filter",
+                provider="test",
+                status_code=400,
+            )
+
+    error_primary = ProviderError()
+    error_fallback = Provider('{"fallback":true}')
+    error_provider = _EmptyResponseFallbackProvider(
+        error_primary,
+        error_fallback,
+        primary_model="primary",
+        fallback_model="fallback",
+    )
+    assert error_provider.complete(system="s", user="u", max_tokens=1) == (
+        '{"fallback":true}',
+        {"provider": '{"fallback":true}'},
+    )
+    assert error_primary.calls == 1
+    assert error_fallback.calls == 1
+
+
+def test_actor_card_admission_provider_builds_configured_fallback():
+    from types import SimpleNamespace
+
+    from virtual_context.providers.generic_openai import GenericOpenAIProvider
+
+    pipeline = object.__new__(CompactionPipeline)
+    pipeline._config = SimpleNamespace(
+        assembler=SimpleNamespace(
+            actor_card_admission_model="anthropic/claude-fable-5",
+            actor_card_admission_fallback_model="openai/gpt-5.4",
+        ),
+    )
+    pipeline._compactor = SimpleNamespace(
+        llm=GenericOpenAIProvider(
+            base_url="https://openrouter.ai/api/v1",
+            model="google/gemini-2.5-flash-lite",
+            api_key="test-key",
+        ),
+    )
+
+    provider = pipeline._actor_card_admission_provider()
+    assert isinstance(provider, _EmptyResponseFallbackProvider)
+    assert provider._primary.model == "anthropic/claude-fable-5"
+    assert provider._fallback.model == "openai/gpt-5.4"
+    assert provider._primary.base_url == provider._fallback.base_url
+    assert provider._primary.api_key == provider._fallback.api_key == "test-key"
+    assert provider._primary.temperature == provider._fallback.temperature == 0.0
+    assert (
+        provider._primary.reasoning_effort
+        == provider._fallback.reasoning_effort
+        == "low"
+    )
+
+
+def _single_guild_card_source(store):
+    _conversation(store, "guild")
+    _turn(
+        store,
+        "ct-guild",
+        "guild",
+        OPTICS,
+        "guild",
+        "chan-guild",
+        content="I am leading the Atlas migration.",
+    )
+    _segment(store, "seg-guild", "guild", ["ct-guild"])
+    _fact(store, "f-guild", "guild", "seg-guild", OPTICS)
+    store.upsert_actor_profile_from_turn(
+        "guild",
+        OPTICS,
+        "Optics",
+        seen_at=_now(),
+    )
+
+
+def test_empty_primary_valid_fallback_passes_full_admission_gate(store):
+    _single_guild_card_source(store)
+
+    class Curator:
+        def complete(self, **_kwargs):
+            return json.dumps(_curation([{
+                "kind": CARD_KIND_ACTIVE_GOAL,
+                "body": "Is leading the Atlas migration.",
+                "confidence": 0.9,
+                "sensitivity": "normal",
+                "fact_ids": ["f-guild"],
+                "turn_ids": ["ct-guild"],
+            }])), {}
+
+    class Empty:
+        calls = 0
+
+        def complete(self, **_kwargs):
+            self.calls += 1
+            return "", {}
+
+    class ValidFallback:
+        calls = 0
+
+        def complete(self, **kwargs):
+            self.calls += 1
+            prompt = json.loads(kwargs["user"])
+            decisions = [{
+                "candidate_id": item["candidate_id"],
+                "admit": True,
+                "sensitivity": item["proposed_sensitivity"],
+                "reason": "durable",
+            } for item in prompt["candidates"]]
+            return json.dumps(_admission(decisions)), {}
+
+    primary = Empty()
+    fallback = ValidFallback()
+    pipeline = _card_pipeline(
+        store,
+        Curator(),
+        admission=_EmptyResponseFallbackProvider(
+            primary,
+            fallback,
+            primary_model="primary",
+            fallback_model="fallback",
+        ),
+    )
+
+    assert pipeline._rebuild_actor_card(OPTICS) == 1
+    assert primary.calls == 1
+    assert fallback.calls == 1
+    assert _bodies(store.get_actor_card(
+        "t1",
+        OPTICS,
+        owner_conversation_id="guild",
+        audience_conversation_id="guild",
+        audience_channel_id="chan-guild",
+    )) == ["Is leading the Atlas migration."]
+
+
+def test_both_admission_models_empty_fails_closed(store):
+    _single_guild_card_source(store)
+
+    class Curator:
+        def complete(self, **_kwargs):
+            return json.dumps(_curation([{
+                "kind": CARD_KIND_ACTIVE_GOAL,
+                "body": "Is leading the Atlas migration.",
+                "confidence": 0.9,
+                "sensitivity": "normal",
+                "fact_ids": ["f-guild"],
+                "turn_ids": ["ct-guild"],
+            }])), {}
+
+    class Empty:
+        def complete(self, **_kwargs):
+            return "", {}
+
+    pipeline = _card_pipeline(
+        store,
+        Curator(),
+        admission=_EmptyResponseFallbackProvider(
+            Empty(),
+            Empty(),
+            primary_model="primary",
+            fallback_model="fallback",
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="semantic admission failed"):
+        pipeline._rebuild_actor_card(OPTICS)
+    status = store.get_actor_card_rebuild_status("t1", OPTICS)
+    assert status is not None
+    assert status["outcome"] == "admission_error"
+    assert store.get_actor_profile("t1", OPTICS).card_dirty is True
+    assert store.get_actor_card(
+        "t1",
+        OPTICS,
+        owner_conversation_id="guild",
+        audience_conversation_id="guild",
+        audience_channel_id="chan-guild",
+    ) is None
 
 
 # ---------------------------------------------------------------------------

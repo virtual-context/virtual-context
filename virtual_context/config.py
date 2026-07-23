@@ -283,6 +283,10 @@ def _build_config(raw: dict[str, Any], *, validate: bool = True) -> VirtualConte
             "actor_card_admission_model",
             _asm_defaults.actor_card_admission_model,
         ),
+        actor_card_admission_fallback_model=assembly_raw.get(
+            "actor_card_admission_fallback_model",
+            _asm_defaults.actor_card_admission_fallback_model,
+        ) or "",
         protected_window_db_source=assembly_raw.get(
             "protected_window_db_source",
             _asm_defaults.protected_window_db_source,
@@ -554,6 +558,14 @@ def validate_config(config: VirtualContextConfig) -> list[str]:
             errors.append(
                 "assembly.actor_card_admission_model is required as a "
                 "non-empty string when actor_card_enabled is true"
+            )
+        if not isinstance(
+            config.assembler.actor_card_admission_fallback_model,
+            str,
+        ):
+            errors.append(
+                "assembly.actor_card_admission_fallback_model must be a "
+                "string when provided"
             )
 
     # Segmenter config

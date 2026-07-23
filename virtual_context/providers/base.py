@@ -134,6 +134,27 @@ class BaseProvider(ABC):
                 usage = data.get("usage", {})
                 self.last_usage = usage
                 text = self._extract_text(data)
+                if not isinstance(text, str):
+                    text = ""
+                if not text.strip():
+                    choices = data.get("choices", [])
+                    choice = (
+                        choices[0]
+                        if isinstance(choices, list)
+                        and choices
+                        and isinstance(choices[0], dict)
+                        else {}
+                    )
+                    logger.warning(
+                        "LLM_EMPTY_RESPONSE provider=%s model=%s "
+                        "finish_reason=%s native_finish_reason=%s",
+                        self._provider_name(),
+                        model,
+                        choice.get("finish_reason")
+                        or data.get("stop_reason", ""),
+                        choice.get("native_finish_reason")
+                        or data.get("stop_reason", ""),
+                    )
                 logger.info(
                     "LLM_CALL provider=%s model=%s %.0fms tokens_in=%s tokens_out=%s "
                     "system_len=%d user_len=%d response_len=%d",

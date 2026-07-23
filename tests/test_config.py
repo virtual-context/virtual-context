@@ -33,6 +33,7 @@ def test_actor_card_assembly_config_parses_yaml_keys():
             "actor_card_turn_limit": 81,
             "actor_card_entries_per_kind": 2,
             "actor_card_admission_model": "anthropic/claude-fable-5",
+            "actor_card_admission_fallback_model": "openai/gpt-5.4",
         },
     })
 
@@ -45,6 +46,10 @@ def test_actor_card_assembly_config_parses_yaml_keys():
         config.assembler.actor_card_admission_model
         == "anthropic/claude-fable-5"
     )
+    assert (
+        config.assembler.actor_card_admission_fallback_model
+        == "openai/gpt-5.4"
+    )
 
 
 def test_actor_card_gate_requires_a_semantic_admission_model():
@@ -56,6 +61,31 @@ def test_actor_card_gate_requires_a_semantic_admission_model():
             if value != "":
                 assembly["actor_card_admission_model"] = value
             load_config(config_dict={"assembly": assembly})
+
+
+def test_actor_card_fallback_model_must_be_a_string_when_provided():
+    with pytest.raises(
+        ValueError,
+        match="actor_card_admission_fallback_model must be a string",
+    ):
+        load_config(config_dict={
+            "assembly": {
+                "actor_card_enabled": True,
+                "actor_card_admission_model": "primary",
+                "actor_card_admission_fallback_model": 17,
+            },
+        })
+
+
+def test_actor_card_null_fallback_model_normalizes_to_unset():
+    config = load_config(config_dict={
+        "assembly": {
+            "actor_card_enabled": True,
+            "actor_card_admission_model": "primary",
+            "actor_card_admission_fallback_model": None,
+        },
+    })
+    assert config.assembler.actor_card_admission_fallback_model == ""
 
 
 def test_actor_cards_refuse_a_non_sql_or_split_store():
