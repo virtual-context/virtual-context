@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 from .engine_utils import extract_turn_pairs
 from .store import ContextStore
 from .turn_tag_index import TurnTagIndex
+from ..types import LLMProviderError
 
 if TYPE_CHECKING:
     from .compactor import DomainCompactor
@@ -56,6 +57,45 @@ class _ActorCardAdmissionError(RuntimeError):
 
 class _ActorCardCoverageError(_ActorCardAdmissionError):
     """A deterministic curator/admission judgment disagreement."""
+
+
+class _EmptyResponseFallbackProvider:
+    """Use a second independent model only for a refused/empty completion."""
+
+    def __init__(
+        self,
+        primary,
+        fallback,
+        *,
+        primary_model: str,
+        fallback_model: str,
+    ) -> None:
+        self._primary = primary
+        self._fallback = fallback
+        self._primary_model = primary_model
+        self._fallback_model = fallback_model
+
+    def complete(self, **kwargs):
+        try:
+            text, usage = self._primary.complete(**kwargs)
+        except LLMProviderError as exc:
+            logger.warning(
+                "ACTOR_CARD_ADMISSION_FALLBACK primary_model=%s "
+                "fallback_model=%s reason=provider_error status=%s",
+                self._primary_model,
+                self._fallback_model,
+                exc.status_code,
+            )
+            return self._fallback.complete(**kwargs)
+        if isinstance(text, str) and text.strip():
+            return text, usage
+        logger.warning(
+            "ACTOR_CARD_ADMISSION_FALLBACK primary_model=%s "
+            "fallback_model=%s reason=empty_response",
+            self._primary_model,
+            self._fallback_model,
+        )
+        return self._fallback.complete(**kwargs)
 
 
 # Lazy-import for _is_stub_content from engine to avoid circular imports.
@@ -248,6 +288,22 @@ class CompactionPipeline:
         tenant_id = self._config.tenant_id
 
         def _read_inputs() -> tuple[list, list, str]:
+            admission_model = (
+                getattr(
+                    self._config.assembler,
+                    "actor_card_admission_model",
+                    "",
+                )
+                or ""
+            ).strip()
+            admission_fallback_model = (
+                getattr(
+                    self._config.assembler,
+                    "actor_card_admission_fallback_model",
+                    "",
+                )
+                or ""
+            ).strip()
             facts = list(self._store.list_actor_facts(
                 tenant_id,
                 actor_id,
@@ -309,13 +365,10 @@ class CompactionPipeline:
             )
             digest = hashlib.sha256(json.dumps(
                 {
-                    "policy": 8,
+                    "policy": 9,
                     "curation_model": curation_model,
-                    "admission_model": getattr(
-                        self._config.assembler,
-                        "actor_card_admission_model",
-                        "",
-                    ),
+                    "admission_model": admission_model,
+                    "admission_fallback_model": admission_fallback_model,
                     "facts": fact_payload,
                     "turns": turn_payload,
                 },
@@ -1107,28 +1160,47 @@ class CompactionPipeline:
         ).strip()
         if not model:
             return None
+        fallback_model = (
+            getattr(
+                self._config.assembler,
+                "actor_card_admission_fallback_model",
+                "",
+            )
+            or ""
+        ).strip()
         base = self._compactor.llm
         from ..providers.anthropic import AnthropicProvider
         from ..providers.generic_openai import GenericOpenAIProvider
 
-        if isinstance(base, GenericOpenAIProvider):
-            return GenericOpenAIProvider(
-                base_url=base.base_url,
-                model=model,
-                temperature=0.0,
-                api_key=base.api_key,
-                reasoning_effort="low",
+        def _provider_for(selected_model: str):
+            if isinstance(base, GenericOpenAIProvider):
+                return GenericOpenAIProvider(
+                    base_url=base.base_url,
+                    model=selected_model,
+                    temperature=0.0,
+                    api_key=base.api_key,
+                    reasoning_effort="low",
+                )
+            if isinstance(base, AnthropicProvider):
+                return AnthropicProvider(
+                    api_key=base.api_key,
+                    model=selected_model,
+                    temperature=0.0,
+                )
+            raise RuntimeError(
+                "actor-card admission model override is unsupported by "
+                f"{type(base).__name__}"
             )
-        if isinstance(base, AnthropicProvider):
-            return AnthropicProvider(
-                api_key=base.api_key,
-                model=model,
-                temperature=0.0,
+
+        primary = _provider_for(model)
+        if fallback_model and fallback_model != model:
+            return _EmptyResponseFallbackProvider(
+                primary,
+                _provider_for(fallback_model),
+                primary_model=model,
+                fallback_model=fallback_model,
             )
-        raise RuntimeError(
-            "actor-card admission model override is unsupported by "
-            f"{type(base).__name__}"
-        )
+        return primary
 
     def _actor_card_evidence_segments(
         self,
