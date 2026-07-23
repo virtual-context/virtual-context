@@ -2165,13 +2165,19 @@ class AssemblerConfig:
     # Person cards. SHIPS DARK: with the gate off, no profile or card read is
     # performed, no budget key is added, and rendered output is byte-identical.
     # YAML keys: assembly.actor_card_enabled, assembly.actor_card_max_tokens,
-    # assembly.actor_card_fact_limit, assembly.actor_card_entries_per_kind.
+    # assembly.actor_card_fact_limit, assembly.actor_card_entries_per_kind,
+    # assembly.actor_card_admission_model.
     actor_card_enabled: bool = False
     actor_card_max_tokens: int = 400
     # Bounds on the curation pass: how many of an actor's facts it may read,
     # and how many entries it may emit per kind.
     actor_card_fact_limit: int = 60
     actor_card_entries_per_kind: int = 3
+    # Dedicated semantic admission model. Person cards fail configuration
+    # closed when the card gate is enabled without one: the cheap fact
+    # compactor is allowed to propose candidates, but it must not decide that
+    # a temporary test instruction is a durable identity preference.
+    actor_card_admission_model: str = ""
     # Speaker roster. Independent of the actor card and SHIPS DARK: with the
     # gate off, no roster or handle-assignment read is performed, no budget
     # key is added, and rendered output and tool schemas are byte-identical.

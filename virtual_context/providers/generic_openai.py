@@ -19,12 +19,14 @@ class GenericOpenAIProvider(BaseProvider):
         model: str = "qwen3:4b-instruct-2507-fp16",
         temperature: float = 0.3,
         api_key: str = "not-needed",
+        reasoning_effort: str = "",
     ) -> None:
         super().__init__()
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.temperature = temperature
         self.api_key = api_key
+        self.reasoning_effort = reasoning_effort
 
     def _provider_name(self) -> str:
         return "generic_openai"
@@ -56,10 +58,14 @@ class GenericOpenAIProvider(BaseProvider):
             payload["max_completion_tokens"] = max_tokens
         else:
             payload["max_tokens"] = max_tokens
+        if self.reasoning_effort and "openrouter.ai" in self.base_url:
+            payload["reasoning"] = {"effort": self.reasoning_effort}
+        elif self.reasoning_effort and "api.openai.com" in self.base_url:
+            payload["reasoning_effort"] = self.reasoning_effort
         return payload
 
     def _extract_text(self, data: dict) -> str:
         choices = data.get("choices", [])
         if choices:
-            return choices[0].get("message", {}).get("content", "")
+            return choices[0].get("message", {}).get("content") or ""
         return ""
