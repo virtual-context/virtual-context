@@ -25,7 +25,7 @@ import hashlib
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Iterable, Optional
 
-from ..types import Message
+from ..types import Message, get_current_conversation_info
 
 if TYPE_CHECKING:  # pragma: no cover - import-only
     from ..types import CanonicalTurnRow
@@ -187,10 +187,11 @@ def _merge_protected_window(
            ``turn_hash`` (fallback for legacy paths that bypassed
            stamping). Payload entries win ties; DB-source entries are
            dropped on conflict.
-        3. Append every unique DB-source ``Message`` to the merged list
-           in chronological order (``sort_key`` ascending; ties broken
-           by ``created_at`` ASC then ``canonical_turn_id`` ASC for
-           determinism).
+        3. Insert every unique DB-source ``Message`` in chronological order
+           immediately before a trailing unstamped active-user request
+           (``sort_key`` ascending; ties broken by ``created_at`` ASC then
+           ``canonical_turn_id`` ASC for determinism). Callers without such
+           an active tail retain append behavior.
 
     Token-budget enforcement is intentionally NOT performed here. The
     existing downstream context-builder (filter + assembler) enforces
@@ -203,9 +204,13 @@ def _merge_protected_window(
     if not db_recent_rows:
         return list(payload_history)
 
-    # Build dedup index from payload-side metadata.
+    # Build dedup indexes from payload-side metadata.  Source-message ids are
+    # load-bearing for the normal prepare race: the current inbound user row
+    # can already exist in canonical_turns by the time Tier 3 reads.  Text is
+    # deliberately never a key because short repeated messages are valid.
     payload_canonical_ids: set[str] = set()
     payload_turn_hashes: set[str] = set()
+    payload_source_message_ids: set[str] = set()
     for message in payload_history:
         metadata = message.metadata or {}
         if isinstance(metadata, dict):
@@ -215,10 +220,16 @@ def _merge_protected_window(
             turn_hash = metadata.get("turn_hash")
             if isinstance(turn_hash, str) and turn_hash:
                 payload_turn_hashes.add(turn_hash)
+            source_message_id = metadata.get("source_message_id")
+            if not (isinstance(source_message_id, str) and source_message_id):
+                current = get_current_conversation_info(metadata)
+                source_message_id = current.get("message_id")
+            if isinstance(source_message_id, str) and source_message_id:
+                payload_source_message_ids.add(source_message_id)
 
     # Determinism: sort the DB rows by sort_key ASC then created_at ASC then
     # canonical_turn_id ASC. The store returns DESC for fast LIMIT N; the
-    # merge wants chronological ASC so the appended messages read
+    # merge wants chronological ASC so the inserted messages read
     # oldest-to-newest in the augmented history.
     def _sort_key_tuple(row: "CanonicalTurnRow") -> tuple:
         sk = getattr(row, "sort_key", 0.0) or 0.0
@@ -228,17 +239,46 @@ def _merge_protected_window(
 
     sorted_rows = sorted(db_recent_rows, key=_sort_key_tuple)
 
+    # Fill channel provenance across physical rows belonging to the same
+    # logical turn group.  Canonical ingestion may store the user and
+    # assistant halves as separate rows; only the user half carries the
+    # transport channel, but the assistant reply belongs to that same group.
+    group_provenance: dict[int, dict[str, str]] = {}
+    group_user_rows: dict[int, int] = {}
+    for row in sorted_rows:
+        group_number = getattr(row, "turn_group_number", -1)
+        if not isinstance(group_number, int) or group_number < 0:
+            continue
+        # Transport provenance is asserted by the physical user input.  Do
+        # not let an assistant-only row become the source of authority for a
+        # different row after a historical group-number collision.
+        if not (getattr(row, "user_content", "") or ""):
+            continue
+        group_user_rows[group_number] = group_user_rows.get(group_number, 0) + 1
+        values = group_provenance.setdefault(group_number, {})
+        for key in (
+            "origin_channel_id",
+            "origin_channel_label",
+            "audience_conversation_id",
+        ):
+            value = getattr(row, key, "") or ""
+            if isinstance(value, str) and value and not values.get(key):
+                values[key] = value
+
     # Cache the turn-hash for legacy fallback when canonical_turn_id is
     # absent on the payload side but the row carries a hash. Importing
     # the canonical-turns hash helper lazily avoids a hard dependency
     # in this module for callers that only use the dedup index.
-    augmented: list[Message] = list(payload_history)
+    db_messages: list[Message] = []
     for row in sorted_rows:
         canonical_id = getattr(row, "canonical_turn_id", "") or ""
         turn_hash = getattr(row, "turn_hash", "") or ""
+        source_message_id = getattr(row, "source_message_id", "") or ""
         if canonical_id and canonical_id in payload_canonical_ids:
             continue
         if turn_hash and turn_hash in payload_turn_hashes:
+            continue
+        if source_message_id and source_message_id in payload_source_message_ids:
             continue
 
         # Convert row to message(s). Tool-only rows emit zero or one
@@ -246,11 +286,39 @@ def _merge_protected_window(
         user_text = getattr(row, "user_content", "") or ""
         assistant_text = getattr(row, "assistant_content", "") or ""
         timestamp = _row_timestamp(row)
-        base_metadata = {
+        group_number = getattr(row, "turn_group_number", -1)
+        # Only a physical assistant/tool half may inherit transport provenance
+        # from its paired user half.  A user row with empty provenance is a
+        # privacy boundary (for example, a DM row folded into this owner) and
+        # must never become group-eligible merely because a historical group
+        # number collided.
+        inherited = (
+            group_provenance.get(group_number, {})
+            if (
+                not user_text
+                and isinstance(group_number, int)
+                and group_number >= 0
+                and group_user_rows.get(group_number) == 1
+            )
+            else {}
+        )
+        base_metadata: dict[str, object] = {
             "canonical_turn_id": canonical_id,
             "turn_number": getattr(row, "turn_number", -1),
+            "turn_group_number": group_number,
+            "sort_key": getattr(row, "sort_key", 0.0) or 0.0,
             "source": "db_recent",
         }
+        for key in (
+            "origin_channel_id",
+            "origin_channel_label",
+            "audience_conversation_id",
+        ):
+            value = getattr(row, key, "") or inherited.get(key, "")
+            if isinstance(value, str) and value:
+                base_metadata[key] = value
+        if source_message_id:
+            base_metadata["source_message_id"] = source_message_id
         if user_text:
             user_metadata = dict(base_metadata)
             # Sender attributes the human half only. A legacy row may carry
@@ -259,13 +327,16 @@ def _merge_protected_window(
             sender = (getattr(row, "sender", "") or "").strip()
             if sender:
                 user_metadata["sender"] = {"name": sender}
+            sender_actor_id = (getattr(row, "sender_actor_id", "") or "").strip()
+            if sender_actor_id:
+                user_metadata["sender_actor_id"] = sender_actor_id
             user_msg = Message(
                 role="user",
                 content=user_text,
                 timestamp=timestamp,
                 metadata=user_metadata,
             )
-            augmented.append(user_msg)
+            db_messages.append(user_msg)
         if assistant_text:
             assistant_msg = Message(
                 role="assistant",
@@ -273,7 +344,7 @@ def _merge_protected_window(
                 timestamp=timestamp,
                 metadata=dict(base_metadata),
             )
-            augmented.append(assistant_msg)
+            db_messages.append(assistant_msg)
         # Record the canonical_id for downstream dedup against further
         # rows that might collide (defensive, sorted_rows should already
         # be unique).
@@ -281,8 +352,31 @@ def _merge_protected_window(
             payload_canonical_ids.add(canonical_id)
         if turn_hash:
             payload_turn_hashes.add(turn_hash)
+        if source_message_id:
+            payload_source_message_ids.add(source_message_id)
 
-    return augmented
+    # The active inbound user is deliberately unstamped and belongs AFTER the
+    # DB gap.  The old implementation appended DB rows after it, reversing the
+    # chronology and causing the trim pass to protect the wrong suffix.  Insert
+    # the canonical gap immediately before one trailing unstamped user; library
+    # callers with no active tail retain the historical append behavior.
+    insert_at = len(payload_history)
+    while insert_at > 0:
+        tail = payload_history[insert_at - 1]
+        tail_meta = tail.metadata if isinstance(tail.metadata, dict) else {}
+        if (
+            tail.role == "user"
+            and not tail_meta.get("canonical_turn_id")
+            and tail_meta.get("source") != "db_recent"
+        ):
+            insert_at -= 1
+            continue
+        break
+    return (
+        list(payload_history[:insert_at])
+        + db_messages
+        + list(payload_history[insert_at:])
+    )
 
 
 def _row_timestamp(row: "CanonicalTurnRow") -> datetime | None:

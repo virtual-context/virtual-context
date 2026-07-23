@@ -12,7 +12,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from virtual_context.core.protected_window import _merge_protected_window
-from virtual_context.types import Message
+from virtual_context.types import Message, build_user_turn_metadata
 
 
 def _row(
@@ -24,6 +24,13 @@ def _row(
     user_content: str = "",
     assistant_content: str = "",
     created_at: str = "",
+    turn_group_number: int = -1,
+    source_message_id: str = "",
+    origin_channel_id: str = "",
+    origin_channel_label: str = "",
+    audience_conversation_id: str = "",
+    sender: str = "",
+    sender_actor_id: str = "",
 ) -> SimpleNamespace:
     return SimpleNamespace(
         canonical_turn_id=canonical_turn_id,
@@ -36,6 +43,13 @@ def _row(
         last_seen_at="",
         first_seen_at="",
         updated_at="",
+        turn_group_number=turn_group_number,
+        source_message_id=source_message_id,
+        origin_channel_id=origin_channel_id,
+        origin_channel_label=origin_channel_label,
+        audience_conversation_id=audience_conversation_id,
+        sender=sender,
+        sender_actor_id=sender_actor_id,
     )
 
 
@@ -60,19 +74,41 @@ def test_merge_empty_rows_returns_payload_copy() -> None:
     assert merged is not payload
 
 
-def test_merge_appends_new_rows_chronologically() -> None:
+def test_merge_inserts_new_rows_before_trailing_active_user() -> None:
     payload = [_msg("user", "active turn")]
     rows = [
         _row(canonical_turn_id="db-2", sort_key=2.0, user_content="b-user", assistant_content="b-asst"),
         _row(canonical_turn_id="db-1", sort_key=1.0, user_content="a-user", assistant_content="a-asst"),
     ]
     merged = _merge_protected_window(payload, rows, mode="merge")
-    # sort_key ASC ordering: a-user, a-asst, b-user, b-asst appended
+    # sort_key ASC ordering, with the unstamped active request remaining last.
     contents = [m.content for m in merged]
     assert contents == [
-        "active turn",
         "a-user", "a-asst",
         "b-user", "b-asst",
+        "active turn",
+    ]
+
+
+def test_merge_inserts_before_every_trailing_unstamped_user() -> None:
+    payload = [
+        _msg("assistant", "completed reply", canonical_turn_id="old"),
+        _msg("user", "queued one"),
+        _msg("user", "queued two"),
+    ]
+    rows = [_row(
+        canonical_turn_id="db-1",
+        sort_key=1.0,
+        user_content="cross-channel history",
+    )]
+
+    merged = _merge_protected_window(payload, rows, mode="merge")
+
+    assert [m.content for m in merged] == [
+        "completed reply",
+        "cross-channel history",
+        "queued one",
+        "queued two",
     ]
 
 
@@ -162,3 +198,102 @@ def test_merge_does_not_mutate_input() -> None:
     merged = _merge_protected_window(payload, rows, mode="merge")
     assert merged is not payload
     assert [m.content for m in payload] == ["p"]
+
+
+def test_merge_dedups_same_request_race_by_source_message_id() -> None:
+    payload = [Message(
+        role="user",
+        content="current request",
+        metadata=build_user_turn_metadata(source_message_id="discord-123"),
+    )]
+    rows = [_row(
+        canonical_turn_id="db-current",
+        sort_key=9.0,
+        source_message_id="discord-123",
+        user_content="current request",
+    )]
+    merged = _merge_protected_window(payload, rows, mode="merge")
+    assert [m.content for m in merged] == ["current request"]
+
+
+def test_merge_propagates_group_channel_to_separate_assistant_row() -> None:
+    rows = [
+        _row(
+            canonical_turn_id="u",
+            turn_group_number=4,
+            sort_key=1.0,
+            user_content="preference",
+            origin_channel_id="chan-a",
+            origin_channel_label="#alpha",
+            audience_conversation_id="guild-owner",
+            sender="optics",
+            sender_actor_id="actor:discord:1",
+        ),
+        _row(
+            canonical_turn_id="a",
+            turn_group_number=4,
+            sort_key=2.0,
+            assistant_content="acknowledged",
+        ),
+    ]
+    merged = _merge_protected_window([], rows, mode="merge")
+    assert merged[0].metadata["origin_channel_id"] == "chan-a"
+    assert merged[1].metadata["origin_channel_id"] == "chan-a"
+    assert merged[1].metadata["audience_conversation_id"] == "guild-owner"
+    assert merged[0].metadata["sender_actor_id"] == "actor:discord:1"
+    assert "sender_actor_id" not in merged[1].metadata
+
+
+def test_merge_never_propagates_group_channel_to_unproved_user_row() -> None:
+    rows = [
+        _row(
+            canonical_turn_id="guild-user",
+            turn_group_number=4,
+            sort_key=1.0,
+            user_content="proved guild message",
+            origin_channel_id="chan-a",
+            audience_conversation_id="guild-owner",
+        ),
+        _row(
+            canonical_turn_id="unproved-user",
+            turn_group_number=4,
+            sort_key=2.0,
+            user_content="must remain ineligible",
+        ),
+    ]
+
+    merged = _merge_protected_window([], rows, mode="merge")
+
+    assert merged[0].metadata["origin_channel_id"] == "chan-a"
+    assert "origin_channel_id" not in merged[1].metadata
+    assert "audience_conversation_id" not in merged[1].metadata
+
+
+def test_merge_disables_assistant_inheritance_for_colliding_user_group() -> None:
+    rows = [
+        _row(
+            canonical_turn_id="guild-user",
+            turn_group_number=4,
+            sort_key=1.0,
+            user_content="proved guild message",
+            origin_channel_id="chan-a",
+            audience_conversation_id="guild-owner",
+        ),
+        _row(
+            canonical_turn_id="unproved-user",
+            turn_group_number=4,
+            sort_key=2.0,
+            user_content="unproved second user",
+        ),
+        _row(
+            canonical_turn_id="ambiguous-assistant",
+            turn_group_number=4,
+            sort_key=3.0,
+            assistant_content="cannot safely choose an audience",
+        ),
+    ]
+
+    merged = _merge_protected_window([], rows, mode="merge")
+
+    assert "origin_channel_id" not in merged[2].metadata
+    assert "audience_conversation_id" not in merged[2].metadata
