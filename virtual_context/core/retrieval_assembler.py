@@ -314,6 +314,18 @@ class RetrievalAssembler:
                             payload_history=_payload_view,
                             db_recent_rows=_db_recent_rows,
                             mode="merge",
+                            dedup_origin_channel_id=(
+                                (
+                                    getattr(
+                                        request_roles,
+                                        "origin_channel_id",
+                                        "",
+                                    )
+                                    or ""
+                                ).strip()
+                                if request_roles is not None
+                                else ""
+                            ),
                         )
                         _gate_merged_rows = max(
                             0, len(conversation_history) - _pre_len,

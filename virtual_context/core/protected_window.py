@@ -29,7 +29,7 @@ import hashlib
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Iterable, Optional
 
-from ..types import Message, get_current_conversation_info
+from ..types import Message, get_current_conversation_info, get_origin_channel
 from .canonical_turns import partition_canonical_rows_into_logical_turns
 
 if TYPE_CHECKING:  # pragma: no cover - import-only
@@ -89,6 +89,27 @@ def _stamp_canonical_turn_ids(
         turn_number = getattr(row, "turn_number", -1)
         if isinstance(turn_number, int) and turn_number >= 0:
             message.metadata["turn_number"] = turn_number
+
+
+def _drop_active_tail_ingest_rows(
+    ingest_rows: Iterable["CanonicalTurnRow"],
+    active_tail_messages: int,
+) -> list["CanonicalTurnRow"]:
+    """Return only ingest rows that can correspond to completed history.
+
+    The active inbound tail is present in the request body and canonical
+    ingest result but is deliberately absent from the completed-history list
+    being stamped. When every returned row belongs to that active tail, the
+    safe result is an empty list rather than suffix-stamping an older retained
+    message with the current request's identity.
+    """
+    rows = list(ingest_rows)
+    drop = max(0, int(active_tail_messages))
+    if drop <= 0:
+        return rows
+    if drop >= len(rows):
+        return []
+    return rows[:-drop]
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +259,8 @@ def _merge_protected_window(
     payload_history: list[Message],
     db_recent_rows: list["CanonicalTurnRow"],
     mode: str = "merge",
+    *,
+    dedup_origin_channel_id: str = "",
 ) -> list[Message]:
     """Merge payload-history with DB-recent canonical_turns rows.
 
@@ -251,7 +274,7 @@ def _merge_protected_window(
         1. Convert each ``CanonicalTurnRow`` into the two-``Message``
            shape (user + assistant). Tool-only rows emit at most one
            ``Message``.
-        2. Dedup logical DB groups against ``payload_history`` by
+        2. Dedup logical DB groups against same-channel ``payload_history`` by
            ``canonical_turn_id`` (preferred, populated by
            ``_stamp_canonical_turn_ids``), ``turn_hash``, or
            ``source_message_id``. A complete payload pair (or the active
@@ -293,6 +316,25 @@ def _merge_protected_window(
     for payload_index, message in enumerate(payload_history):
         metadata = message.metadata or {}
         if isinstance(metadata, dict):
+            # A unified guild engine retains history contributed by every
+            # channel, while the upstream Discord payload remains
+            # channel-local. A canonical twin in another channel's retained
+            # engine history is therefore not proof that the model-visible
+            # payload contains that turn. Let only exact same-channel rows
+            # suppress the canonical copy. Unknown-channel legacy rows also
+            # fail open to a duplicate rather than silently hiding the only
+            # cross-channel copy from the model.
+            if dedup_origin_channel_id:
+                payload_origin, _ = get_origin_channel(metadata)
+                if not payload_origin:
+                    top_level_origin = metadata.get("origin_channel_id")
+                    payload_origin = (
+                        top_level_origin
+                        if isinstance(top_level_origin, str)
+                        else ""
+                    )
+                if payload_origin != dedup_origin_channel_id:
+                    continue
             _index_value(
                 payload_canonical_indexes,
                 metadata.get("canonical_turn_id"),
@@ -600,6 +642,7 @@ def _row_timestamp(row: "CanonicalTurnRow") -> datetime | None:
 
 __all__ = [
     "_stamp_canonical_turn_ids",
+    "_drop_active_tail_ingest_rows",
     "_last_already_canonical_turn_number",
     "_merge_protected_window",
     "_slice_payload_prefix_preserving_db_recent",

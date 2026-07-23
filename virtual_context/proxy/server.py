@@ -1375,7 +1375,10 @@ async def prepare_payload(
                     and getattr(_phase_decision, "canonical_ingest_rows", ())
                 ):
                     try:
-                        from ..core.protected_window import _stamp_canonical_turn_ids
+                        from ..core.protected_window import (
+                            _drop_active_tail_ingest_rows,
+                            _stamp_canonical_turn_ids,
+                        )
                         _ingest_rows = list(_phase_decision.canonical_ingest_rows)
                         # Drop suffix rows that correspond to the active-tail
                         # user message ingested in this request but excluded
@@ -1384,8 +1387,10 @@ async def prepare_payload(
                         _extracted = _extract_ingestible_messages(body)
                         _completed = state._completed_history_messages(_extracted)
                         _drop = max(0, len(_extracted) - len(_completed))
-                        if _drop and len(_ingest_rows) > _drop:
-                            _ingest_rows = _ingest_rows[:-_drop]
+                        _ingest_rows = _drop_active_tail_ingest_rows(
+                            _ingest_rows,
+                            _drop,
+                        )
                         _stamp_canonical_turn_ids(
                             state.conversation_history, _ingest_rows,
                         )

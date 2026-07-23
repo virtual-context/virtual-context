@@ -449,6 +449,33 @@ Use `pytest -m regression` to run all regression tests.
   - `test_recent_conversation_assembly.py::test_budget_does_not_conflate_reused_raw_group_numbers`
   - `test_recent_conversation_assembly.py::test_budget_legacy_fallback_evicts_only_leading_contiguous_group`
 
+### BUG-046 — Retained peer-channel history suppresses the canonical copy
+
+- **Symptom**: The complete newest preference pair is correct in canonical
+  storage but absent from the next channel's `<recent-conversation>`. Older
+  groups render normally, and the preference continues to work only in the
+  channel where it was authored.
+- **Root cause**: A unified guild reuses one in-memory engine history across
+  channels, while Discord sends channel-local model payloads. Tier 3 treated
+  any matching retained engine row as proof that the current payload already
+  carried the canonical turn, so the immediately preceding peer-channel group
+  was suppressed even though it was not model-visible. An active-only ingest
+  result could also suffix-stamp that current row's identity onto older
+  completed history when the active-tail drop equaled the entire result.
+- **Fix**: When a request has a proved origin channel, only retained rows from
+  that exact channel may suppress a canonical copy; production nested channel
+  metadata is read through `get_origin_channel`, with the DB-recent top-level
+  shape as fallback. Active-tail ingest rows are removed with an empty-safe
+  helper before completed-history stamping. Requests without a proved channel
+  retain legacy dedup behavior.
+- **Tests**:
+  - `test_protected_window_gate.py::test_other_channel_engine_history_cannot_suppress_canonical_recent_pair`
+  - `test_protected_window_gate.py::test_same_channel_payload_twin_still_suppresses_canonical_copy`
+  - `test_protected_window_gate.py::test_same_channel_active_tail_race_still_suppresses_db_user`
+  - `test_canonical_turn_id_stamping.py::test_drop_active_tail_equal_to_all_rows_returns_empty`
+  - `test_canonical_turn_id_stamping.py::test_drop_active_tail_keeps_completed_prefix`
+  - `test_canonical_turn_id_stamping.py::test_drop_active_tail_zero_is_identity_view`
+
 ### BUG-043 — RRF's missing-signal penalty buries embedding-only candidates below the fused top-K
 
 - **Symptom**: On analog queries with no keyword overlap, the tag the embedding signal surfaces most strongly lands far outside the fused top-K (embedding candidates observed at fused rank 15-33 while the selection cut is 10), because RRF penalizes every candidate absent from the idf/bm25 signals. The context-augmented embedding signal (BUG-042) surfaces the right tag but fusion then discards it.
@@ -536,7 +563,8 @@ Use `pytest -m regression` to run all regression tests.
 | `test_tag_summary_materialization.py` | BUG-041 |
 | `test_embedding_context_guard.py` | BUG-042 |
 | `test_embedding_reserved_seats.py` | BUG-043 |
-| `test_protected_window_gate.py` | BUG-044, BUG-045 |
+| `test_protected_window_gate.py` | BUG-044, BUG-045, BUG-046 |
+| `test_canonical_turn_id_stamping.py` | BUG-046 |
 | `test_retrieval_assembler_protected_window_merge.py` | BUG-045 |
 | `test_sqlite_mirror_store_methods.py` | BUG-045 |
 | `test_postgres_mirror_store_methods.py` | BUG-045 |
