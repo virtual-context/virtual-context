@@ -304,21 +304,32 @@ def test_rebuild_actor_cards_runs_while_read_gate_is_dark(tmp_path):
 
     class LLM:
         def complete(self, **_kwargs):
-            return json.dumps({"entries": [{
-                "kind": "communication_pref", "body": "prefers terse answers",
-                "confidence": 0.9, "sensitivity": "normal",
-                "fact_ids": ["fact-card"],
-            }]}), {}
+            return json.dumps({
+                "substantive": True,
+                "coverage_reason": "substantive",
+                "entries": [{
+                    "kind": "communication_pref",
+                    "body": "prefers terse answers",
+                    "confidence": 0.9,
+                    "sensitivity": "normal",
+                    "fact_ids": ["fact-card"],
+                    "turn_ids": [],
+                }],
+            }), {}
 
     class Admission:
         def complete(self, **kwargs):
             candidate = json.loads(kwargs["user"])["candidates"][0]
-            return json.dumps({"decisions": [{
-                "candidate_id": candidate["candidate_id"],
-                "admit": True,
-                "sensitivity": candidate["proposed_sensitivity"],
-                "reason": "durable",
-            }]}), {}
+            return json.dumps({
+                "substantive": True,
+                "coverage_reason": "substantive",
+                "decisions": [{
+                    "candidate_id": candidate["candidate_id"],
+                    "admit": True,
+                    "sensitivity": candidate["proposed_sensitivity"],
+                    "reason": "durable",
+                }],
+            }), {}
 
     engine._compactor = DomainCompactor(LLM(), engine.config.compactor)
     engine._compaction._compactor = engine._compactor

@@ -30,6 +30,7 @@ def test_actor_card_assembly_config_parses_yaml_keys():
             "actor_card_enabled": True,
             "actor_card_max_tokens": 321,
             "actor_card_fact_limit": 17,
+            "actor_card_turn_limit": 81,
             "actor_card_entries_per_kind": 2,
             "actor_card_admission_model": "anthropic/claude-fable-5",
         },
@@ -38,6 +39,7 @@ def test_actor_card_assembly_config_parses_yaml_keys():
     assert config.assembler.actor_card_enabled is True
     assert config.assembler.actor_card_max_tokens == 321
     assert config.assembler.actor_card_fact_limit == 17
+    assert config.assembler.actor_card_turn_limit == 81
     assert config.assembler.actor_card_entries_per_kind == 2
     assert (
         config.assembler.actor_card_admission_model

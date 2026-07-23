@@ -760,12 +760,33 @@ class ContextStore(ABC):
         """
         return []
 
+    def list_actor_turn_sources(
+        self,
+        tenant_id: str,
+        actor_id: str,
+        *,
+        limit: int = 120,
+    ) -> list:
+        """Enumerate exact canonical user rows eligible as card evidence.
+
+        The backend must prove tenant ownership, actor attribution, audience
+        attribution, and owner/audience lifecycle epochs before returning a
+        row. Unknown or legacy provenance fails closed.
+        """
+        return []
+
     def get_actor_profile(self, tenant_id: str, actor_id: str):
         """Return the tenant-scoped profile/cache state, or ``None``."""
         return None
 
-    def mark_actor_card_dirty(self, tenant_id: str, actor_id: str) -> bool:
-        """Make a card unreadable before a changed-input curation call."""
+    def mark_actor_card_dirty(
+        self,
+        tenant_id: str,
+        actor_id: str,
+        *,
+        build_input_hash: str = "",
+    ) -> bool:
+        """Make a card unreadable and optionally stamp a build CAS marker."""
         return False
 
     def replace_actor_card(
@@ -776,6 +797,7 @@ class ContextStore(ABC):
         *,
         input_hash: str = "",
         expected_source_epochs: dict[str, int] | None = None,
+        expected_build_marker: str | None = None,
     ) -> int:
         """Atomically replace an actor's card and clear its dirty flag."""
         return 0
@@ -802,6 +824,16 @@ class ContextStore(ABC):
     ) -> dict | None:
         """Return the latest bounded rebuild diagnostic for one actor."""
         return None
+
+    def list_due_actor_card_rebuilds(
+        self,
+        tenant_id: str,
+        *,
+        due_at: str,
+        limit: int = 25,
+    ) -> list[str]:
+        """Return dirty actors whose transient-failure backoff has elapsed."""
+        return []
 
     def get_actor_card(
         self,
