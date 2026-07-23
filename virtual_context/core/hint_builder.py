@@ -10,6 +10,47 @@ from typing import Callable
 from ..types import DepthLevel, TagSummary, WorkingSetEntry
 
 
+def _largest_fitting_prefix(
+    entries: list[str],
+    *,
+    render: Callable[[list[str]], str],
+    token_counter: Callable[[str], int],
+    max_tokens: int,
+) -> tuple[list[str], str]:
+    """Return the longest prefix whose rendered form fits *max_tokens*.
+
+    Hint truncation is tail-only, so the fit predicate is monotonic for the
+    supported token counters.  Binary search avoids re-rendering and
+    re-tokenizing the full topic list once per removed entry, which made a
+    1,500-topic supervised hint take tens of seconds.  A final downward check
+    keeps the result safe if a custom counter has unusual boundary behavior.
+    """
+    rendered: dict[int, str] = {}
+    counts: dict[int, int] = {}
+
+    def _render_count(size: int) -> tuple[str, int]:
+        if size not in rendered:
+            value = render(entries[:size])
+            rendered[size] = value
+            counts[size] = token_counter(value)
+        return rendered[size], counts[size]
+
+    low, high = 0, len(entries)
+    while low < high:
+        middle = (low + high + 1) // 2
+        _, count = _render_count(middle)
+        if count <= max_tokens:
+            low = middle
+        else:
+            high = middle - 1
+
+    value, count = _render_count(low)
+    while low > 0 and count > max_tokens:
+        low -= 1
+        value, count = _render_count(low)
+    return entries[:low], value
+
+
 def build_autonomous_hint(
     tag_summaries: list[TagSummary],
     working_set: dict[str, WorkingSetEntry],
@@ -280,12 +321,19 @@ def build_supervised_hint(
     hint = _assemble(expanded_lines, available_entries)
 
     if token_counter(hint) > max_hint_tokens:
-        while available_entries and token_counter(hint) > max_hint_tokens:
-            available_entries.pop()
-            hint = _assemble(expanded_lines, available_entries)
-        while expanded_lines and token_counter(hint) > max_hint_tokens:
-            expanded_lines.pop()
-            hint = _assemble(expanded_lines, available_entries)
+        available_entries, hint = _largest_fitting_prefix(
+            available_entries,
+            render=lambda entries: _assemble(expanded_lines, entries),
+            token_counter=token_counter,
+            max_tokens=max_hint_tokens,
+        )
+        if token_counter(hint) > max_hint_tokens:
+            expanded_lines, hint = _largest_fitting_prefix(
+                expanded_lines,
+                render=lambda entries: _assemble(entries, available_entries),
+                token_counter=token_counter,
+                max_tokens=max_hint_tokens,
+            )
 
     return hint
 

@@ -159,6 +159,35 @@ def _compacted_engine(tmp_path, provider=None, conversation_id: str = "c"):
 
 
 class TestWarmAtCommit:
+    def test_prewarm_overwrites_stale_same_key_in_both_layers(self, tmp_path):
+        """A derived rebuild may change summaries without changing the key."""
+        engine, provider, _report = _compacted_engine(tmp_path)
+        try:
+            mode = (
+                engine._retrieval._resolve_paging_mode("")
+                if engine.config.paging.enabled
+                else None
+            )
+            key = engine._retrieval._build_context_hint_cache_key(mode)
+            conv = engine.config.conversation_id
+            stale = "<context-topics>stale derived content</context-topics>"
+            engine._retrieval._context_hint_cache_key = key
+            engine._retrieval._context_hint_cache_value = stale
+            provider.hints[(conv, key)] = stale
+            provider.load_calls.clear()
+
+            engine._retrieval._store = MagicMock(
+                wraps=engine._retrieval._store,
+            )
+            hint = engine._retrieval.prewarm_context_hint_cache()
+
+            assert hint and hint != stale
+            assert provider.hints[(conv, key)] == hint
+            assert not provider.load_calls, "forced prewarm must bypass shared reads"
+            assert engine._retrieval._store.get_all_tag_summaries.called
+        finally:
+            engine.close()
+
     def test_commit_saves_hint_under_next_request_key(self, tmp_path):
         engine, provider, report = _compacted_engine(tmp_path)
         try:
