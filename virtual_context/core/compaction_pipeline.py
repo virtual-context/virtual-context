@@ -225,7 +225,7 @@ class CompactionPipeline:
         ]
         input_hash = hashlib.sha256(json.dumps(
             {
-                "policy": 5,
+                "policy": 6,
                 "admission_model": getattr(
                     self._config.assembler,
                     "actor_card_admission_model",
@@ -283,6 +283,10 @@ class CompactionPipeline:
                 "goal, or preference rather than a generic placeholder. Write "
                 "natural person-facing language, not a serialization of "
                 "subject/verb/object fields, ontology names, or tag labels. "
+                "Preserve every material qualifier from the source, including "
+                "exceptions, exclusions, uncertainty, frequency, timing, and "
+                "scope. Do not turn a qualified statement into a broader or "
+                "more certain claim. "
                 "Do not promote temporary, test-only, one-turn, session-only, "
                 "or channel-only instructions into communication_pref or "
                 "interaction_style. Do not retain a preference or goal that a "
@@ -841,6 +845,13 @@ class CompactionPipeline:
             "preference) is omitted. The body must be fully entailed by the "
             "cited actor-authored messages. Compact fact fields and tags help "
             "locate evidence but cannot independently justify body text. "
+            "Full entailment requires preserving every material qualifier in "
+            "the source, including exceptions, exclusions, uncertainty, "
+            "frequency, timing, and scope. Reject with insufficient_evidence "
+            "if the immutable body drops a qualifier, broadens the statement, "
+            "or increases its certainty. For example, source text like "
+            "\"good blood pressure, excluding stressful events\" does not "
+            "entail the unqualified body \"has good blood pressure.\" "
             "Reject with not_person_card when a body exposes internal "
             "ontology/tag language or serializes a machine fact triple rather "
             "than stating a natural person fact. Medical, sexual, financial, "
