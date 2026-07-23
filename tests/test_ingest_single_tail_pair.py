@@ -210,3 +210,38 @@ def test_genuinely_new_pair_still_appends_both_rows(tmp_path):
         assert rows[3][1] == "assistant reply one"
     finally:
         engine.close()
+
+
+@pytest.mark.regression("BUG-047")
+def test_completed_pair_override_does_not_trust_a_stale_shared_tail(tmp_path):
+    """A REST caller's request-owned pair wins over a stale guild-state tail.
+
+    Server-scoped conversations share one engine state across channels, and
+    prepare/ingest may land on different workers.  The shared history can
+    therefore end in another channel's pending user when the current assistant
+    arrives.  Persisting that inferred pair attaches current provenance and
+    reply text to the wrong human message.
+    """
+    engine = _make_engine(tmp_path)
+    try:
+        stale_user = Message(role="user", content="stale peer-channel prompt")
+        current_assistant = Message(
+            role="assistant", content="answer for the current request",
+        )
+        shared_history = [stale_user, current_assistant]
+
+        engine.persist_completed_turn(
+            shared_history,
+            completed_user_message=Message(
+                role="user", content="current request-owned prompt",
+            ),
+            completed_assistant_message=current_assistant,
+        )
+
+        rows = _rows(tmp_path)
+        assert rows == [
+            ("current request-owned prompt", "", 1000.0),
+            ("", "answer for the current request", 2000.0),
+        ]
+    finally:
+        engine.close()
