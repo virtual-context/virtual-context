@@ -301,8 +301,11 @@ class ContextAssembler:
         """Return whether one DB row has the guild audience proof to render.
 
         Owner-scoped lookup is not enough: every physical row still needs an
-        origin channel and audience. This is the DM/privacy fail-closed
-        boundary shared by native requester replay and peer reference context.
+        origin channel and audience. A DM has no origin channel, so this is the
+        DM/privacy fail-closed boundary shared by native requester replay and
+        peer reference context. Audience equality is intentionally *not*
+        required: peer guild channels and retained pre-alias routes have
+        distinct audience ids inside the same owner-scoped conversation.
         """
         if not cls._is_db_recent(message):
             return False
