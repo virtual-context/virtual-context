@@ -830,6 +830,13 @@ class TestPrepareRouting:
             ("assistant", "Compass: Understood."),
             ("user", "Name one moon of Mars."),
         ]
+        assert prepared.metadata["recent_conversation_native"] == {
+            "message_count": 2,
+            "message_hashes": [
+                "19840a3886672e5e7a60658ea0af898c8b33aadf3fda19eb859a91397b272a0c",
+                "9a80c78c6760c0b7a10d4b500fb7603a53a3441024b1ccd770be56b7c54f149f",
+            ],
+        }
 
         raw_admitted, _ = extract_ingestible_messages(
             prepared.body,
@@ -844,6 +851,63 @@ class TestPrepareRouting:
             "Compass:" not in message.content
             for message in history_passed_to_engine
         )
+
+    def test_deduplicated_client_rows_are_not_attested_as_inserted_replay(self):
+        state, metrics = self._make_state()
+        state.handle_prepare_payload = MagicMock(
+            return_value=PhaseDecision(phase="active", started_tagger=True)
+        )
+        state.resolve_prepare_state = MagicMock(
+            return_value=(SessionState.ACTIVE, None)
+        )
+        state.has_pending_indexing = MagicMock(return_value=False)
+        replay = [
+            Message(
+                role="user",
+                content="Begin replies with ExistingNative29:.",
+                metadata={
+                    "source": "db_recent",
+                    "db_recent_group_key": "canonical:existing",
+                },
+            ),
+            Message(
+                role="assistant",
+                content="ExistingNative29: Understood.",
+                metadata={
+                    "source": "db_recent",
+                    "db_recent_group_key": "canonical:existing",
+                },
+            ),
+        ]
+        state.engine.on_message_inbound.return_value = AssembledContext(
+            recent_conversation_messages=replay,
+            recent_conversation_message_tokens=12,
+        )
+        body = {
+            "model": "claude-opus-4-6",
+            "stream": False,
+            "messages": [
+                {"role": "user", "content": replay[0].content},
+                {"role": "assistant", "content": replay[1].content},
+                {
+                    "role": "user",
+                    "content": "What is the chemical symbol for gold?",
+                },
+            ],
+        }
+
+        prepared = asyncio.run(
+            prepare_payload(
+                body,
+                state,
+                AnthropicFormat(),
+                metrics,
+                body_bytes=json.dumps(body).encode("utf-8"),
+            )
+        )
+
+        assert prepared.enriched_body["messages"] == body["messages"]
+        assert "recent_conversation_native" not in prepared.metadata
 
     def test_prepare_payload_restored_ready_conversation_stays_active(self):
         state, metrics = self._make_state()

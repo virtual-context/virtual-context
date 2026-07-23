@@ -304,6 +304,35 @@ def test_unproved_db_row_is_excluded_even_for_a_proved_group_request() -> None:
     assert "private sentinel" not in assembled.prepend_text
 
 
+def test_dm_audience_row_is_excluded_from_guild_native_replay() -> None:
+    private = _db_message(
+        "user",
+        "private DM sentinel",
+        actor=ACTOR,
+        channel="dm-channel",
+    )
+    private.metadata["audience_conversation_id"] = "sk:agent:vast:discord:direct:42"
+    private.metadata["origin_channel_id"] = ""
+    private_reply = _db_message(
+        "assistant",
+        "private DM acknowledgement",
+        channel="dm-channel",
+    )
+    private_reply.metadata["audience_conversation_id"] = (
+        "sk:agent:vast:discord:direct:42"
+    )
+    private_reply.metadata["origin_channel_id"] = ""
+
+    assembled = _assemble(
+        [private, private_reply, Message(role="user", content="Hello guild")],
+        _roles(channel="chan-b"),
+    )
+
+    assert assembled.recent_conversation_messages == []
+    assert "private DM sentinel" not in assembled.prepend_text
+    assert "private DM acknowledgement" not in assembled.prepend_text
+
+
 def test_budget_keeps_newest_recent_group_and_drops_oldest_whole() -> None:
     older = [
         _db_message("user", "OLD-USER", actor=ACTOR, group=1, turn=1),
@@ -662,6 +691,29 @@ def test_native_replay_deduplicates_only_a_complete_ordered_group() -> None:
         ("user", 'For future replies, begin with "Compass:".')
     ) == 2
     assert ("assistant", "Compass: Understood.") in contents
+
+
+def test_native_replay_delivery_outcome_excludes_deduplicated_group() -> None:
+    fmt = OpenAIFormat()
+    replay = _assemble(_compass_history(), _roles()).recent_conversation_messages
+    complete = {
+        "messages": [
+            {
+                "role": "user",
+                "content": 'For future replies, begin with "Compass:".',
+            },
+            {"role": "assistant", "content": "Compass: Understood."},
+            {"role": "user", "content": "Name one moon of Mars."},
+        ]
+    }
+
+    unchanged, delivered = fmt.inject_replayed_conversation_with_delivery(
+        complete,
+        replay,
+    )
+
+    assert unchanged == complete
+    assert delivered == []
 
 
 def test_openai_responses_string_input_is_normalized_without_messages_field() -> None:

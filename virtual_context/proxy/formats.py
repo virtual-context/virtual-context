@@ -872,18 +872,34 @@ class PayloadFormat(ABC):
         body: dict,
         replay_messages: list,
     ) -> dict:
+        """Insert replay and return the provider-shaped body."""
+        enriched, _ = self.inject_replayed_conversation_with_delivery(
+            body,
+            replay_messages,
+        )
+        return enriched
+
+    def inject_replayed_conversation_with_delivery(
+        self,
+        body: dict,
+        replay_messages: list,
+    ) -> tuple[dict, list]:
         """Insert exact prior requester turns into the outbound copy only.
 
         The caller invokes this after the raw request has been captured and
         after canonical ingestion has examined the client body. No internal
         metadata is serialized. Other-member rows never reach this method.
+
+        The second return value contains only rows this call actually inserted.
+        Callers use that outcome—not the requested replay list—to attest final
+        delivery after all later payload transforms.
         """
         if not replay_messages:
-            return body
+            return body, []
         body = copy.deepcopy(body)
         items = self.get_messages(body)
         if not isinstance(items, list):
-            return body
+            return body, []
 
         # Insert immediately before the active conversational user message.
         # A tool_result carrier is not a valid insertion boundary because
@@ -900,7 +916,7 @@ class PayloadFormat(ABC):
                 active_user_index = index
                 break
         if active_user_index is None:
-            return body
+            return body, []
 
         # The protected-window merge normally removes same-channel canonical
         # twins before assembly. Exact ordered *group* dedup is a final
@@ -919,6 +935,7 @@ class PayloadFormat(ABC):
             existing.append((role, self.extract_message_text(item)))
 
         serialized: list[dict] = []
+        delivered: list = []
         groups: list[list] = []
         current_group: list = []
         current_key: tuple[object, ...] | None = None
@@ -934,6 +951,7 @@ class PayloadFormat(ABC):
 
         for group in groups:
             normalized: list[tuple[str, str]] = []
+            accepted: list = []
             for message in group:
                 role = getattr(message, "role", "")
                 content = getattr(message, "content", "")
@@ -942,6 +960,7 @@ class PayloadFormat(ABC):
                 if not isinstance(content, str) or not content:
                     continue
                 normalized.append((role, content))
+                accepted.append(message)
             if not normalized:
                 continue
             if self._contains_ordered_fingerprints(existing, normalized):
@@ -950,16 +969,17 @@ class PayloadFormat(ABC):
                 self._serialize_replayed_message(role, content)
                 for role, content in normalized
             )
+            delivered.extend(accepted)
             existing.extend(normalized)
         if not serialized:
-            return body
+            return body, []
 
         items[active_user_index:active_user_index] = serialized
         body[self._get_message_key(body)] = items
         # Strict-alternation providers accept the merged result; tool messages
         # are never merged by this helper.
         self.merge_consecutive_conversational(body)
-        return body
+        return body, delivered
 
     # -- Conversation markers -----------------------------------------------------
 
@@ -3078,11 +3098,11 @@ class OpenAIResponsesFormat(PayloadFormat):
             ],
         }
 
-    def inject_replayed_conversation(
+    def inject_replayed_conversation_with_delivery(
         self,
         body: dict,
         replay_messages: list,
-    ) -> dict:
+    ) -> tuple[dict, list]:
         """Normalize supported string input before native replay insertion.
 
         ``get_messages`` exposes string-valued Responses input as a synthetic
@@ -3105,7 +3125,10 @@ class OpenAIResponsesFormat(PayloadFormat):
                     ],
                 }
             ]
-        return super().inject_replayed_conversation(body, replay_messages)
+        return super().inject_replayed_conversation_with_delivery(
+            body,
+            replay_messages,
+        )
 
     # -- helpers --
 
