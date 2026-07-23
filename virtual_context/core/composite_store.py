@@ -1101,6 +1101,43 @@ class CompositeStore:
             ))
         return 0
 
+    def record_actor_card_rebuild_status(
+        self,
+        tenant_id: str,
+        actor_id: str,
+        *,
+        attempted_at: str,
+        input_hash: str,
+        source_count: int,
+        raw_entry_count: int,
+        accepted_entry_count: int,
+        rejected_counts: dict[str, int],
+        outcome: str,
+        response_hash: str,
+        written_count: int,
+    ) -> None:
+        fn = getattr(self._facts, "record_actor_card_rebuild_status", None)
+        if callable(fn):
+            fn(
+                tenant_id,
+                actor_id,
+                attempted_at=attempted_at,
+                input_hash=input_hash,
+                source_count=source_count,
+                raw_entry_count=raw_entry_count,
+                accepted_entry_count=accepted_entry_count,
+                rejected_counts=rejected_counts,
+                outcome=outcome,
+                response_hash=response_hash,
+                written_count=written_count,
+            )
+
+    def get_actor_card_rebuild_status(
+        self, tenant_id: str, actor_id: str,
+    ) -> dict | None:
+        fn = getattr(self._facts, "get_actor_card_rebuild_status", None)
+        return fn(tenant_id, actor_id) if callable(fn) else None
+
     def get_actor_card(
         self,
         tenant_id: str,

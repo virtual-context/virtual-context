@@ -1983,7 +1983,8 @@ CREATE TABLE IF NOT EXISTS request_captures (
         # silent privacy failure: delete/merge invalidation would have nothing
         # to invalidate.
         for table in ("actor_profiles", "actor_card_entries",
-                      "actor_card_entry_sources"):
+                      "actor_card_entry_sources",
+                      "actor_card_rebuild_status"):
             if not self._table_exists(conn, table):
                 raise RuntimeError(
                     f"{table} is missing; refusing to run person cards on a "
@@ -2069,6 +2070,24 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 ON actor_card_entry_sources(tenant_id, audience_conversation_id);
             CREATE INDEX IF NOT EXISTS idx_actor_card_sources_fact
                 ON actor_card_entry_sources(fact_id);
+
+            CREATE TABLE IF NOT EXISTS actor_card_rebuild_status (
+                tenant_id TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                attempted_at TEXT NOT NULL,
+                input_hash TEXT NOT NULL DEFAULT '',
+                source_count INTEGER NOT NULL DEFAULT 0,
+                raw_entry_count INTEGER NOT NULL DEFAULT 0,
+                accepted_entry_count INTEGER NOT NULL DEFAULT 0,
+                rejected_counts_json TEXT NOT NULL DEFAULT '{{}}',
+                outcome TEXT NOT NULL,
+                response_hash TEXT NOT NULL DEFAULT '',
+                written_count INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (tenant_id, actor_id),
+                FOREIGN KEY (tenant_id, actor_id)
+                    REFERENCES actor_profiles(tenant_id, actor_id)
+                    ON DELETE CASCADE
+            );
         """)
 
     def _ensure_speaker_handle_schema(self, conn: sqlite3.Connection) -> None:
@@ -10554,6 +10573,68 @@ CREATE TABLE IF NOT EXISTS request_captures (
         except Exception:
             conn.execute("ROLLBACK")
             raise
+
+    def record_actor_card_rebuild_status(
+        self,
+        tenant_id: str,
+        actor_id: str,
+        *,
+        attempted_at: str,
+        input_hash: str,
+        source_count: int,
+        raw_entry_count: int,
+        accepted_entry_count: int,
+        rejected_counts: dict[str, int],
+        outcome: str,
+        response_hash: str,
+        written_count: int,
+    ) -> None:
+        conn = self._get_conn()
+        conn.execute(
+            """INSERT INTO actor_card_rebuild_status
+                   (tenant_id, actor_id, attempted_at, input_hash,
+                    source_count, raw_entry_count, accepted_entry_count,
+                    rejected_counts_json, outcome, response_hash, written_count)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT (tenant_id, actor_id) DO UPDATE SET
+                   attempted_at = excluded.attempted_at,
+                   input_hash = excluded.input_hash,
+                   source_count = excluded.source_count,
+                   raw_entry_count = excluded.raw_entry_count,
+                   accepted_entry_count = excluded.accepted_entry_count,
+                   rejected_counts_json = excluded.rejected_counts_json,
+                   outcome = excluded.outcome,
+                   response_hash = excluded.response_hash,
+                   written_count = excluded.written_count""",
+            (
+                tenant_id, actor_id, attempted_at, input_hash,
+                max(0, int(source_count)), max(0, int(raw_entry_count)),
+                max(0, int(accepted_entry_count)),
+                json.dumps(rejected_counts, sort_keys=True, separators=(",", ":")),
+                outcome, response_hash, max(0, int(written_count)),
+            ),
+        )
+        conn.commit()
+
+    def get_actor_card_rebuild_status(
+        self, tenant_id: str, actor_id: str,
+    ) -> dict | None:
+        row = self._get_conn().execute(
+            """SELECT * FROM actor_card_rebuild_status
+                WHERE tenant_id = ? AND actor_id = ?""",
+            (tenant_id, actor_id),
+        ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        try:
+            result["rejected_counts"] = json.loads(
+                result.pop("rejected_counts_json") or "{}"
+            )
+        except (TypeError, ValueError):
+            result["rejected_counts"] = {}
+            result.pop("rejected_counts_json", None)
+        return result
 
     def get_actor_card(
         self,
