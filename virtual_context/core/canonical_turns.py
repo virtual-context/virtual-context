@@ -74,6 +74,101 @@ def default_sort_key(existing: list[CanonicalTurnRow]) -> float:
     return max(float(row.sort_key or 0.0) for row in existing) + 1000.0
 
 
+def partition_canonical_rows_into_logical_turns(
+    rows: list[CanonicalTurnRow],
+) -> list[list[CanonicalTurnRow]]:
+    """Partition chronologically ordered physical rows into logical turns.
+
+    ``turn_group_number`` is useful only as an adjacency proof. Historical
+    merge races can reuse a number for far-apart turns, so grouping every row
+    with the same integer would conflate unrelated history. Canonical turn
+    storage emits at most one user half and one assistant half per logical
+    turn; legacy rows without group numbers fall back to the same adjacency
+    pairing.
+    """
+    groups: list[list[CanonicalTurnRow]] = []
+    pending_user: list[CanonicalTurnRow] = []
+
+    def _flush_pending() -> None:
+        nonlocal pending_user
+        if pending_user:
+            groups.append(list(pending_user))
+            pending_user = []
+
+    def _same_explicit_group(
+        user_row: CanonicalTurnRow,
+        assistant_row: CanonicalTurnRow,
+    ) -> bool:
+        def _group_number(row: CanonicalTurnRow) -> int:
+            raw = getattr(row, "turn_group_number", -1)
+            try:
+                return int(raw) if raw is not None else -1
+            except (TypeError, ValueError):
+                return -1
+
+        user_group = _group_number(user_row)
+        assistant_group = _group_number(assistant_row)
+        return (
+            user_group < 0
+            or assistant_group < 0
+            or user_group == assistant_group
+        )
+
+    for row in rows:
+        has_user = bool(row.user_content)
+        has_assistant = bool(row.assistant_content)
+        if has_user:
+            _flush_pending()
+            if has_assistant:
+                groups.append([row])
+            else:
+                pending_user = [row]
+            continue
+        if has_assistant:
+            if pending_user and _same_explicit_group(pending_user[0], row):
+                pending_user.append(row)
+                _flush_pending()
+            else:
+                _flush_pending()
+                groups.append([row])
+            continue
+
+        # A malformed/tool-only physical row still counts as a singleton
+        # boundary so it cannot bridge two otherwise unrelated turns.
+        _flush_pending()
+        groups.append([row])
+
+    _flush_pending()
+    return groups
+
+
+def select_recent_logical_turn_rows(
+    rows_desc: list[CanonicalTurnRow],
+    *,
+    limit: int,
+) -> list[CanonicalTurnRow]:
+    """Select the newest ``limit`` logical turns from DESC physical rows.
+
+    Callers fetch ``2 * limit + 1`` rows: at most two physical rows belong to
+    one canonical logical turn, and the extra row absorbs a boundary that
+    begins on an assistant half. The returned rows retain DESC order.
+    """
+    if limit <= 0 or not rows_desc:
+        return []
+    groups = partition_canonical_rows_into_logical_turns(
+        list(reversed(rows_desc))
+    )
+    selected = groups[-int(limit):]
+    # ``groups`` is chronological; callers promise and expect DESC order.
+    # Flatten and reverse rather than relying on Python object identity, which
+    # would be fragile if a future backend materialized/cached equivalent rows.
+    return list(reversed([
+        row
+        for group in selected
+        for row in group
+    ]))
+
+
 def midpoint_sort_key(left: float | None, right: float | None) -> float:
     if left is None and right is None:
         return 1000.0

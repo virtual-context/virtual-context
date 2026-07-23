@@ -35,6 +35,7 @@ def _db_message(
     sender: str = "",
     channel: str = "chan-a",
     group: int = 7,
+    group_key: str = "",
     turn: int = 10,
 ) -> Message:
     metadata: dict[str, object] = {
@@ -46,6 +47,8 @@ def _db_message(
         "origin_channel_label": "#alpha",
         "audience_conversation_id": OWNER,
     }
+    if group_key:
+        metadata["db_recent_group_key"] = group_key
     if actor:
         metadata["sender_actor_id"] = actor
     if sender:
@@ -205,6 +208,103 @@ def test_budget_keeps_newest_recent_group_and_drops_oldest_whole() -> None:
     assert assembled.recent_conversation_text.index("NEW-USER") < (
         assembled.recent_conversation_text.index("NEW-ASSISTANT")
     )
+
+
+def test_budget_does_not_conflate_reused_raw_group_numbers() -> None:
+    older = [
+        _db_message(
+            "user",
+            "OLD-USER",
+            actor=ACTOR,
+            group=7,
+            group_key="canonical:old",
+            turn=1,
+        ),
+        _db_message(
+            "assistant",
+            "OLD-ASSISTANT",
+            group=7,
+            group_key="canonical:old",
+            turn=2,
+        ),
+    ]
+    newer = [
+        _db_message(
+            "user",
+            "NEW-USER",
+            actor=ACTOR,
+            group=7,
+            group_key="canonical:new",
+            turn=3,
+        ),
+        _db_message(
+            "assistant",
+            "NEW-ASSISTANT",
+            group=7,
+            group_key="canonical:new",
+            turn=4,
+        ),
+    ]
+    active = Message(role="user", content="now")
+    assembler = ContextAssembler(
+        config=AssemblerConfig(),
+        token_counter=len,
+        conversation_id=OWNER,
+        tenant_id="tenant-1",
+    )
+    newer_text = assembler._render_recent_conversation(newer, _roles())
+
+    assembled = _assemble(
+        older + newer + [active],
+        _roles(),
+        budget=len(active.content) + len(newer_text),
+        counter=len,
+    )
+
+    assert "OLD-USER" not in assembled.recent_conversation_text
+    assert "OLD-ASSISTANT" not in assembled.recent_conversation_text
+    assert "NEW-USER" in assembled.recent_conversation_text
+    assert "NEW-ASSISTANT" in assembled.recent_conversation_text
+
+
+def test_budget_legacy_fallback_evicts_only_leading_contiguous_group() -> None:
+    older = [
+        _db_message("user", "OLD-USER", actor=ACTOR, group=7, turn=1),
+        _db_message("assistant", "OLD-ASSISTANT", group=7, turn=2),
+    ]
+    middle = [
+        _db_message("user", "MID-USER", actor=ACTOR, group=8, turn=3),
+        _db_message("assistant", "MID-ASSISTANT", group=8, turn=4),
+    ]
+    newer = [
+        _db_message("user", "NEW-USER", actor=ACTOR, group=7, turn=5),
+        _db_message("assistant", "NEW-ASSISTANT", group=7, turn=6),
+    ]
+    active = Message(role="user", content="now")
+    assembler = ContextAssembler(
+        config=AssemblerConfig(),
+        token_counter=len,
+        conversation_id=OWNER,
+        tenant_id="tenant-1",
+    )
+    kept_text = assembler._render_recent_conversation(
+        middle + newer,
+        _roles(),
+    )
+
+    assembled = _assemble(
+        older + middle + newer + [active],
+        _roles(),
+        budget=len(active.content) + len(kept_text),
+        counter=len,
+    )
+
+    assert "OLD-USER" not in assembled.recent_conversation_text
+    assert "OLD-ASSISTANT" not in assembled.recent_conversation_text
+    assert "MID-USER" in assembled.recent_conversation_text
+    assert "MID-ASSISTANT" in assembled.recent_conversation_text
+    assert "NEW-USER" in assembled.recent_conversation_text
+    assert "NEW-ASSISTANT" in assembled.recent_conversation_text
 
 
 def test_assemble_never_splits_one_recent_group_at_budget_boundary() -> None:

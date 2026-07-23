@@ -16,7 +16,12 @@ import pytest
 
 from virtual_context.config import load_config
 from virtual_context.engine import VirtualContextEngine
-from virtual_context.types import CanonicalTurnRow, Message, RequestRoles
+from virtual_context.types import (
+    CanonicalTurnRow,
+    Message,
+    RequestRoles,
+    build_user_turn_metadata,
+)
 
 
 def _make_config(tmp_path, *, mode: str = "merge", conversation_id: str | None = None):
@@ -382,6 +387,215 @@ def test_tier3_db_pair_survives_payload_compaction_offset(tmp_path):
     assert reassembled.index("For future replies") < reassembled.index(
         "test3: Understood."
     )
+
+
+@pytest.mark.regression("BUG-045")
+def test_tier3_payload_duplicate_cannot_suppress_db_user_before_offset(tmp_path):
+    """A completed payload duplicate must not strand the DB assistant half.
+
+    This is the exact second live Discord shape behind BUG-045.  The previous
+    guild turn is still present in the in-memory payload when Tier 3 reads the
+    same split canonical group.  Source-message dedup suppresses the DB user
+    half, then the payload watermark consumes the payload copy of that user
+    instruction.  Without group-aware replacement, only the DB assistant
+    acknowledgement reaches ``recent-conversation``.
+    """
+    eng = _make_participant_engine(tmp_path)
+    assembler = eng._retrieval
+    fake_provider = MagicMock()
+    fake_provider.get_marker.return_value = None
+    assembler._session_state_provider = fake_provider
+    fake_store = MagicMock(wraps=eng._store)
+    fake_store.get_recent_canonical_turns.return_value = [
+        CanonicalTurnRow(
+            conversation_id="target-1",
+            canonical_turn_id="pref-user",
+            turn_number=1072,
+            turn_group_number=566,
+            sort_key=1073000.0,
+            user_content='For future replies, begin with "GuildProof73:".',
+            sender="optics",
+            sender_actor_id="actor:discord:42",
+            source_message_id="discord-pref",
+            origin_channel_id="chan-a",
+            origin_channel_label="#alpha",
+            audience_conversation_id="target-1",
+        ),
+        CanonicalTurnRow(
+            conversation_id="target-1",
+            canonical_turn_id="pref-assistant",
+            turn_number=1073,
+            turn_group_number=566,
+            sort_key=1074000.0,
+            assistant_content="GuildProof73: Understood.",
+        ),
+    ]
+    assembler._store = fake_store
+    eng._engine_state.flushed_prefix_messages = 2
+
+    payload_user = Message(
+        role="user",
+        content='For future replies, begin with "GuildProof73:".',
+        metadata=build_user_turn_metadata(
+            sender_name="optics",
+            sender_actor_id="actor:discord:42",
+            source_message_id="discord-pref",
+            origin_channel_id="chan-a",
+            origin_channel_label="#alpha",
+        ),
+    )
+    payload_assistant = Message(
+        role="assistant",
+        content="GuildProof73: Understood.",
+    )
+    active = Message(role="user", content="In one sentence, how are you?")
+    roles = RequestRoles(
+        requester_actor_id="actor:discord:42",
+        owner_conversation_id="target-1",
+        audience_conversation_id="target-1",
+        origin_channel_id="chan-b",
+    )
+
+    assembled = eng.on_message_inbound(
+        active.content,
+        [payload_user, payload_assistant, active],
+        request_roles=roles,
+    )
+
+    recent = assembled.recent_conversation_text
+    assert recent.count(
+        'For future replies, begin with \\"GuildProof73:\\".'
+    ) == 1
+    assert recent.count("GuildProof73: Understood.") == 1
+    assert '"authority":"current_requester_user"' in recent
+    assert recent.index("For future replies") < recent.index(
+        "GuildProof73: Understood."
+    )
+    assert [(message.role, message.content) for message in assembled.conversation_history] == [
+        ("user", "In one sentence, how are you?"),
+    ]
+
+
+@pytest.mark.regression("BUG-045")
+def test_tier2_equal_with_payload_offset_forces_canonical_replacement(tmp_path):
+    """Marker equality cannot skip Tier 3 when the payload will be sliced."""
+    eng = _make_participant_engine(tmp_path)
+    assembler = eng._retrieval
+    fake_provider = MagicMock()
+    fake_provider.get_marker.return_value = 3
+    assembler._session_state_provider = fake_provider
+    fake_store = MagicMock(wraps=eng._store)
+    fake_store.get_recent_canonical_turns.return_value = [
+        CanonicalTurnRow(
+            conversation_id="target-1",
+            canonical_turn_id="pref-user",
+            turn_number=2,
+            turn_group_number=1,
+            sort_key=3000.0,
+            user_content="Remember the cross-channel instruction.",
+            sender="optics",
+            sender_actor_id="actor:discord:42",
+            origin_channel_id="chan-a",
+            origin_channel_label="#alpha",
+            audience_conversation_id="target-1",
+        ),
+        CanonicalTurnRow(
+            conversation_id="target-1",
+            canonical_turn_id="pref-assistant",
+            turn_number=3,
+            turn_group_number=1,
+            sort_key=4000.0,
+            assistant_content="Instruction acknowledged.",
+        ),
+    ]
+    assembler._store = fake_store
+    eng._engine_state.flushed_prefix_messages = 2
+
+    active = Message(role="user", content="Use it now.")
+    history = [
+        _stamped(
+            "user",
+            "Remember the cross-channel instruction.",
+            canonical_turn_id="pref-user",
+            turn_number=2,
+        ),
+        _stamped(
+            "assistant",
+            "Instruction acknowledged.",
+            canonical_turn_id="pref-assistant",
+            turn_number=3,
+        ),
+        active,
+    ]
+    roles = RequestRoles(
+        requester_actor_id="actor:discord:42",
+        owner_conversation_id="target-1",
+        audience_conversation_id="target-1",
+        origin_channel_id="chan-b",
+    )
+
+    assembled = eng.on_message_inbound(
+        active.content,
+        history,
+        request_roles=roles,
+    )
+
+    fake_store.get_recent_canonical_turns.assert_called_once_with(
+        "target-1",
+        limit=eng.config.monitor.protected_recent_turns,
+    )
+    recent = assembled.recent_conversation_text
+    assert recent.count("Remember the cross-channel instruction.") == 1
+    assert recent.count("Instruction acknowledged.") == 1
+    assert '"authority":"current_requester_user"' in recent
+    assert [(message.role, message.content) for message in assembled.conversation_history] == [
+        ("user", "Use it now."),
+    ]
+    assert eng._retrieval.reassemble_context() == assembled.prepend_text
+
+
+@pytest.mark.regression("BUG-045")
+def test_tier3_read_failure_preserves_unsliced_payload(tmp_path):
+    """A failed canonical replacement must not erase local payload history."""
+    eng = _make_participant_engine(tmp_path)
+    assembler = eng._retrieval
+    fake_provider = MagicMock()
+    fake_provider.get_marker.return_value = 3
+    assembler._session_state_provider = fake_provider
+    fake_store = MagicMock(wraps=eng._store)
+    fake_store.get_recent_canonical_turns.side_effect = RuntimeError(
+        "canonical store unavailable"
+    )
+    assembler._store = fake_store
+    eng._engine_state.flushed_prefix_messages = 2
+
+    active = Message(role="user", content="Use it now.")
+    history = [
+        _stamped(
+            "user",
+            "Remember the cross-channel instruction.",
+            canonical_turn_id="pref-user",
+            turn_number=2,
+        ),
+        _stamped(
+            "assistant",
+            "Instruction acknowledged.",
+            canonical_turn_id="pref-assistant",
+            turn_number=3,
+        ),
+        active,
+    ]
+
+    assembled = eng.on_message_inbound(active.content, history)
+
+    assert [
+        (message.role, message.content)
+        for message in assembled.conversation_history
+    ] == [
+        ("user", "Remember the cross-channel instruction."),
+        ("assistant", "Instruction acknowledged."),
+        ("user", "Use it now."),
+    ]
 
 
 # ---------------------------------------------------------------------------

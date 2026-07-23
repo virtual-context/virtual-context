@@ -304,11 +304,12 @@ class ContextStore(ABC):
     ) -> list[CanonicalTurnRow]:
         """Tier 3 cross-channel-mirror lookup.
 
-        Returns at most ``limit`` rows from ``canonical_turns`` for
-        ``conversation_id``, ordered by ``sort_key DESC`` so the
-        caller sees the most recent rows first. Filtering by
-        ``tagged_at`` is intentionally NOT applied — see the
-        cross-channel-mirror spec §1.2 ``tagged_at`` decision.
+        Returns every physical row belonging to the newest ``limit`` logical
+        turn groups for ``conversation_id``, ordered by ``sort_key DESC`` so
+        the caller sees the most recent rows first. Split user/assistant rows
+        are atomic at the window boundary. Filtering by ``tagged_at`` is
+        intentionally NOT applied — fresh peer-channel rows must surface
+        before the tagger catches up.
 
         Backends that do not host canonical_turns (filesystem,
         secondary graph stores) return ``[]`` defensively.

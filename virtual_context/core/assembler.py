@@ -422,18 +422,39 @@ class ContextAssembler:
                 if isinstance(candidates[0].metadata, dict)
                 else {}
             )
-            first_group = first_meta.get("turn_group_number")
-            if isinstance(first_group, int) and first_group >= 0:
+            first_group_key = first_meta.get("db_recent_group_key")
+            if isinstance(first_group_key, str) and first_group_key:
                 candidates = [
                     message
                     for message in candidates
                     if not (
                         isinstance(message.metadata, dict)
-                        and message.metadata.get("turn_group_number") == first_group
+                        and message.metadata.get("db_recent_group_key")
+                        == first_group_key
                     )
                 ]
             else:
-                candidates = candidates[1:]
+                first_group = first_meta.get("turn_group_number")
+                if isinstance(first_group, int) and first_group >= 0:
+                    # Legacy messages may lack the request-local unique group
+                    # key, and repaired histories can reuse the same raw
+                    # integer far apart. Evict only the leading contiguous
+                    # group rather than every matching integer in the window.
+                    group_end = 1
+                    while group_end < len(candidates):
+                        metadata = (
+                            candidates[group_end].metadata
+                            if isinstance(
+                                candidates[group_end].metadata, dict
+                            )
+                            else {}
+                        )
+                        if metadata.get("turn_group_number") != first_group:
+                            break
+                        group_end += 1
+                    candidates = candidates[group_end:]
+                else:
+                    candidates = candidates[1:]
             dropped_groups += 1
         if dropped_groups:
             logger.info(
