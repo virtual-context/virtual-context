@@ -42,7 +42,6 @@ from ..types import (
     CARD_SCOPES,
     CARD_SCOPE_SAME_CONVERSATION,
     CARD_SENSITIVITIES,
-    CARD_SENSITIVITY_NORMAL,
     RESERVED_SPEAKER_HANDLES,
     ActorCard,
     ActorCardEntry,
@@ -11059,7 +11058,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
     ) -> ActorCard | None:
         """Read one clean, policy-filtered card.
 
-        This method owns the clean/superseded/privacy/audience predicates so no
+        This method owns the clean/superseded/audience predicates so no
         caller can fetch an unsafe superset and filter it afterwards.
 
         The audience is the validated PRE-ALIAS route, not the resolved owner:
@@ -11111,15 +11110,17 @@ CREATE TABLE IF NOT EXISTS request_captures (
         # The audience predicate runs in SQL, before the return:
         #   * cross_context is allowed only for the policy-granted kinds;
         #   * same_conversation requires EVERY source to carry this exact
-        #     audience id, and — when the request has a durable channel — this
-        #     exact channel. An empty source channel is unknown, not wildcard,
-        #     so it fails closed.
+        #     audience id. Channels inside one guild conversation are
+        #     provenance, not privacy boundaries.
+        #
+        # The legacy sensitivity column is intentionally not a serving gate.
+        # Subject matter does not determine whether a grounded card entry can
+        # reach the model.
         rows = conn.execute(
             f"""SELECT e.* FROM actor_card_entries e
                  WHERE e.tenant_id = ?
                    AND e.actor_id = ?
                    AND e.superseded_by IS NULL
-                   AND e.sensitivity = ?
                    AND (
                      EXISTS (
                        SELECT 1 FROM actor_card_entry_sources fs
@@ -11139,37 +11140,23 @@ CREATE TABLE IF NOT EXISTS request_captures (
                        e.audience_scope = 'same_conversation'
                        AND NOT EXISTS (
                          SELECT 1 FROM actor_card_entry_sources fs
-                          WHERE fs.entry_id = e.id
-                            AND fs.tenant_id = e.tenant_id
-                            AND (
-                              fs.audience_conversation_id <> ?
-                              OR (
-                                ? <> ''
-                                AND fs.audience_channel_id <> ?
-                              )
-                            )
+                            WHERE fs.entry_id = e.id
+                              AND fs.tenant_id = e.tenant_id
+                            AND fs.audience_conversation_id <> ?
                        )
                        AND NOT EXISTS (
                          SELECT 1 FROM actor_card_turn_sources ts
                           WHERE ts.entry_id = e.id
                             AND ts.tenant_id = e.tenant_id
-                            AND (
-                              ts.audience_conversation_id <> ?
-                              OR (
-                                ? <> ''
-                                AND ts.audience_channel_id <> ?
-                              )
-                            )
+                            AND ts.audience_conversation_id <> ?
                        )
                      )
                    )
                  ORDER BY e.kind, e.confidence DESC, e.updated_at, e.id""",
             (
-                tenant_id, actor_id, CARD_SENSITIVITY_NORMAL,
+                tenant_id, actor_id,
                 audience_conversation_id,
-                audience_channel_id or "", audience_channel_id or "",
                 audience_conversation_id,
-                audience_channel_id or "", audience_channel_id or "",
             ),
         ).fetchall()
         if not rows:

@@ -211,8 +211,8 @@ class ContextAssembler:
         if card is None or not card.entries:
             return "", 0, []
 
-        # The store already applied the sensitivity/audience/superseded
-        # predicates; this is only the token cap.
+        # The store already applied the audience/superseded predicates; this is
+        # only the token cap.
         entries = list(card.entries)
         cap = max(0, int(self.config.actor_card_max_tokens))
         allowed = min(cap, max(0, int(base_pool)))
