@@ -17,6 +17,7 @@ from virtual_context.types import (
     CARD_KIND_ACTIVE_GOAL,
     CARD_KIND_COMMUNICATION_PREF,
     CARD_KIND_INTERACTION_STYLE,
+    CARD_KIND_RELEVANT_HISTORY,
     CARD_SCOPE_CROSS_CONTEXT,
     CARD_SCOPE_SAME_CONVERSATION,
     CARD_SENSITIVITY_HIGH,
@@ -716,6 +717,325 @@ def test_compaction_card_builder_rejects_any_unknown_fact_citation(store):
     ) is None
 
 
+def test_compaction_card_builder_repairs_a_visible_turn_in_fact_ids(store):
+    _dm_and_guild(store)
+
+    class Curator:
+        def complete(self, **kwargs):
+            visible = {
+                item["id"]
+                for item in json.loads(kwargs["user"])["turns"]
+            }
+            if "ct-guild" not in visible:
+                return json.dumps(_curation([])), {}
+            return json.dumps(_curation([{
+                "kind": CARD_KIND_RELEVANT_HISTORY,
+                "body": "Has discussed a substantive guild topic.",
+                "confidence": 0.9,
+                "sensitivity": "normal",
+                # The same valid turn was copied into the wrong namespace by
+                # the curator shape observed in production.
+                "fact_ids": ["ct-guild"],
+                "turn_ids": ["ct-guild"],
+            }])), {}
+
+    class Admission(_AdmitAll):
+        prompts = []
+
+        def complete(self, **kwargs):
+            self.prompts.append(json.loads(kwargs["user"]))
+            return super().complete(**kwargs)
+
+    admission = Admission()
+    pipeline = _card_pipeline(
+        store,
+        Curator(),
+        admission=admission,
+    )
+    assert pipeline._rebuild_actor_card(OPTICS) == 1
+    candidate = next(
+        prompt["candidates"][0]
+        for prompt in admission.prompts
+        if prompt["candidates"]
+    )
+    assert candidate["fact_ids"] == []
+    assert candidate["turn_ids"] == ["ct-guild"]
+    assert _bodies(store.get_actor_card(
+        "t1",
+        OPTICS,
+        owner_conversation_id="guild",
+        audience_conversation_id="guild",
+        audience_channel_id="chan-guild",
+    )) == ["Has discussed a substantive guild topic."]
+
+
+def test_compaction_card_builder_repairs_a_visible_fact_in_turn_ids(store):
+    _dm_and_guild(store)
+
+    class Curator:
+        def complete(self, **kwargs):
+            visible = {
+                item["id"]
+                for item in json.loads(kwargs["user"])["facts"]
+            }
+            if "f-guild" not in visible:
+                return json.dumps(_curation([])), {}
+            return json.dumps(_curation([{
+                "kind": CARD_KIND_RELEVANT_HISTORY,
+                "body": "Has discussed a substantive guild topic.",
+                "confidence": 0.9,
+                "sensitivity": "normal",
+                "fact_ids": [],
+                "turn_ids": ["f-guild"],
+            }])), {}
+
+    class Admission(_AdmitAll):
+        prompts = []
+
+        def complete(self, **kwargs):
+            self.prompts.append(json.loads(kwargs["user"]))
+            return super().complete(**kwargs)
+
+    admission = Admission()
+    pipeline = _card_pipeline(
+        store,
+        Curator(),
+        admission=admission,
+    )
+    assert pipeline._rebuild_actor_card(OPTICS) == 1
+    candidate = next(
+        prompt["candidates"][0]
+        for prompt in admission.prompts
+        if prompt["candidates"]
+    )
+    assert candidate["fact_ids"] == ["f-guild"]
+    assert candidate["turn_ids"] == []
+
+
+def test_compaction_card_builder_bounds_excessive_citations(store):
+    _conversation(store, "guild")
+    turn_ids = []
+    for index in range(17):
+        turn_id = f"ct-{index}"
+        turn_ids.append(turn_id)
+        _turn(
+            store,
+            turn_id,
+            "guild",
+            OPTICS,
+            "guild",
+            "chan-guild",
+            content=f"Substantive topic message {index}.",
+        )
+    store.upsert_actor_profile_from_turn(
+        "guild",
+        OPTICS,
+        "Optics",
+        seen_at=_now(),
+    )
+
+    class Curator:
+        def complete(self, **_kwargs):
+            base = {
+                "kind": CARD_KIND_RELEVANT_HISTORY,
+                "body": "Has discussed a substantive guild topic.",
+                "confidence": 0.9,
+                "sensitivity": "normal",
+                "fact_ids": [],
+            }
+            return json.dumps(_curation([
+                {**base, "turn_ids": turn_ids},
+                {**base, "turn_ids": list(reversed(turn_ids))},
+            ])), {}
+
+    pipeline = _card_pipeline(
+        store,
+        Curator(),
+        admission=_AdmitAll(),
+    )
+    assert pipeline._rebuild_actor_card(OPTICS) == 1
+    status = store.get_actor_card_rebuild_status("t1", OPTICS)
+    assert status is not None
+    assert status["rejected_counts"] == {
+        "citations_trimmed": 2,
+        "duplicate_entry": 1,
+    }
+    card = store.get_actor_card(
+        "t1",
+        OPTICS,
+        owner_conversation_id="guild",
+        audience_conversation_id="guild",
+        audience_channel_id="chan-guild",
+    )
+    assert card is not None
+    assert len(card.entries) == 1
+    source_count = store._get_conn().execute(
+        """SELECT COUNT(*)
+             FROM actor_card_turn_sources
+            WHERE entry_id = ?""",
+        (card.entries[0].id,),
+    ).fetchone()[0]
+    assert source_count == 16
+
+
+def test_compaction_card_builder_rejects_cross_audience_wrong_namespace_id(
+    store,
+):
+    _dm_and_guild(store)
+
+    class Curator:
+        def complete(self, **kwargs):
+            visible = {
+                item["id"]
+                for item in json.loads(kwargs["user"])["turns"]
+            }
+            if "ct-guild" not in visible:
+                return json.dumps(_curation([])), {}
+            return json.dumps(_curation([{
+                "kind": CARD_KIND_RELEVANT_HISTORY,
+                "body": "Has discussed a substantive guild topic.",
+                "confidence": 0.9,
+                "sensitivity": "normal",
+                # This is a real turn, but it belongs to the private DM
+                # partition and was not exposed to this guild call.
+                "fact_ids": ["ct-dm"],
+                "turn_ids": [],
+            }])), {}
+
+    pipeline = _card_pipeline(
+        store,
+        Curator(),
+        admission=_AdmitAll(),
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="rejected every model entry",
+    ):
+        pipeline._rebuild_actor_card(OPTICS)
+    status = store.get_actor_card_rebuild_status("t1", OPTICS)
+    assert status is not None
+    assert status["rejected_counts"] == {
+        "unknown_or_cross_audience_fact_id": 1,
+    }
+
+
+def test_compaction_card_builder_rejects_same_audience_turn_omitted_from_prompt(
+    store,
+):
+    _conversation(store, "guild")
+    _turn(
+        store,
+        "ct-stored-but-omitted",
+        "guild",
+        OPTICS,
+        "guild",
+        "chan-guild",
+        content="A real stored message outside the rendered prompt window.",
+    )
+    store.upsert_actor_profile_from_turn(
+        "guild",
+        OPTICS,
+        "Optics",
+        seen_at=_now(),
+    )
+
+    class Curator:
+        def complete(self, **_kwargs):
+            return json.dumps(_curation([{
+                "kind": CARD_KIND_RELEVANT_HISTORY,
+                "body": "Has discussed a substantive guild topic.",
+                "confidence": 0.9,
+                "sensitivity": "normal",
+                "fact_ids": ["ct-stored-but-omitted"],
+                "turn_ids": [],
+            }])), {}
+
+    pipeline = _card_pipeline(
+        store,
+        Curator(),
+        admission=_AdmitAll(),
+    )
+    pipeline._actor_card_prompt_turns = lambda _turns: []
+    with pytest.raises(
+        RuntimeError,
+        match="rejected every model entry",
+    ):
+        pipeline._rebuild_actor_card(OPTICS)
+    status = store.get_actor_card_rebuild_status("t1", OPTICS)
+    assert status is not None
+    assert status["rejected_counts"] == {
+        "unknown_or_cross_audience_fact_id": 1,
+    }
+
+
+def test_compaction_card_builder_deduplicates_after_namespace_repair(store):
+    _dm_and_guild(store)
+    _turn(
+        store,
+        "ct-guild-2",
+        "guild",
+        OPTICS,
+        "guild",
+        "chan-guild",
+        content="A second substantive guild topic message.",
+    )
+
+    class Curator:
+        def complete(self, **kwargs):
+            visible = {
+                item["id"]
+                for item in json.loads(kwargs["user"])["turns"]
+            }
+            if "ct-guild" not in visible:
+                return json.dumps(_curation([])), {}
+            base = {
+                "kind": CARD_KIND_COMMUNICATION_PREF,
+                "body": "Prefers concise summaries for substantive topics.",
+                "confidence": 0.9,
+            }
+            return json.dumps(_curation([
+                {
+                    **base,
+                    "sensitivity": "normal",
+                    "fact_ids": [],
+                    "turn_ids": ["ct-guild", "ct-guild-2"],
+                },
+                {
+                    **base,
+                    "confidence": 0.95,
+                    "sensitivity": "high",
+                    # Same source set, reordered and partly copied into the
+                    # wrong namespace.
+                    "fact_ids": ["ct-guild-2"],
+                    "turn_ids": ["ct-guild"],
+                },
+            ])), {}
+
+    pipeline = _card_pipeline(
+        store,
+        Curator(),
+        admission=_AdmitAll(),
+    )
+    assert pipeline._rebuild_actor_card(OPTICS) == 1
+    status = store.get_actor_card_rebuild_status("t1", OPTICS)
+    assert status is not None
+    assert status["accepted_entry_count"] == 1
+    assert status["written_count"] == 1
+    assert status["rejected_counts"] == {"duplicate_entry": 1}
+    stored = store._get_conn().execute(
+        """SELECT confidence, sensitivity, audience_scope
+             FROM actor_card_entries
+            WHERE tenant_id = ? AND actor_id = ?
+              AND superseded_by IS NULL""",
+        ("t1", OPTICS),
+    ).fetchall()
+    assert [tuple(row) for row in stored] == [(
+        0.95,
+        CARD_SENSITIVITY_HIGH,
+        CARD_SCOPE_SAME_CONVERSATION,
+    )]
+
+
 def test_actor_card_failures_back_off_and_terminally_suppress_same_input(store):
     _dm_and_guild(store)
 
@@ -978,6 +1298,10 @@ def test_compaction_card_builder_accepts_explicit_clean_empty_and_records_contra
     assert "Do not turn a qualified statement into a broader" in (
         llm.kwargs["system"]
     )
+    assert "at most 16 citation ids total per entry" in (
+        llm.kwargs["system"]
+    )
+    assert llm.kwargs["max_tokens"] == 2000
     prompt = json.loads(llm.kwargs["user"])
     assert prompt["facts"]
     assert all(
