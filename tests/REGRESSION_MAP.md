@@ -392,6 +392,23 @@ Use `pytest -m regression` to run all regression tests.
 - **Fix**: The precondition counts coverage over the conversation's row tail INCLUDING tagged rows. The pair walker gains a hydrate fast-path: pairs whose backing rows are all tagged (matched by per-message `turn_hash`) get their TurnTagIndex entries from the stored row tags, consuming the strict cursor without invoking the tag generator or rewriting rows. Half-tagged pairs fall through to the normal tagger (idempotent). Supporting fix: the canonical-turn full-row loaders now SELECT `covered_ingestible_entries` so legacy combined rows (coverage 2) count correctly.
 - **Tests**: `test_strict_tagging_tagged_rows.py` — prod-signature repro, hydration tag fidelity, zero-tagger-call full hydration, untagged-tail still tagged, half-tagged fall-through, missing-rows and stale-epoch invariants preserved.
 
+### BUG-044 — Compaction offset splits a recovered cross-channel turn
+
+- **Symptom**: A temporary reply preference authored in one Discord guild
+  channel is acknowledged there but ignored in another channel. The outbound
+  recent-conversation block contains only the assistant acknowledgement, not
+  the authoritative user instruction.
+- **Root cause**: Tier 3 inserts `source=db_recent` rows into channel-local
+  payload history before `history_offset()` is applied. The payload-owned
+  compaction offset is then used as a raw index into the merged list, so it can
+  consume the user half of a recovered logical group while leaving the
+  assistant half.
+- **Fix**: Build the uncompacted view with a source-aware, active-tail-safe
+  slice: consume the offset from payload-owned rows only, never from DB-recent
+  rows or the trailing unstamped active-user block.
+- **Tests**:
+  - `test_protected_window_gate.py::test_tier3_db_pair_survives_payload_compaction_offset`
+
 ### BUG-043 — RRF's missing-signal penalty buries embedding-only candidates below the fused top-K
 
 - **Symptom**: On analog queries with no keyword overlap, the tag the embedding signal surfaces most strongly lands far outside the fused top-K (embedding candidates observed at fused rank 15-33 while the selection cut is 10), because RRF penalizes every candidate absent from the idf/bm25 signals. The context-augmented embedding signal (BUG-042) surfaces the right tag but fusion then discards it.
@@ -479,3 +496,4 @@ Use `pytest -m regression` to run all regression tests.
 | `test_tag_summary_materialization.py` | BUG-041 |
 | `test_embedding_context_guard.py` | BUG-042 |
 | `test_embedding_reserved_seats.py` | BUG-043 |
+| `test_protected_window_gate.py` | BUG-044 |

@@ -11,7 +11,10 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from virtual_context.core.protected_window import _merge_protected_window
+from virtual_context.core.protected_window import (
+    _merge_protected_window,
+    _slice_payload_prefix_preserving_db_recent,
+)
 from virtual_context.types import Message, build_user_turn_metadata
 
 
@@ -198,6 +201,61 @@ def test_merge_does_not_mutate_input() -> None:
     merged = _merge_protected_window(payload, rows, mode="merge")
     assert merged is not payload
     assert [m.content for m in payload] == ["p"]
+
+
+def test_payload_offset_preserves_db_group_and_active_user() -> None:
+    history = [
+        _msg("user", f"old-{index}", canonical_turn_id=f"old-{index}")
+        for index in range(7)
+    ]
+    history.extend([
+        _msg(
+            "user",
+            "cross-channel instruction",
+            source="db_recent",
+            turn_group_number=4,
+        ),
+        _msg(
+            "assistant",
+            "cross-channel acknowledgement",
+            source="db_recent",
+            turn_group_number=4,
+        ),
+        _msg("user", "active request"),
+    ])
+
+    view = _slice_payload_prefix_preserving_db_recent(history, payload_offset=8)
+
+    assert [message.content for message in view] == [
+        "cross-channel instruction",
+        "cross-channel acknowledgement",
+        "active request",
+    ]
+
+
+def test_payload_offset_matches_plain_slice_without_db_or_active_tail() -> None:
+    history = [
+        _msg("user", "old-0", canonical_turn_id="old-0"),
+        _msg("assistant", "old-1", canonical_turn_id="old-1"),
+        _msg("user", "keep-2", canonical_turn_id="keep-2"),
+        _msg("assistant", "keep-3", canonical_turn_id="keep-3"),
+    ]
+
+    view = _slice_payload_prefix_preserving_db_recent(history, payload_offset=2)
+
+    assert [message.content for message in view] == ["keep-2", "keep-3"]
+
+
+def test_payload_offset_preserves_every_trailing_unstamped_user() -> None:
+    history = [
+        _msg("assistant", "old", canonical_turn_id="old"),
+        _msg("user", "queued one"),
+        _msg("user", "queued two"),
+    ]
+
+    view = _slice_payload_prefix_preserving_db_recent(history, payload_offset=99)
+
+    assert [message.content for message in view] == ["queued one", "queued two"]
 
 
 def test_merge_dedups_same_request_race_by_source_message_id() -> None:
