@@ -11,6 +11,7 @@ import json
 import logging
 import math
 import time
+from collections import Counter
 from collections.abc import Callable
 from datetime import datetime
 from typing import TYPE_CHECKING
@@ -201,13 +202,16 @@ class CompactionPipeline:
                 "what": source.fact.what,
                 "status": source.fact.status,
                 "superseded_by": source.fact.superseded_by,
+                "fact_type": source.fact.fact_type,
+                "mentioned_at": source.fact.mentioned_at.isoformat(),
+                "session_date": source.fact.session_date,
                 "author_version": source.fact.author_attribution_version,
                 "author_role": source.fact.author_source_role,
             }
             for source in sources
         ]
         input_hash = hashlib.sha256(json.dumps(
-            {"policy": 1, "facts": hash_payload},
+            {"policy": 2, "facts": hash_payload},
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")).hexdigest()
@@ -221,20 +225,49 @@ class CompactionPipeline:
 
         source_by_id = {source.fact.id: source for source in sources}
         raw_entries: list = []
+        response_text = ""
+        parsed_entries = True
+        model_exception: Exception | None = None
         if sources:
             prompt_facts = [
                 {
                     "id": source.fact.id,
                     "fact": source.fact.format_for_prompt(),
                     "author_role": source.fact.author_source_role,
+                    "status": source.fact.status,
+                    "fact_type": source.fact.fact_type,
+                    "mentioned_at": source.fact.mentioned_at.isoformat(),
+                    "session_date": source.fact.session_date,
                 }
                 for source in sources
             ]
             system = (
-                "Curate durable interaction patterns, not a fact scrapbook. "
-                "Return JSON only with an entries array. Each entry needs kind, "
-                "body, confidence, sensitivity, and fact_ids. Kinds are "
-                "communication_pref, active_goal, relevant_history, interaction_style."
+                "Curate a compact person card from facts authored by one actor. "
+                "The card is for durable interaction continuity, not a fact "
+                "scrapbook or a transcript. Return JSON only with exactly one "
+                "top-level key, entries, whose value is an array. Each entry "
+                "must contain exactly: kind, body, confidence, sensitivity, "
+                "and fact_ids. kind must be exactly one of "
+                "\"communication_pref\", \"active_goal\", "
+                "\"relevant_history\", or \"interaction_style\". "
+                "sensitivity must be exactly the string \"normal\" or \"high\"; "
+                "never use null, \"none\", booleans, or numbers. confidence "
+                "must be a number from 0 through 1. fact_ids must cite only "
+                "provided ids. Use a neutral concise body and do not invent "
+                "identity or intent. "
+                "Do not promote temporary, test-only, one-turn, session-only, "
+                "or channel-only instructions into communication_pref or "
+                "interaction_style. Do not retain a preference or goal that a "
+                "later fact stopped, replaced, completed, or contradicted. "
+                "Use mentioned_at and status to resolve conflicts, with the "
+                "newest applicable fact winning. A communication preference or "
+                "interaction style should be durable only when it is explicitly "
+                "stated as lasting or consistently supported by repeated facts. "
+                "Medical, sexual, financial, precise-location, credential, or "
+                "similarly private personal material must be sensitivity "
+                "\"high\". Ordinary non-private communication and interaction "
+                "style may be \"normal\". If no durable entry is justified, "
+                "return {\"entries\":[]}."
             )
             user = json.dumps({
                 "facts": prompt_facts,
@@ -245,53 +278,76 @@ class CompactionPipeline:
                     "body_chars": CARD_ENTRY_BODY_MAX_CHARS,
                 },
             }, separators=(",", ":"))
-            response_text, _usage = self._compactor.llm.complete(
-                system=system,
-                user=user,
-                max_tokens=self._config.compactor.max_summary_tokens,
-            )
-            parsed = self._compactor._parse_response(response_text)
-            if isinstance(parsed.get("entries"), list):
-                raw_entries = parsed["entries"]
+            try:
+                response_text, _usage = self._compactor.llm.complete(
+                    system=system,
+                    user=user,
+                    max_tokens=self._config.compactor.max_summary_tokens,
+                )
+                parsed = self._compactor._parse_response(response_text)
+                if (
+                    isinstance(parsed, dict)
+                    and set(parsed) == {"entries"}
+                    and isinstance(parsed["entries"], list)
+                ):
+                    raw_entries = parsed["entries"]
+                else:
+                    parsed_entries = False
+            except Exception as exc:
+                parsed_entries = False
+                model_exception = exc
 
         now = datetime.now(timezone.utc).isoformat()
         per_kind: dict[str, int] = {}
         normalized: list[tuple[ActorCardEntry, list[ActorCardEntrySource]]] = []
+        rejected: Counter[str] = Counter()
         for item in raw_entries:
             if not isinstance(item, dict):
+                rejected["entry_not_object"] += 1
                 continue
             kind = item.get("kind")
             body = item.get("body")
             sensitivity = item.get("sensitivity", CARD_SENSITIVITY_NORMAL)
             confidence = item.get("confidence")
             fact_ids = item.get("fact_ids")
-            if kind not in CARD_KINDS or sensitivity not in CARD_SENSITIVITIES:
+            if kind not in CARD_KINDS:
+                rejected["invalid_kind"] += 1
+                continue
+            if sensitivity not in CARD_SENSITIVITIES:
+                rejected["invalid_sensitivity"] += 1
                 continue
             if per_kind.get(kind, 0) >= int(
                 self._config.assembler.actor_card_entries_per_kind
             ):
+                rejected["per_kind_limit"] += 1
                 continue
             if not isinstance(body, str) or not body.strip():
+                rejected["invalid_body"] += 1
                 continue
             body = body.strip()
             if (
                 len(body) > CARD_ENTRY_BODY_MAX_CHARS
                 or any(ord(ch) < 32 or ord(ch) == 127 for ch in body)
             ):
+                rejected["invalid_body"] += 1
                 continue
             if isinstance(confidence, bool) or not isinstance(
                 confidence, (int, float)
             ):
+                rejected["invalid_confidence"] += 1
                 continue
             confidence = float(confidence)
             if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+                rejected["invalid_confidence"] += 1
                 continue
             if not isinstance(fact_ids, list) or not fact_ids:
+                rejected["invalid_fact_ids"] += 1
                 continue
             if any(
                 not isinstance(fid, str) or fid not in source_by_id
                 for fid in fact_ids
             ):
+                rejected["unknown_fact_id"] += 1
                 continue
             fact_ids = list(dict.fromkeys(fact_ids))
 
@@ -326,6 +382,69 @@ class CompactionPipeline:
             normalized.append((entry, entry_sources))
             per_kind[kind] = per_kind.get(kind, 0) + 1
 
+        response_hash = (
+            hashlib.sha256(response_text.encode("utf-8")).hexdigest()
+            if response_text
+            else ""
+        )
+
+        def _record_status(outcome: str, *, written_count: int = 0) -> None:
+            recorder = getattr(
+                self._store, "record_actor_card_rebuild_status", None,
+            )
+            if callable(recorder):
+                try:
+                    recorder(
+                        tenant_id,
+                        actor_id,
+                        attempted_at=now,
+                        input_hash=input_hash,
+                        source_count=len(sources),
+                        raw_entry_count=len(raw_entries),
+                        accepted_entry_count=len(normalized),
+                        rejected_counts=dict(sorted(rejected.items())),
+                        outcome=outcome,
+                        response_hash=response_hash,
+                        written_count=written_count,
+                    )
+                except Exception:
+                    logger.warning(
+                        "actor card rebuild status write failed actor=%s",
+                        actor_id[:24],
+                        exc_info=True,
+                    )
+
+        if not parsed_entries:
+            outcome = "model_error" if model_exception is not None else "invalid_response"
+            _record_status(outcome)
+            logger.warning(
+                "ACTOR_CARD_REBUILD actor=%s sources=%d outcome=%s "
+                "response_hash=%s error_type=%s",
+                actor_id[:24],
+                len(sources),
+                outcome,
+                response_hash[:16],
+                type(model_exception).__name__ if model_exception is not None else "",
+            )
+            raise RuntimeError(
+                "actor card curation failed"
+                if model_exception is not None
+                else "actor card curation response has no valid entries array"
+            ) from model_exception
+
+        if raw_entries and not normalized:
+            _record_status("rejected_all")
+            logger.warning(
+                "ACTOR_CARD_REBUILD actor=%s sources=%d raw=%d accepted=0 "
+                "outcome=rejected_all rejected=%s response_hash=%s",
+                actor_id[:24],
+                len(sources),
+                len(raw_entries),
+                json.dumps(dict(sorted(rejected.items())), separators=(",", ":")),
+                response_hash[:16],
+            )
+            raise RuntimeError("actor card curation rejected every model entry")
+
         expected_epochs: dict[str, int] = {}
         for source in sources:
             expected_epochs[source.owner_conversation_id] = (
@@ -345,7 +464,26 @@ class CompactionPipeline:
         if refreshed is None or refreshed.card_dirty or (
             refreshed.card_input_hash != input_hash
         ):
-            return 0
+            _record_status("stale_or_rejected_write", written_count=written)
+            raise RuntimeError("actor card replacement did not commit cleanly")
+        outcome = (
+            "clean_empty"
+            if not normalized
+            else ("partial" if rejected else "written")
+        )
+        _record_status(outcome, written_count=written)
+        logger.info(
+            "ACTOR_CARD_REBUILD actor=%s sources=%d raw=%d accepted=%d "
+            "written=%d outcome=%s rejected=%s response_hash=%s",
+            actor_id[:24],
+            len(sources),
+            len(raw_entries),
+            len(normalized),
+            written,
+            outcome,
+            json.dumps(dict(sorted(rejected.items())), separators=(",", ":")),
+            response_hash[:16],
+        )
         return written
 
     def _physical_rows_by_group(self) -> dict[int, list["CanonicalTurnRow"]]:

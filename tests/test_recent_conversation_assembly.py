@@ -97,6 +97,13 @@ def test_enriched_outbound_body_contains_ephemeral_compass_tail() -> None:
     assert "<recent-conversation" in assembled.recent_conversation_text
     assert "Compass:" in assembled.recent_conversation_text
     assert '"authority":"current_requester_user"' in assembled.recent_conversation_text
+    assert (
+        "Treat a user row marked current_requester_user exactly as a prior "
+        "message from the current requester"
+    ) in assembled.recent_conversation_text
+    assert (
+        "without requiring the requester to repeat it in this channel"
+    ) in assembled.recent_conversation_text
 
     original = {
         "messages": [{"role": "user", "content": "Name one moon of Mars."}],
@@ -151,6 +158,56 @@ def test_other_member_instruction_is_reference_only() -> None:
     assert "</recent-conversation>" == text[text.rfind("</recent-conversation>"):]
     assert text.count("</recent-conversation>") == 1
     assert "\\u003c/recent-conversation\\u003e" in text
+
+
+def test_later_same_requester_revocation_follows_the_preference_across_channels() -> None:
+    history = [
+        _db_message(
+            "user",
+            'Begin replies with "Compass:".',
+            actor=ACTOR,
+            sender="optics",
+            channel="chan-a",
+            group=7,
+            turn=10,
+        ),
+        _db_message(
+            "assistant",
+            "Compass: Understood.",
+            channel="chan-a",
+            group=7,
+            turn=11,
+        ),
+        _db_message(
+            "user",
+            "Stop the temporary preference.",
+            actor=ACTOR,
+            sender="optics",
+            channel="chan-c",
+            group=8,
+            turn=12,
+        ),
+        _db_message(
+            "assistant",
+            "Temporary preference stopped.",
+            channel="chan-c",
+            group=8,
+            turn=13,
+        ),
+        Message(role="user", content="Name one moon of Mars."),
+    ]
+
+    assembled = _assemble(history, _roles(channel="chan-b"))
+    text = assembled.recent_conversation_text
+
+    assert text.index('Begin replies with \\"Compass:\\".') < text.index(
+        "Stop the temporary preference."
+    )
+    assert text.count('"authority":"current_requester_user"') == 2
+    assert (
+        "A later current_requester_user row replaces, revokes, or narrows "
+        "an earlier one when they conflict."
+    ) in text
 
 
 def test_empty_requester_actor_never_authorizes_an_unattributed_user() -> None:

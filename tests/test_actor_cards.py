@@ -230,6 +230,14 @@ def test_compaction_card_builder_curates_and_skips_unchanged_input(store):
         audience_conversation_id="dm", audience_channel_id="chan-dm",
     )
     assert _bodies(card) == ["finish the migration"]
+    status = store.get_actor_card_rebuild_status("t1", OPTICS)
+    assert status is not None
+    assert status["outcome"] == "written"
+    assert status["source_count"] == 2
+    assert status["raw_entry_count"] == 1
+    assert status["accepted_entry_count"] == 1
+    assert status["written_count"] == 1
+    assert status["rejected_counts"] == {}
 
     assert pipeline._rebuild_actor_card(OPTICS) == 0
     assert llm.calls == 1
@@ -266,7 +274,15 @@ def test_compaction_card_builder_rejects_any_unknown_fact_citation(store):
         _parse_response=lambda text: json.loads(text),
     )
 
-    assert pipeline._rebuild_actor_card(OPTICS) == 0
+    with pytest.raises(
+        RuntimeError, match="rejected every model entry",
+    ):
+        pipeline._rebuild_actor_card(OPTICS)
+    assert store.get_actor_profile("t1", OPTICS).card_dirty is True
+    status = store.get_actor_card_rebuild_status("t1", OPTICS)
+    assert status is not None
+    assert status["outcome"] == "rejected_all"
+    assert status["rejected_counts"] == {"unknown_fact_id": 1}
     assert store.get_actor_card(
         "t1", OPTICS, owner_conversation_id="dm",
         audience_conversation_id="dm", audience_channel_id="chan-dm",
@@ -303,11 +319,112 @@ def test_compaction_card_builder_rejects_boolean_confidence(store):
         llm=LLM(), _parse_response=lambda text: json.loads(text),
     )
 
-    assert pipeline._rebuild_actor_card(OPTICS) == 0
+    with pytest.raises(
+        RuntimeError, match="rejected every model entry",
+    ):
+        pipeline._rebuild_actor_card(OPTICS)
+    assert store.get_actor_profile("t1", OPTICS).card_dirty is True
+    status = store.get_actor_card_rebuild_status("t1", OPTICS)
+    assert status is not None
+    assert status["outcome"] == "rejected_all"
+    assert status["rejected_counts"] == {"invalid_confidence": 1}
     assert store.get_actor_card(
         "t1", OPTICS, owner_conversation_id="dm",
         audience_conversation_id="dm", audience_channel_id="chan-dm",
     ) is None
+
+
+@pytest.mark.parametrize("sensitivity", ["none", 0, 1])
+def test_compaction_card_builder_reports_invalid_sensitivity(store, sensitivity):
+    """The malformed values observed in production must not become clean-empty."""
+    from types import SimpleNamespace
+
+    _dm_and_guild(store)
+
+    class LLM:
+        def complete(self, **_kwargs):
+            return json.dumps({"entries": [{
+                "kind": CARD_KIND_COMMUNICATION_PREF,
+                "body": "prefers concise answers",
+                "confidence": 0.8,
+                "sensitivity": sensitivity,
+                "fact_ids": ["f-guild"],
+            }]}), {}
+
+    pipeline = object.__new__(CompactionPipeline)
+    pipeline._store = store
+    pipeline._config = SimpleNamespace(
+        tenant_id="t1",
+        assembler=SimpleNamespace(
+            actor_card_enabled=True,
+            actor_card_fact_limit=60,
+            actor_card_entries_per_kind=3,
+        ),
+        compactor=SimpleNamespace(max_summary_tokens=500),
+    )
+    pipeline._compactor = SimpleNamespace(
+        llm=LLM(), _parse_response=lambda text: json.loads(text),
+    )
+
+    with pytest.raises(
+        RuntimeError, match="rejected every model entry",
+    ):
+        pipeline._rebuild_actor_card(OPTICS)
+
+    assert store.get_actor_profile("t1", OPTICS).card_dirty is True
+    status = store.get_actor_card_rebuild_status("t1", OPTICS)
+    assert status is not None
+    assert status["outcome"] == "rejected_all"
+    assert status["rejected_counts"] == {"invalid_sensitivity": 1}
+
+
+def test_compaction_card_builder_accepts_explicit_clean_empty_and_records_contract(
+    store,
+):
+    """No durable pattern is valid; malformed output is not."""
+    from types import SimpleNamespace
+
+    _dm_and_guild(store)
+
+    class LLM:
+        kwargs = None
+
+        def complete(self, **kwargs):
+            self.kwargs = kwargs
+            return '{"entries":[]}', {}
+
+    llm = LLM()
+    pipeline = object.__new__(CompactionPipeline)
+    pipeline._store = store
+    pipeline._config = SimpleNamespace(
+        tenant_id="t1",
+        assembler=SimpleNamespace(
+            actor_card_enabled=True,
+            actor_card_fact_limit=60,
+            actor_card_entries_per_kind=3,
+        ),
+        compactor=SimpleNamespace(max_summary_tokens=500),
+    )
+    pipeline._compactor = SimpleNamespace(
+        llm=llm, _parse_response=lambda text: json.loads(text),
+    )
+
+    assert pipeline._rebuild_actor_card(OPTICS) == 0
+    assert "exactly the string \"normal\" or \"high\"" in llm.kwargs["system"]
+    assert "temporary, test-only" in llm.kwargs["system"]
+    prompt = json.loads(llm.kwargs["user"])
+    assert prompt["facts"]
+    assert all(
+        isinstance(item["mentioned_at"], str)
+        for item in prompt["facts"]
+    )
+    assert store.get_actor_profile("t1", OPTICS).card_dirty is False
+    status = store.get_actor_card_rebuild_status("t1", OPTICS)
+    assert status is not None
+    assert status["outcome"] == "clean_empty"
+    assert status["source_count"] == 2
+    assert status["raw_entry_count"] == 0
+    assert status["accepted_entry_count"] == 0
 
 
 def test_list_actor_facts_is_tenant_scoped(store):

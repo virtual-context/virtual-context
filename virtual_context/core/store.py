@@ -780,6 +780,29 @@ class ContextStore(ABC):
         """Atomically replace an actor's card and clear its dirty flag."""
         return 0
 
+    def record_actor_card_rebuild_status(
+        self,
+        tenant_id: str,
+        actor_id: str,
+        *,
+        attempted_at: str,
+        input_hash: str,
+        source_count: int,
+        raw_entry_count: int,
+        accepted_entry_count: int,
+        rejected_counts: dict[str, int],
+        outcome: str,
+        response_hash: str,
+        written_count: int,
+    ) -> None:
+        """Persist the latest bounded rebuild diagnostic for one actor."""
+
+    def get_actor_card_rebuild_status(
+        self, tenant_id: str, actor_id: str,
+    ) -> dict | None:
+        """Return the latest bounded rebuild diagnostic for one actor."""
+        return None
+
     def get_actor_card(
         self,
         tenant_id: str,

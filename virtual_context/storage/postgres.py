@@ -1940,7 +1940,8 @@ class PostgresStore(ContextStore):
             # silent privacy failure: delete/merge invalidation would have
             # nothing to invalidate.
             for table in ("actor_profiles", "actor_card_entries",
-                          "actor_card_entry_sources"):
+                          "actor_card_entry_sources",
+                          "actor_card_rebuild_status"):
                 hit = conn.execute(
                     "SELECT to_regclass(%s) AS reg", (f"public.{table}",),
                 ).fetchone()
@@ -2053,6 +2054,25 @@ class PostgresStore(ContextStore):
                 """CREATE INDEX IF NOT EXISTS idx_actor_card_sources_fact
                    ON actor_card_entry_sources(fact_id)"""
             )
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS actor_card_rebuild_status (
+                    tenant_id TEXT NOT NULL,
+                    actor_id TEXT NOT NULL,
+                    attempted_at TEXT NOT NULL,
+                    input_hash TEXT NOT NULL DEFAULT '',
+                    source_count INTEGER NOT NULL DEFAULT 0,
+                    raw_entry_count INTEGER NOT NULL DEFAULT 0,
+                    accepted_entry_count INTEGER NOT NULL DEFAULT 0,
+                    rejected_counts_json TEXT NOT NULL DEFAULT '{}',
+                    outcome TEXT NOT NULL,
+                    response_hash TEXT NOT NULL DEFAULT '',
+                    written_count INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (tenant_id, actor_id),
+                    FOREIGN KEY (tenant_id, actor_id)
+                        REFERENCES actor_profiles(tenant_id, actor_id)
+                        ON DELETE CASCADE
+                )
+            """)
 
     def _ensure_speaker_handle_schema(self) -> None:
         """Create the durable speaker-handle assignment relation.
@@ -10951,6 +10971,71 @@ class PostgresStore(ContextStore):
                     (now, input_hash or "", tenant_id, actor_id),
                 )
                 return written
+
+    def record_actor_card_rebuild_status(
+        self,
+        tenant_id: str,
+        actor_id: str,
+        *,
+        attempted_at: str,
+        input_hash: str,
+        source_count: int,
+        raw_entry_count: int,
+        accepted_entry_count: int,
+        rejected_counts: dict[str, int],
+        outcome: str,
+        response_hash: str,
+        written_count: int,
+    ) -> None:
+        with self.pool.connection() as conn:
+            conn.execute(
+                """INSERT INTO actor_card_rebuild_status
+                       (tenant_id, actor_id, attempted_at, input_hash,
+                        source_count, raw_entry_count, accepted_entry_count,
+                        rejected_counts_json, outcome, response_hash,
+                        written_count)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                   ON CONFLICT (tenant_id, actor_id) DO UPDATE SET
+                       attempted_at = EXCLUDED.attempted_at,
+                       input_hash = EXCLUDED.input_hash,
+                       source_count = EXCLUDED.source_count,
+                       raw_entry_count = EXCLUDED.raw_entry_count,
+                       accepted_entry_count = EXCLUDED.accepted_entry_count,
+                       rejected_counts_json = EXCLUDED.rejected_counts_json,
+                       outcome = EXCLUDED.outcome,
+                       response_hash = EXCLUDED.response_hash,
+                       written_count = EXCLUDED.written_count""",
+                (
+                    tenant_id, actor_id, attempted_at, input_hash,
+                    max(0, int(source_count)), max(0, int(raw_entry_count)),
+                    max(0, int(accepted_entry_count)),
+                    json.dumps(
+                        rejected_counts, sort_keys=True, separators=(",", ":"),
+                    ),
+                    outcome, response_hash, max(0, int(written_count)),
+                ),
+            )
+
+    def get_actor_card_rebuild_status(
+        self, tenant_id: str, actor_id: str,
+    ) -> dict | None:
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                """SELECT * FROM actor_card_rebuild_status
+                    WHERE tenant_id = %s AND actor_id = %s""",
+                (tenant_id, actor_id),
+            ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        try:
+            result["rejected_counts"] = json.loads(
+                result.pop("rejected_counts_json") or "{}"
+            )
+        except (TypeError, ValueError):
+            result["rejected_counts"] = {}
+            result.pop("rejected_counts_json", None)
+        return result
 
     def get_actor_card(
         self,
