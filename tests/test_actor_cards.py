@@ -464,6 +464,9 @@ def test_compaction_card_builder_accepts_explicit_clean_empty_and_records_contra
     assert pipeline._rebuild_actor_card(OPTICS) == 0
     assert "exactly the string \"normal\" or \"high\"" in llm.kwargs["system"]
     assert "temporary, test-only" in llm.kwargs["system"]
+    assert "Every body must be self-contained and unambiguous" in (
+        llm.kwargs["system"]
+    )
     prompt = json.loads(llm.kwargs["user"])
     assert prompt["facts"]
     assert all(
@@ -497,9 +500,11 @@ def test_semantic_admission_rejects_candidate_without_rewriting_card(store):
 
     class Admission:
         prompt = None
+        system = None
 
         def complete(self, **kwargs):
             self.prompt = json.loads(kwargs["user"])
+            self.system = kwargs["system"]
             candidate_id = self.prompt["candidates"][0]["candidate_id"]
             return json.dumps({"decisions": [{
                 "candidate_id": candidate_id,
@@ -530,6 +535,11 @@ def test_semantic_admission_rejects_candidate_without_rewriting_card(store):
     assert admission.prompt["candidates"][0]["body"] == (
         "begin every reply with a temporary probe prefix"
     )
+    assert (
+        "candidate body itself must be self-contained and unambiguous"
+        in admission.system
+    )
+    assert "reject with insufficient_evidence" in admission.system
     assert any(
         message["content"] == "hello"
         for segment in admission.prompt["evidence_segments"]

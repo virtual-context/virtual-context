@@ -225,7 +225,7 @@ class CompactionPipeline:
         ]
         input_hash = hashlib.sha256(json.dumps(
             {
-                "policy": 3,
+                "policy": 4,
                 "admission_model": getattr(
                     self._config.assembler,
                     "actor_card_admission_model",
@@ -277,7 +277,10 @@ class CompactionPipeline:
                 "never use null, \"none\", booleans, or numbers. confidence "
                 "must be a number from 0 through 1. fact_ids must cite only "
                 "provided ids. Use a neutral concise body and do not invent "
-                "identity or intent. "
+                "identity or intent. Every body must be self-contained and "
+                "unambiguous when read without the surrounding transcript; "
+                "include essential referents such as the specific medication, "
+                "goal, or preference rather than a generic placeholder. "
                 "Do not promote temporary, test-only, one-turn, session-only, "
                 "or channel-only instructions into communication_pref or "
                 "interaction_style. Do not retain a preference or goal that a "
@@ -829,7 +832,11 @@ class CompactionPipeline:
             "explicitly establishes durability beyond the current test, "
             "session, and channel, or when consistent natural evidence spans "
             "at least two distinct source segments. Repeated test instructions "
-            "do not establish a pattern. Medical, sexual, financial, "
+            "do not establish a pattern. The immutable candidate body itself "
+            "must be self-contained and unambiguous without relying on the "
+            "surrounding segment; reject with insufficient_evidence when an "
+            "essential referent (such as which medication, goal, or "
+            "preference) is omitted. Medical, sexual, financial, "
             "precise-location, credential, or similarly private material must "
             "be high sensitivity. When uncertain, reject."
         )
