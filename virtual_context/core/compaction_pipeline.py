@@ -59,7 +59,7 @@ class _ActorCardCoverageError(_ActorCardAdmissionError):
 
 
 class _EmptyResponseFallbackProvider:
-    """Use a second independent model only for a refused/empty completion."""
+    """Use a second model for refusal fallback and coverage adjudication."""
 
     def __init__(
         self,
@@ -75,6 +75,11 @@ class _EmptyResponseFallbackProvider:
         self._fallback_model = fallback_model
 
     def complete(self, **kwargs):
+        text, usage, _source = self.complete_with_source(**kwargs)
+        return text, usage
+
+    def complete_with_source(self, **kwargs):
+        """Complete and report which independent model supplied the result."""
         try:
             text, usage = self._primary.complete(**kwargs)
         except LLMProviderError as exc:
@@ -85,16 +90,28 @@ class _EmptyResponseFallbackProvider:
                 self._fallback_model,
                 exc.status_code,
             )
-            return self._fallback.complete(**kwargs)
+            fallback_text, fallback_usage = self._fallback.complete(**kwargs)
+            return fallback_text, fallback_usage, "fallback"
         if isinstance(text, str) and text.strip():
-            return text, usage
+            return text, usage, "primary"
         logger.warning(
             "ACTOR_CARD_ADMISSION_FALLBACK primary_model=%s "
             "fallback_model=%s reason=empty_response",
             self._primary_model,
             self._fallback_model,
         )
-        return self._fallback.complete(**kwargs)
+        fallback_text, fallback_usage = self._fallback.complete(**kwargs)
+        return fallback_text, fallback_usage, "fallback"
+
+    def complete_fallback(self, **kwargs):
+        """Call the independent fallback directly for a coverage tiebreak."""
+        text, usage = self._fallback.complete(**kwargs)
+        if not isinstance(text, str) or not text.strip():
+            logger.warning(
+                "ACTOR_CARD_COVERAGE_ADJUDICATOR_EMPTY model=%s",
+                self._fallback_model,
+            )
+        return text, usage
 
 
 # Lazy-import for _is_stub_content from engine to avoid circular imports.
@@ -1506,88 +1523,157 @@ class CompactionPipeline:
             "actor_turns": actor_turns,
             "evidence_segments": evidence_segments,
         }, separators=(",", ":"))
-        response_text, _usage = provider.complete(
-            system=system,
-            user=user,
-            max_tokens=max(
+        request_kwargs = {
+            "system": system,
+            "user": user,
+            "max_tokens": max(
                 800,
                 min(
                     4000,
                     300 + 250 * len(candidates),
                 ),
             ),
-        )
-        parsed = self._compactor._parse_response(response_text)
-        if (
-            not isinstance(parsed, dict)
-            or set(parsed)
-            != {"substantive", "coverage_reason", "decisions"}
-            or not isinstance(parsed["substantive"], bool)
-            or not isinstance(parsed["coverage_reason"], str)
-            or not isinstance(parsed["decisions"], list)
-        ):
-            raise _ActorCardAdmissionError(
-                "actor-card admission response has invalid coverage shape",
-                response_text,
-            )
-        independently_substantive = parsed["substantive"]
-        valid_coverage_reasons = {
-            "substantive",
-            "greeting_only",
-            "one_off_trivia",
-            "bot_meta_or_test",
-            "no_durable_context",
-            "insufficient_evidence",
         }
-        if (
-            parsed["coverage_reason"] not in valid_coverage_reasons
-            or independently_substantive
-            != (parsed["coverage_reason"] == "substantive")
-        ):
-            raise _ActorCardAdmissionError(
-                "actor-card admission response has invalid coverage decision",
-                response_text,
+        complete_with_source = getattr(provider, "complete_with_source", None)
+        if callable(complete_with_source):
+            response_text, _usage, admission_source = complete_with_source(
+                **request_kwargs,
             )
-        decisions: dict[str, dict] = {}
-        valid_reasons = {
-            "durable",
-            "temporary",
-            "test_probe",
-            "stopped_or_replaced",
-            "completed",
-            "contradicted",
-            "insufficient_evidence",
-            "not_durable",
-            "not_person_card",
-            "explicit_privacy_request",
-        }
-        for decision in parsed["decisions"]:
+        else:
+            response_text, _usage = provider.complete(**request_kwargs)
+            admission_source = "provider"
+
+        def _parse_admission(
+            text: str,
+        ) -> tuple[bool, dict[str, dict]]:
+            parsed = self._compactor._parse_response(text)
             if (
-                not isinstance(decision, dict)
-                or set(decision) != {"candidate_id", "admit", "reason"}
-                or not isinstance(decision.get("candidate_id"), str)
-                or not isinstance(decision.get("admit"), bool)
-                or decision.get("reason") not in valid_reasons
-                or (
-                    bool(decision.get("admit"))
-                    != (decision.get("reason") == "durable")
-                )
-                or decision["candidate_id"] in decisions
+                not isinstance(parsed, dict)
+                or set(parsed)
+                != {"substantive", "coverage_reason", "decisions"}
+                or not isinstance(parsed["substantive"], bool)
+                or not isinstance(parsed["coverage_reason"], str)
+                or not isinstance(parsed["decisions"], list)
             ):
                 raise _ActorCardAdmissionError(
-                    "actor-card admission response contains an invalid decision",
+                    "actor-card admission response has invalid coverage shape",
+                    text,
+                )
+            independently_substantive = parsed["substantive"]
+            valid_coverage_reasons = {
+                "substantive",
+                "greeting_only",
+                "one_off_trivia",
+                "bot_meta_or_test",
+                "no_durable_context",
+                "insufficient_evidence",
+            }
+            if (
+                parsed["coverage_reason"] not in valid_coverage_reasons
+                or independently_substantive
+                != (parsed["coverage_reason"] == "substantive")
+            ):
+                raise _ActorCardAdmissionError(
+                    "actor-card admission response has invalid coverage decision",
+                    text,
+                )
+            decisions: dict[str, dict] = {}
+            valid_reasons = {
+                "durable",
+                "temporary",
+                "test_probe",
+                "stopped_or_replaced",
+                "completed",
+                "contradicted",
+                "insufficient_evidence",
+                "not_durable",
+                "not_person_card",
+                "explicit_privacy_request",
+            }
+            for decision in parsed["decisions"]:
+                if (
+                    not isinstance(decision, dict)
+                    or set(decision) != {"candidate_id", "admit", "reason"}
+                    or not isinstance(decision.get("candidate_id"), str)
+                    or not isinstance(decision.get("admit"), bool)
+                    or decision.get("reason") not in valid_reasons
+                    or (
+                        bool(decision.get("admit"))
+                        != (decision.get("reason") == "durable")
+                    )
+                    or decision["candidate_id"] in decisions
+                ):
+                    raise _ActorCardAdmissionError(
+                        "actor-card admission response contains an invalid decision",
+                        text,
+                    )
+                decisions[decision["candidate_id"]] = decision
+            if set(decisions) != set(eligible):
+                raise _ActorCardAdmissionError(
+                    "actor-card admission response does not cover every candidate",
+                    text,
+                )
+            return independently_substantive, decisions
+
+        independently_substantive, decisions = _parse_admission(response_text)
+        if independently_substantive != curator_substantive:
+            primary_substantive = independently_substantive
+            complete_fallback = getattr(provider, "complete_fallback", None)
+            if (
+                admission_source == "fallback"
+                or not callable(complete_fallback)
+            ):
+                raise _ActorCardCoverageError(
+                    "actor-card curator and admission coverage decisions disagree",
                     response_text,
                 )
-            decisions[decision["candidate_id"]] = decision
-        if set(decisions) != set(eligible):
-            raise _ActorCardAdmissionError(
-                "actor-card admission response does not cover every candidate",
-                response_text,
+            adjudication_text = ""
+            try:
+                adjudication_text, _usage = complete_fallback(**request_kwargs)
+                adjudicated_substantive, adjudicated_decisions = (
+                    _parse_admission(adjudication_text)
+                )
+            except Exception as exc:
+                combined = json.dumps(
+                    {
+                        "primary": response_text,
+                        "adjudicator": (
+                            getattr(exc, "response_text", "")
+                            or adjudication_text
+                        ),
+                        "selected": "error",
+                        "error_type": type(exc).__name__,
+                    },
+                    separators=(",", ":"),
+                )
+                raise _ActorCardAdmissionError(
+                    "actor-card coverage adjudicator failed",
+                    combined,
+                ) from exc
+            # With boolean coverage and an initial disagreement, the third
+            # judgment necessarily agrees with either the curator or the
+            # primary admission model. Select that two-of-three result and
+            # its internally consistent candidate decisions.
+            selected = "primary"
+            if adjudicated_substantive == curator_substantive:
+                independently_substantive = adjudicated_substantive
+                decisions = adjudicated_decisions
+                selected = "curator_fallback"
+            logger.warning(
+                "ACTOR_CARD_COVERAGE_ADJUDICATED curator=%s primary=%s "
+                "fallback=%s selected=%s",
+                curator_substantive,
+                primary_substantive,
+                adjudicated_substantive,
+                selected,
             )
-        if independently_substantive != curator_substantive:
-            raise _ActorCardCoverageError(
-                "actor-card curator and admission coverage decisions disagree",
-                response_text,
+            response_text = json.dumps(
+                {
+                    "primary": response_text,
+                    "adjudicator": adjudication_text,
+                    "selected": selected,
+                },
+                separators=(",", ":"),
             )
 
         admitted: list[

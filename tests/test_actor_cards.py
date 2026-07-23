@@ -280,20 +280,29 @@ def test_actor_card_admission_fallback_only_runs_for_empty_primary():
         fallback_model="fallback",
     )
 
-    assert provider.complete(system="s", user="u", max_tokens=1) == (
+    assert provider.complete_with_source(system="s", user="u", max_tokens=1) == (
         '{"ok":true}',
         {"provider": '{"ok":true}'},
+        "primary",
     )
     assert primary.calls == 1
     assert fallback.calls == 0
 
-    primary.response = " \n "
-    assert provider.complete(system="s", user="u", max_tokens=1) == (
+    assert provider.complete_fallback(system="s", user="u", max_tokens=1) == (
         '{"fallback":true}',
         {"provider": '{"fallback":true}'},
     )
-    assert primary.calls == 2
+    assert primary.calls == 1
     assert fallback.calls == 1
+
+    primary.response = " \n "
+    assert provider.complete_with_source(system="s", user="u", max_tokens=1) == (
+        '{"fallback":true}',
+        {"provider": '{"fallback":true}'},
+        "fallback",
+    )
+    assert primary.calls == 2
+    assert fallback.calls == 2
 
     class ProviderError:
         calls = 0
@@ -1617,6 +1626,172 @@ def test_semantic_admission_rejects_candidate_without_rewriting_card(store):
     assert status["accepted_entry_count"] == 1
     assert status["rejected_counts"] == {}
     assert status["failure_count"] == 3
+
+
+def test_fallback_supplied_initial_judgment_is_not_counted_twice(store):
+    """One fallback model cannot manufacture a 2-of-3 majority."""
+    _single_guild_card_source(store)
+
+    class Curator:
+        def complete(self, **kwargs):
+            entries = [{
+                "kind": CARD_KIND_INTERACTION_STYLE,
+                "body": "I do not talk much.",
+                "confidence": 1.0,
+                "fact_ids": ["f-guild"],
+            }]
+            return json.dumps(
+                _curation_for_visible_fact(kwargs, "f-guild", entries),
+            ), {}
+
+    class EmptyPrimary:
+        calls = 0
+
+        def complete(self, **_kwargs):
+            self.calls += 1
+            return "", {}
+
+    class RejectingFallback:
+        calls = 0
+
+        def complete(self, **kwargs):
+            self.calls += 1
+            prompt = json.loads(kwargs["user"])
+            decisions = [{
+                "candidate_id": candidate["candidate_id"],
+                "admit": False,
+                "reason": "not_durable",
+            } for candidate in prompt["candidates"]]
+            return json.dumps(_admission(decisions)), {}
+
+    primary = EmptyPrimary()
+    fallback = RejectingFallback()
+    admission = _EmptyResponseFallbackProvider(
+        primary,
+        fallback,
+        primary_model="primary",
+        fallback_model="fallback",
+    )
+    pipeline = _card_pipeline(store, Curator(), admission=admission)
+
+    with pytest.raises(RuntimeError, match="semantic admission failed"):
+        pipeline._rebuild_actor_card(OPTICS)
+    assert primary.calls == 1
+    assert fallback.calls == 1
+    status = store.get_actor_card_rebuild_status("t1", OPTICS)
+    assert status is not None
+    assert status["outcome"] == "coverage_disagreement"
+    assert status["response_hash"]
+
+
+def test_coverage_disagreement_uses_fallback_majority_for_clean_empty(store):
+    """Two independent admission models can overrule one curator outlier."""
+    _single_guild_card_source(store)
+
+    class Curator:
+        def complete(self, **kwargs):
+            entries = [{
+                "kind": CARD_KIND_INTERACTION_STYLE,
+                "body": "I do not talk much.",
+                "confidence": 1.0,
+                "fact_ids": ["f-guild"],
+            }]
+            return json.dumps(
+                _curation_for_visible_fact(kwargs, "f-guild", entries),
+            ), {}
+
+    class Admission:
+        primary_calls = 0
+        fallback_calls = 0
+
+        @staticmethod
+        def _rejection(kwargs):
+            prompt = json.loads(kwargs["user"])
+            decisions = [{
+                "candidate_id": candidate["candidate_id"],
+                "admit": False,
+                "reason": "not_durable",
+            } for candidate in prompt["candidates"]]
+            return json.dumps(_admission(decisions)), {}
+
+        def complete(self, **kwargs):
+            self.primary_calls += 1
+            return self._rejection(kwargs)
+
+        def complete_fallback(self, **kwargs):
+            self.fallback_calls += 1
+            return self._rejection(kwargs)
+
+    admission = Admission()
+    pipeline = _card_pipeline(store, Curator(), admission=admission)
+
+    assert pipeline._rebuild_actor_card(OPTICS) == 0
+    assert admission.primary_calls == 1
+    assert admission.fallback_calls == 1
+    assert store.get_actor_profile("t1", OPTICS).card_dirty is False
+    status = store.get_actor_card_rebuild_status("t1", OPTICS)
+    assert status is not None
+    assert status["outcome"] == "clean_empty_filtered"
+    assert status["rejected_counts"] == {"semantic_not_durable": 1}
+
+
+def test_coverage_disagreement_uses_curator_fallback_majority_for_card(store):
+    """The fallback's candidate decisions win with the curator's coverage."""
+    _single_guild_card_source(store)
+    body = "Is leading the Atlas migration."
+
+    class Curator:
+        def complete(self, **kwargs):
+            entries = [{
+                "kind": CARD_KIND_ACTIVE_GOAL,
+                "body": body,
+                "confidence": 0.9,
+                "fact_ids": ["f-guild"],
+            }]
+            return json.dumps(
+                _curation_for_visible_fact(kwargs, "f-guild", entries),
+            ), {}
+
+    class Admission:
+        primary_calls = 0
+        fallback_calls = 0
+
+        def complete(self, **kwargs):
+            self.primary_calls += 1
+            prompt = json.loads(kwargs["user"])
+            decisions = [{
+                "candidate_id": candidate["candidate_id"],
+                "admit": False,
+                "reason": "not_durable",
+            } for candidate in prompt["candidates"]]
+            return json.dumps(_admission(decisions)), {}
+
+        def complete_fallback(self, **kwargs):
+            self.fallback_calls += 1
+            prompt = json.loads(kwargs["user"])
+            decisions = [{
+                "candidate_id": candidate["candidate_id"],
+                "admit": True,
+                "reason": "durable",
+            } for candidate in prompt["candidates"]]
+            return json.dumps(_admission(decisions)), {}
+
+    admission = Admission()
+    pipeline = _card_pipeline(store, Curator(), admission=admission)
+
+    assert pipeline._rebuild_actor_card(OPTICS) == 1
+    assert admission.primary_calls == 1
+    assert admission.fallback_calls == 1
+    assert _bodies(store.get_actor_card(
+        "t1",
+        OPTICS,
+        owner_conversation_id="guild",
+        audience_conversation_id="guild",
+        audience_channel_id="another-guild-channel",
+    )) == [body]
+    status = store.get_actor_card_rebuild_status("t1", OPTICS)
+    assert status is not None
+    assert status["outcome"] == "written"
 
 
 def test_medical_subject_is_admitted_without_a_sensitivity_category(store):
