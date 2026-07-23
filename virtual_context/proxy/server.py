@@ -1710,10 +1710,19 @@ async def prepare_payload(
     _note_prep("merge_consecutive_messages", _merge_stage)
 
     _inject_stage = time.monotonic()
+    _replay_messages = (
+        assembled.recent_conversation_messages
+        if assembled is not None
+        else []
+    )
+    # Native requester continuity is injected only into this outbound copy.
+    # ``body`` and ``_pre_filter_body`` remain the client-owned shapes used by
+    # canonical ingestion, so replayed rows cannot be re-admitted.
+    _replayed_body = fmt.inject_replayed_conversation(body, _replay_messages)
     if api_format == "anthropic" and prepend_text:
         from ..core.provider_adapters import AnthropicAdapter
 
-        enriched_body = copy.deepcopy(body)
+        enriched_body = copy.deepcopy(_replayed_body)
         AnthropicAdapter(api_key="").inject_context(enriched_body, prepend_text)
         if isinstance(enriched_body.get("system"), list):
             enriched_body["system"] = "\n\n".join(
@@ -1722,7 +1731,11 @@ async def prepare_payload(
                 if isinstance(block, dict) and block.get("type") == "text"
             )
     else:
-        enriched_body = _inject_context(body, prepend_text, api_format)
+        enriched_body = _inject_context(
+            _replayed_body,
+            prepend_text,
+            api_format,
+        )
     _note_prep("inject_context", _inject_stage)
 
     # Inject VC paging tools for autonomous mode (formats that support it)
@@ -2196,6 +2209,10 @@ async def prepare_payload(
             _non_virtualizable_floor = fmt._estimate_system_tokens(_pre_filter_body) + fmt.estimate_tools_tokens(_pre_filter_body)
         else:
             _vc_tokens = fmt._count(prepend_text) if prepend_text else 0
+            if assembled is not None:
+                _vc_tokens += int(
+                    assembled.recent_conversation_message_tokens or 0
+                )
             _sys_t, _tools_t = _current_outbound_floor_components(enriched_body)
             _non_virtualizable_floor = _sys_t + _tools_t
         state._last_non_virtualizable_floor = _non_virtualizable_floor

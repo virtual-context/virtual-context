@@ -68,6 +68,13 @@ def _unstamped(role: str, content: str) -> Message:
     return Message(role=role, content=content)
 
 
+def _replayed_pairs(assembled) -> list[tuple[str, str]]:
+    return [
+        (message.role, message.content)
+        for message in assembled.recent_conversation_messages
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Tier 0 off — full no-op
 # ---------------------------------------------------------------------------
@@ -295,9 +302,11 @@ def test_tier3_compass_tail_is_model_visible_but_absent_from_returned_roles(tmp_
         request_roles=roles,
     )
 
-    assert "<recent-conversation" in assembled.prepend_text
-    assert "Compass:" in assembled.prepend_text
-    assert '"authority":"current_requester_user"' in assembled.prepend_text
+    assert assembled.recent_conversation_text == ""
+    assert _replayed_pairs(assembled) == [
+        ("user", 'For future replies, begin with "Compass:".'),
+    ]
+    assert "Compass:" not in assembled.prepend_text
     assert [(m.role, m.content) for m in assembled.conversation_history] == [
         ("user", "Name one moon of Mars."),
     ]
@@ -370,11 +379,11 @@ def test_tier3_db_pair_survives_payload_compaction_offset(tmp_path):
         request_roles=roles,
     )
 
-    recent = assembled.recent_conversation_text
-    assert 'For future replies, begin with \\"test3:\\".' in recent
-    assert "test3: Understood." in recent
-    assert '"authority":"current_requester_user"' in recent
-    assert recent.index("For future replies") < recent.index("test3: Understood.")
+    assert assembled.recent_conversation_text == ""
+    assert _replayed_pairs(assembled) == [
+        ("user", 'For future replies, begin with "test3:".'),
+        ("assistant", "test3: Understood."),
+    ]
     assert [(m.role, m.content) for m in assembled.conversation_history] == [
         ("user", "How are you?"),
     ]
@@ -383,10 +392,8 @@ def test_tier3_db_pair_survives_payload_compaction_offset(tmp_path):
         for m in assembled.conversation_history
     )
     reassembled = eng._retrieval.reassemble_context()
-    assert 'For future replies, begin with \\"test3:\\".' in reassembled
-    assert reassembled.index("For future replies") < reassembled.index(
-        "test3: Understood."
-    )
+    assert reassembled == assembled.prepend_text
+    assert "test3:" not in reassembled
 
 
 @pytest.mark.regression("BUG-045")
@@ -462,15 +469,11 @@ def test_tier3_payload_duplicate_cannot_suppress_db_user_before_offset(tmp_path)
         request_roles=roles,
     )
 
-    recent = assembled.recent_conversation_text
-    assert recent.count(
-        'For future replies, begin with \\"GuildProof73:\\".'
-    ) == 1
-    assert recent.count("GuildProof73: Understood.") == 1
-    assert '"authority":"current_requester_user"' in recent
-    assert recent.index("For future replies") < recent.index(
-        "GuildProof73: Understood."
-    )
+    assert assembled.recent_conversation_text == ""
+    assert _replayed_pairs(assembled) == [
+        ("user", 'For future replies, begin with "GuildProof73:".'),
+        ("assistant", "GuildProof73: Understood."),
+    ]
     assert [(message.role, message.content) for message in assembled.conversation_history] == [
         ("user", "In one sentence, how are you?"),
     ]
@@ -563,15 +566,11 @@ def test_other_channel_engine_history_cannot_suppress_canonical_recent_pair(tmp_
         request_roles=roles,
     )
 
-    recent = assembled.recent_conversation_text
-    assert recent.count(
-        'Keep replies concise and begin with \\"LiveGuild83:\\".'
-    ) == 1
-    assert recent.count("LiveGuild83: Understood.") == 1
-    assert recent.index("Keep replies concise") < recent.index(
-        "LiveGuild83: Understood."
-    )
-    assert '"authority":"current_requester_user"' in recent
+    assert assembled.recent_conversation_text == ""
+    assert _replayed_pairs(assembled) == [
+        ("user", 'Keep replies concise and begin with "LiveGuild83:".'),
+        ("assistant", "LiveGuild83: Understood."),
+    ]
 
 
 @pytest.mark.regression("BUG-046")
@@ -650,6 +649,7 @@ def test_same_channel_payload_twin_still_suppresses_canonical_copy(tmp_path):
     )
 
     assert assembled.recent_conversation_text == ""
+    assert assembled.recent_conversation_messages == []
 
 
 @pytest.mark.regression("BUG-046")
@@ -698,6 +698,7 @@ def test_same_channel_active_tail_race_still_suppresses_db_user(tmp_path):
     )
 
     assert assembled.recent_conversation_text == ""
+    assert assembled.recent_conversation_messages == []
     assert [(message.role, message.content) for message in assembled.conversation_history] == [
         ("user", "Current same-channel question."),
     ]
@@ -771,10 +772,11 @@ def test_tier2_equal_with_payload_offset_forces_canonical_replacement(tmp_path):
         "target-1",
         limit=eng.config.monitor.protected_recent_turns,
     )
-    recent = assembled.recent_conversation_text
-    assert recent.count("Remember the cross-channel instruction.") == 1
-    assert recent.count("Instruction acknowledged.") == 1
-    assert '"authority":"current_requester_user"' in recent
+    assert assembled.recent_conversation_text == ""
+    assert _replayed_pairs(assembled) == [
+        ("user", "Remember the cross-channel instruction."),
+        ("assistant", "Instruction acknowledged."),
+    ]
     assert [(message.role, message.content) for message in assembled.conversation_history] == [
         ("user", "Use it now."),
     ]

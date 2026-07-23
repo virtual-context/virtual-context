@@ -1955,10 +1955,17 @@ class AssembledContext:
     budget_breakdown: dict[str, int] = field(default_factory=dict)
     prepend_text: str = ""
     # Ephemeral, escaped canonical tail rendered inside ``prepend_text``.
-    # It is model-visible for this request but is never added to payload role
-    # messages, which prevents OpenClaw session and canonical re-admission
-    # pollution.
+    # This contains reference-only rows from other guild members. Exact rows
+    # authored by the current requester are carried separately below so they
+    # can retain ordinary user-message authority.
     recent_conversation_text: str = ""
+    # Exact requester-authored canonical rows and their paired assistant
+    # replies, selected for request-local native-role replay. The proxy injects
+    # these only into the outbound enriched copy after the raw ingest body has
+    # been captured; they never enter ``conversation_history`` or canonical
+    # persistence.
+    recent_conversation_messages: list[Message] = field(default_factory=list)
+    recent_conversation_message_tokens: int = 0
     # Rendered requester person card, influence-only. Surfaced so its cost is
     # measurable rather than inferred. Empty with the gate off.
     actor_card_text: str = ""

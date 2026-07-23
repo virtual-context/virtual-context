@@ -12,6 +12,7 @@ import pytest
 
 from virtual_context.proxy.server import (
     ProxyState,
+    SessionState,
     _compute_protected_turn_stats,
     _build_continuation_request,
     _inject_vc_tools,
@@ -19,9 +20,15 @@ from virtual_context.proxy.server import (
     prepare_payload,
 )
 from virtual_context.config import load_config
-from virtual_context.proxy.formats import AnthropicFormat, PayloadTokenCache, PayloadTokenEstimate
+from virtual_context.proxy.formats import (
+    AnthropicFormat,
+    PayloadTokenCache,
+    PayloadTokenEstimate,
+    extract_ingestible_messages,
+)
 from virtual_context.proxy.metrics import ProxyMetrics
 from virtual_context.proxy.handlers import _handle_non_streaming
+from virtual_context.proxy.state import PhaseDecision
 from virtual_context.core.turn_tag_index import TurnTagIndex
 from virtual_context.types import AssembledContext, EngineState, Message, SplitResult, TagResult, TurnTagEntry
 
@@ -753,6 +760,90 @@ class TestPrepareRouting:
         engine.on_message_inbound.return_value = AssembledContext()
         metrics = ProxyMetrics()
         return ProxyState(engine, metrics=metrics), metrics
+
+    def test_native_requester_replay_is_outbound_only(self):
+        state, metrics = self._make_state()
+        raw_seen_by_canonical_ingest: dict = {}
+
+        def _capture_raw_prepare(*, body, **_kwargs):
+            raw_seen_by_canonical_ingest.update(
+                json.loads(json.dumps(body))
+            )
+            return PhaseDecision(phase="active", started_tagger=True)
+
+        state.handle_prepare_payload = _capture_raw_prepare
+        state.resolve_prepare_state = MagicMock(
+            return_value=(SessionState.ACTIVE, None)
+        )
+        state.has_pending_indexing = MagicMock(return_value=False)
+        state.engine.on_message_inbound.return_value = AssembledContext(
+            recent_conversation_messages=[
+                Message(
+                    role="user",
+                    content='For future replies, begin with "Compass:".',
+                    metadata={
+                        "source": "db_recent",
+                        "db_recent_group_key": "canonical:preference",
+                        "turn_group_number": 7,
+                    },
+                ),
+                Message(
+                    role="assistant",
+                    content="Compass: Understood.",
+                    metadata={
+                        "source": "db_recent",
+                        "db_recent_group_key": "canonical:preference",
+                        "turn_group_number": 7,
+                    },
+                ),
+            ],
+            recent_conversation_message_tokens=17,
+        )
+        body = {
+            "model": "claude-opus-4-6",
+            "stream": False,
+            "messages": [
+                {"role": "user", "content": "Earlier local question."},
+                {"role": "assistant", "content": "Earlier local answer."},
+                {"role": "user", "content": "Name one moon of Mars."},
+            ],
+        }
+
+        prepared = asyncio.run(
+            prepare_payload(
+                body,
+                state,
+                AnthropicFormat(),
+                metrics,
+                body_bytes=json.dumps(body).encode("utf-8"),
+            )
+        )
+
+        assert "Compass:" not in json.dumps(raw_seen_by_canonical_ingest)
+        assert "Compass:" not in json.dumps(prepared.body)
+        assert "Compass:" not in json.dumps(prepared.pre_filter_body)
+        assert [
+            (message["role"], message["content"])
+            for message in prepared.enriched_body["messages"][-3:]
+        ] == [
+            ("user", 'For future replies, begin with "Compass:".'),
+            ("assistant", "Compass: Understood."),
+            ("user", "Name one moon of Mars."),
+        ]
+
+        raw_admitted, _ = extract_ingestible_messages(
+            prepared.body,
+            AnthropicFormat(),
+            mode="ingest",
+        )
+        assert all("Compass:" not in message.content for message in raw_admitted)
+        history_passed_to_engine = (
+            state.engine.on_message_inbound.call_args.args[1]
+        )
+        assert all(
+            "Compass:" not in message.content
+            for message in history_passed_to_engine
+        )
 
     def test_prepare_payload_restored_ready_conversation_stays_active(self):
         state, metrics = self._make_state()
