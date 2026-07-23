@@ -225,7 +225,7 @@ class CompactionPipeline:
         ]
         input_hash = hashlib.sha256(json.dumps(
             {
-                "policy": 4,
+                "policy": 5,
                 "admission_model": getattr(
                     self._config.assembler,
                     "actor_card_admission_model",
@@ -280,7 +280,9 @@ class CompactionPipeline:
                 "identity or intent. Every body must be self-contained and "
                 "unambiguous when read without the surrounding transcript; "
                 "include essential referents such as the specific medication, "
-                "goal, or preference rather than a generic placeholder. "
+                "goal, or preference rather than a generic placeholder. Write "
+                "natural person-facing language, not a serialization of "
+                "subject/verb/object fields, ontology names, or tag labels. "
                 "Do not promote temporary, test-only, one-turn, session-only, "
                 "or channel-only instructions into communication_pref or "
                 "interaction_style. Do not retain a preference or goal that a "
@@ -836,7 +838,12 @@ class CompactionPipeline:
             "must be self-contained and unambiguous without relying on the "
             "surrounding segment; reject with insufficient_evidence when an "
             "essential referent (such as which medication, goal, or "
-            "preference) is omitted. Medical, sexual, financial, "
+            "preference) is omitted. The body must be fully entailed by the "
+            "cited actor-authored messages. Compact fact fields and tags help "
+            "locate evidence but cannot independently justify body text. "
+            "Reject with not_person_card when a body exposes internal "
+            "ontology/tag language or serializes a machine fact triple rather "
+            "than stating a natural person fact. Medical, sexual, financial, "
             "precise-location, credential, or similarly private material must "
             "be high sensitivity. When uncertain, reject."
         )

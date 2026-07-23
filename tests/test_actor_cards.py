@@ -467,6 +467,9 @@ def test_compaction_card_builder_accepts_explicit_clean_empty_and_records_contra
     assert "Every body must be self-contained and unambiguous" in (
         llm.kwargs["system"]
     )
+    assert "not a serialization of subject/verb/object fields" in (
+        llm.kwargs["system"]
+    )
     prompt = json.loads(llm.kwargs["user"])
     assert prompt["facts"]
     assert all(
@@ -540,6 +543,8 @@ def test_semantic_admission_rejects_candidate_without_rewriting_card(store):
         in admission.system
     )
     assert "reject with insufficient_evidence" in admission.system
+    assert "Compact fact fields and tags" in admission.system
+    assert "Reject with not_person_card" in admission.system
     assert any(
         message["content"] == "hello"
         for segment in admission.prompt["evidence_segments"]
