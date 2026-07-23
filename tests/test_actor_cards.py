@@ -470,6 +470,12 @@ def test_compaction_card_builder_accepts_explicit_clean_empty_and_records_contra
     assert "not a serialization of subject/verb/object fields" in (
         llm.kwargs["system"]
     )
+    assert "Preserve every material qualifier from the source" in (
+        llm.kwargs["system"]
+    )
+    assert "Do not turn a qualified statement into a broader" in (
+        llm.kwargs["system"]
+    )
     prompt = json.loads(llm.kwargs["user"])
     assert prompt["facts"]
     assert all(
@@ -544,6 +550,9 @@ def test_semantic_admission_rejects_candidate_without_rewriting_card(store):
     )
     assert "reject with insufficient_evidence" in admission.system
     assert "Compact fact fields and tags" in admission.system
+    assert "preserving every material qualifier" in admission.system
+    assert "drops a qualifier, broadens the statement" in admission.system
+    assert "does not entail the unqualified body" in admission.system
     assert "Reject with not_person_card" in admission.system
     assert any(
         message["content"] == "hello"
