@@ -10,13 +10,22 @@ from typing import Callable
 from ..types import DepthLevel, TagSummary, WorkingSetEntry
 
 
+def _minimal_hint(
+    token_counter: Callable[[str], int],
+    max_tokens: int,
+) -> str:
+    """Smallest valid hint, or empty when even the wrapper cannot fit."""
+    value = "<context-topics></context-topics>"
+    return value if max_tokens >= 0 and token_counter(value) <= max_tokens else ""
+
+
 def _largest_fitting_prefix(
     entries: list[str],
     *,
     render: Callable[[list[str]], str],
     token_counter: Callable[[str], int],
     max_tokens: int,
-) -> tuple[list[str], str]:
+) -> tuple[list[str], str, int]:
     """Return the longest prefix whose rendered form fits *max_tokens*.
 
     Hint truncation is tail-only, so the fit predicate is monotonic for the
@@ -48,7 +57,7 @@ def _largest_fitting_prefix(
     while low > 0 and count > max_tokens:
         low -= 1
         value, count = _render_count(low)
-    return entries[:low], value
+    return entries[:low], value, count
 
 
 def build_autonomous_hint(
@@ -172,16 +181,39 @@ def build_autonomous_hint(
         "Scan [all topics]. Never answer without searching first."
     )
 
-    # Compact name-only list of ALL tags — never truncated.
+    # Compact name-only coverage list.  It is complete when it fits and
+    # explicitly reports omissions when the hard hint budget requires a
+    # prefix.  A full unbounded line was able to exceed max_hint_tokens by
+    # itself on large conversations.
     all_tag_names = [ts.tag for ts in tag_summaries]
-    all_topics_line = (
-        f"[all {len(all_tag_names)} topics] "
-        + ", ".join(all_tag_names)
-        + "\nScan before answering — relevant context may be under "
-        "an unexpected topic name."
-    )
+    total_tag_names = len(all_tag_names)
 
-    def _assemble(exp_lines: list[str], avail: list[str], *, compact: bool = False) -> str:
+    def _all_topics_line(names: list[str]) -> str:
+        shown = len(names)
+        header = f"[all {total_tag_names} topics"
+        if shown < total_tag_names:
+            header += f"; showing {shown}"
+        header += "]"
+        entries = (" " + ", ".join(names)) if names else ""
+        omitted = (
+            f"\n{total_tag_names - shown} topic names omitted by the hint "
+            "budget; use search tools or recall_all for complete coverage."
+            if shown < total_tag_names
+            else ""
+        )
+        return (
+            header + entries + omitted
+            + "\nScan before answering — relevant context may be under "
+            "an unexpected topic name."
+        )
+
+    def _assemble(
+        exp_lines: list[str],
+        avail: list[str],
+        all_names: list[str],
+        *,
+        compact: bool = False,
+    ) -> str:
         parts: list[str] = []
         if exp_lines:
             parts.append("[in context \u2014 expand for full detail]")
@@ -193,34 +225,70 @@ def build_autonomous_hint(
                 "[available] " + ", ".join(avail)
             )
         parts.append("")
-        parts.append(all_topics_line)
+        parts.append(_all_topics_line(all_names))
         body = "\n".join(parts)
         rules = _COMPACT_RULES if compact else _RULES
+        tool_footer = (
+            "Tools: find_quote | search_summaries | query_facts | recall_all | "
+            "remember_when | expand_topic"
+            if compact
+            else
+            "Tools: find_quote(query) | search_summaries(query) | "
+            "query_facts(subject?, verb?, status?, object_contains?) | "
+            "recall_all() | remember_when(query, time_range) | "
+            "expand_topic(tag, depth?, collapse_tags?)"
+        )
         return (
             f'<context-topics budget="{budget}" used="{used}"'
             f' available="{budget - used}">\n'
             f"{rules}\n\n"
             f"{body}\n\n"
-            f"Tools: find_quote(query) | search_summaries(query) | "
-            f"query_facts(subject?, verb?, status?, object_contains?) | "
-            f"recall_all() | remember_when(query, time_range) | "
-            f"expand_topic(tag, depth?, collapse_tags?)\n"
+            f"{tool_footer}\n"
             f"</context-topics>"
         )
 
-    hint = _assemble(expanded_lines, available_entries)
+    visible_all_names = list(all_tag_names)
+    hint = _assemble(expanded_lines, available_entries, visible_all_names)
 
     # Truncate: prefer compact boilerplate before dropping any tag entries.
     compact_mode = False
     if token_counter(hint) > max_hint_tokens:
         compact_mode = True
-        hint = _assemble(expanded_lines, available_entries, compact=True)
-    while available_entries and token_counter(hint) > max_hint_tokens:
-        available_entries.pop()
-        hint = _assemble(expanded_lines, available_entries, compact=compact_mode)
-    while expanded_lines and token_counter(hint) > max_hint_tokens:
-        expanded_lines.pop()
-        hint = _assemble(expanded_lines, available_entries, compact=True)
+        hint = _assemble(
+            expanded_lines, available_entries, visible_all_names, compact=True,
+        )
+    if token_counter(hint) > max_hint_tokens:
+        available_entries, hint, hint_count = _largest_fitting_prefix(
+            available_entries,
+            render=lambda entries: _assemble(
+                expanded_lines, entries, visible_all_names, compact=compact_mode,
+            ),
+            token_counter=token_counter,
+            max_tokens=max_hint_tokens,
+        )
+    else:
+        hint_count = token_counter(hint)
+    if hint_count > max_hint_tokens:
+        visible_all_names, hint, hint_count = _largest_fitting_prefix(
+            visible_all_names,
+            render=lambda names: _assemble(
+                expanded_lines, available_entries, names, compact=True,
+            ),
+            token_counter=token_counter,
+            max_tokens=max_hint_tokens,
+        )
+        compact_mode = True
+    if hint_count > max_hint_tokens:
+        expanded_lines, hint, hint_count = _largest_fitting_prefix(
+            expanded_lines,
+            render=lambda entries: _assemble(
+                entries, available_entries, visible_all_names, compact=True,
+            ),
+            token_counter=token_counter,
+            max_tokens=max_hint_tokens,
+        )
+    if hint_count > max_hint_tokens:
+        return _minimal_hint(token_counter, max_hint_tokens)
 
     return hint
 
@@ -253,16 +321,29 @@ def build_supervised_hint(
                 entry += f" — {ts.description}"
             available_entries.append(entry)
 
-    # Compact name-only list of ALL tags — never truncated.
+    # Compact coverage list, strictly bounded with an explicit omission count.
     all_tag_names = [ts.tag for ts in tag_summaries]
-    all_topics_line = (
-        f"[all {len(all_tag_names)} topics] "
-        + ", ".join(all_tag_names)
-        + "\nScan before answering — relevant context may be under "
-        "an unexpected topic name."
-    )
+    total_tag_names = len(all_tag_names)
 
-    def _assemble(exp_lines: list[str], avail: list[str]) -> str:
+    def _all_topics_line(names: list[str]) -> str:
+        shown = len(names)
+        suffix = f"; showing {shown}" if shown < total_tag_names else ""
+        entries = (" " + ", ".join(names)) if names else ""
+        omitted = (
+            f"\n{total_tag_names - shown} topic names omitted by the hint "
+            "budget; use search tools or recall_all for complete coverage."
+            if shown < total_tag_names
+            else ""
+        )
+        return (
+            f"[all {total_tag_names} topics{suffix}]" + entries + omitted
+            + "\nScan before answering — relevant context may be under "
+            "an unexpected topic name."
+        )
+
+    def _assemble(
+        exp_lines: list[str], avail: list[str], all_names: list[str],
+    ) -> str:
         parts: list[str] = []
         if exp_lines:
             parts.append("[in context]")
@@ -272,7 +353,7 @@ def build_supervised_hint(
                 parts.append("")
             parts.append("[available] " + ", ".join(avail))
         parts.append("")
-        parts.append(all_topics_line)
+        parts.append(_all_topics_line(all_names))
         body = "\n".join(parts)
         return (
             "<context-topics>\n"
@@ -318,22 +399,38 @@ def build_supervised_hint(
             "</context-topics>"
         )
 
-    hint = _assemble(expanded_lines, available_entries)
+    visible_all_names = list(all_tag_names)
+    hint = _assemble(expanded_lines, available_entries, visible_all_names)
 
     if token_counter(hint) > max_hint_tokens:
-        available_entries, hint = _largest_fitting_prefix(
+        available_entries, hint, hint_count = _largest_fitting_prefix(
             available_entries,
-            render=lambda entries: _assemble(expanded_lines, entries),
+            render=lambda entries: _assemble(
+                expanded_lines, entries, visible_all_names,
+            ),
             token_counter=token_counter,
             max_tokens=max_hint_tokens,
         )
-        if token_counter(hint) > max_hint_tokens:
-            expanded_lines, hint = _largest_fitting_prefix(
-                expanded_lines,
-                render=lambda entries: _assemble(entries, available_entries),
+        if hint_count > max_hint_tokens:
+            visible_all_names, hint, hint_count = _largest_fitting_prefix(
+                visible_all_names,
+                render=lambda names: _assemble(
+                    expanded_lines, available_entries, names,
+                ),
                 token_counter=token_counter,
                 max_tokens=max_hint_tokens,
             )
+        if hint_count > max_hint_tokens:
+            expanded_lines, hint, hint_count = _largest_fitting_prefix(
+                expanded_lines,
+                render=lambda entries: _assemble(
+                    entries, available_entries, visible_all_names,
+                ),
+                token_counter=token_counter,
+                max_tokens=max_hint_tokens,
+            )
+        if hint_count > max_hint_tokens:
+            return _minimal_hint(token_counter, max_hint_tokens)
 
     return hint
 
@@ -343,14 +440,37 @@ def build_default_hint(
     max_hint_tokens: int,
     token_counter: Callable[[str], int],
 ) -> str:
-    # Compact name-only list of ALL tags — never truncated.
+    # Compact coverage list, strictly bounded with an explicit omission count.
     all_tag_names = [ts.tag for ts in tag_summaries]
-    all_topics_line = (
-        f"[all {len(all_tag_names)} topics] "
-        + ", ".join(all_tag_names)
-        + "\nScan before answering — relevant context may be under "
-        "an unexpected topic name."
-    )
+    total_tag_names = len(all_tag_names)
+
+    def _all_topics_line(names: list[str]) -> str:
+        shown = len(names)
+        suffix = f"; showing {shown}" if shown < total_tag_names else ""
+        entries = (" " + ", ".join(names)) if names else ""
+        omitted = (
+            f"\n{total_tag_names - shown} topic names omitted by the hint "
+            "budget; use retrieval for complete coverage."
+            if shown < total_tag_names
+            else ""
+        )
+        return (
+            f"[all {total_tag_names} topics{suffix}]" + entries + omitted
+            + "\nScan before answering — relevant context may be under "
+            "an unexpected topic name."
+        )
+
+    visible_all_names = list(all_tag_names)
+
+    def _assemble(detail_lines: list[str], names: list[str]) -> str:
+        body = "\n".join(detail_lines)
+        return (
+            "<context-topics>\n"
+            "Prior conversation topics available for recall:\n"
+            f"{body}\n\n"
+            f"{_all_topics_line(names)}\n"
+            "</context-topics>"
+        )
 
     lines: list[str] = []
     for ts in tag_summaries:
@@ -360,25 +480,23 @@ def build_default_hint(
             desc += "..."
         lines.append(f"- {ts.tag} ({turn_count} turns): {desc}")
 
-    body = "\n".join(lines)
-    hint = (
-        "<context-topics>\n"
-        "Prior conversation topics available for recall:\n"
-        f"{body}\n\n"
-        f"{all_topics_line}\n"
-        "</context-topics>"
-    )
+    hint = _assemble(lines, visible_all_names)
 
     if token_counter(hint) > max_hint_tokens:
-        while lines and token_counter(hint) > max_hint_tokens:
-            lines.pop()
-            body = "\n".join(lines)
-            hint = (
-                "<context-topics>\n"
-                "Prior conversation topics available for recall:\n"
-                f"{body}\n\n"
-                f"{all_topics_line}\n"
-                "</context-topics>"
+        lines, hint, hint_count = _largest_fitting_prefix(
+            lines,
+            render=lambda entries: _assemble(entries, visible_all_names),
+            token_counter=token_counter,
+            max_tokens=max_hint_tokens,
+        )
+        if hint_count > max_hint_tokens:
+            visible_all_names, hint, hint_count = _largest_fitting_prefix(
+                visible_all_names,
+                render=lambda names: _assemble(lines, names),
+                token_counter=token_counter,
+                max_tokens=max_hint_tokens,
             )
+        if hint_count > max_hint_tokens:
+            return _minimal_hint(token_counter, max_hint_tokens)
 
     return hint

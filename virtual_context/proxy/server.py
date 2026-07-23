@@ -438,6 +438,7 @@ def _roles_for_active_user(
         reply_target_body=probe.reply_target_body,
         owner_conversation_id=owner,
         audience_conversation_id=audience_conversation_id,
+        origin_channel_id=channel_id,
         audience_channel_id=speaker_channel_id,
         audience_channel_label=channel_label,
     )

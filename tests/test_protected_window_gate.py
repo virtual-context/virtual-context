@@ -16,7 +16,7 @@ import pytest
 
 from virtual_context.config import load_config
 from virtual_context.engine import VirtualContextEngine
-from virtual_context.types import Message
+from virtual_context.types import CanonicalTurnRow, Message, RequestRoles
 
 
 def _make_config(tmp_path, *, mode: str = "merge", conversation_id: str | None = None):
@@ -250,6 +250,52 @@ def test_tier3_db_read_exception_degrades_gracefully(tmp_path):
     # Must not raise — gate degrades to no-merge.
     assembled = eng.on_message_inbound("next", history)
     assert assembled is not None
+
+
+def test_tier3_compass_tail_is_model_visible_but_absent_from_returned_roles(tmp_path):
+    """Pin the real gate -> assembler seam behind the original regression."""
+    eng = _make_participant_engine(tmp_path)
+    assembler = eng._retrieval
+    fake_provider = MagicMock()
+    fake_provider.get_marker.return_value = None
+    assembler._session_state_provider = fake_provider
+    fake_store = MagicMock(wraps=eng._store)
+    fake_store.get_recent_canonical_turns.return_value = [
+        CanonicalTurnRow(
+            conversation_id="target-1",
+            canonical_turn_id="pref-1",
+            turn_number=8,
+            turn_group_number=4,
+            sort_key=8.0,
+            user_content='For future replies, begin with "Compass:".',
+            sender="optics",
+            sender_actor_id="actor:discord:42",
+            origin_channel_id="chan-a",
+            origin_channel_label="#alpha",
+            audience_conversation_id="source-a",
+        ),
+    ]
+    assembler._store = fake_store
+    active = Message(role="user", content="Name one moon of Mars.")
+    roles = RequestRoles(
+        requester_actor_id="actor:discord:42",
+        owner_conversation_id="target-1",
+        audience_conversation_id="source-b",
+        origin_channel_id="chan-b",
+    )
+
+    assembled = eng.on_message_inbound(
+        active.content,
+        [active],
+        request_roles=roles,
+    )
+
+    assert "<recent-conversation" in assembled.prepend_text
+    assert "Compass:" in assembled.prepend_text
+    assert '"authority":"current_requester_user"' in assembled.prepend_text
+    assert [(m.role, m.content) for m in assembled.conversation_history] == [
+        ("user", "Name one moon of Mars."),
+    ]
 
 
 # ---------------------------------------------------------------------------

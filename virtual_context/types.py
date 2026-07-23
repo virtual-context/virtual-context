@@ -802,6 +802,11 @@ class RequestRoles:
     # routed through a VCMERGE alias. An unproved route stays empty and reads
     # no card — silently substituting the owner is the DM-to-guild leak.
     audience_conversation_id: str = ""
+    # The physical group-channel id observed on this request before alias
+    # resolution.  Unlike ``audience_channel_id`` this is never blanked by
+    # speaker-roster scoping preferences.  A non-empty value is the proof that
+    # raw recent group history may be mirrored; DMs intentionally carry none.
+    origin_channel_id: str = ""
     audience_channel_id: str = ""
     audience_channel_label: str = ""
 
@@ -1949,6 +1954,11 @@ class AssembledContext:
     total_tokens: int = 0
     budget_breakdown: dict[str, int] = field(default_factory=dict)
     prepend_text: str = ""
+    # Ephemeral, escaped canonical tail rendered inside ``prepend_text``.
+    # It is model-visible for this request but is never added to payload role
+    # messages, which prevents OpenClaw session and canonical re-admission
+    # pollution.
+    recent_conversation_text: str = ""
     # Rendered requester person card, influence-only. Surfaced so its cost is
     # measurable rather than inferred. Empty with the gate off.
     actor_card_text: str = ""
