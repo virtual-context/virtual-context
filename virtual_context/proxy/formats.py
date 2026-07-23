@@ -819,6 +819,148 @@ class PayloadFormat(ABC):
     def inject_context(self, body: dict, prepend_text: str) -> dict:
         ...
 
+    def _serialize_replayed_message(self, role: str, content: str) -> dict:
+        """Build one provider-native text message for ephemeral replay."""
+        return {"role": role, "content": content}
+
+    @staticmethod
+    def _normalized_conversation_role(item: dict) -> str:
+        role = item.get("role", "")
+        if role in ("user", "human"):
+            return "user"
+        if role in ("assistant", "model"):
+            return "assistant"
+        return ""
+
+    @staticmethod
+    def _replay_group_key(message, index: int) -> tuple[object, ...]:
+        """Return the assembler's request-local logical replay group key."""
+        metadata = (
+            message.metadata
+            if isinstance(getattr(message, "metadata", None), dict)
+            else {}
+        )
+        unique_key = metadata.get("db_recent_group_key")
+        if isinstance(unique_key, str) and unique_key:
+            return ("canonical", unique_key)
+        raw_group = metadata.get("turn_group_number")
+        if isinstance(raw_group, int) and raw_group >= 0:
+            return ("legacy", raw_group)
+        canonical_id = metadata.get("canonical_turn_id")
+        if isinstance(canonical_id, str) and canonical_id:
+            return ("row", canonical_id)
+        # Metadata-free callers retain the ordinary user-starts-a-turn shape.
+        role = getattr(message, "role", "")
+        return ("position", index) if role == "user" else ("position", index - 1)
+
+    @staticmethod
+    def _contains_ordered_fingerprints(
+        haystack: list[tuple[str, str] | None],
+        needle: list[tuple[str, str]],
+    ) -> bool:
+        """Return whether one complete replay group already appears in order."""
+        if not needle or len(needle) > len(haystack):
+            return False
+        width = len(needle)
+        return any(
+            haystack[start : start + width] == needle
+            for start in range(len(haystack) - width + 1)
+        )
+
+    def inject_replayed_conversation(
+        self,
+        body: dict,
+        replay_messages: list,
+    ) -> dict:
+        """Insert exact prior requester turns into the outbound copy only.
+
+        The caller invokes this after the raw request has been captured and
+        after canonical ingestion has examined the client body. No internal
+        metadata is serialized. Other-member rows never reach this method.
+        """
+        if not replay_messages:
+            return body
+        body = copy.deepcopy(body)
+        items = self.get_messages(body)
+        if not isinstance(items, list):
+            return body
+
+        # Insert immediately before the active conversational user message.
+        # A tool_result carrier is not a valid insertion boundary because
+        # splitting its tool chain would make the provider payload invalid.
+        active_user_index = None
+        for index in range(len(items) - 1, -1, -1):
+            item = items[index]
+            if not isinstance(item, dict):
+                continue
+            if (
+                self._normalized_conversation_role(item) == "user"
+                and self._is_conversational_message(item)
+            ):
+                active_user_index = index
+                break
+        if active_user_index is None:
+            return body
+
+        # The protected-window merge normally removes same-channel canonical
+        # twins before assembly. Exact ordered *group* dedup is a final
+        # outbound-only guard for callers whose payload metadata could not be
+        # stamped. Row-at-a-time dedup is intentionally forbidden: a repeated
+        # user sentence must never be dropped while its assistant half remains.
+        existing: list[tuple[str, str] | None] = []
+        for item in items[:active_user_index]:
+            if not isinstance(item, dict):
+                existing.append(None)
+                continue
+            role = self._normalized_conversation_role(item)
+            if not role or not self._is_conversational_message(item):
+                existing.append(None)
+                continue
+            existing.append((role, self.extract_message_text(item)))
+
+        serialized: list[dict] = []
+        groups: list[list] = []
+        current_group: list = []
+        current_key: tuple[object, ...] | None = None
+        for index, message in enumerate(replay_messages):
+            key = self._replay_group_key(message, index)
+            if current_group and key != current_key:
+                groups.append(current_group)
+                current_group = []
+            current_key = key
+            current_group.append(message)
+        if current_group:
+            groups.append(current_group)
+
+        for group in groups:
+            normalized: list[tuple[str, str]] = []
+            for message in group:
+                role = getattr(message, "role", "")
+                content = getattr(message, "content", "")
+                if role not in ("user", "assistant"):
+                    continue
+                if not isinstance(content, str) or not content:
+                    continue
+                normalized.append((role, content))
+            if not normalized:
+                continue
+            if self._contains_ordered_fingerprints(existing, normalized):
+                continue
+            serialized.extend(
+                self._serialize_replayed_message(role, content)
+                for role, content in normalized
+            )
+            existing.extend(normalized)
+        if not serialized:
+            return body
+
+        items[active_user_index:active_user_index] = serialized
+        body[self._get_message_key(body)] = items
+        # Strict-alternation providers accept the merged result; tool messages
+        # are never merged by this helper.
+        self.merge_consecutive_conversational(body)
+        return body
+
     # -- Conversation markers -----------------------------------------------------
 
     @abstractmethod
@@ -2455,6 +2597,12 @@ class GeminiFormat(PayloadFormat):
     def name(self) -> str:
         return "gemini"
 
+    def _serialize_replayed_message(self, role: str, content: str) -> dict:
+        return {
+            "role": "model" if role == "assistant" else "user",
+            "parts": [{"text": content}],
+        }
+
     # -- helpers --
 
     @staticmethod
@@ -2917,6 +3065,47 @@ class OpenAIResponsesFormat(PayloadFormat):
     @property
     def name(self) -> str:
         return "openai_responses"
+
+    def _serialize_replayed_message(self, role: str, content: str) -> dict:
+        return {
+            "type": "message",
+            "role": role,
+            "content": [
+                {
+                    "type": "output_text" if role == "assistant" else "input_text",
+                    "text": content,
+                }
+            ],
+        }
+
+    def inject_replayed_conversation(
+        self,
+        body: dict,
+        replay_messages: list,
+    ) -> dict:
+        """Normalize supported string input before native replay insertion.
+
+        ``get_messages`` exposes string-valued Responses input as a synthetic
+        one-message list for read-only extraction. The base insertion helper
+        must instead operate on a list physically owned by ``body``; otherwise
+        it would create an invalid sibling ``messages`` field. Conversion is
+        outbound-only because both this override and the base helper copy.
+        """
+        if replay_messages and isinstance(body.get("input"), str):
+            body = copy.deepcopy(body)
+            body["input"] = [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": body["input"],
+                        }
+                    ],
+                }
+            ]
+        return super().inject_replayed_conversation(body, replay_messages)
 
     # -- helpers --
 
