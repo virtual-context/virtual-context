@@ -43,6 +43,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_ACTOR_CARD_CITATION_LIMIT = 16
+
 
 class _ActorCardAdmissionError(RuntimeError):
     """Validation failure that preserves a hashable, non-logged response."""
@@ -237,6 +239,7 @@ class CompactionPipeline:
             CARD_SCOPE_CROSS_CONTEXT,
             CARD_SCOPE_SAME_CONVERSATION,
             CARD_SENSITIVITIES,
+            CARD_SENSITIVITY_HIGH,
             CARD_SENSITIVITY_NORMAL,
             ActorCardEntry,
             ActorCardEntrySource,
@@ -306,7 +309,7 @@ class CompactionPipeline:
             )
             digest = hashlib.sha256(json.dumps(
                 {
-                    "policy": 7,
+                    "policy": 8,
                     "curation_model": curation_model,
                     "admission_model": getattr(
                         self._config.assembler,
@@ -392,11 +395,15 @@ class CompactionPipeline:
         # it clears the marker and makes the transactional replacement fail.
         fact_sources, turn_sources, input_hash = _read_inputs()
 
-        fact_source_by_id = {
-            source.fact.id: source for source in fact_sources
+        fact_source_by_audience_id = {
+            (source.audience_conversation_id, source.fact.id): source
+            for source in fact_sources
         }
-        turn_source_by_id = {
-            source.turn.canonical_turn_id: source
+        turn_source_by_audience_id = {
+            (
+                source.audience_conversation_id,
+                source.turn.canonical_turn_id,
+            ): source
             for source in turn_sources
         }
         raw_entries: list[tuple[str, dict, set[str]]] = []
@@ -464,6 +471,7 @@ class CompactionPipeline:
             str,
             list[tuple[ActorCardEntry, list[ActorCardEntrySource]]],
         ] = {}
+        normalized_entries_by_key: dict[tuple, ActorCardEntry] = {}
         rejected: Counter[str] = Counter()
         for audience_id, item, prompt_turn_ids in raw_entries:
             if not isinstance(item, dict):
@@ -492,11 +500,6 @@ class CompactionPipeline:
                 rejected["invalid_sensitivity"] += 1
                 continue
             quota_key = (audience_id, kind)
-            if per_audience_kind.get(quota_key, 0) >= int(
-                self._config.assembler.actor_card_entries_per_kind
-            ):
-                rejected["per_kind_limit"] += 1
-                continue
             if not isinstance(body, str) or not body.strip():
                 rejected["invalid_body"] += 1
                 continue
@@ -519,30 +522,82 @@ class CompactionPipeline:
             if not isinstance(fact_ids, list):
                 rejected["invalid_fact_ids"] += 1
                 continue
-            if any(
-                not isinstance(fid, str)
-                or fid not in fact_source_by_id
-                or fact_source_by_id[fid].audience_conversation_id
-                != audience_id
-                for fid in fact_ids
-            ):
-                rejected["unknown_or_cross_audience_fact_id"] += 1
-                continue
-            fact_ids = list(dict.fromkeys(fact_ids))
             if not isinstance(turn_ids, list):
                 rejected["invalid_turn_ids"] += 1
                 continue
-            if any(
-                not isinstance(turn_id, str)
-                or turn_id not in turn_source_by_id
-                or turn_id not in prompt_turn_ids
-                or turn_source_by_id[turn_id].audience_conversation_id
-                != audience_id
-                for turn_id in turn_ids
-            ):
+            if any(not isinstance(fid, str) for fid in fact_ids):
+                rejected["invalid_fact_ids"] += 1
+                continue
+            if any(not isinstance(turn_id, str) for turn_id in turn_ids):
+                rejected["invalid_turn_ids"] += 1
+                continue
+
+            # Some otherwise schema-compliant curators copy a canonical turn
+            # id into both citation arrays. IDs are opaque, so repair only the
+            # case that is structurally provable from this exact partition:
+            # an id placed in the wrong namespace must resolve as a visible
+            # source in the other namespace under the same audience. Truly
+            # unknown or cross-audience ids still reject the whole entry.
+            normalized_fact_ids: list[str] = []
+            normalized_turn_ids: list[str] = []
+
+            def _valid_fact_id(source_id: str) -> bool:
+                return (
+                    audience_id,
+                    source_id,
+                ) in fact_source_by_audience_id
+
+            def _valid_turn_id(source_id: str) -> bool:
+                return bool(
+                    source_id in prompt_turn_ids
+                    and (
+                        audience_id,
+                        source_id,
+                    ) in turn_source_by_audience_id
+                )
+
+            unknown_fact_id = False
+            for source_id in dict.fromkeys(fact_ids):
+                if _valid_fact_id(source_id):
+                    normalized_fact_ids.append(source_id)
+                elif _valid_turn_id(source_id):
+                    normalized_turn_ids.append(source_id)
+                else:
+                    unknown_fact_id = True
+                    break
+            if unknown_fact_id:
+                rejected["unknown_or_cross_audience_fact_id"] += 1
+                continue
+
+            unknown_turn_id = False
+            for source_id in dict.fromkeys(turn_ids):
+                if _valid_turn_id(source_id):
+                    normalized_turn_ids.append(source_id)
+                elif _valid_fact_id(source_id):
+                    normalized_fact_ids.append(source_id)
+                else:
+                    unknown_turn_id = True
+                    break
+            if unknown_turn_id:
                 rejected["unknown_or_cross_audience_turn_id"] += 1
                 continue
-            turn_ids = list(dict.fromkeys(turn_ids))
+
+            fact_ids = list(dict.fromkeys(normalized_fact_ids))
+            turn_ids = list(dict.fromkeys(normalized_turn_ids))
+            # Citation order has no semantics. Canonicalize it before both
+            # bounding and identity so even over-limit reordered copies retain
+            # the same exact source subset and cannot evade deduplication.
+            fact_ids = sorted(fact_ids)
+            turn_ids = sorted(turn_ids)
+            if (
+                len(fact_ids) + len(turn_ids)
+                > _ACTOR_CARD_CITATION_LIMIT
+            ):
+                remaining = _ACTOR_CARD_CITATION_LIMIT
+                fact_ids = fact_ids[:remaining]
+                remaining -= len(fact_ids)
+                turn_ids = turn_ids[:remaining]
+                rejected["citations_trimmed"] += 1
             if not fact_ids and not turn_ids:
                 rejected["missing_citations"] += 1
                 continue
@@ -563,18 +618,55 @@ class CompactionPipeline:
                 sensitivity=sensitivity, audience_scope=scope,
                 created_at=now, updated_at=now,
             )
+            semantic_key = (
+                audience_id,
+                kind,
+                body,
+                tuple(fact_ids),
+                tuple(turn_ids),
+            )
+            existing_entry = normalized_entries_by_key.get(semantic_key)
+            if existing_entry is not None:
+                # Duplicate model candidates are one immutable claim. Keep the
+                # most conservative sensitivity and strongest confidence
+                # regardless of curator output order.
+                existing_entry.confidence = max(
+                    existing_entry.confidence,
+                    entry.confidence,
+                )
+                if (
+                    existing_entry.sensitivity == CARD_SENSITIVITY_HIGH
+                    or entry.sensitivity == CARD_SENSITIVITY_HIGH
+                ):
+                    existing_entry.sensitivity = CARD_SENSITIVITY_HIGH
+                    existing_entry.audience_scope = (
+                        CARD_SCOPE_SAME_CONVERSATION
+                    )
+                rejected["duplicate_entry"] += 1
+                continue
+            if per_audience_kind.get(quota_key, 0) >= int(
+                self._config.assembler.actor_card_entries_per_kind
+            ):
+                rejected["per_kind_limit"] += 1
+                continue
             entry_sources = [
                 ActorCardEntrySource(
                     entry_id=entry.id,
                     tenant_id=tenant_id,
                     owner_conversation_id=(
-                        fact_source_by_id[fid].owner_conversation_id
+                        fact_source_by_audience_id[
+                            (audience_id, fid)
+                        ].owner_conversation_id
                     ),
                     audience_conversation_id=(
-                        fact_source_by_id[fid].audience_conversation_id
+                        fact_source_by_audience_id[
+                            (audience_id, fid)
+                        ].audience_conversation_id
                     ),
                     audience_channel_id=(
-                        fact_source_by_id[fid].audience_channel_id
+                        fact_source_by_audience_id[
+                            (audience_id, fid)
+                        ].audience_channel_id
                     ),
                     fact_id=fid,
                 )
@@ -585,18 +677,25 @@ class CompactionPipeline:
                     entry_id=entry.id,
                     tenant_id=tenant_id,
                     owner_conversation_id=(
-                        turn_source_by_id[turn_id].owner_conversation_id
+                        turn_source_by_audience_id[
+                            (audience_id, turn_id)
+                        ].owner_conversation_id
                     ),
                     audience_conversation_id=(
-                        turn_source_by_id[turn_id].audience_conversation_id
+                        turn_source_by_audience_id[
+                            (audience_id, turn_id)
+                        ].audience_conversation_id
                     ),
                     audience_channel_id=(
-                        turn_source_by_id[turn_id].audience_channel_id
+                        turn_source_by_audience_id[
+                            (audience_id, turn_id)
+                        ].audience_channel_id
                     ),
                     canonical_turn_id=turn_id,
                 )
                 for turn_id in turn_ids
             )
+            normalized_entries_by_key[semantic_key] = entry
             normalized.append((entry, entry_sources))
             normalized_by_audience.setdefault(audience_id, []).append(
                 (entry, entry_sources)
@@ -899,7 +998,11 @@ class CompactionPipeline:
             "numbers. confidence must be a number from 0 through 1. fact_ids "
             "and turn_ids must be arrays, may individually be empty, and "
             "together must cite at least one provided id that fully supports "
-            "the body. Use a neutral concise body and do not invent identity "
+            f"the body. Use at most {_ACTOR_CARD_CITATION_LIMIT} citation ids "
+            "total per entry. Put "
+            "fact ids only in fact_ids and turn ids only in turn_ids; never "
+            "copy an id into both arrays. Obey entries_per_kind as a hard "
+            "maximum. Use a neutral concise body and do not invent identity "
             "or intent. Every body must be self-contained and unambiguous when "
             "read without the surrounding transcript; include essential "
             "referents such as the specific medication, goal, preference, or "
@@ -920,6 +1023,9 @@ class CompactionPipeline:
             "relevant_history for concise, useful continuity about a "
             "meaningful topic this actor actually discussed with the agent "
             "when no narrower durable preference or goal is justified. "
+            "An isolated, underspecified follow-up whose missing referent "
+            "cannot be recovered from the supplied evidence is insufficient "
+            "for relevant_history, even if it sounds medical or important. "
             "Medical, sexual, financial, precise-location, credential, or "
             "similarly private personal material must be sensitivity \"high\". "
             "Ordinary non-private communication and interaction style may be "
@@ -938,7 +1044,13 @@ class CompactionPipeline:
         response_text, _usage = self._compactor.llm.complete(
             system=system,
             user=user,
-            max_tokens=self._config.compactor.max_summary_tokens,
+            max_tokens=max(
+                2000,
+                min(
+                    4000,
+                    2 * int(self._config.compactor.max_summary_tokens),
+                ),
+            ),
         )
         parsed = self._compactor._parse_response(response_text)
         valid_coverage_reasons = {
