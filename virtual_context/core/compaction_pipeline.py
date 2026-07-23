@@ -609,11 +609,12 @@ class CompactionPipeline:
         *,
         max_chars: int = 64_000,
     ) -> tuple[list[dict], set[tuple[str, str]]]:
-        """Return bounded, actor-authored source turns for semantic admission.
+        """Return bounded actor-authored turns from candidate-cited segments.
 
         Selection is provenance-based: canonical actor ids and segment source
         mappings decide which messages are evidence. Message text is never
-        regex-classified.
+        regex-classified. Uncited segments remain available to the admission
+        model as compact facts, not as unrelated raw conversation text.
         """
         source_by_id = {source.fact.id: source for source in sources}
         candidate_refs = {
@@ -638,7 +639,11 @@ class CompactionPipeline:
         for source in sources:
             ref = source.fact.segment_ref
             ref_key = (source.owner_conversation_id, ref)
-            if not ref or ref_key in by_ref:
+            if (
+                not ref
+                or ref_key not in candidate_refs
+                or ref_key in by_ref
+            ):
                 continue
             segment = self._store.get_segment(
                 ref,
@@ -683,14 +688,12 @@ class CompactionPipeline:
                     "segment_ref": ref,
                     "messages": messages,
                     "_newest_time": newest_time,
-                    "_candidate_source": ref_key in candidate_refs,
                 }
 
         ordered = sorted(
             by_ref.values(),
             key=lambda item: (
                 -item["_newest_time"],
-                not item["_candidate_source"],
                 item["owner_conversation_id"],
                 item["segment_ref"],
             ),
@@ -803,7 +806,10 @@ class CompactionPipeline:
             "card. Candidate bodies are immutable: you may admit or reject "
             "them and correct sensitivity, but you may not invent, rewrite, "
             "or merge candidates. Use only actor-authored facts and source "
-            "messages. Return JSON only with exactly one top-level key, "
+            "messages. All available compact facts are supplied so later "
+            "facts can revoke or replace a candidate; raw source messages are "
+            "limited to the segments the candidate cites. Return JSON only "
+            "with exactly one top-level key, "
             "decisions. Return exactly one decision for every candidate, with "
             "exactly candidate_id, admit, sensitivity, and reason. admit must "
             "be a boolean and sensitivity must be exactly \"normal\" or "
