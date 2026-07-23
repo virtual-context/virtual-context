@@ -1,8 +1,10 @@
 """Unit tests for canonical_turn_id / turn_number stamping at ingest time.
 
-Covers ``_stamp_canonical_turn_ids`` and ``_last_already_canonical_turn_number``
-from ``virtual_context.core.protected_window``. Pure helpers — no engine,
-store, or proxy-state dependency.
+Covers ``_stamp_canonical_turn_ids``,
+``_drop_active_tail_ingest_rows``, and
+``_last_already_canonical_turn_number`` from
+``virtual_context.core.protected_window``. Pure helpers — no engine, store,
+or proxy-state dependency.
 """
 
 from __future__ import annotations
@@ -10,6 +12,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from virtual_context.core.protected_window import (
+    _drop_active_tail_ingest_rows,
     _last_already_canonical_turn_number,
     _stamp_canonical_turn_ids,
 )
@@ -87,6 +90,26 @@ def test_stamp_skips_rows_without_canonical_id() -> None:
     _stamp_canonical_turn_ids(msgs, rows)
     assert msgs[0].metadata is None
     assert msgs[1].metadata == {"canonical_turn_id": "c2", "turn_number": 1}
+
+
+# ---------------------------------------------------------------------------
+# _drop_active_tail_ingest_rows
+# ---------------------------------------------------------------------------
+
+
+def test_drop_active_tail_equal_to_all_rows_returns_empty() -> None:
+    rows = [_row("active", 9)]
+    assert _drop_active_tail_ingest_rows(rows, 1) == []
+
+
+def test_drop_active_tail_keeps_completed_prefix() -> None:
+    rows = [_row("u", 7), _row("a", 8), _row("active", 9)]
+    assert _drop_active_tail_ingest_rows(rows, 1) == rows[:2]
+
+
+def test_drop_active_tail_zero_is_identity_view() -> None:
+    rows = [_row("u", 7), _row("a", 8)]
+    assert _drop_active_tail_ingest_rows(rows, 0) == rows
 
 
 # ---------------------------------------------------------------------------
