@@ -948,6 +948,31 @@ class TestContextHintModes:
         count = sum(1 for i in range(50) if f"topic-{i:03d}" in hint)
         assert count >= 25, f"Only {count}/50 tags fit in supervised mode"
 
+    def test_supervised_hint_large_truncation_uses_bounded_token_counts(self, tmp_path):
+        """Large topic lists must not tokenize once per discarded tag."""
+        engine = self._make_engine(tmp_path, paging_enabled=True)
+        for i in range(1600):
+            engine._store.save_tag_summary(TagSummary(
+                tag=f"topic-{i:04d}",
+                summary="Detailed discussion of a production topic.",
+                description=("Production topic description " * 4).strip(),
+                summary_tokens=12,
+                source_turn_numbers=[i],
+            ), conversation_id=engine.config.conversation_id)
+
+        calls = 0
+
+        def counting_estimator(text):
+            nonlocal calls
+            calls += 1
+            return max(1, len(text) // 4) if text else 0
+
+        engine._retrieval._token_counter = counting_estimator
+        hint = engine._retrieval._build_context_hint(paging_mode="supervised")
+
+        assert hint.startswith("<context-topics>")
+        assert calls <= 24, f"large hint used {calls} full token-count passes"
+
     def test_autonomous_hint_includes_description(self, tmp_path):
         """Autonomous hint includes ts.description when available."""
         engine = self._make_engine(tmp_path, paging_enabled=True)

@@ -773,6 +773,7 @@ class RetrievalAssembler:
         paging_mode: str | None = None,
         *,
         instrumentation: dict[str, object] | None = None,
+        force_rebuild: bool = False,
     ) -> str:
         """Build a topic list for post-compaction prompts.
 
@@ -795,6 +796,12 @@ class RetrievalAssembler:
         the instrumentation entirely with no per-call overhead beyond
         the parameter check.
 
+        *force_rebuild* bypasses both cache reads while still publishing the
+        freshly rendered hint to both cache layers.  Compaction pre-warm uses
+        this path because a derived-data rebuild can return to the same state
+        fingerprint while changing the tag summaries behind it; accepting a
+        same-key cache hit there would preserve stale topic content.
+
         Returns empty string if compaction hasn't occurred or the feature is disabled.
         """
         if not self.config.assembler.context_hint_enabled:
@@ -808,11 +815,16 @@ class RetrievalAssembler:
             paging_mode = self._resolve_paging_mode()
 
         cache_key = self._build_context_hint_cache_key(paging_mode)
-        if cache_key and cache_key == self._context_hint_cache_key:
+        if (
+            not force_rebuild
+            and cache_key
+            and cache_key == self._context_hint_cache_key
+        ):
             return self._context_hint_cache_value
         _cache_load_ms: float | None = None
         if (
-            cache_key
+            not force_rebuild
+            and cache_key
             and self._session_state_provider is not None
             and self.config.conversation_id
         ):
@@ -856,7 +868,9 @@ class RetrievalAssembler:
                 getattr(self._engine_state, "conversation_generation", 0) or 0
             )
             instrumentation["working_set_size"] = len(self._paging.working_set)
-            instrumentation["cache_layer"] = "both_miss"
+            instrumentation["cache_layer"] = (
+                "forced_rebuild" if force_rebuild else "both_miss"
+            )
             if _cache_load_ms is not None:
                 instrumentation["load_context_hint_cache_ms"] = _cache_load_ms
 
@@ -951,6 +965,7 @@ class RetrievalAssembler:
         hint = self._build_context_hint(
             paging_mode=paging_mode,
             instrumentation=instrumentation,
+            force_rebuild=True,
         )
         logger.info(
             "CONTEXT_HINT_PREWARM conv=%s mode=%s bytes=%d total_ms=%s %s",
