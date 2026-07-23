@@ -310,8 +310,20 @@ def test_rebuild_actor_cards_runs_while_read_gate_is_dark(tmp_path):
                 "fact_ids": ["fact-card"],
             }]}), {}
 
+    class Admission:
+        def complete(self, **kwargs):
+            candidate = json.loads(kwargs["user"])["candidates"][0]
+            return json.dumps({"decisions": [{
+                "candidate_id": candidate["candidate_id"],
+                "admit": True,
+                "sensitivity": candidate["proposed_sensitivity"],
+                "reason": "durable",
+            }]}), {}
+
     engine._compactor = DomainCompactor(LLM(), engine.config.compactor)
     engine._compaction._compactor = engine._compactor
+    engine.config.assembler.actor_card_admission_model = "semantic-model"
+    engine._compaction._actor_card_admission_provider_override = Admission()
     assert engine.config.assembler.actor_card_enabled is False
 
     report = engine.rebuild_actor_cards(GUILD)
