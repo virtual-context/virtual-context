@@ -52,6 +52,10 @@ class _ActorCardAdmissionError(RuntimeError):
         self.response_text = response_text
 
 
+class _ActorCardCoverageError(_ActorCardAdmissionError):
+    """A deterministic curator/admission judgment disagreement."""
+
+
 # Lazy-import for _is_stub_content from engine to avoid circular imports.
 _is_stub_content_fn: Callable[[str], bool] | None = None
 
@@ -177,8 +181,46 @@ class CompactionPipeline:
             except Exception as e:
                 logger.warning("Failed to embed fact %s: %s", fact.id, e)
 
+    def _due_actor_card_rebuilds(self, *, limit: int = 25) -> list[str]:
+        """Read the bounded retry queue for transient card-build failures."""
+        if not getattr(
+            self._config.assembler,
+            "actor_card_enabled",
+            False,
+        ):
+            return []
+        getter = getattr(
+            self._store,
+            "list_due_actor_card_rebuilds",
+            None,
+        )
+        if not callable(getter):
+            return []
+        from datetime import datetime, timezone
+
+        try:
+            return list(getter(
+                self._config.tenant_id,
+                due_at=datetime.now(timezone.utc).isoformat(),
+                limit=max(0, int(limit)),
+            ))
+        except Exception:
+            logger.warning(
+                "actor card retry queue read failed",
+                exc_info=True,
+            )
+            return []
+
     def _rebuild_actor_card(self, actor_id: str, *, force: bool = False) -> int:
-        """Curate and atomically replace one actor's rebuildable card cache."""
+        """Curate and atomically replace one actor's rebuildable card cache.
+
+        Facts are useful compact evidence, but they are not the membership
+        criterion for a person card. Exact actor-authored canonical turns are
+        also supplied so a substantive contributor can receive a meaningful
+        card even when the fact extractor emitted nothing. A separate model
+        independently judges substantive coverage and semantically admits each
+        immutable candidate before the atomic replacement.
+        """
         if (
             not force
             and not getattr(self._config.assembler, "actor_card_enabled", False)
@@ -201,139 +243,229 @@ class CompactionPipeline:
         )
 
         tenant_id = self._config.tenant_id
-        sources = list(self._store.list_actor_facts(
-            tenant_id,
-            actor_id,
-            limit=int(self._config.assembler.actor_card_fact_limit),
-        ))
-        hash_payload = [
-            {
-                "id": source.fact.id,
-                "subject": source.fact.subject,
-                "verb": source.fact.verb,
-                "object": source.fact.object,
-                "what": source.fact.what,
-                "status": source.fact.status,
-                "superseded_by": source.fact.superseded_by,
-                "fact_type": source.fact.fact_type,
-                "mentioned_at": source.fact.mentioned_at.isoformat(),
-                "session_date": source.fact.session_date,
-                "author_version": source.fact.author_attribution_version,
-                "author_role": source.fact.author_source_role,
-            }
-            for source in sources
-        ]
-        input_hash = hashlib.sha256(json.dumps(
-            {
-                "policy": 6,
-                "admission_model": getattr(
+
+        def _read_inputs() -> tuple[list, list, str]:
+            facts = list(self._store.list_actor_facts(
+                tenant_id,
+                actor_id,
+                limit=int(self._config.assembler.actor_card_fact_limit),
+            ))
+            turns = list(self._store.list_actor_turn_sources(
+                tenant_id,
+                actor_id,
+                limit=int(getattr(
                     self._config.assembler,
-                    "actor_card_admission_model",
+                    "actor_card_turn_limit",
+                    120,
+                )),
+            ))
+            fact_payload = [
+                {
+                    "id": source.fact.id,
+                    "subject": source.fact.subject,
+                    "verb": source.fact.verb,
+                    "object": source.fact.object,
+                    "what": source.fact.what,
+                    "status": source.fact.status,
+                    "superseded_by": source.fact.superseded_by,
+                    "fact_type": source.fact.fact_type,
+                    "mentioned_at": source.fact.mentioned_at.isoformat(),
+                    "session_date": source.fact.session_date,
+                    "author_version": (
+                        source.fact.author_attribution_version
+                    ),
+                    "author_role": source.fact.author_source_role,
+                }
+                for source in facts
+            ]
+            turn_payload = [
+                {
+                    "id": source.turn.canonical_turn_id,
+                    "owner": source.owner_conversation_id,
+                    "audience": source.audience_conversation_id,
+                    "channel": source.audience_channel_id,
+                    "content": source.turn.user_content,
+                    "created_at": (
+                        source.turn.created_at
+                        or source.turn.first_seen_at
+                        or ""
+                    ),
+                    "owner_epoch": source.owner_lifecycle_epoch,
+                    "audience_epoch": source.audience_lifecycle_epoch,
+                }
+                for source in turns
+            ]
+            curation_model = (
+                getattr(self._compactor, "model_name", "")
+                or getattr(
+                    getattr(self._compactor, "llm", None),
+                    "model",
                     "",
-                ),
-                "facts": hash_payload,
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")).hexdigest()
+                )
+                or type(getattr(self._compactor, "llm", None)).__name__
+            )
+            digest = hashlib.sha256(json.dumps(
+                {
+                    "policy": 7,
+                    "curation_model": curation_model,
+                    "admission_model": getattr(
+                        self._config.assembler,
+                        "actor_card_admission_model",
+                        "",
+                    ),
+                    "facts": fact_payload,
+                    "turns": turn_payload,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")).hexdigest()
+            return facts, turns, digest
+
+        fact_sources, turn_sources, input_hash = _read_inputs()
         profile = self._store.get_actor_profile(tenant_id, actor_id)
         if profile is None:
             return 0
+        if not force:
+            status_getter = getattr(
+                self._store,
+                "get_actor_card_rebuild_status",
+                None,
+            )
+            status = (
+                status_getter(tenant_id, actor_id)
+                if callable(status_getter)
+                else None
+            )
+            failed_outcomes = {
+                "model_error",
+                "invalid_response",
+                "rejected_all",
+                "admission_error",
+                "coverage_disagreement",
+                "coverage_gap",
+                "stale_or_rejected_write",
+            }
+            if (
+                status
+                and (status.get("input_hash") or "") == input_hash
+                and status.get("outcome") in failed_outcomes
+            ):
+                failures = int(status.get("failure_count") or 0)
+                if failures >= 3:
+                    logger.error(
+                        "ACTOR_CARD_REBUILD_SUPPRESSED actor=%s "
+                        "input_hash=%s failures=%d reason=terminal",
+                        actor_id[:24],
+                        input_hash[:16],
+                        failures,
+                    )
+                    return 0
+                retry_raw = status.get("next_retry_at") or ""
+                try:
+                    retry_at = datetime.fromisoformat(
+                        str(retry_raw).replace("Z", "+00:00")
+                    )
+                except (TypeError, ValueError):
+                    retry_at = None
+                if retry_at is not None and retry_at > datetime.now(timezone.utc):
+                    logger.info(
+                        "ACTOR_CARD_REBUILD_SUPPRESSED actor=%s "
+                        "input_hash=%s failures=%d reason=backoff",
+                        actor_id[:24],
+                        input_hash[:16],
+                        failures,
+                    )
+                    return 0
         if profile.card_input_hash == input_hash and not profile.card_dirty:
             return 0
-        if not self._store.mark_actor_card_dirty(tenant_id, actor_id):
+        build_marker = (
+            f"building:{input_hash}:{time.time_ns()}:{id(self)}"
+        )
+        if not self._store.mark_actor_card_dirty(
+            tenant_id,
+            actor_id,
+            build_input_hash=build_marker,
+        ):
             return 0
+        # Re-enumerate only after the unique build marker is installed. A
+        # mutation before the marker is therefore included; a mutation after
+        # it clears the marker and makes the transactional replacement fail.
+        fact_sources, turn_sources, input_hash = _read_inputs()
 
-        source_by_id = {source.fact.id: source for source in sources}
-        raw_entries: list = []
+        fact_source_by_id = {
+            source.fact.id: source for source in fact_sources
+        }
+        turn_source_by_id = {
+            source.turn.canonical_turn_id: source
+            for source in turn_sources
+        }
+        raw_entries: list[tuple[str, dict, set[str]]] = []
+        curator_substantive_by_audience: dict[str, bool] = {}
+        fact_sources_by_audience: dict[str, list] = {}
+        turn_sources_by_audience: dict[str, list] = {}
+        for source in fact_sources:
+            fact_sources_by_audience.setdefault(
+                source.audience_conversation_id,
+                [],
+            ).append(source)
+        for source in turn_sources:
+            turn_sources_by_audience.setdefault(
+                source.audience_conversation_id,
+                [],
+            ).append(source)
+        audience_ids = sorted(
+            set(fact_sources_by_audience)
+            | set(turn_sources_by_audience)
+        )
         response_text = ""
         admission_response_text = ""
         parsed_entries = True
         model_exception: Exception | None = None
         admission_exception: Exception | None = None
-        if sources:
-            prompt_facts = [
-                {
-                    "id": source.fact.id,
-                    "fact": source.fact.format_for_prompt(),
-                    "author_role": source.fact.author_source_role,
-                    "status": source.fact.status,
-                    "fact_type": source.fact.fact_type,
-                    "mentioned_at": source.fact.mentioned_at.isoformat(),
-                    "session_date": source.fact.session_date,
-                }
-                for source in sources
-            ]
-            system = (
-                "Curate a compact person card from facts authored by one actor. "
-                "The card is for durable interaction continuity, not a fact "
-                "scrapbook or a transcript. Return JSON only with exactly one "
-                "top-level key, entries, whose value is an array. Each entry "
-                "must contain exactly: kind, body, confidence, sensitivity, "
-                "and fact_ids. kind must be exactly one of "
-                "\"communication_pref\", \"active_goal\", "
-                "\"relevant_history\", or \"interaction_style\". "
-                "sensitivity must be exactly the string \"normal\" or \"high\"; "
-                "never use null, \"none\", booleans, or numbers. confidence "
-                "must be a number from 0 through 1. fact_ids must cite only "
-                "provided ids. Use a neutral concise body and do not invent "
-                "identity or intent. Every body must be self-contained and "
-                "unambiguous when read without the surrounding transcript; "
-                "include essential referents such as the specific medication, "
-                "goal, or preference rather than a generic placeholder. Write "
-                "natural person-facing language, not a serialization of "
-                "subject/verb/object fields, ontology names, or tag labels. "
-                "Preserve every material qualifier from the source, including "
-                "exceptions, exclusions, uncertainty, frequency, timing, and "
-                "scope. Do not turn a qualified statement into a broader or "
-                "more certain claim. "
-                "Do not promote temporary, test-only, one-turn, session-only, "
-                "or channel-only instructions into communication_pref or "
-                "interaction_style. Do not retain a preference or goal that a "
-                "later fact stopped, replaced, completed, or contradicted. "
-                "Use mentioned_at and status to resolve conflicts, with the "
-                "newest applicable fact winning. A communication preference or "
-                "interaction style should be durable only when it is explicitly "
-                "stated as lasting or consistently supported by repeated facts. "
-                "Medical, sexual, financial, precise-location, credential, or "
-                "similarly private personal material must be sensitivity "
-                "\"high\". Ordinary non-private communication and interaction "
-                "style may be \"normal\". If no durable entry is justified, "
-                "return {\"entries\":[]}."
-            )
-            user = json.dumps({
-                "facts": prompt_facts,
-                "limits": {
-                    "entries_per_kind": int(
-                        self._config.assembler.actor_card_entries_per_kind
-                    ),
-                    "body_chars": CARD_ENTRY_BODY_MAX_CHARS,
-                },
-            }, separators=(",", ":"))
-            try:
-                response_text, _usage = self._compactor.llm.complete(
-                    system=system,
-                    user=user,
-                    max_tokens=self._config.compactor.max_summary_tokens,
+        curation_responses: list[str] = []
+        try:
+            for audience_id in audience_ids:
+                (
+                    partition_response,
+                    partition_substantive,
+                    _coverage_reason,
+                    partition_entries,
+                    visible_turn_ids,
+                ) = self._curate_actor_card_partition(
+                    fact_sources_by_audience.get(audience_id, []),
+                    turn_sources_by_audience.get(audience_id, []),
                 )
-                parsed = self._compactor._parse_response(response_text)
-                if (
-                    isinstance(parsed, dict)
-                    and set(parsed) == {"entries"}
-                    and isinstance(parsed["entries"], list)
-                ):
-                    raw_entries = parsed["entries"]
-                else:
-                    parsed_entries = False
-            except Exception as exc:
-                parsed_entries = False
+                curation_responses.append(partition_response)
+                curator_substantive_by_audience[audience_id] = (
+                    partition_substantive
+                )
+                raw_entries.extend(
+                    (audience_id, item, visible_turn_ids)
+                    for item in partition_entries
+                )
+            response_text = json.dumps(
+                curation_responses,
+                separators=(",", ":"),
+            )
+        except Exception as exc:
+            parsed_entries = False
+            response_text = getattr(exc, "response_text", "")
+            if not isinstance(exc, _ActorCardAdmissionError):
                 model_exception = exc
 
         now = datetime.now(timezone.utc).isoformat()
-        per_kind: dict[str, int] = {}
+        # Every audience is curated independently and receives the configured
+        # per-kind budget in its own prompt. Enforce the same boundary here:
+        # a busy DM must not consume a guild's quota (or vice versa) and turn
+        # an otherwise substantive partition into a terminal coverage gap.
+        per_audience_kind: dict[tuple[str, str], int] = {}
         normalized: list[tuple[ActorCardEntry, list[ActorCardEntrySource]]] = []
+        normalized_by_audience: dict[
+            str,
+            list[tuple[ActorCardEntry, list[ActorCardEntrySource]]],
+        ] = {}
         rejected: Counter[str] = Counter()
-        for item in raw_entries:
+        for audience_id, item, prompt_turn_ids in raw_entries:
             if not isinstance(item, dict):
                 rejected["entry_not_object"] += 1
                 continue
@@ -342,13 +474,25 @@ class CompactionPipeline:
             sensitivity = item.get("sensitivity", CARD_SENSITIVITY_NORMAL)
             confidence = item.get("confidence")
             fact_ids = item.get("fact_ids")
+            turn_ids = item.get("turn_ids")
+            if set(item) != {
+                "kind",
+                "body",
+                "confidence",
+                "sensitivity",
+                "fact_ids",
+                "turn_ids",
+            }:
+                rejected["invalid_entry_shape"] += 1
+                continue
             if kind not in CARD_KINDS:
                 rejected["invalid_kind"] += 1
                 continue
             if sensitivity not in CARD_SENSITIVITIES:
                 rejected["invalid_sensitivity"] += 1
                 continue
-            if per_kind.get(kind, 0) >= int(
+            quota_key = (audience_id, kind)
+            if per_audience_kind.get(quota_key, 0) >= int(
                 self._config.assembler.actor_card_entries_per_kind
             ):
                 rejected["per_kind_limit"] += 1
@@ -372,16 +516,36 @@ class CompactionPipeline:
             if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
                 rejected["invalid_confidence"] += 1
                 continue
-            if not isinstance(fact_ids, list) or not fact_ids:
+            if not isinstance(fact_ids, list):
                 rejected["invalid_fact_ids"] += 1
                 continue
             if any(
-                not isinstance(fid, str) or fid not in source_by_id
+                not isinstance(fid, str)
+                or fid not in fact_source_by_id
+                or fact_source_by_id[fid].audience_conversation_id
+                != audience_id
                 for fid in fact_ids
             ):
-                rejected["unknown_fact_id"] += 1
+                rejected["unknown_or_cross_audience_fact_id"] += 1
                 continue
             fact_ids = list(dict.fromkeys(fact_ids))
+            if not isinstance(turn_ids, list):
+                rejected["invalid_turn_ids"] += 1
+                continue
+            if any(
+                not isinstance(turn_id, str)
+                or turn_id not in turn_source_by_id
+                or turn_id not in prompt_turn_ids
+                or turn_source_by_id[turn_id].audience_conversation_id
+                != audience_id
+                for turn_id in turn_ids
+            ):
+                rejected["unknown_or_cross_audience_turn_id"] += 1
+                continue
+            turn_ids = list(dict.fromkeys(turn_ids))
+            if not fact_ids and not turn_ids:
+                rejected["missing_citations"] += 1
+                continue
 
             scope = (
                 CARD_SCOPE_CROSS_CONTEXT
@@ -390,7 +554,8 @@ class CompactionPipeline:
                 else CARD_SCOPE_SAME_CONVERSATION
             )
             digest = hashlib.sha256(json.dumps(
-                [actor_id, kind, body, fact_ids], separators=(",", ":"),
+                [actor_id, kind, body, fact_ids, turn_ids],
+                separators=(",", ":"),
             ).encode("utf-8")).hexdigest()[:32]
             entry = ActorCardEntry(
                 id=f"card-{digest}", tenant_id=tenant_id, actor_id=actor_id,
@@ -402,31 +567,88 @@ class CompactionPipeline:
                 ActorCardEntrySource(
                     entry_id=entry.id,
                     tenant_id=tenant_id,
-                    owner_conversation_id=source_by_id[fid].owner_conversation_id,
-                    audience_conversation_id=(
-                        source_by_id[fid].audience_conversation_id
+                    owner_conversation_id=(
+                        fact_source_by_id[fid].owner_conversation_id
                     ),
-                    audience_channel_id=source_by_id[fid].audience_channel_id,
+                    audience_conversation_id=(
+                        fact_source_by_id[fid].audience_conversation_id
+                    ),
+                    audience_channel_id=(
+                        fact_source_by_id[fid].audience_channel_id
+                    ),
                     fact_id=fid,
                 )
                 for fid in fact_ids
             ]
+            entry_sources.extend(
+                ActorCardEntrySource(
+                    entry_id=entry.id,
+                    tenant_id=tenant_id,
+                    owner_conversation_id=(
+                        turn_source_by_id[turn_id].owner_conversation_id
+                    ),
+                    audience_conversation_id=(
+                        turn_source_by_id[turn_id].audience_conversation_id
+                    ),
+                    audience_channel_id=(
+                        turn_source_by_id[turn_id].audience_channel_id
+                    ),
+                    canonical_turn_id=turn_id,
+                )
+                for turn_id in turn_ids
+            )
             normalized.append((entry, entry_sources))
-            per_kind[kind] = per_kind.get(kind, 0) + 1
+            normalized_by_audience.setdefault(audience_id, []).append(
+                (entry, entry_sources)
+            )
+            per_audience_kind[quota_key] = (
+                per_audience_kind.get(quota_key, 0) + 1
+            )
 
         basic_accepted_count = len(normalized)
-        if parsed_entries and normalized:
+        independently_substantive = False
+        coverage_gap = False
+        if parsed_entries and (fact_sources or turn_sources):
             try:
-                (
-                    normalized,
-                    admission_response_text,
-                    admission_rejections,
-                ) = self._admit_actor_card_entries(
-                    actor_id,
-                    sources,
-                    normalized,
+                admitted_entries: list[
+                    tuple[ActorCardEntry, list[ActorCardEntrySource]]
+                ] = []
+                admission_responses: list[str] = []
+                for audience_id in audience_ids:
+                    (
+                        partition_admitted,
+                        partition_response,
+                        admission_rejections,
+                        partition_substantive,
+                    ) = self._admit_actor_card_entries(
+                        actor_id,
+                        audience_id,
+                        fact_sources_by_audience.get(audience_id, []),
+                        turn_sources_by_audience.get(audience_id, []),
+                        normalized_by_audience.get(audience_id, []),
+                        curator_substantive=(
+                            curator_substantive_by_audience[audience_id]
+                        ),
+                    )
+                    admitted_entries.extend(partition_admitted)
+                    admission_responses.append(partition_response)
+                    rejected.update(admission_rejections)
+                    independently_substantive = (
+                        independently_substantive
+                        or partition_substantive
+                    )
+                    coverage_gap = (
+                        coverage_gap
+                        or (
+                            partition_substantive
+                            and not partition_admitted
+                        )
+                    )
+                normalized = admitted_entries
+                admission_response_text = json.dumps(
+                    admission_responses,
+                    separators=(",", ":"),
                 )
-                rejected.update(admission_rejections)
             except Exception as exc:
                 admission_exception = exc
                 admission_response_text = getattr(
@@ -457,7 +679,7 @@ class CompactionPipeline:
                         actor_id,
                         attempted_at=now,
                         input_hash=input_hash,
-                        source_count=len(sources),
+                        source_count=len(fact_sources) + len(turn_sources),
                         raw_entry_count=len(raw_entries),
                         accepted_entry_count=len(normalized),
                         rejected_counts=dict(sorted(rejected.items())),
@@ -479,7 +701,7 @@ class CompactionPipeline:
                 "ACTOR_CARD_REBUILD actor=%s sources=%d outcome=%s "
                 "response_hash=%s error_type=%s",
                 actor_id[:24],
-                len(sources),
+                len(fact_sources) + len(turn_sources),
                 outcome,
                 response_hash[:16],
                 type(model_exception).__name__ if model_exception is not None else "",
@@ -496,7 +718,7 @@ class CompactionPipeline:
                 "ACTOR_CARD_REBUILD actor=%s sources=%d raw=%d accepted=0 "
                 "outcome=rejected_all rejected=%s response_hash=%s",
                 actor_id[:24],
-                len(sources),
+                len(fact_sources) + len(turn_sources),
                 len(raw_entries),
                 json.dumps(dict(sorted(rejected.items())), separators=(",", ":")),
                 response_hash[:16],
@@ -504,24 +726,39 @@ class CompactionPipeline:
             raise RuntimeError("actor card curation rejected every model entry")
 
         if admission_exception is not None:
-            _record_status("admission_error")
+            admission_outcome = (
+                "coverage_disagreement"
+                if isinstance(
+                    admission_exception,
+                    _ActorCardCoverageError,
+                )
+                else "admission_error"
+            )
+            _record_status(admission_outcome)
             logger.warning(
                 "ACTOR_CARD_REBUILD actor=%s sources=%d raw=%d "
-                "basic_accepted=%d outcome=admission_error error_type=%s "
+                "basic_accepted=%d outcome=%s error_type=%s "
                 "response_hash=%s",
                 actor_id[:24],
-                len(sources),
+                len(fact_sources) + len(turn_sources),
                 len(raw_entries),
                 basic_accepted_count,
+                admission_outcome,
                 type(admission_exception).__name__,
                 response_hash[:16],
             )
             raise RuntimeError("actor card semantic admission failed") from (
                 admission_exception
             )
+        if coverage_gap:
+            _record_status("coverage_gap")
+            raise RuntimeError(
+                "actor card coverage gate found a substantive actor "
+                "without an admitted entry"
+            )
 
         expected_epochs: dict[str, int] = {}
-        for source in sources:
+        for source in [*fact_sources, *turn_sources]:
             expected_epochs[source.owner_conversation_id] = (
                 source.owner_lifecycle_epoch
             )
@@ -534,6 +771,7 @@ class CompactionPipeline:
             normalized,
             input_hash=input_hash,
             expected_source_epochs=expected_epochs,
+            expected_build_marker=build_marker,
         )
         refreshed = self._store.get_actor_profile(tenant_id, actor_id)
         if refreshed is None or refreshed.card_dirty or (
@@ -555,7 +793,7 @@ class CompactionPipeline:
             "ACTOR_CARD_REBUILD actor=%s sources=%d raw=%d accepted=%d "
             "written=%d outcome=%s rejected=%s response_hash=%s",
             actor_id[:24],
-            len(sources),
+            len(fact_sources) + len(turn_sources),
             len(raw_entries),
             len(normalized),
             written,
@@ -564,6 +802,176 @@ class CompactionPipeline:
             response_hash[:16],
         )
         return written
+
+    @staticmethod
+    def _actor_card_prompt_turns(
+        turn_sources: list,
+        *,
+        max_chars: int = 96_000,
+    ) -> list[dict]:
+        """Render a bounded, deterministic set of actor-authored messages.
+
+        Discord messages are normally small, but canonical ingestion is also
+        used by API callers. Individual and aggregate bounds prevent one actor
+        from turning card curation into an unbounded model call. A truncated
+        message remains visibly marked so neither model can treat it as exact
+        evidence for a dropped qualifier.
+        """
+        rendered: list[dict] = []
+        used = 0
+        for source in turn_sources:
+            content = (source.turn.user_content or "").strip()
+            if not content:
+                continue
+            truncated = len(content) > 4_000
+            if truncated:
+                content = (
+                    content[:1_940]
+                    + "\n...[middle omitted; do not infer omitted text]...\n"
+                    + content[-1_940:]
+                )
+            item = {
+                "id": source.turn.canonical_turn_id,
+                "timestamp": (
+                    source.turn.created_at
+                    or source.turn.first_seen_at
+                    or ""
+                ),
+                "audience_conversation_id": (
+                    source.audience_conversation_id
+                ),
+                "audience_channel_id": source.audience_channel_id,
+                "content": content,
+                "truncated": truncated,
+            }
+            cost = len(json.dumps(item, separators=(",", ":")))
+            if used + cost > max(0, int(max_chars)):
+                break
+            rendered.append(item)
+            used += cost
+        return rendered
+
+    def _curate_actor_card_partition(
+        self,
+        fact_sources: list,
+        turn_sources: list,
+    ) -> tuple[str, bool, str, list, set[str]]:
+        """Curate one audience partition without exposing another audience."""
+        from ..types import CARD_ENTRY_BODY_MAX_CHARS
+
+        prompt_facts = [
+            {
+                "id": source.fact.id,
+                "fact": source.fact.format_for_prompt(),
+                "author_role": source.fact.author_source_role,
+                "status": source.fact.status,
+                "fact_type": source.fact.fact_type,
+                "mentioned_at": source.fact.mentioned_at.isoformat(),
+                "session_date": source.fact.session_date,
+            }
+            for source in fact_sources
+        ]
+        prompt_turns = self._actor_card_prompt_turns(turn_sources)
+        prompt_turn_ids = {item["id"] for item in prompt_turns}
+        system = (
+            "Curate a compact person card from exact messages and facts "
+            "authored by one actor in one policy audience. The card is for "
+            "durable interaction continuity, not a fact scrapbook or a "
+            "transcript. Independently decide whether the actor contributed "
+            "substantive interaction. Substantive means at least one "
+            "informative message that reveals a useful ongoing goal, durable "
+            "preference/style, or a meaningful topic the actor has discussed "
+            "with the agent. Greetings, bot invocation checks, memory/"
+            "preference probes, and isolated trivia questions are not "
+            "substantive. Return JSON only with exactly: substantive, "
+            "coverage_reason, and entries. substantive must be boolean. "
+            "coverage_reason must be exactly one of \"substantive\", "
+            "\"greeting_only\", \"one_off_trivia\", \"bot_meta_or_test\", "
+            "\"no_durable_context\", or \"insufficient_evidence\". It must be "
+            "\"substantive\" exactly when substantive is true. entries must "
+            "be an array. A substantive actor must receive at least one entry; "
+            "a non-substantive actor must receive none. Each entry must contain "
+            "exactly kind, body, confidence, sensitivity, fact_ids, and "
+            "turn_ids. kind must be exactly one of \"communication_pref\", "
+            "\"active_goal\", \"relevant_history\", or "
+            "\"interaction_style\". sensitivity must be exactly the string "
+            "\"normal\" or \"high\"; never use null, \"none\", booleans, or "
+            "numbers. confidence must be a number from 0 through 1. fact_ids "
+            "and turn_ids must be arrays, may individually be empty, and "
+            "together must cite at least one provided id that fully supports "
+            "the body. Use a neutral concise body and do not invent identity "
+            "or intent. Every body must be self-contained and unambiguous when "
+            "read without the surrounding transcript; include essential "
+            "referents such as the specific medication, goal, preference, or "
+            "discussion topic. Write natural person-facing language, not a "
+            "serialization of subject/verb/object fields, ontology names, or "
+            "tag labels. Preserve every material qualifier from the source, "
+            "including exceptions, exclusions, uncertainty, frequency, "
+            "timing, and scope. Do not turn a qualified statement into a "
+            "broader or more certain claim. Do not promote temporary, "
+            "test-only, one-turn, session-only, or channel-only instructions "
+            "into communication_pref or interaction_style. Do not retain a "
+            "preference or goal that later evidence stopped, replaced, "
+            "completed, or contradicted. Use message timestamps, mentioned_at, "
+            "and status to resolve conflicts, with the newest applicable "
+            "evidence winning. A communication preference or interaction "
+            "style is durable only when explicitly stated as lasting or "
+            "consistently supported by repeated natural interactions. Use "
+            "relevant_history for concise, useful continuity about a "
+            "meaningful topic this actor actually discussed with the agent "
+            "when no narrower durable preference or goal is justified. "
+            "Medical, sexual, financial, precise-location, credential, or "
+            "similarly private personal material must be sensitivity \"high\". "
+            "Ordinary non-private communication and interaction style may be "
+            "\"normal\"."
+        )
+        user = json.dumps({
+            "facts": prompt_facts,
+            "turns": prompt_turns,
+            "limits": {
+                "entries_per_kind": int(
+                    self._config.assembler.actor_card_entries_per_kind
+                ),
+                "body_chars": CARD_ENTRY_BODY_MAX_CHARS,
+            },
+        }, separators=(",", ":"))
+        response_text, _usage = self._compactor.llm.complete(
+            system=system,
+            user=user,
+            max_tokens=self._config.compactor.max_summary_tokens,
+        )
+        parsed = self._compactor._parse_response(response_text)
+        valid_coverage_reasons = {
+            "substantive",
+            "greeting_only",
+            "one_off_trivia",
+            "bot_meta_or_test",
+            "no_durable_context",
+            "insufficient_evidence",
+        }
+        if (
+            not isinstance(parsed, dict)
+            or set(parsed)
+            != {"substantive", "coverage_reason", "entries"}
+            or not isinstance(parsed.get("substantive"), bool)
+            or not isinstance(parsed.get("coverage_reason"), str)
+            or not isinstance(parsed.get("entries"), list)
+            or parsed["coverage_reason"] not in valid_coverage_reasons
+            or parsed["substantive"]
+            != (parsed["coverage_reason"] == "substantive")
+            or parsed["substantive"] != bool(parsed["entries"])
+        ):
+            raise _ActorCardAdmissionError(
+                "actor card curation response has invalid coverage shape",
+                response_text,
+            )
+        return (
+            response_text,
+            parsed["substantive"],
+            parsed["coverage_reason"],
+            parsed["entries"],
+            prompt_turn_ids,
+        )
 
     def _actor_card_admission_provider(self):
         """Build the dedicated semantic admission provider.
@@ -613,6 +1021,7 @@ class CompactionPipeline:
     def _actor_card_evidence_segments(
         self,
         actor_id: str,
+        audience_conversation_id: str,
         sources: list,
         candidate_fact_ids: set[str],
         *,
@@ -625,7 +1034,13 @@ class CompactionPipeline:
         regex-classified. Uncited segments remain available to the admission
         model as compact facts, not as unrelated raw conversation text.
         """
-        source_by_id = {source.fact.id: source for source in sources}
+        from ..types import AUDIENCE_ATTRIBUTION_VERSION
+
+        source_by_id = {
+            source.fact.id: source
+            for source in sources
+            if source.audience_conversation_id == audience_conversation_id
+        }
         candidate_refs = {
             (
                 source_by_id[fact_id].owner_conversation_id,
@@ -675,6 +1090,10 @@ class CompactionPipeline:
                 if (
                     row is None
                     or row.sender_actor_id != actor_id
+                    or row.audience_conversation_id
+                    != audience_conversation_id
+                    or int(row.audience_attribution_version or 0)
+                    != AUDIENCE_ATTRIBUTION_VERSION
                     or not content
                 ):
                     continue
@@ -730,14 +1149,19 @@ class CompactionPipeline:
     def _admit_actor_card_entries(
         self,
         actor_id: str,
-        sources: list,
+        audience_conversation_id: str,
+        fact_sources: list,
+        turn_sources: list,
         normalized: list[tuple["ActorCardEntry", list["ActorCardEntrySource"]]],
+        *,
+        curator_substantive: bool,
     ) -> tuple[
         list[tuple["ActorCardEntry", list["ActorCardEntrySource"]]],
         str,
         Counter[str],
+        bool,
     ]:
-        """Semantically admit immutable candidates against source evidence."""
+        """Independently check coverage and admit immutable candidates."""
         from ..types import (
             CARD_CROSS_CONTEXT_KINDS,
             CARD_SCOPE_CROSS_CONTEXT,
@@ -756,31 +1180,58 @@ class CompactionPipeline:
             source.fact_id
             for _entry, entry_sources in normalized
             for source in entry_sources
+            if source.fact_id
         }
         evidence_segments, evidence_refs = (
             self._actor_card_evidence_segments(
                 actor_id,
-                sources,
+                audience_conversation_id,
+                fact_sources,
                 candidate_fact_ids,
             )
         )
-        source_by_id = {source.fact.id: source for source in sources}
+        fact_source_by_id = {
+            source.fact.id: source for source in fact_sources
+        }
+        turn_source_by_id = {
+            source.turn.canonical_turn_id: source
+            for source in turn_sources
+        }
+        actor_turns = self._actor_card_prompt_turns(turn_sources)
+        visible_turn_ids = {turn["id"] for turn in actor_turns}
         candidates: list[dict] = []
         eligible: dict[
             str, tuple["ActorCardEntry", list["ActorCardEntrySource"]]
         ] = {}
         rejection_counts: Counter[str] = Counter()
         for entry, entry_sources in normalized:
-            fact_ids = [source.fact_id for source in entry_sources]
+            fact_ids = [
+                source.fact_id for source in entry_sources
+                if source.fact_id
+            ]
+            turn_ids = [
+                source.canonical_turn_id for source in entry_sources
+                if source.canonical_turn_id
+            ]
             refs = {
                 (
-                    source_by_id[fact_id].owner_conversation_id,
-                    source_by_id[fact_id].fact.segment_ref,
+                    fact_source_by_id[fact_id].owner_conversation_id,
+                    fact_source_by_id[fact_id].fact.segment_ref,
                 )
                 for fact_id in fact_ids
-                if fact_id in source_by_id
+                if fact_id in fact_source_by_id
             }
-            if not refs or not refs.issubset(evidence_refs):
+            if refs and not refs.issubset(evidence_refs):
+                rejection_counts["evidence_unavailable"] += 1
+                continue
+            if any(
+                turn_id not in turn_source_by_id
+                or turn_id not in visible_turn_ids
+                for turn_id in turn_ids
+            ):
+                rejection_counts["evidence_unavailable"] += 1
+                continue
+            if not fact_ids and not turn_ids:
                 rejection_counts["evidence_unavailable"] += 1
                 continue
             eligible[entry.id] = (entry, entry_sources)
@@ -791,6 +1242,7 @@ class CompactionPipeline:
                 "proposed_confidence": entry.confidence,
                 "proposed_sensitivity": entry.sensitivity,
                 "fact_ids": fact_ids,
+                "turn_ids": turn_ids,
                 "source_segments": [
                     {
                         "owner_conversation_id": owner,
@@ -799,8 +1251,6 @@ class CompactionPipeline:
                     for owner, ref in sorted(refs)
                 ],
             })
-        if not candidates:
-            return [], "", rejection_counts
 
         compact_facts = [{
             "id": source.fact.id,
@@ -809,17 +1259,30 @@ class CompactionPipeline:
             "fact": source.fact.format_for_prompt(),
             "status": source.fact.status,
             "mentioned_at": source.fact.mentioned_at.isoformat(),
-        } for source in sources]
+        } for source in fact_sources]
         system = (
             "You are the conservative semantic admission gate for a person "
             "card. Candidate bodies are immutable: you may admit or reject "
             "them and correct sensitivity, but you may not invent, rewrite, "
             "or merge candidates. Use only actor-authored facts and source "
-            "messages. All available compact facts are supplied so later "
-            "facts can revoke or replace a candidate; raw source messages are "
-            "limited to the segments the candidate cites. Return JSON only "
-            "with exactly one top-level key, "
-            "decisions. Return exactly one decision for every candidate, with "
+            "messages. All bounded actor turns and compact facts are supplied "
+            "so later evidence can revoke or replace a candidate. "
+            "Independently decide whether this actor contributed substantive "
+            "interaction; do not defer to the curator's claim. Substantive "
+            "means at least one informative message that reveals a useful "
+            "ongoing goal, durable preference/style, or a meaningful topic "
+            "the actor discussed with the agent. Greetings, bot invocation "
+            "checks, memory/preference probes, and isolated trivia questions "
+            "are not substantive. A substantive actor must finish with at "
+            "least one admitted card entry; relevant_history is appropriate "
+            "for useful topic continuity when no narrower entry is justified. "
+            "Return JSON only with exactly substantive, coverage_reason, and "
+            "decisions. substantive must be boolean. coverage_reason must be "
+            "exactly one of \"substantive\", \"greeting_only\", "
+            "\"one_off_trivia\", \"bot_meta_or_test\", "
+            "\"no_durable_context\", or \"insufficient_evidence\", and must "
+            "be \"substantive\" exactly when substantive is true. "
+            "Return exactly one decision for every candidate, with "
             "exactly candidate_id, admit, sensitivity, and reason. admit must "
             "be a boolean and sensitivity must be exactly \"normal\" or "
             "\"high\". You may raise sensitivity from normal to high, but "
@@ -856,11 +1319,15 @@ class CompactionPipeline:
             "ontology/tag language or serializes a machine fact triple rather "
             "than stating a natural person fact. Medical, sexual, financial, "
             "precise-location, credential, or similarly private material must "
-            "be high sensitivity. When uncertain, reject."
+            "be high sensitivity. A visibly truncated turn cannot prove a "
+            "claim whose qualifier may be in omitted text. When uncertain, "
+            "reject."
         )
         user = json.dumps({
+            "curator_substantive_claim": curator_substantive,
             "candidates": candidates,
             "facts": compact_facts,
+            "actor_turns": actor_turns,
             "evidence_segments": evidence_segments,
         }, separators=(",", ":"))
         response_text, _usage = provider.complete(
@@ -877,11 +1344,32 @@ class CompactionPipeline:
         parsed = self._compactor._parse_response(response_text)
         if (
             not isinstance(parsed, dict)
-            or set(parsed) != {"decisions"}
+            or set(parsed)
+            != {"substantive", "coverage_reason", "decisions"}
+            or not isinstance(parsed["substantive"], bool)
+            or not isinstance(parsed["coverage_reason"], str)
             or not isinstance(parsed["decisions"], list)
         ):
             raise _ActorCardAdmissionError(
-                "actor-card admission response has no decisions array",
+                "actor-card admission response has invalid coverage shape",
+                response_text,
+            )
+        independently_substantive = parsed["substantive"]
+        valid_coverage_reasons = {
+            "substantive",
+            "greeting_only",
+            "one_off_trivia",
+            "bot_meta_or_test",
+            "no_durable_context",
+            "insufficient_evidence",
+        }
+        if (
+            parsed["coverage_reason"] not in valid_coverage_reasons
+            or independently_substantive
+            != (parsed["coverage_reason"] == "substantive")
+        ):
+            raise _ActorCardAdmissionError(
+                "actor-card admission response has invalid coverage decision",
                 response_text,
             )
         decisions: dict[str, dict] = {}
@@ -921,6 +1409,11 @@ class CompactionPipeline:
                 "actor-card admission response does not cover every candidate",
                 response_text,
             )
+        if independently_substantive != curator_substantive:
+            raise _ActorCardCoverageError(
+                "actor-card curator and admission coverage decisions disagree",
+                response_text,
+            )
 
         admitted: list[
             tuple["ActorCardEntry", list["ActorCardEntrySource"]]
@@ -955,7 +1448,17 @@ class CompactionPipeline:
                 ),
                 entry_sources,
             ))
-        return admitted, response_text, rejection_counts
+        if not independently_substantive and admitted:
+            raise _ActorCardAdmissionError(
+                "non-substantive actor cannot have an admitted card entry",
+                response_text,
+            )
+        return (
+            admitted,
+            response_text,
+            rejection_counts,
+            independently_substantive,
+        )
 
     def _physical_rows_by_group(self) -> dict[int, list["CanonicalTurnRow"]]:
         """Physical canonical rows of this conversation, grouped by turn group.
@@ -2335,6 +2838,11 @@ class CompactionPipeline:
             progress_callback=_compactor_progress,
         )
 
+        # Coalesce person-card work across every segment in this compaction.
+        # One actor can appear in many segments; rebuilding after each one
+        # wastes model calls and lets an early rebuild observe only part of the
+        # just-written evidence.
+        card_actors_to_rebuild: set[str] = set()
         for seg_idx, result in enumerate(results):
             seg = compactable[seg_idx]
             new_turn_range = segment_turn_ranges.get(seg.id)
@@ -2459,6 +2967,16 @@ class CompactionPipeline:
 
             all_results.append(result)
             stored_done = seg_idx + 1
+            card_actors_to_rebuild.update(
+                (physical_by_id[canonical_id].sender_actor_id or "").strip()
+                for canonical_id in (
+                    stored.metadata.canonical_turn_ids or []
+                )
+                if canonical_id in physical_by_id
+                and (
+                    physical_by_id[canonical_id].sender_actor_id or ""
+                ).strip()
+            )
 
             _emit_progress(
                 stored_done,
@@ -2473,11 +2991,11 @@ class CompactionPipeline:
             _seg_ref = stored.ref
             _existing_facts_before = self._store.get_facts_by_segment(_seg_ref)
             if result.facts or _existing_facts_before:
-                _actors_to_rebuild = {
+                card_actors_to_rebuild.update({
                     (fact.author_actor_id or "").strip()
                     for fact in [*_existing_facts_before, *result.facts]
                     if (fact.author_actor_id or "").strip()
-                }
+                })
                 for fact in result.facts:
                     fact.segment_ref = _seg_ref
                     fact.conversation_id = self._config.conversation_id
@@ -2521,18 +3039,6 @@ class CompactionPipeline:
                             operation_id=operation_id,
                             guard_kwargs=self._compaction_guard_kwargs(operation_id),
                         )
-                    for actor_id in sorted(_actors_to_rebuild):
-                        try:
-                            self._rebuild_actor_card(actor_id)
-                        except Exception:
-                            # replace_facts_for_segment already dirtied the
-                            # profile in the same transaction. A failed
-                            # curation therefore leaves the old entries
-                            # auditable but unreadable.
-                            logger.warning(
-                                "actor card rebuild failed actor=%s",
-                                actor_id[:24], exc_info=True,
-                            )
                 _superseded_count = 0
                 _links_count = 0
                 # C2R gate (fencing plan §7.2 #7/#8): backlog-sweeper
@@ -2585,5 +3091,27 @@ class CompactionPipeline:
                     superseded_count=_superseded_count,
                     links_count=_links_count,
                 )
+
+        if not disable_replacement_passes:
+            # A previous transient model/provider failure must not leave a
+            # since-silent actor's card unreadable forever. Any ordinary
+            # compaction services a bounded tenant-local retry queue after its
+            # stored backoff expires. Terminal semantic disagreements remain
+            # operator-visible and are not retried blindly.
+            card_actors_to_rebuild.update(
+                self._due_actor_card_rebuilds(limit=25)
+            )
+            for actor_id in sorted(card_actors_to_rebuild):
+                try:
+                    self._rebuild_actor_card(actor_id)
+                except Exception:
+                    # Canonical/fact mutation dirties any prior card before
+                    # this call. A failed curation therefore leaves old
+                    # entries auditable but unreadable.
+                    logger.warning(
+                        "actor card rebuild failed actor=%s",
+                        actor_id[:24],
+                        exc_info=True,
+                    )
 
         return all_results

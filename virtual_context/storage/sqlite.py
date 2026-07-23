@@ -49,6 +49,7 @@ from ..types import (
     ActorCardEntrySource,
     ActorFactSource,
     ActorProfile,
+    ActorTurnSource,
     SpeakerHandleAssignment,
     SpeakerHandleCandidate,
     is_valid_speaker_handle,
@@ -1984,6 +1985,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
         # to invalidate.
         for table in ("actor_profiles", "actor_card_entries",
                       "actor_card_entry_sources",
+                      "actor_card_turn_sources",
                       "actor_card_rebuild_status"):
             if not self._table_exists(conn, table):
                 raise RuntimeError(
@@ -2071,6 +2073,134 @@ CREATE TABLE IF NOT EXISTS request_captures (
             CREATE INDEX IF NOT EXISTS idx_actor_card_sources_fact
                 ON actor_card_entry_sources(fact_id);
 
+            CREATE TABLE IF NOT EXISTS actor_card_turn_sources (
+                entry_id TEXT NOT NULL,
+                tenant_id TEXT NOT NULL,
+                owner_conversation_id TEXT NOT NULL,
+                audience_conversation_id TEXT NOT NULL,
+                audience_channel_id TEXT NOT NULL DEFAULT '',
+                canonical_turn_id TEXT NOT NULL,
+                PRIMARY KEY (entry_id, canonical_turn_id),
+                FOREIGN KEY (entry_id, tenant_id)
+                    REFERENCES actor_card_entries(id, tenant_id)
+                    ON DELETE CASCADE,
+                FOREIGN KEY (canonical_turn_id)
+                    REFERENCES canonical_turns(canonical_turn_id)
+                    ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_actor_card_turn_sources_owner
+                ON actor_card_turn_sources(
+                    tenant_id, owner_conversation_id
+                );
+            CREATE INDEX IF NOT EXISTS idx_actor_card_turn_sources_audience
+                ON actor_card_turn_sources(
+                    tenant_id, audience_conversation_id
+                );
+            CREATE INDEX IF NOT EXISTS idx_actor_card_turn_sources_turn
+                ON actor_card_turn_sources(canonical_turn_id);
+
+            DROP TRIGGER IF EXISTS
+                trg_dirty_actor_card_on_canonical_insert;
+            CREATE TRIGGER trg_dirty_actor_card_on_canonical_insert
+            AFTER INSERT ON canonical_turns
+            FOR EACH ROW
+            WHEN NEW.sender_actor_id <> '' AND NEW.user_content <> ''
+            BEGIN
+                UPDATE actor_profiles
+                   SET card_dirty = 1, card_input_hash = ''
+                 WHERE actor_id = NEW.sender_actor_id
+                   AND tenant_id = (
+                       SELECT tenant_id
+                         FROM conversations
+                        WHERE conversation_id = NEW.conversation_id
+                          AND phase <> 'deleted'
+                   );
+            END;
+
+            DROP TRIGGER IF EXISTS
+                trg_invalidate_actor_card_turn_source_delete;
+            CREATE TRIGGER trg_invalidate_actor_card_turn_source_delete
+            BEFORE DELETE ON canonical_turns
+            FOR EACH ROW
+            BEGIN
+                UPDATE actor_profiles
+                   SET card_dirty = 1, card_input_hash = ''
+                 WHERE actor_id = OLD.sender_actor_id
+                   AND OLD.sender_actor_id <> ''
+                   AND tenant_id = (
+                       SELECT tenant_id
+                         FROM conversations
+                        WHERE conversation_id = OLD.conversation_id
+                   );
+                UPDATE actor_profiles
+                   SET card_dirty = 1, card_input_hash = ''
+                 WHERE (tenant_id, actor_id) IN (
+                       SELECT e.tenant_id, e.actor_id
+                         FROM actor_card_entries e
+                         JOIN actor_card_turn_sources s
+                           ON s.entry_id = e.id
+                          AND s.tenant_id = e.tenant_id
+                        WHERE s.canonical_turn_id =
+                              OLD.canonical_turn_id
+                 );
+                DELETE FROM actor_card_entries
+                 WHERE id IN (
+                       SELECT entry_id
+                         FROM actor_card_turn_sources
+                        WHERE canonical_turn_id =
+                              OLD.canonical_turn_id
+                 );
+            END;
+
+            DROP TRIGGER IF EXISTS
+                trg_invalidate_actor_card_turn_source_update;
+            CREATE TRIGGER trg_invalidate_actor_card_turn_source_update
+            BEFORE UPDATE OF
+                conversation_id, user_content, sender_actor_id,
+                audience_conversation_id, audience_attribution_version,
+                origin_channel_id, created_at, first_seen_at
+            ON canonical_turns
+            FOR EACH ROW
+            BEGIN
+                UPDATE actor_profiles
+                   SET card_dirty = 1, card_input_hash = ''
+                 WHERE actor_id = OLD.sender_actor_id
+                   AND OLD.sender_actor_id <> ''
+                   AND tenant_id = (
+                       SELECT tenant_id
+                         FROM conversations
+                        WHERE conversation_id = OLD.conversation_id
+                   );
+                UPDATE actor_profiles
+                   SET card_dirty = 1, card_input_hash = ''
+                 WHERE actor_id = NEW.sender_actor_id
+                   AND NEW.sender_actor_id <> ''
+                   AND tenant_id = (
+                       SELECT tenant_id
+                         FROM conversations
+                        WHERE conversation_id = NEW.conversation_id
+                   );
+                UPDATE actor_profiles
+                   SET card_dirty = 1, card_input_hash = ''
+                 WHERE (tenant_id, actor_id) IN (
+                       SELECT e.tenant_id, e.actor_id
+                         FROM actor_card_entries e
+                         JOIN actor_card_turn_sources s
+                           ON s.entry_id = e.id
+                          AND s.tenant_id = e.tenant_id
+                        WHERE s.canonical_turn_id =
+                              OLD.canonical_turn_id
+                 );
+                DELETE FROM actor_card_entries
+                 WHERE id IN (
+                       SELECT entry_id
+                         FROM actor_card_turn_sources
+                        WHERE canonical_turn_id =
+                              OLD.canonical_turn_id
+                 );
+            END;
+
             CREATE TABLE IF NOT EXISTS actor_card_rebuild_status (
                 tenant_id TEXT NOT NULL,
                 actor_id TEXT NOT NULL,
@@ -2083,12 +2213,26 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 outcome TEXT NOT NULL,
                 response_hash TEXT NOT NULL DEFAULT '',
                 written_count INTEGER NOT NULL DEFAULT 0,
+                failure_count INTEGER NOT NULL DEFAULT 0,
+                next_retry_at TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY (tenant_id, actor_id),
                 FOREIGN KEY (tenant_id, actor_id)
                     REFERENCES actor_profiles(tenant_id, actor_id)
                     ON DELETE CASCADE
             );
         """)
+        self._add_column_if_missing(
+            conn,
+            "actor_card_rebuild_status",
+            "failure_count",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
+        self._add_column_if_missing(
+            conn,
+            "actor_card_rebuild_status",
+            "next_retry_at",
+            "TEXT NOT NULL DEFAULT ''",
+        )
 
     def _ensure_speaker_handle_schema(self, conn: sqlite3.Connection) -> None:
         """Create the durable speaker-handle assignment relation.
@@ -8586,6 +8730,12 @@ CREATE TABLE IF NOT EXISTS request_captures (
                        OR audience_conversation_id = ?""",
                 (owner, owner),
             )
+            derived_counts["actor_card_turn_sources"] = _count(
+                """SELECT COUNT(*) FROM actor_card_turn_sources
+                    WHERE owner_conversation_id = ?
+                       OR audience_conversation_id = ?""",
+                (owner, owner),
+            )
             report = {
                 "platform": platform_name,
                 "sender_rows_to_normalize": sender_rows,
@@ -10122,7 +10272,8 @@ CREATE TABLE IF NOT EXISTS request_captures (
         updated = 0
         for actor_id in sorted(actor_ids):
             cur = conn.execute(
-                """UPDATE actor_profiles SET card_dirty = 1
+                """UPDATE actor_profiles
+                      SET card_dirty = 1, card_input_hash = ''
                     WHERE tenant_id = ? AND actor_id = ?""",
                 (tenant_id, actor_id),
             )
@@ -10344,6 +10495,68 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 break
         return out
 
+    def list_actor_turn_sources(
+        self,
+        tenant_id: str,
+        actor_id: str,
+        *,
+        limit: int = 120,
+    ) -> list[ActorTurnSource]:
+        """Enumerate exact, audience-proved canonical user rows for one actor."""
+        actor_id = (actor_id or "").strip()
+        cap = max(0, int(limit))
+        if not actor_id or cap <= 0:
+            return []
+        rows = self._get_conn().execute(
+            """SELECT ct.*, owner.lifecycle_epoch AS _owner_epoch,
+                      audience.lifecycle_epoch AS _audience_epoch
+                 FROM canonical_turns ct
+                 JOIN conversations owner
+                   ON owner.conversation_id = ct.conversation_id
+                 JOIN conversations audience
+                   ON audience.conversation_id =
+                      ct.audience_conversation_id
+                WHERE ct.sender_actor_id = ?
+                  AND owner.tenant_id = ?
+                  AND audience.tenant_id = ?
+                  AND owner.phase NOT IN ('deleted', 'merged')
+                  AND audience.phase <> 'deleted'
+                  AND ct.audience_attribution_version = ?
+                  AND ct.audience_conversation_id <> ''
+                  AND ct.user_content <> ''
+                ORDER BY
+                    COALESCE(
+                        NULLIF(ct.created_at, ''),
+                        NULLIF(ct.first_seen_at, ''),
+                        NULLIF(ct.updated_at, ''),
+                        ''
+                    ) DESC,
+                    ct.sort_key DESC,
+                    ct.canonical_turn_id DESC
+                LIMIT ?""",
+            (
+                actor_id,
+                tenant_id,
+                tenant_id,
+                AUDIENCE_ATTRIBUTION_VERSION,
+                cap,
+            ),
+        ).fetchall()
+        return [
+            ActorTurnSource(
+                turn=_row_to_canonical_turn(row),
+                tenant_id=tenant_id,
+                owner_conversation_id=row["conversation_id"] or "",
+                audience_conversation_id=(
+                    row["audience_conversation_id"] or ""
+                ),
+                audience_channel_id=row["origin_channel_id"] or "",
+                owner_lifecycle_epoch=int(row["_owner_epoch"] or 0),
+                audience_lifecycle_epoch=int(row["_audience_epoch"] or 0),
+            )
+            for row in rows or ()
+        ]
+
     def get_actor_profile(self, tenant_id: str, actor_id: str) -> ActorProfile | None:
         row = self._get_conn().execute(
             """SELECT * FROM actor_profiles
@@ -10360,12 +10573,19 @@ CREATE TABLE IF NOT EXISTS request_captures (
             card_input_hash=row["card_input_hash"] or "",
         )
 
-    def mark_actor_card_dirty(self, tenant_id: str, actor_id: str) -> bool:
+    def mark_actor_card_dirty(
+        self,
+        tenant_id: str,
+        actor_id: str,
+        *,
+        build_input_hash: str = "",
+    ) -> bool:
         conn = self._get_conn()
         cur = conn.execute(
-            """UPDATE actor_profiles SET card_dirty = 1
+            """UPDATE actor_profiles
+                  SET card_dirty = 1, card_input_hash = ?
                 WHERE tenant_id = ? AND actor_id = ?""",
-            (tenant_id, actor_id),
+            (build_input_hash or "", tenant_id, actor_id),
         )
         conn.commit()
         return int(cur.rowcount or 0) == 1
@@ -10378,6 +10598,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
         *,
         input_hash: str = "",
         expected_source_epochs: dict[str, int] | None = None,
+        expected_build_marker: str | None = None,
     ) -> int:
         """Atomically replace an actor's card and clear its dirty flag.
 
@@ -10399,11 +10620,18 @@ CREATE TABLE IF NOT EXISTS request_captures (
         conn.execute("BEGIN IMMEDIATE")
         try:
             prof = conn.execute(
-                """SELECT 1 FROM actor_profiles
+                """SELECT card_dirty, card_input_hash FROM actor_profiles
                     WHERE tenant_id = ? AND actor_id = ?""",
                 (tenant_id, actor_id),
             ).fetchone()
             if prof is None:
+                conn.execute("ROLLBACK")
+                return 0
+            if expected_build_marker is not None and (
+                not bool(prof["card_dirty"])
+                or (prof["card_input_hash"] or "")
+                != expected_build_marker
+            ):
                 conn.execute("ROLLBACK")
                 return 0
 
@@ -10442,37 +10670,104 @@ CREATE TABLE IF NOT EXISTS request_captures (
                     return 0
                 normalized_sources: list[ActorCardEntrySource] = []
                 for src in sources:
-                    fact_row = conn.execute(
-                        """SELECT f.*, c.lifecycle_epoch AS _owner_epoch
-                             FROM facts f
-                             JOIN conversations c
-                               ON c.conversation_id = f.conversation_id
-                            WHERE f.id = ? AND f.author_actor_id = ?
-                              AND f.superseded_by IS NULL
-                              AND c.tenant_id = ?
-                              AND c.phase NOT IN ('deleted', 'merged')""",
-                        (src.fact_id, actor_id, tenant_id),
-                    ).fetchone()
-                    if fact_row is None:
+                    fact_id = (src.fact_id or "").strip()
+                    turn_id = (src.canonical_turn_id or "").strip()
+                    if bool(fact_id) == bool(turn_id):
                         conn.execute("ROLLBACK")
                         return 0
-                    fact = Fact.from_dict(dict(fact_row), dt_parser=_str_to_dt)
-                    derived = self._fact_audience(conn, fact)
-                    if derived is None:
-                        conn.execute("ROLLBACK")
-                        return 0
-                    audience_id, channel_id = derived
-                    audience_row = conn.execute(
-                        """SELECT lifecycle_epoch FROM conversations
-                            WHERE conversation_id = ? AND tenant_id = ?
-                              AND phase <> 'deleted'""",
-                        (audience_id, tenant_id),
-                    ).fetchone()
-                    owner_id = fact.conversation_id
-                    owner_epoch = int(fact_row["_owner_epoch"] or 0)
-                    audience_epoch = (
-                        int(audience_row[0] or 0) if audience_row is not None else -1
-                    )
+                    if fact_id:
+                        fact_row = conn.execute(
+                            """SELECT f.*,
+                                      c.lifecycle_epoch AS _owner_epoch
+                                 FROM facts f
+                                 JOIN conversations c
+                                   ON c.conversation_id =
+                                      f.conversation_id
+                                WHERE f.id = ?
+                                  AND f.author_actor_id = ?
+                                  AND f.superseded_by IS NULL
+                                  AND c.tenant_id = ?
+                                  AND c.phase NOT IN (
+                                      'deleted', 'merged'
+                                  )""",
+                            (fact_id, actor_id, tenant_id),
+                        ).fetchone()
+                        if fact_row is None:
+                            conn.execute("ROLLBACK")
+                            return 0
+                        fact = Fact.from_dict(
+                            dict(fact_row), dt_parser=_str_to_dt,
+                        )
+                        derived = self._fact_audience(conn, fact)
+                        if derived is None:
+                            conn.execute("ROLLBACK")
+                            return 0
+                        audience_id, channel_id = derived
+                        audience_row = conn.execute(
+                            """SELECT lifecycle_epoch
+                                 FROM conversations
+                                WHERE conversation_id = ?
+                                  AND tenant_id = ?
+                                  AND phase <> 'deleted'""",
+                            (audience_id, tenant_id),
+                        ).fetchone()
+                        owner_id = fact.conversation_id
+                        owner_epoch = int(
+                            fact_row["_owner_epoch"] or 0
+                        )
+                        audience_epoch = (
+                            int(audience_row[0] or 0)
+                            if audience_row is not None else -1
+                        )
+                    else:
+                        turn_row = conn.execute(
+                            """SELECT ct.*,
+                                      owner.lifecycle_epoch
+                                          AS _owner_epoch,
+                                      audience.lifecycle_epoch
+                                          AS _audience_epoch
+                                 FROM canonical_turns ct
+                                 JOIN conversations owner
+                                   ON owner.conversation_id =
+                                      ct.conversation_id
+                                 JOIN conversations audience
+                                   ON audience.conversation_id =
+                                      ct.audience_conversation_id
+                                WHERE ct.canonical_turn_id = ?
+                                  AND ct.sender_actor_id = ?
+                                  AND ct.user_content <> ''
+                                  AND ct.audience_attribution_version = ?
+                                  AND owner.tenant_id = ?
+                                  AND audience.tenant_id = ?
+                                  AND owner.phase NOT IN (
+                                      'deleted', 'merged'
+                                  )
+                                  AND audience.phase <> 'deleted'""",
+                            (
+                                turn_id,
+                                actor_id,
+                                AUDIENCE_ATTRIBUTION_VERSION,
+                                tenant_id,
+                                tenant_id,
+                            ),
+                        ).fetchone()
+                        if turn_row is None:
+                            conn.execute("ROLLBACK")
+                            return 0
+                        owner_id = turn_row["conversation_id"] or ""
+                        audience_id = (
+                            turn_row["audience_conversation_id"] or ""
+                        )
+                        channel_id = (
+                            turn_row["origin_channel_id"] or ""
+                        )
+                        owner_epoch = int(
+                            turn_row["_owner_epoch"] or 0
+                        )
+                        audience_epoch = int(
+                            turn_row["_audience_epoch"] or 0
+                        )
+                        audience_row = turn_row
                     if (
                         audience_row is None
                         or expected.get(owner_id) != owner_epoch
@@ -10491,7 +10786,8 @@ CREATE TABLE IF NOT EXISTS request_captures (
                         owner_conversation_id=owner_id,
                         audience_conversation_id=audience_id,
                         audience_channel_id=channel_id,
-                        fact_id=fact.id,
+                        fact_id=fact_id,
+                        canonical_turn_id=turn_id,
                     ))
                 normalized_entries.append((entry, normalized_sources))
             entries_with_sources = normalized_entries
@@ -10544,22 +10840,52 @@ CREATE TABLE IF NOT EXISTS request_captures (
                         WHERE entry_id = ? AND tenant_id = ?""",
                     (entry.id, tenant_id),
                 )
+                conn.execute(
+                    """DELETE FROM actor_card_turn_sources
+                        WHERE entry_id = ? AND tenant_id = ?""",
+                    (entry.id, tenant_id),
+                )
                 for src in sources:
-                    # Provenance is set from the authoritative fact row by the
-                    # caller; a model- or caller-supplied conversation id is
-                    # never accepted here.
-                    conn.execute(
-                        """INSERT OR REPLACE INTO actor_card_entry_sources
-                               (entry_id, tenant_id, owner_conversation_id,
-                                audience_conversation_id, audience_channel_id,
-                                fact_id)
-                           VALUES (?, ?, ?, ?, ?, ?)""",
-                        (
-                            entry.id, tenant_id, src.owner_conversation_id,
-                            src.audience_conversation_id,
-                            src.audience_channel_id or "", src.fact_id,
-                        ),
-                    )
+                    # Provenance is re-derived from the authoritative fact or
+                    # canonical row above; caller/model conversation ids are
+                    # never trusted.
+                    if src.fact_id:
+                        conn.execute(
+                            """INSERT OR REPLACE INTO
+                                   actor_card_entry_sources
+                                   (entry_id, tenant_id,
+                                    owner_conversation_id,
+                                    audience_conversation_id,
+                                    audience_channel_id, fact_id)
+                               VALUES (?, ?, ?, ?, ?, ?)""",
+                            (
+                                entry.id,
+                                tenant_id,
+                                src.owner_conversation_id,
+                                src.audience_conversation_id,
+                                src.audience_channel_id or "",
+                                src.fact_id,
+                            ),
+                        )
+                    else:
+                        conn.execute(
+                            """INSERT OR REPLACE INTO
+                                   actor_card_turn_sources
+                                   (entry_id, tenant_id,
+                                    owner_conversation_id,
+                                    audience_conversation_id,
+                                    audience_channel_id,
+                                    canonical_turn_id)
+                               VALUES (?, ?, ?, ?, ?, ?)""",
+                            (
+                                entry.id,
+                                tenant_id,
+                                src.owner_conversation_id,
+                                src.audience_conversation_id,
+                                src.audience_channel_id or "",
+                                src.canonical_turn_id,
+                            ),
+                        )
                 written += 1
 
             conn.execute(
@@ -10590,31 +10916,83 @@ CREATE TABLE IF NOT EXISTS request_captures (
         written_count: int,
     ) -> None:
         conn = self._get_conn()
-        conn.execute(
-            """INSERT INTO actor_card_rebuild_status
-                   (tenant_id, actor_id, attempted_at, input_hash,
-                    source_count, raw_entry_count, accepted_entry_count,
-                    rejected_counts_json, outcome, response_hash, written_count)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT (tenant_id, actor_id) DO UPDATE SET
-                   attempted_at = excluded.attempted_at,
-                   input_hash = excluded.input_hash,
-                   source_count = excluded.source_count,
-                   raw_entry_count = excluded.raw_entry_count,
-                   accepted_entry_count = excluded.accepted_entry_count,
-                   rejected_counts_json = excluded.rejected_counts_json,
-                   outcome = excluded.outcome,
-                   response_hash = excluded.response_hash,
-                   written_count = excluded.written_count""",
-            (
-                tenant_id, actor_id, attempted_at, input_hash,
-                max(0, int(source_count)), max(0, int(raw_entry_count)),
-                max(0, int(accepted_entry_count)),
-                json.dumps(rejected_counts, sort_keys=True, separators=(",", ":")),
-                outcome, response_hash, max(0, int(written_count)),
-            ),
-        )
-        conn.commit()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            previous = conn.execute(
+                """SELECT input_hash, failure_count
+                     FROM actor_card_rebuild_status
+                    WHERE tenant_id = ? AND actor_id = ?""",
+                (tenant_id, actor_id),
+            ).fetchone()
+            failed_outcomes = {
+                "model_error",
+                "invalid_response",
+                "rejected_all",
+                "admission_error",
+                "coverage_disagreement",
+                "coverage_gap",
+                "stale_or_rejected_write",
+            }
+            if outcome in failed_outcomes:
+                if outcome in {"coverage_disagreement", "coverage_gap"}:
+                    failure_count = 3
+                else:
+                    failure_count = (
+                        int(previous["failure_count"] or 0) + 1
+                        if previous is not None
+                        and (previous["input_hash"] or "") == input_hash
+                        else 1
+                    )
+                attempted = (
+                    _parse_sequence_timestamp(attempted_at)
+                    or datetime.now(timezone.utc)
+                )
+                next_retry_at = _dt_to_str(
+                    attempted
+                    + timedelta(seconds=min(
+                        3600,
+                        30 * (2 ** max(0, failure_count - 1)),
+                    ))
+                )
+            else:
+                failure_count = 0
+                next_retry_at = ""
+            conn.execute(
+                """INSERT INTO actor_card_rebuild_status
+                       (tenant_id, actor_id, attempted_at, input_hash,
+                        source_count, raw_entry_count, accepted_entry_count,
+                        rejected_counts_json, outcome, response_hash, written_count,
+                        failure_count, next_retry_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT (tenant_id, actor_id) DO UPDATE SET
+                       attempted_at = excluded.attempted_at,
+                       input_hash = excluded.input_hash,
+                       source_count = excluded.source_count,
+                       raw_entry_count = excluded.raw_entry_count,
+                       accepted_entry_count = excluded.accepted_entry_count,
+                       rejected_counts_json = excluded.rejected_counts_json,
+                       outcome = excluded.outcome,
+                       response_hash = excluded.response_hash,
+                       written_count = excluded.written_count,
+                       failure_count = excluded.failure_count,
+                       next_retry_at = excluded.next_retry_at""",
+                (
+                    tenant_id, actor_id, attempted_at, input_hash,
+                    max(0, int(source_count)), max(0, int(raw_entry_count)),
+                    max(0, int(accepted_entry_count)),
+                    json.dumps(
+                        rejected_counts,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    outcome, response_hash, max(0, int(written_count)),
+                    failure_count, next_retry_at,
+                ),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
 
     def get_actor_card_rebuild_status(
         self, tenant_id: str, actor_id: str,
@@ -10635,6 +11013,40 @@ CREATE TABLE IF NOT EXISTS request_captures (
             result["rejected_counts"] = {}
             result.pop("rejected_counts_json", None)
         return result
+
+    def list_due_actor_card_rebuilds(
+        self,
+        tenant_id: str,
+        *,
+        due_at: str,
+        limit: int = 25,
+    ) -> list[str]:
+        """Return transiently failed dirty cards whose backoff has elapsed.
+
+        New evidence is rebuilt by the compaction that wrote it. This query is
+        specifically the retry queue for an already-attempted transient
+        failure; terminal semantic disagreements are deliberately excluded.
+        """
+        cap = max(0, int(limit))
+        if cap <= 0:
+            return []
+        rows = self._get_conn().execute(
+            """SELECT p.actor_id
+                 FROM actor_profiles p
+                 JOIN actor_card_rebuild_status s
+                   ON s.tenant_id = p.tenant_id
+                  AND s.actor_id = p.actor_id
+                WHERE p.tenant_id = ?
+                  AND p.card_dirty = 1
+                  AND s.failure_count > 0
+                  AND s.failure_count < 3
+                  AND s.next_retry_at <> ''
+                  AND s.next_retry_at <= ?
+                ORDER BY s.next_retry_at, p.actor_id
+                LIMIT ?""",
+            (tenant_id, due_at, cap),
+        ).fetchall()
+        return [str(row["actor_id"]) for row in rows]
 
     def get_actor_card(
         self,
@@ -10709,18 +11121,44 @@ CREATE TABLE IF NOT EXISTS request_captures (
                    AND e.superseded_by IS NULL
                    AND e.sensitivity = ?
                    AND (
+                     EXISTS (
+                       SELECT 1 FROM actor_card_entry_sources fs
+                        WHERE fs.entry_id = e.id
+                          AND fs.tenant_id = e.tenant_id
+                     )
+                     OR EXISTS (
+                       SELECT 1 FROM actor_card_turn_sources ts
+                        WHERE ts.entry_id = e.id
+                          AND ts.tenant_id = e.tenant_id
+                     )
+                   )
+                   AND (
                      (e.audience_scope = 'cross_context'
                       AND e.kind IN ({cross_kinds}))
                      OR (
                        e.audience_scope = 'same_conversation'
-                       AND EXISTS (SELECT 1 FROM actor_card_entry_sources s
-                                    WHERE s.entry_id = e.id)
                        AND NOT EXISTS (
-                         SELECT 1 FROM actor_card_entry_sources s
-                          WHERE s.entry_id = e.id
+                         SELECT 1 FROM actor_card_entry_sources fs
+                          WHERE fs.entry_id = e.id
+                            AND fs.tenant_id = e.tenant_id
                             AND (
-                              s.audience_conversation_id <> ?
-                              OR (? <> '' AND s.audience_channel_id <> ?)
+                              fs.audience_conversation_id <> ?
+                              OR (
+                                ? <> ''
+                                AND fs.audience_channel_id <> ?
+                              )
+                            )
+                       )
+                       AND NOT EXISTS (
+                         SELECT 1 FROM actor_card_turn_sources ts
+                          WHERE ts.entry_id = e.id
+                            AND ts.tenant_id = e.tenant_id
+                            AND (
+                              ts.audience_conversation_id <> ?
+                              OR (
+                                ? <> ''
+                                AND ts.audience_channel_id <> ?
+                              )
                             )
                        )
                      )
@@ -10728,6 +11166,8 @@ CREATE TABLE IF NOT EXISTS request_captures (
                  ORDER BY e.kind, e.confidence DESC, e.updated_at, e.id""",
             (
                 tenant_id, actor_id, CARD_SENSITIVITY_NORMAL,
+                audience_conversation_id,
+                audience_channel_id or "", audience_channel_id or "",
                 audience_conversation_id,
                 audience_channel_id or "", audience_channel_id or "",
             ),
@@ -10773,7 +11213,10 @@ CREATE TABLE IF NOT EXISTS request_captures (
         method is safe to invoke from ``delete_conversation`` and from a merge.
         """
         conn = self._get_conn()
-        if not self._table_exists(conn, "actor_card_entry_sources"):
+        if (
+            not self._table_exists(conn, "actor_card_entry_sources")
+            or not self._table_exists(conn, "actor_card_turn_sources")
+        ):
             return 0
         return self._invalidate_actor_cards(conn, conversation_id)
 
@@ -10789,11 +11232,24 @@ CREATE TABLE IF NOT EXISTS request_captures (
         entries are gone too. Discovery therefore has to happen before any fact
         is deleted.
         """
-        if not self._table_exists(conn, "actor_card_entry_sources"):
+        if (
+            not self._table_exists(conn, "actor_card_entry_sources")
+            or not self._table_exists(conn, "actor_card_turn_sources")
+        ):
             return 0
         affected = conn.execute(
             """SELECT DISTINCT s.tenant_id, e.actor_id, s.entry_id
-                 FROM actor_card_entry_sources s
+                 FROM (
+                       SELECT entry_id, tenant_id,
+                              owner_conversation_id,
+                              audience_conversation_id
+                         FROM actor_card_entry_sources
+                       UNION ALL
+                       SELECT entry_id, tenant_id,
+                              owner_conversation_id,
+                              audience_conversation_id
+                         FROM actor_card_turn_sources
+                 ) s
                  JOIN actor_card_entries e
                    ON e.id = s.entry_id AND e.tenant_id = s.tenant_id
                 WHERE s.owner_conversation_id = ?
@@ -10808,6 +11264,10 @@ CREATE TABLE IF NOT EXISTS request_captures (
         for entry_id in sorted(entry_ids):
             conn.execute(
                 "DELETE FROM actor_card_entry_sources WHERE entry_id = ?",
+                (entry_id,),
+            )
+            conn.execute(
+                "DELETE FROM actor_card_turn_sources WHERE entry_id = ?",
                 (entry_id,),
             )
             conn.execute(

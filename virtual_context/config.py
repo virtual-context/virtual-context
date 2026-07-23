@@ -272,6 +272,9 @@ def _build_config(raw: dict[str, Any], *, validate: bool = True) -> VirtualConte
         actor_card_fact_limit=assembly_raw.get(
             "actor_card_fact_limit", _asm_defaults.actor_card_fact_limit,
         ),
+        actor_card_turn_limit=assembly_raw.get(
+            "actor_card_turn_limit", _asm_defaults.actor_card_turn_limit,
+        ),
         actor_card_entries_per_kind=assembly_raw.get(
             "actor_card_entries_per_kind",
             _asm_defaults.actor_card_entries_per_kind,
@@ -537,6 +540,8 @@ def validate_config(config: VirtualContextConfig) -> list[str]:
         errors.append("assembly.actor_card_max_tokens must be >= 0")
     if config.assembler.actor_card_fact_limit < 1:
         errors.append("assembly.actor_card_fact_limit must be >= 1")
+    if config.assembler.actor_card_turn_limit < 1:
+        errors.append("assembly.actor_card_turn_limit must be >= 1")
     if config.assembler.actor_card_entries_per_kind < 1:
         errors.append("assembly.actor_card_entries_per_kind must be >= 1")
     if config.assembler.actor_card_enabled:

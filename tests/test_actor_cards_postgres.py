@@ -147,6 +147,17 @@ def _source(entry_id, tenant, owner, audience, fact_id, channel=""):
     )
 
 
+def _turn_source(entry_id, tenant, owner, audience, turn_id, channel=""):
+    return ActorCardEntrySource(
+        entry_id=entry_id,
+        tenant_id=tenant,
+        owner_conversation_id=owner,
+        audience_conversation_id=audience,
+        audience_channel_id=channel,
+        canonical_turn_id=turn_id,
+    )
+
+
 def _build(w):
     goal_id, pref_id = _uid("e"), _uid("e")
     w.store.replace_actor_card(
@@ -181,6 +192,130 @@ def test_pg_list_actor_facts_derives_audience_and_is_tenant_scoped(store):
         w.f_guild: (w.guild, w.guild, "chan-guild"),
     }
     assert store.list_actor_facts("someone-else", w.optics, limit=10) == []
+
+
+def test_pg_list_actor_turn_sources_is_tenant_and_audience_scoped(store):
+    w = World(store)
+    got = {
+        source.turn.canonical_turn_id: (
+            source.owner_conversation_id,
+            source.audience_conversation_id,
+            source.audience_channel_id,
+        )
+        for source in store.list_actor_turn_sources(
+            w.tenant,
+            w.optics,
+            limit=10,
+        )
+    }
+    assert got == {
+        w.ct_dm: (w.dm, w.dm, "chan-dm"),
+        w.ct_guild: (w.guild, w.guild, "chan-guild"),
+    }
+    assert store.list_actor_turn_sources(
+        "someone-else",
+        w.optics,
+        limit=10,
+    ) == []
+
+
+def test_pg_turn_sourced_card_delete_is_synchronously_invalidated(store):
+    w = World(store)
+    entry_id = _uid("turn-entry")
+    assert store.replace_actor_card(
+        w.tenant,
+        w.optics,
+        [(
+            _entry(
+                entry_id,
+                "relevant_history",
+                "Has discussed a private DM topic with Vast.",
+            ),
+            [_turn_source(
+                entry_id,
+                w.tenant,
+                w.dm,
+                w.dm,
+                w.ct_dm,
+                "chan-dm",
+            )],
+        )],
+        input_hash="turn-source",
+        expected_source_epochs={w.dm: 1},
+    ) == 1
+
+    with store.pool.connection() as conn:
+        conn.execute(
+            """DELETE FROM canonical_turns
+                WHERE canonical_turn_id = %s""",
+            (w.ct_dm,),
+        )
+        assert conn.execute(
+            """SELECT 1 FROM actor_card_entries WHERE id = %s""",
+            (entry_id,),
+        ).fetchone() is None
+    profile = store.get_actor_profile(w.tenant, w.optics)
+    assert profile is not None and profile.card_dirty is True
+
+
+def test_pg_rebuild_failure_backoff_status_round_trips(store):
+    w = World(store)
+    store.mark_actor_card_dirty(
+        w.tenant,
+        w.optics,
+        build_input_hash="building:same-input",
+    )
+    kwargs = {
+        "attempted_at": _now(),
+        "input_hash": "same-input",
+        "source_count": 2,
+        "raw_entry_count": 0,
+        "accepted_entry_count": 0,
+        "rejected_counts": {},
+        "outcome": "invalid_response",
+        "response_hash": "response",
+        "written_count": 0,
+    }
+    store.record_actor_card_rebuild_status(
+        w.tenant,
+        w.optics,
+        **kwargs,
+    )
+    first = store.get_actor_card_rebuild_status(w.tenant, w.optics)
+    assert first is not None
+    assert first["failure_count"] == 1
+    assert first["next_retry_at"]
+    assert store.list_due_actor_card_rebuilds(
+        w.tenant,
+        due_at="2000-01-01T00:00:00+00:00",
+    ) == []
+    assert store.list_due_actor_card_rebuilds(
+        w.tenant,
+        due_at="9999-01-01T00:00:00+00:00",
+    ) == [w.optics]
+
+    store.record_actor_card_rebuild_status(
+        w.tenant,
+        w.optics,
+        **kwargs,
+    )
+    second = store.get_actor_card_rebuild_status(w.tenant, w.optics)
+    assert second is not None
+    assert second["failure_count"] == 2
+
+    store.record_actor_card_rebuild_status(
+        w.tenant,
+        w.optics,
+        **{**kwargs, "outcome": "written", "written_count": 1},
+    )
+    clean = store.get_actor_card_rebuild_status(w.tenant, w.optics)
+    assert clean is not None
+    assert clean["failure_count"] == 0
+    assert clean["next_retry_at"] == ""
+    assert store.list_due_actor_card_rebuilds(
+        w.tenant,
+        due_at="9999-01-01T00:00:00+00:00",
+    ) == []
 
 
 def test_pg_dm_entry_is_not_served_in_the_guild(store):

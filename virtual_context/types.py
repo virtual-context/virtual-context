@@ -1480,8 +1480,9 @@ class ActorCardEntry:
     """One curated line of a person card.
 
     The card is a CACHE, not a second source of truth: every entry is derived
-    from facts carrying that actor's ``author_actor_id`` and is fully
-    rebuildable. ``superseded_by`` mirrors the fact supersession chain.
+    from exact actor-authored canonical turns and/or facts carrying that
+    actor's ``author_actor_id`` and is fully rebuildable. ``superseded_by``
+    preserves the card replacement chain.
     """
     id: str = ""
     tenant_id: str = ""
@@ -1498,13 +1499,19 @@ class ActorCardEntry:
 
 @dataclass
 class ActorCardEntrySource:
-    """Normalized per-fact provenance for one card entry.
+    """Normalized provenance for one card entry.
 
     Both ids are load-bearing and distinct. ``owner_conversation_id`` is where
-    the fact is stored; ``audience_conversation_id`` is the validated pre-alias
-    route the source message actually arrived on. After a merge they differ, and
-    only the audience id may decide disclosure: comparing owners would serve
-    guild influence to a request arriving through a retained DM alias.
+    the source is stored; ``audience_conversation_id`` is the validated
+    pre-alias route the source message actually arrived on. After a merge they
+    differ, and only the audience id may decide disclosure: comparing owners
+    would serve guild influence to a request arriving through a retained DM
+    alias.
+
+    Exactly one of ``fact_id`` and ``canonical_turn_id`` is populated. Facts
+    remain useful compact evidence, while canonical-turn provenance lets a
+    substantive actor build a meaningful card even when the fact extractor did
+    not happen to promote that interaction into a standalone fact.
     """
     entry_id: str = ""
     tenant_id: str = ""
@@ -1512,6 +1519,7 @@ class ActorCardEntrySource:
     audience_conversation_id: str = ""
     audience_channel_id: str = ""   # "" means unknown, which fails closed
     fact_id: str = ""
+    canonical_turn_id: str = ""
 
 
 @dataclass
@@ -1536,6 +1544,24 @@ class ActorFactSource:
     that was deleted.
     """
     fact: "Fact" = None  # type: ignore[assignment]
+    tenant_id: str = ""
+    owner_conversation_id: str = ""
+    audience_conversation_id: str = ""
+    audience_channel_id: str = ""
+    owner_lifecycle_epoch: int = 0
+    audience_lifecycle_epoch: int = 0
+
+
+@dataclass
+class ActorTurnSource:
+    """One exact actor-authored canonical user row eligible as card evidence.
+
+    The row remains the source of truth. Tenant, actor, audience attribution,
+    and both lifecycle epochs are verified during enumeration and verified
+    again inside the atomic card replacement transaction.
+    """
+
+    turn: "CanonicalTurnRow" = None  # type: ignore[assignment]
     tenant_id: str = ""
     owner_conversation_id: str = ""
     audience_conversation_id: str = ""
@@ -2172,13 +2198,14 @@ class AssemblerConfig:
     # Person cards. SHIPS DARK: with the gate off, no profile or card read is
     # performed, no budget key is added, and rendered output is byte-identical.
     # YAML keys: assembly.actor_card_enabled, assembly.actor_card_max_tokens,
-    # assembly.actor_card_fact_limit, assembly.actor_card_entries_per_kind,
-    # assembly.actor_card_admission_model.
+    # assembly.actor_card_fact_limit, assembly.actor_card_turn_limit,
+    # assembly.actor_card_entries_per_kind, assembly.actor_card_admission_model.
     actor_card_enabled: bool = False
     actor_card_max_tokens: int = 400
-    # Bounds on the curation pass: how many of an actor's facts it may read,
-    # and how many entries it may emit per kind.
+    # Bounds on the curation pass: how many facts and exact canonical messages
+    # it may read, and how many entries it may emit per kind.
     actor_card_fact_limit: int = 60
+    actor_card_turn_limit: int = 120
     actor_card_entries_per_kind: int = 3
     # Dedicated semantic admission model. Person cards fail configuration
     # closed when the card gate is enabled without one: the cheap fact
