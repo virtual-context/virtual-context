@@ -535,6 +535,13 @@ def test_semantic_admission_rejects_candidate_without_rewriting_card(store):
         for segment in admission.prompt["evidence_segments"]
         for message in segment["messages"]
     )
+    assert {
+        segment["segment_ref"]
+        for segment in admission.prompt["evidence_segments"]
+    } == {"seg-guild"}
+    assert {
+        fact["id"] for fact in admission.prompt["facts"]
+    } == {"f-dm", "f-guild"}
     assert store.get_actor_card(
         "t1", OPTICS, owner_conversation_id="guild",
         audience_conversation_id="guild", audience_channel_id="chan-guild",
