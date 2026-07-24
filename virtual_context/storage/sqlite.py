@@ -2216,6 +2216,16 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 origin_channel_id, created_at, first_seen_at
             ON canonical_turns
             FOR EACH ROW
+            WHEN OLD.conversation_id IS NOT NEW.conversation_id
+              OR OLD.user_content IS NOT NEW.user_content
+              OR OLD.sender_actor_id IS NOT NEW.sender_actor_id
+              OR OLD.audience_conversation_id
+                    IS NOT NEW.audience_conversation_id
+              OR OLD.audience_attribution_version
+                    IS NOT NEW.audience_attribution_version
+              OR OLD.origin_channel_id IS NOT NEW.origin_channel_id
+              OR OLD.created_at IS NOT NEW.created_at
+              OR OLD.first_seen_at IS NOT NEW.first_seen_at
             BEGIN
                 UPDATE actor_profiles
                    SET card_dirty = 1, card_invalid = 1,

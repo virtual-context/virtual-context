@@ -2744,6 +2744,151 @@ def test_live_build_marker_does_not_overwrite_last_good_card_version(store):
     )) == ["prefers terse answers"]
 
 
+def test_noop_canonical_reconciliation_keeps_turn_sourced_card_valid(store):
+    """A tagger upsert that names unchanged evidence columns is not destructive."""
+    _conversation(store, "guild")
+    _turn(
+        store,
+        "ct-preference",
+        "guild",
+        OPTICS,
+        "guild",
+        "chan-guild",
+        content="Prefer the smallest live integration test.",
+    )
+    store.upsert_actor_profile_from_turn(
+        "guild",
+        OPTICS,
+        "Optics",
+        seen_at=_now(),
+    )
+    conn = store._get_conn()
+    conn.execute(
+        """UPDATE canonical_turns
+              SET first_seen_at = ?
+            WHERE canonical_turn_id = ?""",
+        (_now(), "ct-preference"),
+    )
+    conn.commit()
+    store.replace_actor_card(
+        "t1",
+        OPTICS,
+        [(
+            _entry(
+                "e-pref",
+                CARD_KIND_COMMUNICATION_PREF,
+                "prefers the smallest live integration test",
+                scope=CARD_SCOPE_CROSS_CONTEXT,
+            ),
+            [_turn_source(
+                "e-pref",
+                "guild",
+                "guild",
+                "ct-preference",
+                "chan-guild",
+            )],
+        )],
+        input_hash="h1",
+        expected_source_epochs={"guild": 1},
+    )
+
+    conn.execute(
+        """UPDATE canonical_turns
+              SET user_content = user_content,
+                  sender_actor_id = sender_actor_id,
+                  audience_conversation_id = audience_conversation_id,
+                  audience_attribution_version =
+                      audience_attribution_version,
+                  origin_channel_id = origin_channel_id,
+                  created_at = created_at,
+                  first_seen_at = first_seen_at
+            WHERE canonical_turn_id = ?""",
+        ("ct-preference",),
+    )
+    conn.commit()
+
+    profile = store.get_actor_profile("t1", OPTICS)
+    assert profile is not None
+    assert profile.card_dirty is False
+    assert profile.card_invalid is False
+    assert _bodies(store.get_actor_card(
+        "t1",
+        OPTICS,
+        owner_conversation_id="guild",
+        audience_conversation_id="guild",
+        audience_channel_id="chan-guild",
+    )) == ["prefers the smallest live integration test"]
+
+    # A real evidence edit remains destructive and must invalidate the cache.
+    conn.execute(
+        """UPDATE canonical_turns
+              SET user_content = 'Prefer a broad test suite.'
+            WHERE canonical_turn_id = ?""",
+        ("ct-preference",),
+    )
+    conn.commit()
+    profile = store.get_actor_profile("t1", OPTICS)
+    assert profile is not None
+    assert profile.card_dirty is True
+    assert profile.card_invalid is True
+    assert store.get_actor_card(
+        "t1",
+        OPTICS,
+        owner_conversation_id="guild",
+        audience_conversation_id="guild",
+        audience_channel_id="chan-guild",
+    ) is None
+
+
+def test_nullable_evidence_timestamp_change_still_invalidates_card(store):
+    """SQLite's trigger comparison remains null-safe for historical rows."""
+    _conversation(store, "guild")
+    _turn(store, "ct-pref", "guild", OPTICS, "guild", "chan-guild")
+    store.upsert_actor_profile_from_turn(
+        "guild",
+        OPTICS,
+        "Optics",
+        seen_at=_now(),
+    )
+    conn = store._get_conn()
+    conn.execute(
+        """UPDATE canonical_turns
+              SET first_seen_at = ?
+            WHERE canonical_turn_id = ?""",
+        (_now(), "ct-pref"),
+    )
+    conn.commit()
+    store.replace_actor_card(
+        "t1",
+        OPTICS,
+        [(
+            _entry("e-pref", CARD_KIND_COMMUNICATION_PREF, "prefers brevity"),
+            [_turn_source(
+                "e-pref",
+                "guild",
+                "guild",
+                "ct-pref",
+                "chan-guild",
+            )],
+        )],
+        input_hash="h1",
+        expected_source_epochs={"guild": 1},
+    )
+
+    conn.execute(
+        """UPDATE canonical_turns
+              SET first_seen_at = NULL
+            WHERE canonical_turn_id = ?""",
+        ("ct-pref",),
+    )
+    conn.commit()
+
+    profile = store.get_actor_profile("t1", OPTICS)
+    assert profile is not None
+    assert profile.card_dirty is True
+    assert profile.card_invalid is True
+
+
 def test_delete_conversation_removes_its_contribution_to_every_card(store):
     """No entry whose fact owner or audience origin is deleted may survive."""
     _dm_and_guild(store)
