@@ -175,6 +175,110 @@ def _bodies(card):
     return sorted(e.body for e in card.entries) if card else None
 
 
+def test_first_observed_actor_starts_dirty_for_compaction(store):
+    """The first canonical INSERT precedes profile creation on live ingest."""
+    _conversation(store, "guild")
+    _turn(
+        store,
+        "ct-first",
+        "guild",
+        OPTICS,
+        "guild",
+        "chan-guild",
+        content="A substantive first contribution.",
+    )
+
+    assert store.upsert_actor_profile_from_turn(
+        "guild",
+        OPTICS,
+        "Optics",
+        seen_at=_now(),
+    )
+    profile = store.get_actor_profile("t1", OPTICS)
+
+    assert profile is not None
+    assert profile.card_dirty is True
+    assert profile.card_invalid is False
+    assert profile.card_input_hash == ""
+
+
+def test_repeat_profile_sighting_does_not_redirty_a_clean_card(store):
+    """Exact resends may refresh last_seen/name without scheduling models."""
+    _dm_and_guild(store)
+    _build_dm_goal_and_cross_pref(store)
+    before = store.get_actor_profile("t1", OPTICS)
+    assert before is not None and before.card_dirty is False
+
+    assert store.upsert_actor_profile_from_turn(
+        "guild",
+        OPTICS,
+        "Optics",
+        seen_at=_now(),
+    )
+    after = store.get_actor_profile("t1", OPTICS)
+
+    assert after is not None
+    assert after.card_dirty is False
+    assert after.card_input_hash == "h1"
+
+
+def test_compaction_boundary_coalesces_affected_and_retry_actors():
+    pipeline = object.__new__(CompactionPipeline)
+    pipeline._due_actor_card_rebuilds = lambda *, limit: [
+        "actor:discord:retry",
+        OPTICS,
+    ]
+    calls = []
+    pipeline._rebuild_actor_card = lambda actor_id: (
+        calls.append(actor_id) or 1
+    )
+
+    attempted = pipeline._consolidate_actor_cards_after_compaction({
+        OPTICS,
+        BIGTEX,
+        OPTICS,
+    })
+
+    assert attempted == 3
+    assert calls == sorted({OPTICS, BIGTEX, "actor:discord:retry"})
+
+
+def test_recovery_compaction_skips_actor_card_consolidation():
+    pipeline = object.__new__(CompactionPipeline)
+    calls = []
+    pipeline._due_actor_card_rebuilds = lambda *, limit: calls.append("due")
+    pipeline._rebuild_actor_card = lambda actor_id: calls.append(actor_id)
+
+    attempted = pipeline._consolidate_actor_cards_after_compaction(
+        {OPTICS},
+        disable_replacement_passes=True,
+    )
+
+    assert attempted == 0
+    assert calls == []
+
+
+def test_compaction_boundary_isolates_one_actor_card_failure():
+    pipeline = object.__new__(CompactionPipeline)
+    pipeline._due_actor_card_rebuilds = lambda *, limit: []
+    calls = []
+
+    def _rebuild(actor_id):
+        calls.append(actor_id)
+        if actor_id == BIGTEX:
+            raise RuntimeError("model unavailable")
+        return 1
+
+    pipeline._rebuild_actor_card = _rebuild
+    attempted = pipeline._consolidate_actor_cards_after_compaction({
+        OPTICS,
+        BIGTEX,
+    })
+
+    assert attempted == 2
+    assert calls == sorted({OPTICS, BIGTEX})
+
+
 def _curation(entries, *, substantive=None, coverage_reason=None):
     if substantive is None:
         substantive = bool(entries)

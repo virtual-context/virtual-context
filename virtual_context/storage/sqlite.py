@@ -10293,10 +10293,10 @@ CREATE TABLE IF NOT EXISTS request_captures (
                     )
                 count += 1
 
-            # Dirty the union of outgoing and incoming authors, in the SAME
-            # transaction as the replacement. Marking cards dirty only after
-            # the facts were replaced would leave a crash window in which
-            # stale card content stays readable; readers serve no dirty card.
+            # Invalidate the union of outgoing and incoming authors in the
+            # SAME transaction as this destructive replacement. Delaying
+            # invalidation would leave a crash window in which a card could
+            # serve evidence whose fact source was already replaced.
             incoming_authors = {
                 (f.author_actor_id or "").strip()
                 for f in facts
@@ -10417,8 +10417,8 @@ CREATE TABLE IF NOT EXISTS request_captures (
             conn.execute(
                 """INSERT INTO actor_profiles
                        (tenant_id, actor_id, platform, display_name,
-                        first_seen_at, last_seen_at)
-                   VALUES (?, ?, ?, ?, ?, ?)
+                        first_seen_at, last_seen_at, card_dirty)
+                   VALUES (?, ?, ?, ?, ?, ?, 1)
                    ON CONFLICT (tenant_id, actor_id) DO UPDATE SET
                        last_seen_at = excluded.last_seen_at,
                        display_name = CASE

@@ -21,6 +21,7 @@ from virtual_context.types import (
 
 
 SOURCE_IDS = "_vc_source_canonical_turn_ids"
+ACTOR = "actor:discord:compaction-boundary"
 
 
 def _message(role: str, content: str, canonical_id: str, timestamp: datetime):
@@ -63,6 +64,7 @@ def test_noncontiguous_segments_use_exact_canonical_turn_provenance(tmp_path):
             tagged_at=timestamp.isoformat(),
             primary_tag=f"topic-{turn}",
             tags=[f"topic-{turn}"],
+            sender_actor_id=ACTOR,
             first_seen_at=timestamp.isoformat(),
             last_seen_at=timestamp.isoformat(),
             created_at=timestamp.isoformat(),
@@ -167,13 +169,53 @@ def test_noncontiguous_segments_use_exact_canonical_turn_provenance(tmp_path):
     compactor.model_name = "test-model"
     engine._compaction._compactor = compactor
     engine._tagging._compactor = compactor
+    engine._compaction._segmenter.segment = MagicMock(
+        return_value=[seg_a, seg_b],
+    )
 
     compact_rows = list(store.get_uncompacted_canonical_turns(
         conversation_id, protected_recent_turns=0,
     ))
-    results = engine._compaction._compact_and_store(
-        [seg_a, seg_b], 6, compact_rows=compact_rows,
+    boundary_events = []
+    engine._compaction._build_tag_summaries = lambda **_kwargs: (
+        boundary_events.append("tag_summaries") or (0, [])
     )
+    engine._compaction._refresh_shared_retrieval_snapshots = lambda: (
+        boundary_events.append("retrieval_snapshots")
+    )
+    engine._compaction._prewarm_context_hint = lambda _operation_id: (
+        boundary_events.append("context_prewarm")
+    )
+    engine._compaction._due_actor_card_rebuilds = lambda *, limit: []
+
+    def _consolidate(actor_id):
+        assert store.get_segment(
+            "seg-a",
+            conversation_id=conversation_id,
+        ) is not None
+        assert store.get_segment(
+            "seg-b",
+            conversation_id=conversation_id,
+        ) is not None
+        assert all(
+            row.compacted_at
+            for row in store.get_all_canonical_turns(conversation_id)
+        )
+        assert boundary_events == [
+            "tag_summaries",
+            "retrieval_snapshots",
+            "context_prewarm",
+        ]
+        boundary_events.append(f"actor_card:{actor_id}")
+        return 1
+
+    engine._compaction._rebuild_actor_card = _consolidate
+    report = engine._compaction._run_compaction(
+        [*seg_a.messages, *seg_b.messages],
+        [*seg_a.messages, *seg_b.messages],
+        compact_rows=compact_rows,
+    )
+    results = report.results
 
     assert [result.segment_id for result in results] == ["seg-a", "seg-b"]
     assert [signal.subject for signal in captured["fact_signals_by_segment"]["seg-a"]] == [
@@ -204,3 +246,13 @@ def test_noncontiguous_segments_use_exact_canonical_turn_provenance(tmp_path):
     assert stored_b.metadata.end_turn_number == 1
     assert stored_b.start_timestamp == now + timedelta(minutes=1)
     assert stored_b.end_timestamp == now + timedelta(minutes=1)
+
+    # Both topic segments contain the same speaker. The successful compaction
+    # boundary runs one dedicated card consolidation only after every segment,
+    # canonical marker, tag summary, and retrieval snapshot has finished.
+    assert boundary_events == [
+        "tag_summaries",
+        "retrieval_snapshots",
+        "context_prewarm",
+        f"actor_card:{ACTOR}",
+    ]

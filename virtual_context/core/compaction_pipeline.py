@@ -274,6 +274,73 @@ class CompactionPipeline:
             )
             return []
 
+    def _consolidate_actor_cards_after_compaction(
+        self,
+        actor_ids: set[str],
+        *,
+        disable_replacement_passes: bool = False,
+    ) -> int:
+        """Run dedicated person-card work at the successful compaction boundary.
+
+        Ordinary canonical ingestion only dirties a card.  The model-backed
+        curator/admission workflow belongs here, after the compaction's
+        segments, facts, canonical markers, tag summaries, and retrieval
+        snapshots have all committed.  Actor ids are coalesced across every
+        segment so one compaction performs at most one rebuild attempt per
+        affected person.
+
+        Recovery/backlog compactions deliberately skip this phase along with
+        their other replacement-shaped writes.  A card failure is isolated
+        from the already-successful compaction: additive dirtiness keeps the
+        last known-good card readable, while destructive invalidation remains
+        fail-closed until a later successful rebuild.
+        """
+        candidates = {
+            (actor_id or "").strip()
+            for actor_id in actor_ids
+            if (actor_id or "").strip()
+        }
+        if disable_replacement_passes:
+            if candidates:
+                logger.info(
+                    "ACTOR_CARD_COMPACTION_CONSOLIDATION skipped=%d "
+                    "reason=recovery_gate",
+                    len(candidates),
+                )
+            return 0
+
+        # A previous transient provider failure must not strand a since-silent
+        # actor forever.  Any successful ordinary compaction services a bounded
+        # tenant-local retry queue after its stored backoff expires.
+        candidates.update(self._due_actor_card_rebuilds(limit=25))
+        attempted = 0
+        for actor_id in sorted(candidates):
+            attempted += 1
+            started = time.monotonic()
+            logger.info(
+                "ACTOR_CARD_COMPACTION_CONSOLIDATION actor=%s status=begin",
+                actor_id[:24],
+            )
+            try:
+                written = self._rebuild_actor_card(actor_id)
+            except Exception:
+                logger.warning(
+                    "ACTOR_CARD_COMPACTION_CONSOLIDATION actor=%s "
+                    "status=failed elapsed_ms=%d",
+                    actor_id[:24],
+                    int((time.monotonic() - started) * 1000),
+                    exc_info=True,
+                )
+                continue
+            logger.info(
+                "ACTOR_CARD_COMPACTION_CONSOLIDATION actor=%s "
+                "status=complete written=%d elapsed_ms=%d",
+                actor_id[:24],
+                written,
+                int((time.monotonic() - started) * 1000),
+            )
+        return attempted
+
     def _rebuild_actor_card(self, actor_id: str, *, force: bool = False) -> int:
         """Curate and atomically replace one actor's rebuildable card cache.
 
@@ -2702,6 +2769,7 @@ class CompactionPipeline:
         )
 
         # Phase 2+3: Compact + Store (25-75%)
+        actor_card_candidates: set[str] = set()
         results = self._compact_and_store(
             segments,
             len(compact_messages),
@@ -2710,6 +2778,7 @@ class CompactionPipeline:
             generated_by_turn_id=generated_by_turn_id,
             operation_id=operation_id,
             disable_replacement_passes=disable_replacement_passes,
+            actor_card_candidates=actor_card_candidates,
         )
 
         compacted_turn_ids = [
@@ -2750,6 +2819,10 @@ class CompactionPipeline:
 
         self._refresh_shared_retrieval_snapshots()
         self._prewarm_context_hint(operation_id)
+        self._consolidate_actor_cards_after_compaction(
+            actor_card_candidates,
+            disable_replacement_passes=disable_replacement_passes,
+        )
 
         return report
 
@@ -3058,6 +3131,7 @@ class CompactionPipeline:
         generated_by_turn_id: str = "",
         operation_id: str | None = None,
         disable_replacement_passes: bool = False,
+        actor_card_candidates: set[str] | None = None,
     ) -> list[CompactionResult]:
         """Two-pass compact and store.
 
@@ -3728,26 +3802,7 @@ class CompactionPipeline:
                     links_count=_links_count,
                 )
 
-        if not disable_replacement_passes:
-            # A previous transient model/provider failure must not leave a
-            # since-silent actor's card unreadable forever. Any ordinary
-            # compaction services a bounded tenant-local retry queue after its
-            # stored backoff expires. Terminal semantic disagreements remain
-            # operator-visible and are not retried blindly.
-            card_actors_to_rebuild.update(
-                self._due_actor_card_rebuilds(limit=25)
-            )
-            for actor_id in sorted(card_actors_to_rebuild):
-                try:
-                    self._rebuild_actor_card(actor_id)
-                except Exception:
-                    # Canonical/fact mutation dirties any prior card before
-                    # this call. A failed curation therefore leaves old
-                    # entries auditable but unreadable.
-                    logger.warning(
-                        "actor card rebuild failed actor=%s",
-                        actor_id[:24],
-                        exc_info=True,
-                    )
+        if actor_card_candidates is not None:
+            actor_card_candidates.update(card_actors_to_rebuild)
 
         return all_results
