@@ -275,10 +275,22 @@ def _build_config(raw: dict[str, Any], *, validate: bool = True) -> VirtualConte
         actor_card_turn_limit=assembly_raw.get(
             "actor_card_turn_limit", _asm_defaults.actor_card_turn_limit,
         ),
+        actor_card_prompt_max_chars=assembly_raw.get(
+            "actor_card_prompt_max_chars",
+            _asm_defaults.actor_card_prompt_max_chars,
+        ),
         actor_card_entries_per_kind=assembly_raw.get(
             "actor_card_entries_per_kind",
             _asm_defaults.actor_card_entries_per_kind,
         ),
+        actor_card_curation_model=assembly_raw.get(
+            "actor_card_curation_model",
+            _asm_defaults.actor_card_curation_model,
+        ) or "",
+        actor_card_curation_fallback_model=assembly_raw.get(
+            "actor_card_curation_fallback_model",
+            _asm_defaults.actor_card_curation_fallback_model,
+        ) or "",
         actor_card_admission_model=assembly_raw.get(
             "actor_card_admission_model",
             _asm_defaults.actor_card_admission_model,
@@ -546,9 +558,45 @@ def validate_config(config: VirtualContextConfig) -> list[str]:
         errors.append("assembly.actor_card_fact_limit must be >= 1")
     if config.assembler.actor_card_turn_limit < 1:
         errors.append("assembly.actor_card_turn_limit must be >= 1")
+    if config.assembler.actor_card_prompt_max_chars < 1:
+        errors.append("assembly.actor_card_prompt_max_chars must be >= 1")
     if config.assembler.actor_card_entries_per_kind < 1:
         errors.append("assembly.actor_card_entries_per_kind must be >= 1")
     if config.assembler.actor_card_enabled:
+        if not isinstance(
+            config.assembler.actor_card_curation_model,
+            str,
+        ):
+            errors.append(
+                "assembly.actor_card_curation_model must be a string "
+                "when provided"
+            )
+        if not isinstance(
+            config.assembler.actor_card_curation_fallback_model,
+            str,
+        ):
+            errors.append(
+                "assembly.actor_card_curation_fallback_model must be a "
+                "string when provided"
+            )
+        if (
+            isinstance(
+                config.assembler.actor_card_curation_fallback_model,
+                str,
+            )
+            and config.assembler.actor_card_curation_fallback_model.strip()
+            and (
+                not isinstance(
+                    config.assembler.actor_card_curation_model,
+                    str,
+                )
+                or not config.assembler.actor_card_curation_model.strip()
+            )
+        ):
+            errors.append(
+                "assembly.actor_card_curation_model is required when "
+                "actor_card_curation_fallback_model is configured"
+            )
         if (
             not isinstance(
                 config.assembler.actor_card_admission_model, str,

@@ -2205,15 +2205,26 @@ class AssemblerConfig:
     # performed, no budget key is added, and rendered output is byte-identical.
     # YAML keys: assembly.actor_card_enabled, assembly.actor_card_max_tokens,
     # assembly.actor_card_fact_limit, assembly.actor_card_turn_limit,
-    # assembly.actor_card_entries_per_kind, assembly.actor_card_admission_model,
+    # assembly.actor_card_prompt_max_chars,
+    # assembly.actor_card_entries_per_kind, assembly.actor_card_curation_model,
+    # assembly.actor_card_curation_fallback_model,
+    # assembly.actor_card_admission_model,
     # assembly.actor_card_admission_fallback_model.
     actor_card_enabled: bool = False
     actor_card_max_tokens: int = 400
     # Bounds on the curation pass: how many facts and exact canonical messages
     # it may read, and how many entries it may emit per kind.
     actor_card_fact_limit: int = 60
-    actor_card_turn_limit: int = 120
+    # Applied independently to every policy audience so a busy guild cannot
+    # crowd an actor's DM evidence (or vice versa) out of curation.
+    actor_card_turn_limit: int = 500
+    actor_card_prompt_max_chars: int = 192_000
     actor_card_entries_per_kind: int = 3
+    # Optional dedicated curator. When unset, retain the legacy behavior of
+    # using the general compaction model. Production cards should configure a
+    # stronger curator and an independent malformed-response fallback.
+    actor_card_curation_model: str = ""
+    actor_card_curation_fallback_model: str = ""
     # Dedicated semantic admission model. Person cards fail configuration
     # closed when the card gate is enabled without one: the cheap fact
     # compactor is allowed to propose candidates, but it must not decide that

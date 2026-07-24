@@ -212,7 +212,7 @@ def test_pg_list_actor_turn_sources_is_tenant_and_audience_scoped(store):
         for source in store.list_actor_turn_sources(
             w.tenant,
             w.optics,
-            limit=10,
+            limit=1,
         )
     }
     assert got == {

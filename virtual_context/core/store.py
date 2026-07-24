@@ -765,13 +765,14 @@ class ContextStore(ABC):
         tenant_id: str,
         actor_id: str,
         *,
-        limit: int = 120,
+        limit: int = 500,
     ) -> list:
         """Enumerate exact canonical user rows eligible as card evidence.
 
         The backend must prove tenant ownership, actor attribution, audience
         attribution, and owner/audience lifecycle epochs before returning a
-        row. Unknown or legacy provenance fails closed.
+        row. Unknown or legacy provenance fails closed. ``limit`` is a
+        per-audience bound so one policy audience cannot starve another.
         """
         return []
 

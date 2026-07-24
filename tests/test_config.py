@@ -31,7 +31,10 @@ def test_actor_card_assembly_config_parses_yaml_keys():
             "actor_card_max_tokens": 321,
             "actor_card_fact_limit": 17,
             "actor_card_turn_limit": 81,
+            "actor_card_prompt_max_chars": 123456,
             "actor_card_entries_per_kind": 2,
+            "actor_card_curation_model": "openai/gpt-5.4",
+            "actor_card_curation_fallback_model": "anthropic/claude-fable-5",
             "actor_card_admission_model": "anthropic/claude-fable-5",
             "actor_card_admission_fallback_model": "openai/gpt-5.4",
         },
@@ -41,7 +44,13 @@ def test_actor_card_assembly_config_parses_yaml_keys():
     assert config.assembler.actor_card_max_tokens == 321
     assert config.assembler.actor_card_fact_limit == 17
     assert config.assembler.actor_card_turn_limit == 81
+    assert config.assembler.actor_card_prompt_max_chars == 123456
     assert config.assembler.actor_card_entries_per_kind == 2
+    assert config.assembler.actor_card_curation_model == "openai/gpt-5.4"
+    assert (
+        config.assembler.actor_card_curation_fallback_model
+        == "anthropic/claude-fable-5"
+    )
     assert (
         config.assembler.actor_card_admission_model
         == "anthropic/claude-fable-5"

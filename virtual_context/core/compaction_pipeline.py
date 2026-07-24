@@ -68,11 +68,13 @@ class _EmptyResponseFallbackProvider:
         *,
         primary_model: str,
         fallback_model: str,
+        stage: str = "admission",
     ) -> None:
         self._primary = primary
         self._fallback = fallback
         self._primary_model = primary_model
         self._fallback_model = fallback_model
+        self._stage = stage
 
     def complete(self, **kwargs):
         text, usage, _source = self.complete_with_source(**kwargs)
@@ -84,8 +86,9 @@ class _EmptyResponseFallbackProvider:
             text, usage = self._primary.complete(**kwargs)
         except LLMProviderError as exc:
             logger.warning(
-                "ACTOR_CARD_ADMISSION_FALLBACK primary_model=%s "
+                "ACTOR_CARD_%s_FALLBACK primary_model=%s "
                 "fallback_model=%s reason=provider_error status=%s",
+                self._stage.upper(),
                 self._primary_model,
                 self._fallback_model,
                 exc.status_code,
@@ -95,8 +98,9 @@ class _EmptyResponseFallbackProvider:
         if isinstance(text, str) and text.strip():
             return text, usage, "primary"
         logger.warning(
-            "ACTOR_CARD_ADMISSION_FALLBACK primary_model=%s "
+            "ACTOR_CARD_%s_FALLBACK primary_model=%s "
             "fallback_model=%s reason=empty_response",
+            self._stage.upper(),
             self._primary_model,
             self._fallback_model,
         )
@@ -108,7 +112,8 @@ class _EmptyResponseFallbackProvider:
         text, usage = self._fallback.complete(**kwargs)
         if not isinstance(text, str) or not text.strip():
             logger.warning(
-                "ACTOR_CARD_COVERAGE_ADJUDICATOR_EMPTY model=%s",
+                "ACTOR_CARD_%s_FALLBACK_EMPTY model=%s",
+                self._stage.upper(),
                 self._fallback_model,
             )
         return text, usage
@@ -302,6 +307,22 @@ class CompactionPipeline:
         tenant_id = self._config.tenant_id
 
         def _read_inputs() -> tuple[list, list, str]:
+            configured_curation_model = (
+                getattr(
+                    self._config.assembler,
+                    "actor_card_curation_model",
+                    "",
+                )
+                or ""
+            ).strip()
+            curation_fallback_model = (
+                getattr(
+                    self._config.assembler,
+                    "actor_card_curation_fallback_model",
+                    "",
+                )
+                or ""
+            ).strip()
             admission_model = (
                 getattr(
                     self._config.assembler,
@@ -329,7 +350,7 @@ class CompactionPipeline:
                 limit=int(getattr(
                     self._config.assembler,
                     "actor_card_turn_limit",
-                    120,
+                    500,
                 )),
             ))
             fact_payload = [
@@ -368,7 +389,7 @@ class CompactionPipeline:
                 }
                 for source in turns
             ]
-            curation_model = (
+            curation_model = configured_curation_model or (
                 getattr(self._compactor, "model_name", "")
                 or getattr(
                     getattr(self._compactor, "llm", None),
@@ -379,10 +400,16 @@ class CompactionPipeline:
             )
             digest = hashlib.sha256(json.dumps(
                 {
-                    "policy": 10,
+                    "policy": 11,
                     "curation_model": curation_model,
+                    "curation_fallback_model": curation_fallback_model,
                     "admission_model": admission_model,
                     "admission_fallback_model": admission_fallback_model,
+                    "prompt_max_chars": int(getattr(
+                        self._config.assembler,
+                        "actor_card_prompt_max_chars",
+                        192_000,
+                    )),
                     "facts": fact_payload,
                     "turns": turn_payload,
                 },
@@ -1035,7 +1062,14 @@ class CompactionPipeline:
             }
             for source in fact_sources
         ]
-        prompt_turns = self._actor_card_prompt_turns(turn_sources)
+        prompt_turns = self._actor_card_prompt_turns(
+            turn_sources,
+            max_chars=int(getattr(
+                self._config.assembler,
+                "actor_card_prompt_max_chars",
+                192_000,
+            )),
+        )
         prompt_turn_ids = {item["id"] for item in prompt_turns}
         system = (
             "Curate a compact person card from exact messages and facts "
@@ -1107,18 +1141,6 @@ class CompactionPipeline:
                 "body_chars": CARD_ENTRY_BODY_MAX_CHARS,
             },
         }, separators=(",", ":"))
-        response_text, _usage = self._compactor.llm.complete(
-            system=system,
-            user=user,
-            max_tokens=max(
-                2000,
-                min(
-                    4000,
-                    2 * int(self._config.compactor.max_summary_tokens),
-                ),
-            ),
-        )
-        parsed = self._compactor._parse_response(response_text)
         valid_coverage_reasons = {
             "substantive",
             "greeting_only",
@@ -1127,22 +1149,91 @@ class CompactionPipeline:
             "no_durable_context",
             "insufficient_evidence",
         }
-        if (
-            not isinstance(parsed, dict)
-            or set(parsed)
-            != {"substantive", "coverage_reason", "entries"}
-            or not isinstance(parsed.get("substantive"), bool)
-            or not isinstance(parsed.get("coverage_reason"), str)
-            or not isinstance(parsed.get("entries"), list)
-            or parsed["coverage_reason"] not in valid_coverage_reasons
-            or parsed["substantive"]
-            != (parsed["coverage_reason"] == "substantive")
-            or parsed["substantive"] != bool(parsed["entries"])
-        ):
-            raise _ActorCardAdmissionError(
-                "actor card curation response has invalid coverage shape",
-                response_text,
+
+        def _parse_curation(text: str) -> dict:
+            try:
+                parsed = self._compactor._parse_response(text)
+            except Exception as exc:
+                raise _ActorCardAdmissionError(
+                    "actor card curation response is not valid JSON",
+                    text,
+                ) from exc
+            if (
+                not isinstance(parsed, dict)
+                or set(parsed)
+                != {"substantive", "coverage_reason", "entries"}
+                or not isinstance(parsed.get("substantive"), bool)
+                or not isinstance(parsed.get("coverage_reason"), str)
+                or not isinstance(parsed.get("entries"), list)
+                or parsed["coverage_reason"] not in valid_coverage_reasons
+                or parsed["substantive"]
+                != (parsed["coverage_reason"] == "substantive")
+                or parsed["substantive"] != bool(parsed["entries"])
+            ):
+                raise _ActorCardAdmissionError(
+                    "actor card curation response has invalid coverage shape",
+                    text,
+                )
+            return parsed
+
+        request_kwargs = {
+            "system": system,
+            "user": user,
+            "max_tokens": max(
+                2000,
+                min(
+                    4000,
+                    2 * int(self._config.compactor.max_summary_tokens),
+                ),
+            ),
+        }
+        provider = self._actor_card_curation_provider()
+        complete_with_source = getattr(provider, "complete_with_source", None)
+        if callable(complete_with_source):
+            response_text, _usage, curation_source = complete_with_source(
+                **request_kwargs,
             )
+        else:
+            response_text, _usage = provider.complete(**request_kwargs)
+            curation_source = "provider"
+
+        try:
+            parsed = _parse_curation(response_text)
+        except _ActorCardAdmissionError as primary_exc:
+            complete_fallback = getattr(provider, "complete_fallback", None)
+            if (
+                curation_source == "fallback"
+                or not callable(complete_fallback)
+            ):
+                raise
+            logger.warning(
+                "ACTOR_CARD_CURATION_FALLBACK reason=invalid_response "
+                "response_hash=%s",
+                hashlib.sha256(
+                    response_text.encode("utf-8")
+                ).hexdigest()[:16],
+            )
+            fallback_text = ""
+            try:
+                fallback_text, _usage = complete_fallback(**request_kwargs)
+                parsed = _parse_curation(fallback_text)
+            except Exception as fallback_exc:
+                combined = json.dumps(
+                    {
+                        "primary": primary_exc.response_text,
+                        "fallback": (
+                            getattr(fallback_exc, "response_text", "")
+                            or fallback_text
+                        ),
+                    },
+                    separators=(",", ":"),
+                )
+                raise _ActorCardAdmissionError(
+                    "actor card curation primary and fallback responses "
+                    "were invalid",
+                    combined,
+                ) from fallback_exc
+            response_text = fallback_text
         return (
             response_text,
             parsed["substantive"],
@@ -1150,6 +1241,67 @@ class CompactionPipeline:
             parsed["entries"],
             prompt_turn_ids,
         )
+
+    def _actor_card_provider_for_model(self, selected_model: str):
+        """Create a zero-temperature provider through the configured gateway."""
+        base = self._compactor.llm
+        from ..providers.anthropic import AnthropicProvider
+        from ..providers.generic_openai import GenericOpenAIProvider
+
+        if isinstance(base, GenericOpenAIProvider):
+            return GenericOpenAIProvider(
+                base_url=base.base_url,
+                model=selected_model,
+                temperature=0.0,
+                api_key=base.api_key,
+                reasoning_effort="low",
+            )
+        if isinstance(base, AnthropicProvider):
+            return AnthropicProvider(
+                api_key=base.api_key,
+                model=selected_model,
+                temperature=0.0,
+            )
+        raise RuntimeError(
+            "actor-card model override is unsupported by "
+            f"{type(base).__name__}"
+        )
+
+    def _actor_card_curation_provider(self):
+        """Build the optional dedicated curator and malformed-response fallback."""
+        override = getattr(
+            self, "_actor_card_curation_provider_override", None,
+        )
+        if override is not None:
+            return override
+        model = (
+            getattr(
+                self._config.assembler,
+                "actor_card_curation_model",
+                "",
+            )
+            or ""
+        ).strip()
+        if not model:
+            return self._compactor.llm
+        fallback_model = (
+            getattr(
+                self._config.assembler,
+                "actor_card_curation_fallback_model",
+                "",
+            )
+            or ""
+        ).strip()
+        primary = self._actor_card_provider_for_model(model)
+        if fallback_model and fallback_model != model:
+            return _EmptyResponseFallbackProvider(
+                primary,
+                self._actor_card_provider_for_model(fallback_model),
+                primary_model=model,
+                fallback_model=fallback_model,
+                stage="curation",
+            )
+        return primary
 
     def _actor_card_admission_provider(self):
         """Build the dedicated semantic admission provider.
@@ -1181,35 +1333,11 @@ class CompactionPipeline:
             )
             or ""
         ).strip()
-        base = self._compactor.llm
-        from ..providers.anthropic import AnthropicProvider
-        from ..providers.generic_openai import GenericOpenAIProvider
-
-        def _provider_for(selected_model: str):
-            if isinstance(base, GenericOpenAIProvider):
-                return GenericOpenAIProvider(
-                    base_url=base.base_url,
-                    model=selected_model,
-                    temperature=0.0,
-                    api_key=base.api_key,
-                    reasoning_effort="low",
-                )
-            if isinstance(base, AnthropicProvider):
-                return AnthropicProvider(
-                    api_key=base.api_key,
-                    model=selected_model,
-                    temperature=0.0,
-                )
-            raise RuntimeError(
-                "actor-card admission model override is unsupported by "
-                f"{type(base).__name__}"
-            )
-
-        primary = _provider_for(model)
+        primary = self._actor_card_provider_for_model(model)
         if fallback_model and fallback_model != model:
             return _EmptyResponseFallbackProvider(
                 primary,
-                _provider_for(fallback_model),
+                self._actor_card_provider_for_model(fallback_model),
                 primary_model=model,
                 fallback_model=fallback_model,
             )
@@ -1387,7 +1515,14 @@ class CompactionPipeline:
             source.turn.canonical_turn_id: source
             for source in turn_sources
         }
-        actor_turns = self._actor_card_prompt_turns(turn_sources)
+        actor_turns = self._actor_card_prompt_turns(
+            turn_sources,
+            max_chars=int(getattr(
+                self._config.assembler,
+                "actor_card_prompt_max_chars",
+                192_000,
+            )),
+        )
         visible_turn_ids = {turn["id"] for turn in actor_turns}
         candidates: list[dict] = []
         eligible: dict[
