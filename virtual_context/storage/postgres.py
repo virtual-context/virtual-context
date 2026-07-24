@@ -1988,6 +1988,20 @@ class PostgresStore(ContextStore):
         what makes deletion and audience policy possible at all.
         """
         with self.pool.connection() as conn:
+            profile_table_existed = bool(conn.execute(
+                """SELECT to_regclass(
+                           current_schema() || '.actor_profiles'
+                       ) AS relation"""
+            ).fetchone()["relation"])
+            existing_profile_columns = {
+                row["column_name"]
+                for row in conn.execute(
+                    """SELECT column_name
+                         FROM information_schema.columns
+                        WHERE table_schema = current_schema()
+                          AND table_name = 'actor_profiles'"""
+                ).fetchall()
+            }
             conn.execute(f"""
                 CREATE TABLE IF NOT EXISTS actor_profiles (
                     tenant_id TEXT NOT NULL,
@@ -1998,10 +2012,35 @@ class PostgresStore(ContextStore):
                     last_seen_at TEXT NOT NULL,
                     card_built_at TEXT NULL,
                     card_dirty INTEGER NOT NULL DEFAULT 0,
+                    card_invalid INTEGER NOT NULL DEFAULT 0,
                     card_input_hash TEXT NOT NULL DEFAULT '',
+                    card_build_marker TEXT NOT NULL DEFAULT '',
                     PRIMARY KEY (tenant_id, actor_id)
                 )
             """)
+            conn.execute(
+                """ALTER TABLE actor_profiles
+                   ADD COLUMN IF NOT EXISTS card_invalid
+                   INTEGER NOT NULL DEFAULT 0"""
+            )
+            conn.execute(
+                """ALTER TABLE actor_profiles
+                   ADD COLUMN IF NOT EXISTS card_build_marker
+                   TEXT NOT NULL DEFAULT ''"""
+            )
+            # Existing dirty rows predate the distinction between additive
+            # refresh and destructive invalidation. Preserve the old
+            # fail-closed behavior for those ambiguous rows; fresh canonical
+            # inserts below are explicitly refresh-only.
+            if (
+                profile_table_existed
+                and "card_invalid" not in existing_profile_columns
+            ):
+                conn.execute(
+                    """UPDATE actor_profiles
+                          SET card_invalid = CASE
+                              WHEN card_dirty <> 0 THEN 1 ELSE 0 END"""
+                )
             conn.execute(f"""
                 CREATE TABLE IF NOT EXISTS actor_card_entries (
                     id TEXT PRIMARY KEY,
@@ -2098,7 +2137,7 @@ class PostgresStore(ContextStore):
                     IF NEW.sender_actor_id <> ''
                        AND NEW.user_content <> '' THEN
                         UPDATE actor_profiles p
-                           SET card_dirty = 1, card_input_hash = ''
+                           SET card_dirty = 1, card_build_marker = ''
                           FROM conversations c
                          WHERE c.conversation_id = NEW.conversation_id
                            AND c.phase <> 'deleted'
@@ -2128,7 +2167,8 @@ class PostgresStore(ContextStore):
                 AS $$
                 BEGIN
                     UPDATE actor_profiles p
-                       SET card_dirty = 1, card_input_hash = ''
+                       SET card_dirty = 1, card_invalid = 1,
+                           card_build_marker = ''
                       FROM conversations c
                      WHERE c.conversation_id = OLD.conversation_id
                        AND p.tenant_id = c.tenant_id
@@ -2137,7 +2177,8 @@ class PostgresStore(ContextStore):
 
                     IF TG_OP = 'UPDATE' THEN
                         UPDATE actor_profiles p
-                           SET card_dirty = 1, card_input_hash = ''
+                           SET card_dirty = 1, card_invalid = 1,
+                               card_build_marker = ''
                           FROM conversations c
                          WHERE c.conversation_id = NEW.conversation_id
                            AND p.tenant_id = c.tenant_id
@@ -2146,7 +2187,8 @@ class PostgresStore(ContextStore):
                     END IF;
 
                     UPDATE actor_profiles p
-                       SET card_dirty = 1, card_input_hash = ''
+                       SET card_dirty = 1, card_invalid = 1,
+                           card_build_marker = ''
                       FROM actor_card_entries e,
                            actor_card_turn_sources s
                      WHERE s.canonical_turn_id = OLD.canonical_turn_id
@@ -8713,7 +8755,9 @@ class PostgresStore(ContextStore):
 
                 report["cards_invalidated"] = self._invalidate_actor_cards(conn, owner)
                 conn.execute(
-                    """UPDATE actor_profiles SET card_dirty = 1, card_input_hash = ''
+                    """UPDATE actor_profiles
+                          SET card_dirty = 1, card_invalid = 1,
+                              card_build_marker = ''
                         WHERE tenant_id = %s AND actor_id IN (
                             SELECT DISTINCT sender_actor_id FROM canonical_turns
                              WHERE conversation_id = %s
@@ -8991,7 +9035,9 @@ class PostgresStore(ContextStore):
                         "actor-id normalization lost its lifecycle compare-and-set"
                     )
                 conn.execute(
-                    """UPDATE actor_profiles SET card_dirty = 1, card_input_hash = ''
+                    """UPDATE actor_profiles
+                          SET card_dirty = 1, card_invalid = 1,
+                              card_build_marker = ''
                         WHERE tenant_id = %s AND actor_id IN (
                           SELECT DISTINCT sender_actor_id FROM canonical_turns
                            WHERE conversation_id = %s
@@ -10653,7 +10699,8 @@ class PostgresStore(ContextStore):
         tenant_id = row["tenant_id"] or ""
         result = conn.execute(
             """UPDATE actor_profiles
-                  SET card_dirty = 1, card_input_hash = ''
+                  SET card_dirty = 1, card_invalid = 1,
+                      card_build_marker = ''
                 WHERE tenant_id = %s AND actor_id = ANY(%s)""",
             (tenant_id, actor_ids),
         )
@@ -10972,7 +11019,9 @@ class PostgresStore(ContextStore):
                 _dt_to_str(row["card_built_at"]) if row["card_built_at"] else None
             ),
             card_dirty=bool(row["card_dirty"]),
+            card_invalid=bool(row["card_invalid"]),
             card_input_hash=row["card_input_hash"] or "",
+            card_build_marker=row["card_build_marker"] or "",
         )
 
     def mark_actor_card_dirty(
@@ -10985,7 +11034,7 @@ class PostgresStore(ContextStore):
         with self.pool.connection() as conn:
             cur = conn.execute(
                 """UPDATE actor_profiles
-                      SET card_dirty = 1, card_input_hash = %s
+                      SET card_dirty = 1, card_build_marker = %s
                     WHERE tenant_id = %s AND actor_id = %s""",
                 (build_input_hash or "", tenant_id, actor_id),
             )
@@ -11047,7 +11096,8 @@ class PostgresStore(ContextStore):
                     ).fetchone()
 
                 prof = conn.execute(
-                    """SELECT card_dirty, card_input_hash FROM actor_profiles
+                    """SELECT card_dirty, card_build_marker
+                         FROM actor_profiles
                         WHERE tenant_id = %s AND actor_id = %s FOR UPDATE""",
                     (tenant_id, actor_id),
                 ).fetchone()
@@ -11055,7 +11105,7 @@ class PostgresStore(ContextStore):
                     return 0
                 if expected_build_marker is not None and (
                     not bool(prof["card_dirty"])
-                    or (prof["card_input_hash"] or "")
+                    or (prof["card_build_marker"] or "")
                     != expected_build_marker
                 ):
                     return 0
@@ -11321,7 +11371,8 @@ class PostgresStore(ContextStore):
                 conn.execute(
                     """UPDATE actor_profiles
                           SET card_built_at = %s, card_dirty = 0,
-                              card_input_hash = %s
+                              card_invalid = 0, card_input_hash = %s,
+                              card_build_marker = ''
                         WHERE tenant_id = %s AND actor_id = %s""",
                     (now, input_hash or "", tenant_id, actor_id),
                 )
@@ -11516,14 +11567,16 @@ class PostgresStore(ContextStore):
                 return None
 
             prof = conn.execute(
-                """SELECT display_name, card_built_at, card_dirty, card_input_hash
+                """SELECT display_name, card_built_at, card_dirty,
+                          card_invalid, card_input_hash
                      FROM actor_profiles
                     WHERE tenant_id = %s AND actor_id = %s""",
                 (tenant_id, actor_id),
             ).fetchone()
-            if prof is None or int(prof["card_dirty"] or 0):
-                # A dirty card is unreadable. That is what makes delete and
-                # merge invalidation safe without any post-commit callback.
+            if prof is None or int(prof["card_invalid"] or 0):
+                # Destructive provenance changes fail closed. Additive new
+                # turns only set card_dirty, so the last known-good card stays
+                # available while a refresh is pending.
                 return None
 
             cross_kinds = _sql_in_list(CARD_CROSS_CONTEXT_KINDS)
@@ -11666,7 +11719,8 @@ class PostgresStore(ContextStore):
         for tenant_id, actor_id in profiles:
             conn.execute(
                 """UPDATE actor_profiles
-                      SET card_dirty = 1, card_input_hash = ''
+                      SET card_dirty = 1, card_invalid = 1,
+                          card_build_marker = ''
                     WHERE tenant_id = %s AND actor_id = %s""",
                 (tenant_id, actor_id),
             )

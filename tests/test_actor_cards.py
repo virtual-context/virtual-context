@@ -2683,18 +2683,65 @@ def test_entries_supersede_rather_than_duplicate(store):
     assert old[0] == "e2"  # superseded by its same-kind replacement, not deleted
 
 
-def test_dirty_card_is_not_served(store):
+def test_additive_turn_keeps_last_good_card_served_while_refresh_is_pending(store):
+    _dm_and_guild(store)
+    _build_dm_goal_and_cross_pref(store)
+    _turn(
+        store,
+        "ct-new-preference",
+        "guild",
+        OPTICS,
+        "guild",
+        "chan-guild",
+        content="Please prefer the smallest live integration test.",
+    )
+    profile = store.get_actor_profile("t1", OPTICS)
+    assert profile is not None
+    assert profile.card_dirty is True
+    assert profile.card_invalid is False
+    assert profile.card_input_hash == "h1"
+    assert _bodies(store.get_actor_card(
+        "t1", OPTICS, owner_conversation_id="dm",
+        audience_conversation_id="dm", audience_channel_id="chan-dm",
+    )) == ["prefers terse answers", "private DM goal"]
+
+
+def test_destructively_invalidated_card_is_not_served(store):
     _dm_and_guild(store)
     _build_dm_goal_and_cross_pref(store)
     conn = store._get_conn()
     conn.execute(
-        "UPDATE actor_profiles SET card_dirty = 1 WHERE actor_id = ?", (OPTICS,)
+        """UPDATE actor_profiles
+              SET card_dirty = 1, card_invalid = 1
+            WHERE actor_id = ?""",
+        (OPTICS,),
     )
     conn.commit()
     assert store.get_actor_card(
         "t1", OPTICS, owner_conversation_id="dm",
         audience_conversation_id="dm", audience_channel_id="chan-dm",
     ) is None
+
+
+def test_live_build_marker_does_not_overwrite_last_good_card_version(store):
+    _dm_and_guild(store)
+    _build_dm_goal_and_cross_pref(store)
+    assert store.mark_actor_card_dirty(
+        "t1",
+        OPTICS,
+        build_input_hash="building:new-version",
+    )
+    profile = store.get_actor_profile("t1", OPTICS)
+    assert profile is not None
+    assert profile.card_dirty is True
+    assert profile.card_invalid is False
+    assert profile.card_input_hash == "h1"
+    assert profile.card_build_marker == "building:new-version"
+    assert _bodies(store.get_actor_card(
+        "t1", OPTICS, owner_conversation_id="guild",
+        audience_conversation_id="guild",
+        audience_channel_id="chan-guild",
+    )) == ["prefers terse answers"]
 
 
 def test_delete_conversation_removes_its_contribution_to_every_card(store):
