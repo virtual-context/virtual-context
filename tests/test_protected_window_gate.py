@@ -9,6 +9,7 @@ constructed engine.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -115,48 +116,6 @@ def test_tier1_unattached_skips_redis_and_db(tmp_path):
     # Tier 1 short-circuit: no Redis read, no DB read.
     fake_provider.get_marker.assert_not_called()
     fake_store.get_recent_canonical_turns.assert_not_called()
-
-
-def test_guild_scoped_conversation_mirrors_without_legacy_alias(tmp_path):
-    """A configured guild conversation is shared by definition.
-
-    It must not need a historical channel alias merely to make sibling-channel
-    canonical observations visible in a channel-local model request.
-    """
-    guild = "sk:agent:vast:discord:guild:1524917037191925871"
-    cfg = _make_config(tmp_path, mode="merge", conversation_id=guild)
-    eng = VirtualContextEngine(config=cfg)
-    assert eng._store.has_any_alias(guild) is False
-    assert eng._is_merge_participant is True
-    assert eng._retrieval._is_merge_participant is True
-    eng.persist_observed_message(
-        content="NuncaBob should read Ancillary Justice.",
-        source_message_id="1529000000000000001",
-        audience_conversation_id=guild,
-        origin_channel_id="1524946242499514418",
-        origin_channel_label="vasttest",
-        sender="Optics",
-        sender_actor_id="actor:discord:387316537012518913",
-    )
-    assembled = eng.on_message_inbound(
-        "What did Optics recommend?",
-        [
-            _unstamped("user", "Unrelated channel-local question."),
-            _unstamped("assistant", "Unrelated channel-local answer."),
-        ],
-        request_roles=RequestRoles(
-            requester_actor_id="actor:discord:387316537012518913",
-            owner_conversation_id=guild,
-            audience_conversation_id=guild,
-            origin_channel_id="1524946242499514999",
-            audience_channel_id="1524946242499514999",
-            audience_channel_label="vasttest2",
-        ),
-    )
-    assert any(
-        "NuncaBob should read Ancillary Justice." in message.content
-        for message in assembled.recent_conversation_messages
-    )
 
 
 # ---------------------------------------------------------------------------

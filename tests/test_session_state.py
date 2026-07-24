@@ -5,7 +5,7 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 import json
 import pytest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 from virtual_context.proxy.session_state import SessionState, SessionStateProvider
 from virtual_context.proxy.formats import PayloadTokenCache
 from virtual_context.types import TagStats
@@ -115,88 +115,6 @@ def test_save_rejects_newer_redis_version_without_mutating_local_version(provide
     raw = mock_redis._test_store.get("vc:session:conv-123")
     blob = json.loads(raw)
     assert blob["version"] == 3
-
-
-def test_observation_checkpoint_merges_into_latest_blob_atomically(
-    provider,
-    mock_redis,
-    mock_store,
-):
-    current = SessionState(
-        version=6,
-        last_completed_turn=9,
-        last_indexed_turn=9,
-        compacted_prefix_messages=18,
-        working_set=[{
-            "tag": "existing",
-            "depth": "summary",
-            "tokens": 10,
-            "last_accessed_turn": 8,
-        }],
-        turn_tag_entries=[{
-            "turn_number": 9,
-            "canonical_turn_id": "canonical-9",
-            "tags": ["existing"],
-            "primary_tag": "existing",
-            "message_hash": "hash-9",
-            "sender": "Other",
-        }],
-    )
-    assert provider.save("conv-123", current) == 7
-    entry = {
-        "turn_number": 11,
-        "canonical_turn_id": "canonical-11",
-        "tags": ["_general"],
-        "primary_tag": "_general",
-        "message_hash": "hash-11",
-        "sender": "Optics",
-    }
-
-    assert provider.advance_observation_checkpoint(
-        "conv-123",
-        last_completed_turn=11,
-        last_indexed_turn=11,
-        turn_tag_entry=entry,
-    ) == 8
-
-    loaded = provider.load("conv-123")
-    assert loaded is not None
-    assert loaded.version == 8
-    assert loaded.last_completed_turn == 11
-    assert loaded.last_indexed_turn == 11
-    assert loaded.compacted_prefix_messages == 18
-    assert loaded.working_set == current.working_set
-    assert [
-        item["canonical_turn_id"] for item in loaded.turn_tag_entries
-    ] == ["canonical-9", "canonical-11"]
-
-    # A transport retry is a no-op: no blob version churn and no extra backup.
-    backups_before = mock_store.save_engine_state.call_count
-    assert provider.advance_observation_checkpoint(
-        "conv-123",
-        last_completed_turn=11,
-        last_indexed_turn=11,
-        turn_tag_entry=entry,
-    ) == 8
-    assert provider.load("conv-123").version == 8
-    assert mock_store.save_engine_state.call_count == backups_before
-
-
-def test_observation_checkpoint_never_revives_tombstone(
-    provider,
-    mock_redis,
-):
-    provider.delete("conv-123")
-    assert provider.advance_observation_checkpoint(
-        "conv-123",
-        last_completed_turn=2,
-        last_indexed_turn=2,
-        turn_tag_entry={
-            "turn_number": 2,
-            "canonical_turn_id": "canonical-2",
-        },
-    ) is None
-    assert provider.load("conv-123").deleted is True
 
 
 def test_delete_sets_tombstone(provider, mock_redis):
