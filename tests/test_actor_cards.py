@@ -401,6 +401,157 @@ def test_actor_card_curation_retries_schema_invalid_primary_with_fallback():
     assert provider.fallback_calls == 1
 
 
+def test_actor_card_admission_retries_schema_invalid_primary_with_fallback(
+    store,
+):
+    _single_guild_card_source(store)
+    body = "Is leading the Atlas migration."
+
+    class Curator:
+        def complete(self, **kwargs):
+            return json.dumps(_curation_for_visible_fact(
+                kwargs,
+                "f-guild",
+                [{
+                    "kind": CARD_KIND_ACTIVE_GOAL,
+                    "body": body,
+                    "confidence": 0.9,
+                    "fact_ids": ["f-guild"],
+                }],
+            )), {}
+
+    class AdmissionWithFallback:
+        primary_calls = 0
+        fallback_calls = 0
+
+        def complete_with_source(self, **_kwargs):
+            self.primary_calls += 1
+            return (
+                '{"substantive":true,"coverage_reason":"substantive",'
+                '"decisions":[',
+                {},
+                "primary",
+            )
+
+        def complete_fallback(self, **kwargs):
+            self.fallback_calls += 1
+            prompt = json.loads(kwargs["user"])
+            decisions = [{
+                "candidate_id": candidate["candidate_id"],
+                "admit": True,
+                "reason": "durable",
+            } for candidate in prompt["candidates"]]
+            return json.dumps(_admission(decisions)), {}
+
+    admission = AdmissionWithFallback()
+    pipeline = _card_pipeline(store, Curator(), admission=admission)
+
+    assert pipeline._rebuild_actor_card(OPTICS) == 1
+    assert admission.primary_calls == 1
+    assert admission.fallback_calls == 1
+    assert _bodies(store.get_actor_card(
+        "t1",
+        OPTICS,
+        owner_conversation_id="guild",
+        audience_conversation_id="guild",
+        audience_channel_id="chan-guild",
+    )) == [body]
+
+
+def test_actor_card_admission_fails_closed_when_both_responses_are_invalid(
+    store,
+):
+    _single_guild_card_source(store)
+
+    class Curator:
+        def complete(self, **kwargs):
+            return json.dumps(_curation_for_visible_fact(
+                kwargs,
+                "f-guild",
+                [{
+                    "kind": CARD_KIND_ACTIVE_GOAL,
+                    "body": "Is leading the Atlas migration.",
+                    "confidence": 0.9,
+                    "fact_ids": ["f-guild"],
+                }],
+            )), {}
+
+    class InvalidAdmission:
+        primary_calls = 0
+        fallback_calls = 0
+
+        def complete_with_source(self, **_kwargs):
+            self.primary_calls += 1
+            return '{"decisions":[', {}, "primary"
+
+        def complete_fallback(self, **_kwargs):
+            self.fallback_calls += 1
+            return '{"decisions":[', {}
+
+    admission = InvalidAdmission()
+    pipeline = _card_pipeline(store, Curator(), admission=admission)
+
+    with pytest.raises(RuntimeError, match="semantic admission failed"):
+        pipeline._rebuild_actor_card(OPTICS)
+    assert admission.primary_calls == 1
+    assert admission.fallback_calls == 1
+    status = store.get_actor_card_rebuild_status("t1", OPTICS)
+    assert status is not None
+    assert status["outcome"] == "admission_error"
+
+
+def test_malformed_primary_fallback_is_not_called_twice_on_disagreement(
+    store,
+):
+    _single_guild_card_source(store)
+
+    class Curator:
+        def complete(self, **kwargs):
+            return json.dumps(_curation_for_visible_fact(
+                kwargs,
+                "f-guild",
+                [{
+                    "kind": CARD_KIND_ACTIVE_GOAL,
+                    "body": "Is leading the Atlas migration.",
+                    "confidence": 0.9,
+                    "fact_ids": ["f-guild"],
+                }],
+            )), {}
+
+    class DisagreeingFallback:
+        primary_calls = 0
+        fallback_calls = 0
+
+        def complete_with_source(self, **_kwargs):
+            self.primary_calls += 1
+            return '{"decisions":[', {}, "primary"
+
+        def complete_fallback(self, **kwargs):
+            self.fallback_calls += 1
+            prompt = json.loads(kwargs["user"])
+            decisions = [{
+                "candidate_id": candidate["candidate_id"],
+                "admit": False,
+                "reason": "not_durable",
+            } for candidate in prompt["candidates"]]
+            return json.dumps(_admission(
+                decisions,
+                substantive=False,
+                coverage_reason="no_durable_context",
+            )), {}
+
+    admission = DisagreeingFallback()
+    pipeline = _card_pipeline(store, Curator(), admission=admission)
+
+    with pytest.raises(RuntimeError, match="semantic admission failed"):
+        pipeline._rebuild_actor_card(OPTICS)
+    assert admission.primary_calls == 1
+    assert admission.fallback_calls == 1
+    status = store.get_actor_card_rebuild_status("t1", OPTICS)
+    assert status is not None
+    assert status["outcome"] == "coverage_disagreement"
+
+
 def _single_guild_card_source(store):
     _conversation(store, "guild")
     _turn(

@@ -1681,7 +1681,13 @@ class CompactionPipeline:
         def _parse_admission(
             text: str,
         ) -> tuple[bool, dict[str, dict]]:
-            parsed = self._compactor._parse_response(text)
+            try:
+                parsed = self._compactor._parse_response(text)
+            except Exception as exc:
+                raise _ActorCardAdmissionError(
+                    "actor-card admission response is not valid JSON",
+                    text,
+                ) from exc
             if (
                 not isinstance(parsed, dict)
                 or set(parsed)
@@ -1750,7 +1756,55 @@ class CompactionPipeline:
                 )
             return independently_substantive, decisions
 
-        independently_substantive, decisions = _parse_admission(response_text)
+        try:
+            independently_substantive, decisions = _parse_admission(
+                response_text,
+            )
+        except _ActorCardAdmissionError as primary_exc:
+            complete_fallback = getattr(provider, "complete_fallback", None)
+            if (
+                admission_source == "fallback"
+                or not callable(complete_fallback)
+            ):
+                raise
+            logger.warning(
+                "ACTOR_CARD_ADMISSION_FALLBACK reason=invalid_response "
+                "response_hash=%s",
+                hashlib.sha256(
+                    response_text.encode("utf-8")
+                ).hexdigest()[:16],
+            )
+            fallback_text = ""
+            try:
+                fallback_text, _usage = complete_fallback(**request_kwargs)
+                independently_substantive, decisions = _parse_admission(
+                    fallback_text,
+                )
+            except Exception as fallback_exc:
+                combined = json.dumps(
+                    {
+                        "primary": primary_exc.response_text,
+                        "fallback": (
+                            getattr(fallback_exc, "response_text", "")
+                            or fallback_text
+                        ),
+                    },
+                    separators=(",", ":"),
+                )
+                raise _ActorCardAdmissionError(
+                    "actor-card admission primary and fallback responses "
+                    "were invalid",
+                    combined,
+                ) from fallback_exc
+            response_text = json.dumps(
+                {
+                    "primary": response_text,
+                    "fallback": fallback_text,
+                    "selected": "fallback",
+                },
+                separators=(",", ":"),
+            )
+            admission_source = "fallback"
         if independently_substantive != curator_substantive:
             primary_substantive = independently_substantive
             complete_fallback = getattr(provider, "complete_fallback", None)
