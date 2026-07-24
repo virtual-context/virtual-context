@@ -2166,6 +2166,34 @@ class PostgresStore(ContextStore):
                 LANGUAGE plpgsql
                 AS $$
                 BEGIN
+                    -- PostgreSQL fires an UPDATE OF trigger when a column is
+                    -- named in SET even if its value did not change. Canonical
+                    -- tagging re-upserts the request-owned row and names these
+                    -- identity/evidence columns, so treat an exact no-op as
+                    -- the additive reconciliation it is. Otherwise every
+                    -- normal live turn invalidates (and can delete) the card
+                    -- entry that just cited it.
+                    IF TG_OP = 'UPDATE'
+                       AND OLD.conversation_id
+                           IS NOT DISTINCT FROM NEW.conversation_id
+                       AND OLD.user_content
+                           IS NOT DISTINCT FROM NEW.user_content
+                       AND OLD.sender_actor_id
+                           IS NOT DISTINCT FROM NEW.sender_actor_id
+                       AND OLD.audience_conversation_id
+                           IS NOT DISTINCT FROM NEW.audience_conversation_id
+                       AND OLD.audience_attribution_version
+                           IS NOT DISTINCT FROM
+                               NEW.audience_attribution_version
+                       AND OLD.origin_channel_id
+                           IS NOT DISTINCT FROM NEW.origin_channel_id
+                       AND OLD.created_at
+                           IS NOT DISTINCT FROM NEW.created_at
+                       AND OLD.first_seen_at
+                           IS NOT DISTINCT FROM NEW.first_seen_at THEN
+                        RETURN NEW;
+                    END IF;
+
                     UPDATE actor_profiles p
                        SET card_dirty = 1, card_invalid = 1,
                            card_build_marker = ''
