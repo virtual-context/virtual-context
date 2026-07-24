@@ -1085,6 +1085,14 @@ class CompositeStore:
             return list(fn(tenant_id, actor_id, limit=limit))
         return []
 
+    def list_actor_card_carryovers(
+        self, tenant_id: str, actor_id: str,
+    ) -> list:
+        fn = getattr(self._facts, "list_actor_card_carryovers", None)
+        if callable(fn):
+            return list(fn(tenant_id, actor_id))
+        return []
+
     def get_actor_profile(self, tenant_id: str, actor_id: str):
         fn = getattr(self._facts, "get_actor_profile", None)
         return fn(tenant_id, actor_id) if callable(fn) else None

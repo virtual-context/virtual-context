@@ -306,7 +306,7 @@ class CompactionPipeline:
 
         tenant_id = self._config.tenant_id
 
-        def _read_inputs() -> tuple[list, list, str]:
+        def _read_inputs() -> tuple[list, list, list, str]:
             configured_curation_model = (
                 getattr(
                     self._config.assembler,
@@ -353,6 +353,16 @@ class CompactionPipeline:
                     500,
                 )),
             ))
+            carryover_getter = getattr(
+                self._store,
+                "list_actor_card_carryovers",
+                None,
+            )
+            carryovers = (
+                list(carryover_getter(tenant_id, actor_id))
+                if callable(carryover_getter)
+                else []
+            )
             fact_payload = [
                 {
                     "id": source.fact.id,
@@ -389,6 +399,32 @@ class CompactionPipeline:
                 }
                 for source in turns
             ]
+            carryover_payload = [
+                {
+                    "entry": {
+                        "id": entry.id,
+                        "kind": entry.kind,
+                        "body": entry.body,
+                        "confidence": entry.confidence,
+                        "scope": entry.audience_scope,
+                    },
+                    "sources": sorted([
+                        {
+                            "owner": source.owner_conversation_id,
+                            "audience": source.audience_conversation_id,
+                            "channel": source.audience_channel_id,
+                            "fact_id": source.fact_id,
+                            "turn_id": source.canonical_turn_id,
+                        }
+                        for source in sources
+                    ], key=lambda item: json.dumps(
+                        item,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )),
+                }
+                for entry, sources in carryovers
+            ]
             curation_model = configured_curation_model or (
                 getattr(self._compactor, "model_name", "")
                 or getattr(
@@ -400,7 +436,7 @@ class CompactionPipeline:
             )
             digest = hashlib.sha256(json.dumps(
                 {
-                    "policy": 11,
+                    "policy": 12,
                     "curation_model": curation_model,
                     "curation_fallback_model": curation_fallback_model,
                     "admission_model": admission_model,
@@ -412,13 +448,19 @@ class CompactionPipeline:
                     )),
                     "facts": fact_payload,
                     "turns": turn_payload,
+                    "carryovers": carryover_payload,
                 },
                 sort_keys=True,
                 separators=(",", ":"),
             ).encode("utf-8")).hexdigest()
-            return facts, turns, digest
+            return facts, turns, carryovers, digest
 
-        fact_sources, turn_sources, input_hash = _read_inputs()
+        (
+            fact_sources,
+            turn_sources,
+            carryover_entries,
+            input_hash,
+        ) = _read_inputs()
         profile = self._store.get_actor_profile(tenant_id, actor_id)
         if profile is None:
             return 0
@@ -487,7 +529,12 @@ class CompactionPipeline:
         # Re-enumerate only after the unique build marker is installed. A
         # mutation before the marker is therefore included; a mutation after
         # it clears the marker and makes the transactional replacement fail.
-        fact_sources, turn_sources, input_hash = _read_inputs()
+        (
+            fact_sources,
+            turn_sources,
+            carryover_entries,
+            input_hash,
+        ) = _read_inputs()
 
         fact_source_by_audience_id = {
             (source.audience_conversation_id, source.fact.id): source
@@ -517,6 +564,12 @@ class CompactionPipeline:
         audience_ids = sorted(
             set(fact_sources_by_audience)
             | set(turn_sources_by_audience)
+            | {
+                (source.audience_conversation_id or "").strip()
+                for _entry, sources in carryover_entries
+                for source in sources
+                if (source.audience_conversation_id or "").strip()
+            }
         )
         response_text = ""
         admission_response_text = ""
@@ -785,10 +838,70 @@ class CompactionPipeline:
                 per_audience_kind.get(quota_key, 0) + 1
             )
 
+        # A fresh curator is allowed to propose better identity/style entries,
+        # but omission is not a deletion decision.  Re-submit every currently
+        # active cross-context entry to semantic admission with its immutable
+        # body and exact sources.  Same-conversation goals/history deliberately
+        # retain replacement semantics: they are the rotating working set.
+        existing_entry_ids_by_audience: dict[str, set[str]] = {}
+        fresh_entry_ids = {
+            entry.id for entry, _sources in normalized
+        }
+        for entry, entry_sources in carryover_entries:
+            if (
+                entry.kind not in CARD_CROSS_CONTEXT_KINDS
+                or entry.audience_scope != CARD_SCOPE_CROSS_CONTEXT
+                or not entry_sources
+            ):
+                logger.error(
+                    "ACTOR_CARD_CARRYOVER_INVALID actor=%s entry=%s "
+                    "kind=%s scope=%s sources=%d",
+                    actor_id[:24],
+                    entry.id,
+                    entry.kind,
+                    entry.audience_scope,
+                    len(entry_sources),
+                )
+                raise RuntimeError(
+                    "actor card carryover violated the cross-context boundary"
+                )
+            audiences = {
+                (source.audience_conversation_id or "").strip()
+                for source in entry_sources
+            }
+            if "" in audiences or len(audiences) != 1:
+                # Never put evidence from two privacy audiences in one model
+                # prompt.  Failing the refresh leaves the last-good card
+                # served; silently dropping it would recreate the bug this
+                # path exists to prevent.
+                logger.error(
+                    "ACTOR_CARD_CARRYOVER_AUDIENCE_INVALID actor=%s "
+                    "entry=%s audience_count=%d",
+                    actor_id[:24],
+                    entry.id,
+                    len(audiences),
+                )
+                raise RuntimeError(
+                    "actor card carryover has ambiguous source audience"
+                )
+            audience_id = next(iter(audiences))
+            existing_entry_ids_by_audience.setdefault(
+                audience_id,
+                set(),
+            ).add(entry.id)
+            if entry.id in fresh_entry_ids:
+                continue
+            normalized.append((entry, entry_sources))
+            normalized_by_audience.setdefault(audience_id, []).append(
+                (entry, entry_sources)
+            )
+
         basic_accepted_count = len(normalized)
         independently_substantive = False
         coverage_gap = False
-        if parsed_entries and (fact_sources or turn_sources):
+        if parsed_entries and (
+            fact_sources or turn_sources or carryover_entries
+        ):
             try:
                 admitted_entries: list[
                     tuple[ActorCardEntry, list[ActorCardEntrySource]]
@@ -809,7 +922,55 @@ class CompactionPipeline:
                         curator_substantive=(
                             curator_substantive_by_audience[audience_id]
                         ),
+                        existing_entry_ids=(
+                            existing_entry_ids_by_audience.get(
+                                audience_id,
+                                set(),
+                            )
+                        ),
                     )
+                    # Carryovers do not bypass the configured per-kind cap.
+                    # When admission leaves more than the cap, retain an
+                    # already-admitted stable entry before a fresh equivalent;
+                    # the prompt asks the model to reject redundant candidates,
+                    # so this is only the deterministic last line of defense.
+                    cap = int(
+                        self._config.assembler.actor_card_entries_per_kind
+                    )
+                    limited: list[
+                        tuple[ActorCardEntry, list[ActorCardEntrySource]]
+                    ] = []
+                    by_kind: dict[
+                        str,
+                        list[
+                            tuple[
+                                ActorCardEntry,
+                                list[ActorCardEntrySource],
+                            ]
+                        ],
+                    ] = {}
+                    for item in partition_admitted:
+                        by_kind.setdefault(item[0].kind, []).append(item)
+                    existing_ids = existing_entry_ids_by_audience.get(
+                        audience_id,
+                        set(),
+                    )
+                    for kind in sorted(by_kind):
+                        ranked = sorted(
+                            by_kind[kind],
+                            key=lambda item: (
+                                0 if item[0].id in existing_ids else 1,
+                                -float(item[0].confidence or 0.0),
+                                item[0].updated_at or "",
+                                item[0].id,
+                            ),
+                        )
+                        limited.extend(ranked[:max(0, cap)])
+                        if len(ranked) > max(0, cap):
+                            rejected["post_admission_per_kind_limit"] += (
+                                len(ranked) - max(0, cap)
+                            )
+                    partition_admitted = limited
                     admitted_entries.extend(partition_admitted)
                     admission_responses.append(partition_response)
                     rejected.update(admission_rejections)
@@ -956,6 +1117,21 @@ class CompactionPipeline:
             expected_epochs[source.audience_conversation_id] = (
                 source.audience_lifecycle_epoch
             )
+        epoch_getter = getattr(self._store, "get_lifecycle_epoch", None)
+        if carryover_entries and not callable(epoch_getter):
+            raise RuntimeError(
+                "actor card carryover cannot prove lifecycle epochs"
+            )
+        for _entry, entry_sources in carryover_entries:
+            for source in entry_sources:
+                for conversation_id in (
+                    source.owner_conversation_id,
+                    source.audience_conversation_id,
+                ):
+                    if conversation_id not in expected_epochs:
+                        expected_epochs[conversation_id] = int(
+                            epoch_getter(conversation_id)
+                        )
         written = self._store.replace_actor_card(
             tenant_id,
             actor_id,
@@ -1480,6 +1656,7 @@ class CompactionPipeline:
         normalized: list[tuple["ActorCardEntry", list["ActorCardEntrySource"]]],
         *,
         curator_substantive: bool,
+        existing_entry_ids: set[str] | None = None,
     ) -> tuple[
         list[tuple["ActorCardEntry", list["ActorCardEntrySource"]]],
         str,
@@ -1493,6 +1670,7 @@ class CompactionPipeline:
             raise RuntimeError(
                 "actor-card semantic admission model is not configured"
             )
+        existing_entry_ids = set(existing_entry_ids or ())
 
         candidate_fact_ids = {
             source.fact_id
@@ -1546,14 +1724,19 @@ class CompactionPipeline:
                 for fact_id in fact_ids
                 if fact_id in fact_source_by_id
             }
-            if refs and not refs.issubset(evidence_refs):
+            is_existing = entry.id in existing_entry_ids
+            if (
+                not is_existing
+                and refs
+                and not refs.issubset(evidence_refs)
+            ):
                 rejection_counts["evidence_unavailable"] += 1
                 continue
             if any(
                 turn_id not in turn_source_by_id
                 or turn_id not in visible_turn_ids
                 for turn_id in turn_ids
-            ):
+            ) and not is_existing:
                 rejection_counts["evidence_unavailable"] += 1
                 continue
             if not fact_ids and not turn_ids:
@@ -1562,6 +1745,7 @@ class CompactionPipeline:
             eligible[entry.id] = (entry, entry_sources)
             candidates.append({
                 "candidate_id": entry.id,
+                "origin": "existing" if is_existing else "fresh",
                 "kind": entry.kind,
                 "body": entry.body,
                 "proposed_confidence": entry.confidence,
@@ -1612,8 +1796,20 @@ class CompactionPipeline:
             "\"durable\", \"temporary\", \"test_probe\", "
             "\"stopped_or_replaced\", \"completed\", \"contradicted\", "
             "\"insufficient_evidence\", \"not_durable\", "
-            "\"not_person_card\", or \"explicit_privacy_request\". Use reason "
+            "\"not_person_card\", \"redundant\", or "
+            "\"explicit_privacy_request\". Use reason "
             "\"durable\" if and only if admit is true. "
+            "Candidate origin is either fresh or existing. An existing "
+            "candidate is an immutable entry that a prior independent "
+            "admission accepted from its cited evidence. Curator omission is "
+            "not evidence against it. Re-admit an existing candidate unless "
+            "later actor-authored evidence explicitly stops, replaces, "
+            "completes, or contradicts it, or a materially better fresh "
+            "candidate makes it redundant. When fresh and existing candidates "
+            "substantially overlap, prefer the existing candidate for "
+            "continuity unless the fresh one materially corrects, updates, or "
+            "better preserves the evidence; reject the other as redundant or "
+            "stopped_or_replaced. Do not admit redundant copies. "
             "Reject temporary, test/probe, one-turn, session-only, "
             "channel-only, stopped, replaced, completed, or contradicted "
             "material. Later source messages revoke or replace earlier "
@@ -1621,9 +1817,10 @@ class CompactionPipeline:
             "not durable identity preferences. A communication preference or "
             "interaction style is admissible only when a source message "
             "explicitly establishes durability beyond the current test, "
-            "session, and channel, or when consistent natural evidence spans "
-            "at least two distinct source segments. Repeated test instructions "
-            "do not establish a pattern. The immutable candidate body itself "
+            "session, and channel, or when consistent natural evidence appears "
+            "across distinct actor-authored messages or interactions, ideally "
+            "spread over time. Repeated test instructions do not establish a "
+            "pattern. The immutable candidate body itself "
             "must be self-contained and unambiguous without relying on the "
             "surrounding segment; reject with insufficient_evidence when an "
             "essential referent (such as which medication, goal, or "
@@ -1729,6 +1926,7 @@ class CompactionPipeline:
                 "insufficient_evidence",
                 "not_durable",
                 "not_person_card",
+                "redundant",
                 "explicit_privacy_request",
             }
             for decision in parsed["decisions"]:
@@ -1870,6 +2068,16 @@ class CompactionPipeline:
         ] = []
         for candidate_id, (entry, entry_sources) in eligible.items():
             decision = decisions[candidate_id]
+            if candidate_id in existing_entry_ids:
+                logger.info(
+                    "ACTOR_CARD_CARRYOVER_DECISION actor=%s audience=%s "
+                    "entry=%s admit=%s reason=%s",
+                    actor_id[:24],
+                    audience_conversation_id[:48],
+                    candidate_id,
+                    bool(decision["admit"]),
+                    decision["reason"],
+                )
             if not decision["admit"]:
                 rejection_counts[
                     f"semantic_{decision['reason']}"

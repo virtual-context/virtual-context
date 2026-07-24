@@ -776,6 +776,21 @@ class ContextStore(ABC):
         """
         return []
 
+    def list_actor_card_carryovers(
+        self,
+        tenant_id: str,
+        actor_id: str,
+    ) -> list:
+        """Return active cross-context entries with their exact sources.
+
+        This is an internal refresh surface, not a serving read.  It exists so
+        a model curator's omission cannot silently delete a previously admitted
+        durable identity/style entry.  Backends must tenant-scope both entries
+        and sources; the normal replacement fence re-validates every source
+        before committing a carried entry.
+        """
+        return []
+
     def get_actor_profile(self, tenant_id: str, actor_id: str):
         """Return the tenant-scoped profile/cache state, or ``None``."""
         return None

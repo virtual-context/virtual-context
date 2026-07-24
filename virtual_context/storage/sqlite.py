@@ -11149,6 +11149,97 @@ CREATE TABLE IF NOT EXISTS request_captures (
         ).fetchall()
         return [str(row["actor_id"]) for row in rows]
 
+    def list_actor_card_carryovers(
+        self,
+        tenant_id: str,
+        actor_id: str,
+    ) -> list[tuple[ActorCardEntry, list[ActorCardEntrySource]]]:
+        """Read active durable identity/style entries for explicit re-admission.
+
+        This intentionally does not apply the request-audience serving filter:
+        refresh partitions each returned entry by its proved source audience
+        before a model sees it.  Only policy-approved cross-context kinds are
+        eligible, and every source remains subject to ``replace_actor_card``'s
+        authoritative provenance checks before it can be written again.
+        """
+        actor_id = (actor_id or "").strip()
+        if not actor_id:
+            return []
+        conn = self._get_conn()
+        cross_kinds = _sql_in_list(CARD_CROSS_CONTEXT_KINDS)
+        rows = conn.execute(
+            f"""SELECT e.* FROM actor_card_entries e
+                 WHERE e.tenant_id = ?
+                   AND e.actor_id = ?
+                   AND e.superseded_by IS NULL
+                   AND e.audience_scope = 'cross_context'
+                   AND e.kind IN ({cross_kinds})
+                   AND (
+                     EXISTS (
+                       SELECT 1 FROM actor_card_entry_sources fs
+                        WHERE fs.entry_id = e.id
+                          AND fs.tenant_id = e.tenant_id
+                     )
+                     OR EXISTS (
+                       SELECT 1 FROM actor_card_turn_sources ts
+                        WHERE ts.entry_id = e.id
+                          AND ts.tenant_id = e.tenant_id
+                     )
+                   )
+                 ORDER BY e.kind, e.confidence DESC, e.updated_at, e.id""",
+            (tenant_id, actor_id),
+        ).fetchall()
+        out: list[tuple[ActorCardEntry, list[ActorCardEntrySource]]] = []
+        for row in rows:
+            source_rows = conn.execute(
+                """SELECT owner_conversation_id, audience_conversation_id,
+                          audience_channel_id, fact_id,
+                          '' AS canonical_turn_id
+                     FROM actor_card_entry_sources
+                    WHERE entry_id = ? AND tenant_id = ?
+                    UNION ALL
+                   SELECT owner_conversation_id, audience_conversation_id,
+                          audience_channel_id, '' AS fact_id,
+                          canonical_turn_id AS canonical_turn_id
+                     FROM actor_card_turn_sources
+                    WHERE entry_id = ? AND tenant_id = ?
+                    ORDER BY fact_id, canonical_turn_id""",
+                (row["id"], tenant_id, row["id"], tenant_id),
+            ).fetchall()
+            sources = [
+                ActorCardEntrySource(
+                    entry_id=row["id"],
+                    tenant_id=tenant_id,
+                    owner_conversation_id=source["owner_conversation_id"] or "",
+                    audience_conversation_id=(
+                        source["audience_conversation_id"] or ""
+                    ),
+                    audience_channel_id=source["audience_channel_id"] or "",
+                    fact_id=source["fact_id"] or "",
+                    canonical_turn_id=source["canonical_turn_id"] or "",
+                )
+                for source in source_rows
+            ]
+            if not sources:
+                continue
+            out.append((
+                ActorCardEntry(
+                    id=row["id"],
+                    tenant_id=tenant_id,
+                    actor_id=actor_id,
+                    kind=row["kind"],
+                    body=row["body"],
+                    confidence=float(row["confidence"] or 0.0),
+                    sensitivity=row["sensitivity"],
+                    audience_scope=row["audience_scope"],
+                    superseded_by=row["superseded_by"],
+                    created_at=row["created_at"],
+                    updated_at=row["updated_at"],
+                ),
+                sources,
+            ))
+        return out
+
     def get_actor_card(
         self,
         tenant_id: str,

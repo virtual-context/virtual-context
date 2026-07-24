@@ -2857,6 +2857,152 @@ def test_additive_turn_keeps_last_good_card_served_while_refresh_is_pending(stor
     )) == ["prefers terse answers", "private DM goal"]
 
 
+def test_refresh_re_admits_existing_cross_context_entry_instead_of_silent_drop(
+    store,
+):
+    """Curator omission is not authority to erase durable identity/style."""
+    _dm_and_guild(store)
+    _build_dm_goal_and_cross_pref(store)
+    _turn(
+        store,
+        "ct-guild-new",
+        "guild",
+        OPTICS,
+        "guild",
+        "chan-guild",
+        content="A new substantive guild discussion.",
+    )
+
+    class Curator:
+        def complete(self, **kwargs):
+            turn = json.loads(kwargs["user"])["turns"][0]
+            return json.dumps(_curation([{
+                "kind": CARD_KIND_RELEVANT_HISTORY,
+                "body": (
+                    "Has a new substantive discussion in "
+                    f"{turn['audience_conversation_id']}."
+                ),
+                "confidence": 0.8,
+                "turn_ids": [turn["id"]],
+            }])), {}
+
+    class Admission:
+        prompts = []
+        system = ""
+
+        def complete(self, **kwargs):
+            self.system = kwargs["system"]
+            prompt = json.loads(kwargs["user"])
+            self.prompts.append(prompt)
+            return json.dumps(_admission([{
+                "candidate_id": candidate["candidate_id"],
+                "admit": True,
+                "reason": "durable",
+            } for candidate in prompt["candidates"]])), {}
+
+    admission = Admission()
+    pipeline = _card_pipeline(
+        store,
+        Curator(),
+        admission=admission,
+    )
+    assert pipeline._rebuild_actor_card(OPTICS) == 3
+
+    carryover = next(
+        candidate
+        for prompt in admission.prompts
+        for candidate in prompt["candidates"]
+        if candidate["candidate_id"] == "e-pref"
+    )
+    assert carryover["origin"] == "existing"
+    assert carryover["body"] == "prefers terse answers"
+    assert "distinct actor-authored messages or interactions" in admission.system
+    assert "distinct source segments" not in admission.system
+
+    # The durable cross-context entry survives verbatim. The old private goal
+    # is same-conversation working memory and legitimately rotates out.
+    assert _bodies(store.get_actor_card(
+        "t1",
+        OPTICS,
+        owner_conversation_id="guild",
+        audience_conversation_id="guild",
+        audience_channel_id="chan-guild",
+    )) == [
+        "Has a new substantive discussion in guild.",
+        "prefers terse answers",
+    ]
+    dm_bodies = _bodies(store.get_actor_card(
+        "t1",
+        OPTICS,
+        owner_conversation_id="dm",
+        audience_conversation_id="dm",
+        audience_channel_id="chan-dm",
+    ))
+    assert "prefers terse answers" in dm_bodies
+    assert "private DM goal" not in dm_bodies
+
+
+def test_refresh_removes_cross_context_entry_only_after_explicit_rejection(
+    store,
+):
+    _dm_and_guild(store)
+    _build_dm_goal_and_cross_pref(store)
+    _turn(
+        store,
+        "ct-guild-stop",
+        "guild",
+        OPTICS,
+        "guild",
+        "chan-guild",
+        content="Stop the old preference.",
+    )
+
+    class Curator:
+        def complete(self, **kwargs):
+            turn = json.loads(kwargs["user"])["turns"][0]
+            return json.dumps(_curation([{
+                "kind": CARD_KIND_RELEVANT_HISTORY,
+                "body": "Has a current substantive discussion.",
+                "confidence": 0.8,
+                "turn_ids": [turn["id"]],
+            }])), {}
+
+    class Admission:
+        def complete(self, **kwargs):
+            prompt = json.loads(kwargs["user"])
+            decisions = []
+            for candidate in prompt["candidates"]:
+                existing = candidate["origin"] == "existing"
+                decisions.append({
+                    "candidate_id": candidate["candidate_id"],
+                    "admit": not existing,
+                    "reason": (
+                        "stopped_or_replaced" if existing else "durable"
+                    ),
+                })
+            return json.dumps(_admission(decisions)), {}
+
+    pipeline = _card_pipeline(
+        store,
+        Curator(),
+        admission=Admission(),
+    )
+    assert pipeline._rebuild_actor_card(OPTICS) == 2
+    assert "prefers terse answers" not in (
+        _bodies(store.get_actor_card(
+            "t1",
+            OPTICS,
+            owner_conversation_id="guild",
+            audience_conversation_id="guild",
+            audience_channel_id="chan-guild",
+        )) or []
+    )
+    status = store.get_actor_card_rebuild_status("t1", OPTICS)
+    assert status["rejected_counts"] == {
+        "semantic_stopped_or_replaced": 1,
+    }
+
+
 def test_destructively_invalidated_card_is_not_served(store):
     _dm_and_guild(store)
     _build_dm_goal_and_cross_pref(store)
