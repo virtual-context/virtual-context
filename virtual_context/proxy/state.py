@@ -187,11 +187,9 @@ class ProxyState:
         self.provider = _derive_provider(upstream)
         self._pool = ThreadPoolExecutor(max_workers=1)       # tagging (serialized)
         self._compact_pool = ThreadPoolExecutor(max_workers=1)  # compaction (background)
-        self._actor_card_pool = ThreadPoolExecutor(max_workers=1)
         self._pending_tag: Future | None = None
         self._pending_compact: Future | None = None
         self._pending_split: Future | None = None
-        self._pending_actor_card: Future | None = None
         self._last_compact_priority: str = ""  # "soft" or "hard" from last tag_turn
         self._ingested_conversations: set[str] = set()
         self._ingested_first_hash: dict[str, str] = {}  # conversation_id → hash of first message
@@ -2133,46 +2131,6 @@ class ProxyState:
                 self.engine.config.conversation_id[:12],
             )
 
-    def fire_actor_card_refresh(self, actor_id: str) -> None:
-        """Queue a post-persist person-card refresh without prepare latency.
-
-        This is deliberately independent of turn tagging and compaction.
-        Shared guild history can make a restored logical turn number diverge
-        from the durable index; that must not strand an otherwise accepted
-        actor turn with a permanently pending card.
-        """
-        actor_id = (actor_id or "").strip()
-        if not actor_id:
-            return
-        try:
-            self._pending_actor_card = self._actor_card_pool.submit(
-                self._run_actor_card_refresh,
-                actor_id,
-            )
-        except RuntimeError:
-            logger.info(
-                "actor card refresh suppressed for shut down session %s",
-                self.engine.config.conversation_id[:12],
-            )
-
-    def _run_actor_card_refresh(self, actor_id: str) -> None:
-        started = time.monotonic()
-        try:
-            written = self.engine.refresh_actor_card(actor_id)
-            logger.info(
-                "ACTOR_CARD_LIVE_REFRESH actor=%s written=%d elapsed_ms=%d",
-                actor_id[:24],
-                written,
-                int((time.monotonic() - started) * 1000),
-            )
-        except Exception:
-            logger.warning(
-                "ACTOR_CARD_LIVE_REFRESH_FAILED actor=%s elapsed_ms=%d",
-                actor_id[:24],
-                int((time.monotonic() - started) * 1000),
-                exc_info=True,
-            )
-
     def _run_tag_turn(
         self,
         history: list[Message],
@@ -3094,7 +3052,6 @@ class ProxyState:
         self._pending_tag = None
         self._pending_compact = None
         self._pending_split = None
-        self._pending_actor_card = None
         self._last_compact_priority = ""
         self._initial_turns = None
         self._initial_tag_count = None
@@ -3135,7 +3092,6 @@ class ProxyState:
             "_pending_tag",
             "_pending_compact",
             "_pending_split",
-            "_pending_actor_card",
         ):
             while True:
                 future = getattr(self, attr, None)
@@ -3161,7 +3117,6 @@ class ProxyState:
             "_pending_tag",
             "_pending_compact",
             "_pending_split",
-            "_pending_actor_card",
         ):
             future = getattr(self, attr, None)
             if future is None:
@@ -3183,7 +3138,6 @@ class ProxyState:
             "_pending_tag",
             "_pending_compact",
             "_pending_split",
-            "_pending_actor_card",
         ):
             future = getattr(self, attr, None)
             if future is None:
@@ -4122,10 +4076,6 @@ class ProxyState:
             self._cancel_background_work()
         self._pool.shutdown(wait=wait, cancel_futures=cancel_futures)
         self._compact_pool.shutdown(wait=wait, cancel_futures=cancel_futures)
-        self._actor_card_pool.shutdown(
-            wait=wait,
-            cancel_futures=cancel_futures,
-        )
         # The engine owns database connection pools. Leaving them open after
         # shutdown leaks one pool's connections per evicted conversation for
         # the life of the process, piling idle server backends until the

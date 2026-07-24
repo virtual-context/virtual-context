@@ -3,7 +3,8 @@
 Skipped unless a Postgres DSN is configured. Keeps the two SQL backends in
 lockstep on the invariants that are privacy boundaries rather than features:
 tenant scoping, audience scoping (a private DM must not shape a public answer),
-cross-actor isolation, dirty-card unreadability, and delete invalidation.
+cross-actor isolation, additive last-good retention, and fail-closed destructive
+invalidation.
 """
 
 from __future__ import annotations
@@ -185,6 +186,37 @@ def _build(w):
 
 def _bodies(card):
     return sorted(e.body for e in card.entries) if card else None
+
+
+def test_pg_first_observed_actor_starts_dirty_for_compaction(store):
+    """A first profile is created after its first row's INSERT trigger fired."""
+    w = World(store)
+
+    profile = store.get_actor_profile(w.tenant, w.optics)
+
+    assert profile is not None
+    assert profile.card_dirty is True
+    assert profile.card_invalid is False
+    assert profile.card_input_hash == ""
+
+
+def test_pg_repeat_profile_sighting_does_not_redirty_clean_card(store):
+    w = World(store)
+    _build(w)
+    before = store.get_actor_profile(w.tenant, w.optics)
+    assert before is not None and before.card_dirty is False
+
+    assert store.upsert_actor_profile_from_turn(
+        w.guild,
+        w.optics,
+        "Optics",
+        seen_at=_now(),
+    )
+    after = store.get_actor_profile(w.tenant, w.optics)
+
+    assert after is not None
+    assert after.card_dirty is False
+    assert after.card_input_hash == "h1"
 
 
 def test_pg_list_actor_facts_derives_audience_and_is_tenant_scoped(store):

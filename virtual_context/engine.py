@@ -2150,8 +2150,9 @@ class VirtualContextEngine:
         number and checkpoint state.
 
         Returns the durable actor id only when the completed user row was
-        accepted into canonical storage.  Callers can use that result to queue
-        post-persist card work without guessing from mutable shared history.
+        accepted into canonical storage. Person-card consolidation is not a
+        post-persist side effect; canonical writes only dirty the cache, and a
+        later successful compaction consolidates affected actors.
         """
         grouped = pair_messages_into_turns(list(conversation_history))
         if not grouped:
@@ -3766,11 +3767,12 @@ class VirtualContextEngine:
         return report
 
     def refresh_actor_card(self, actor_id: str) -> int:
-        """Refresh one dirty actor card from its exact canonical evidence.
+        """Explicitly refresh one dirty actor card from canonical evidence.
 
-        This is the live post-persist surface.  Callers are expected to run it
-        outside request preparation; the store's build marker and atomic
-        replacement still reject a result if newer evidence or destructive
+        Normal request traffic never calls this maintenance surface. Card work
+        is scheduled by the successful compaction boundary; this method remains
+        available for deliberate operator repair. The store's build marker and
+        atomic replacement reject a result if newer evidence or destructive
         provenance changes race the model calls.
         """
         actor_id = (actor_id or "").strip()
