@@ -103,6 +103,161 @@ def test_final_delivery_metadata_rejects_post_injection_mutation() -> None:
     ) == {}
 
 
+def test_final_delivery_metadata_uses_complete_suffix_after_odd_old_group() -> None:
+    replay = [
+        Message(role="user", content="Older requester group lacks an answer."),
+        Message(role="user", content="An older complete requester question."),
+        Message(role="assistant", content="An older complete requester answer."),
+        Message(role="user", content="Begin with CompactedLane73:."),
+        Message(role="assistant", content="CompactedLane73: Understood."),
+    ]
+    expected = replay[-2:]
+    body = {
+        "messages": [
+            {
+                "role": "user",
+                "content": f"{replay[0].content}\n{replay[1].content}",
+            },
+            {"role": "assistant", "content": replay[2].content},
+            {"role": "user", "content": replay[3].content},
+            {"role": "assistant", "content": replay[4].content},
+            {"role": "user", "content": "What is the capital of Portugal?"},
+        ]
+    }
+
+    assert _build_final_recent_conversation_native_metadata(
+        replay,
+        body,
+        AnthropicFormat(),
+    ) == _build_recent_conversation_native_metadata(expected)
+
+
+def test_final_delivery_metadata_does_not_skip_trailing_unpaired_group() -> None:
+    replay = [
+        Message(role="user", content="Begin with OlderLane11:."),
+        Message(role="assistant", content="OlderLane11: Understood."),
+        Message(role="user", content="Newer requester group lacks an answer."),
+    ]
+    body = {
+        "messages": [
+            {"role": "user", "content": replay[0].content},
+            {"role": "assistant", "content": replay[1].content},
+            {"role": "user", "content": replay[2].content},
+            {"role": "user", "content": "What is the capital of Portugal?"},
+        ]
+    }
+
+    assert _build_final_recent_conversation_native_metadata(
+        replay,
+        body,
+        AnthropicFormat(),
+    ) == {}
+
+
+def test_final_delivery_metadata_rejects_body_only_adjacency_gap() -> None:
+    replay = [
+        Message(role="user", content="Begin with GapLane19:."),
+        Message(role="assistant", content="GapLane19: Understood."),
+    ]
+    body = {
+        "messages": [
+            {"role": "user", "content": replay[0].content},
+            {"role": "assistant", "content": replay[1].content},
+            {"role": "user", "content": "Body-only interloper."},
+            {"role": "user", "content": "What is the capital of Portugal?"},
+        ]
+    }
+
+    assert _build_final_recent_conversation_native_metadata(
+        replay,
+        body,
+        AnthropicFormat(),
+    ) == {}
+
+
+def test_final_delivery_metadata_caps_attestation_at_newest_200_messages() -> None:
+    replay = [
+        Message(
+            role="user" if index % 2 == 0 else "assistant",
+            content=f"Replay message {index}.",
+        )
+        for index in range(202)
+    ]
+    body = {
+        "messages": [
+            *[
+                {"role": message.role, "content": message.content}
+                for message in replay
+            ],
+            {"role": "user", "content": "What is the capital of Portugal?"},
+        ]
+    }
+
+    assert _build_final_recent_conversation_native_metadata(
+        replay,
+        body,
+        AnthropicFormat(),
+    ) == _build_recent_conversation_native_metadata(replay[-200:])
+
+
+def test_final_delivery_metadata_rejects_non_user_active_slot() -> None:
+    replay = [
+        Message(role="user", content="Begin with PrefillLane41:."),
+        Message(role="assistant", content="PrefillLane41: Understood."),
+    ]
+    body = {
+        "messages": [
+            {"role": "user", "content": replay[0].content},
+            {"role": "assistant", "content": replay[1].content},
+            {"role": "assistant", "content": "Prefilled active response."},
+        ]
+    }
+
+    assert _build_final_recent_conversation_native_metadata(
+        replay,
+        body,
+        AnthropicFormat(),
+    ) == {}
+
+
+def test_final_delivery_metadata_uses_newer_pair_after_older_mutation() -> None:
+    replay = [
+        Message(role="user", content="Older complete question."),
+        Message(role="assistant", content="Older complete answer."),
+        Message(role="user", content="Begin with MutationLane23:."),
+        Message(role="assistant", content="MutationLane23: Understood."),
+    ]
+    body = {
+        "messages": [
+            {"role": "user", "content": replay[0].content},
+            {"role": "assistant", "content": "Mutated older answer."},
+            {"role": "user", "content": replay[2].content},
+            {"role": "assistant", "content": replay[3].content},
+            {"role": "user", "content": "What is the capital of Portugal?"},
+        ]
+    }
+
+    assert _build_final_recent_conversation_native_metadata(
+        replay,
+        body,
+        AnthropicFormat(),
+    ) == _build_recent_conversation_native_metadata(replay[-2:])
+
+
+def test_final_delivery_metadata_is_empty_without_inserted_replay() -> None:
+    body = {
+        "messages": [
+            {"role": "user", "content": "What is the capital of Portugal?"},
+        ]
+    }
+
+    assert _build_final_recent_conversation_native_metadata(
+        [],
+        body,
+        AnthropicFormat(),
+    ) == {}
+
+
 def test_final_delivery_metadata_supports_openai_responses_content_parts() -> None:
     replay = [
         Message(role="user", content="Begin with ResponsesLane38:."),

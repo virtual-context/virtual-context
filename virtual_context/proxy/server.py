@@ -160,44 +160,55 @@ def _build_final_recent_conversation_native_metadata(
     enriched_body: dict,
     fmt: PayloadFormat,
 ) -> dict[str, object]:
-    """Attest only replay rows still present in the final outbound suffix.
+    """Attest the newest safe replay suffix present in the final payload.
 
     ``messages`` must be the insertion outcome returned by the payload format,
     not the assembler's requested replay. Dedup may intentionally insert
     nothing, while budget enforcement, merging, and upstream trimming can
-    alter an earlier insertion. The plugin accepts only the same contiguous
-    alternating suffix immediately before the active user, so core validates
-    that exact final shape before publishing hashes.
+    alter an earlier insertion.
+
+    A requester window can begin with an incomplete older canonical group
+    after compaction/protected-window recovery. Rejecting the whole delivery
+    in that case makes a newer complete requester pair disappear specifically
+    after compaction. Select the largest valid alternating suffix (bounded to
+    the plugin's 200-message contract) that remains immediately before the
+    active user. Every candidate still comes only from the assembler's
+    actor-proved requester replay; this function never promotes arbitrary
+    payload history.
     """
-    metadata = _build_recent_conversation_native_metadata(messages)
-    if not metadata:
+    if not messages:
         return {}
 
     items = fmt.get_messages(enriched_body)
-    count = int(metadata["message_count"])
-    if not isinstance(items, list) or len(items) <= count:
+    if not isinstance(items, list) or len(items) <= 2:
         return {}
     active_index = len(items) - 1
     active = items[active_index]
     if not isinstance(active, dict) or active.get("role") != "user":
         return {}
 
-    replay_start = active_index - count
-    if replay_start < 0:
-        return {}
-    suffix = items[replay_start:active_index]
-    if len(suffix) != count:
-        return {}
-    for index, (item, expected) in enumerate(zip(suffix, messages)):
-        expected_role = "user" if index % 2 == 0 else "assistant"
-        if (
-            not isinstance(item, dict)
-            or item.get("role") != expected_role
-            or expected.role != expected_role
-            or fmt.extract_message_text(item) != expected.content
+    # Earliest start first means the first match is the largest safe suffix.
+    first_start = max(0, len(messages) - 200)
+    for start in range(first_start, len(messages)):
+        candidate = messages[start:]
+        metadata = _build_recent_conversation_native_metadata(candidate)
+        if not metadata:
+            continue
+        count = int(metadata["message_count"])
+        replay_start = active_index - count
+        if replay_start < 0:
+            continue
+        suffix = items[replay_start:active_index]
+        if len(suffix) != count:
+            continue
+        if all(
+            isinstance(item, dict)
+            and item.get("role") == expected.role
+            and fmt.extract_message_text(item) == expected.content
+            for item, expected in zip(suffix, candidate)
         ):
-            return {}
-    return metadata
+            return metadata
+    return {}
 
 
 # ---------------------------------------------------------------------------
