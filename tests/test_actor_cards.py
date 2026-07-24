@@ -243,19 +243,23 @@ def test_compaction_boundary_coalesces_affected_and_retry_actors():
     assert calls == sorted({OPTICS, BIGTEX, "actor:discord:retry"})
 
 
-def test_recovery_compaction_skips_actor_card_consolidation():
+def test_recovery_compaction_consolidates_affected_and_due_cards():
     pipeline = object.__new__(CompactionPipeline)
     calls = []
-    pipeline._due_actor_card_rebuilds = lambda *, limit: calls.append("due")
-    pipeline._rebuild_actor_card = lambda actor_id: calls.append(actor_id)
+    pipeline._due_actor_card_rebuilds = lambda *, limit: [
+        "actor:discord:retry",
+    ]
+    pipeline._rebuild_actor_card = lambda actor_id: (
+        calls.append(actor_id) or 1
+    )
 
     attempted = pipeline._consolidate_actor_cards_after_compaction(
         {OPTICS},
         disable_replacement_passes=True,
     )
 
-    assert attempted == 0
-    assert calls == []
+    assert attempted == 2
+    assert calls == sorted({OPTICS, "actor:discord:retry"})
 
 
 def test_compaction_boundary_isolates_one_actor_card_failure():

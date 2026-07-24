@@ -214,6 +214,9 @@ def test_noncontiguous_segments_use_exact_canonical_turn_provenance(tmp_path):
         [*seg_a.messages, *seg_b.messages],
         [*seg_a.messages, *seg_b.messages],
         compact_rows=compact_rows,
+        # Backlog/recovery dispatches still rewrite derived facts and must
+        # therefore run the same dedicated actor-card boundary.
+        disable_replacement_passes=True,
     )
     results = report.results
 
@@ -247,9 +250,10 @@ def test_noncontiguous_segments_use_exact_canonical_turn_provenance(tmp_path):
     assert stored_b.start_timestamp == now + timedelta(minutes=1)
     assert stored_b.end_timestamp == now + timedelta(minutes=1)
 
-    # Both topic segments contain the same speaker. The successful compaction
-    # boundary runs one dedicated card consolidation only after every segment,
-    # canonical marker, tag summary, and retrieval snapshot has finished.
+    # Both topic segments contain the same speaker. Even at the recovery
+    # dispatch tier, the successful compaction boundary runs one dedicated card
+    # consolidation only after every segment, canonical marker, tag summary,
+    # and retrieval snapshot has finished.
     assert boundary_events == [
         "tag_summaries",
         "retrieval_snapshots",

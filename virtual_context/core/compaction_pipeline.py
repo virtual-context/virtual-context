@@ -289,28 +289,22 @@ class CompactionPipeline:
         segment so one compaction performs at most one rebuild attempt per
         affected person.
 
-        Recovery/backlog compactions deliberately skip this phase along with
-        their other replacement-shaped writes.  A card failure is isolated
-        from the already-successful compaction: additive dirtiness keeps the
-        last known-good card readable, while destructive invalidation remains
-        fail-closed until a later successful rebuild.
+        Recovery/backlog compactions run this phase too.  They still rewrite
+        derived facts and can therefore invalidate a card's provenance; if
+        they skipped consolidation, that card would remain unavailable until
+        some unrelated future compaction.  A card failure is isolated from the
+        already-successful compaction and remains dirty for a later retry.
         """
         candidates = {
             (actor_id or "").strip()
             for actor_id in actor_ids
             if (actor_id or "").strip()
         }
-        if disable_replacement_passes:
-            if candidates:
-                logger.info(
-                    "ACTOR_CARD_COMPACTION_CONSOLIDATION skipped=%d "
-                    "reason=recovery_gate",
-                    len(candidates),
-                )
-            return 0
-
+        dispatch = (
+            "recovery" if disable_replacement_passes else "ordinary"
+        )
         # A previous transient provider failure must not strand a since-silent
-        # actor forever.  Any successful ordinary compaction services a bounded
+        # actor forever.  Any successful compaction services a bounded
         # tenant-local retry queue after its stored backoff expires.
         candidates.update(self._due_actor_card_rebuilds(limit=25))
         attempted = 0
@@ -318,8 +312,10 @@ class CompactionPipeline:
             attempted += 1
             started = time.monotonic()
             logger.info(
-                "ACTOR_CARD_COMPACTION_CONSOLIDATION actor=%s status=begin",
+                "ACTOR_CARD_COMPACTION_CONSOLIDATION actor=%s "
+                "status=begin dispatch=%s",
                 actor_id[:24],
+                dispatch,
             )
             try:
                 written = self._rebuild_actor_card(actor_id)
