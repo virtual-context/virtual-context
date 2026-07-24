@@ -1078,7 +1078,7 @@ class CompositeStore:
         return []
 
     def list_actor_turn_sources(
-        self, tenant_id: str, actor_id: str, *, limit: int = 120,
+        self, tenant_id: str, actor_id: str, *, limit: int = 500,
     ) -> list:
         fn = getattr(self._facts, "list_actor_turn_sources", None)
         if callable(fn):

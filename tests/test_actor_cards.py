@@ -339,6 +339,8 @@ def test_actor_card_admission_provider_builds_configured_fallback():
     pipeline = object.__new__(CompactionPipeline)
     pipeline._config = SimpleNamespace(
         assembler=SimpleNamespace(
+            actor_card_curation_model="openai/gpt-5.4",
+            actor_card_curation_fallback_model="anthropic/claude-fable-5",
             actor_card_admission_model="anthropic/claude-fable-5",
             actor_card_admission_fallback_model="openai/gpt-5.4",
         ),
@@ -350,6 +352,13 @@ def test_actor_card_admission_provider_builds_configured_fallback():
             api_key="test-key",
         ),
     )
+
+    curator = pipeline._actor_card_curation_provider()
+    assert isinstance(curator, _EmptyResponseFallbackProvider)
+    assert curator._primary.model == "openai/gpt-5.4"
+    assert curator._fallback.model == "anthropic/claude-fable-5"
+    assert curator._primary.base_url == curator._fallback.base_url
+    assert curator._primary.api_key == curator._fallback.api_key == "test-key"
 
     provider = pipeline._actor_card_admission_provider()
     assert isinstance(provider, _EmptyResponseFallbackProvider)
@@ -363,6 +372,33 @@ def test_actor_card_admission_provider_builds_configured_fallback():
         == provider._fallback.reasoning_effort
         == "low"
     )
+
+
+def test_actor_card_curation_retries_schema_invalid_primary_with_fallback():
+    class CuratorWithFallback:
+        fallback_calls = 0
+
+        def complete_with_source(self, **_kwargs):
+            return '{"substantive":true,"coverage_reason":"substantive","entries":[', {}, "primary"
+
+        def complete_fallback(self, **_kwargs):
+            self.fallback_calls += 1
+            return json.dumps(_curation([])), {}
+
+    provider = CuratorWithFallback()
+    pipeline = _card_pipeline(None, provider, admission=_AdmitAll())
+    pipeline._actor_card_curation_provider_override = provider
+
+    response, substantive, reason, entries, visible = (
+        pipeline._curate_actor_card_partition([], [])
+    )
+
+    assert json.loads(response) == _curation([])
+    assert substantive is False
+    assert reason == "no_durable_context"
+    assert entries == []
+    assert visible == set()
+    assert provider.fallback_calls == 1
 
 
 def _single_guild_card_source(store):
@@ -384,6 +420,34 @@ def _single_guild_card_source(store):
         "Optics",
         seen_at=_now(),
     )
+
+
+def test_curator_and_admission_share_the_configured_turn_window(store):
+    _single_guild_card_source(store)
+
+    class Curator:
+        def complete(self, **kwargs):
+            turn_id = json.loads(kwargs["user"])["turns"][0]["id"]
+            return json.dumps(_curation([{
+                "kind": CARD_KIND_ACTIVE_GOAL,
+                "body": "Is leading the Atlas migration.",
+                "confidence": 0.9,
+                "turn_ids": [turn_id],
+            }])), {}
+
+    pipeline = _card_pipeline(store, Curator(), admission=_AdmitAll())
+    pipeline._config.assembler.actor_card_prompt_max_chars = 123_456
+    original = pipeline._actor_card_prompt_turns
+    observed: list[int] = []
+
+    def render(turns, *, max_chars=96_000):
+        observed.append(max_chars)
+        return original(turns, max_chars=max_chars)
+
+    pipeline._actor_card_prompt_turns = render
+
+    assert pipeline._rebuild_actor_card(OPTICS) == 1
+    assert observed == [123_456, 123_456]
 
 
 def test_empty_primary_valid_fallback_passes_full_admission_gate(store):
@@ -504,7 +568,9 @@ def test_list_actor_facts_derives_audience_from_canonical_rows(store):
 
 def test_list_actor_turn_sources_is_exact_tenant_and_audience_scoped(store):
     _dm_and_guild(store)
-    sources = store.list_actor_turn_sources("t1", OPTICS, limit=10)
+    # The cap is per policy audience: neither DM nor guild can crowd the other
+    # out even when each is independently limited to one row.
+    sources = store.list_actor_turn_sources("t1", OPTICS, limit=1)
     got = {
         source.turn.canonical_turn_id: (
             source.owner_conversation_id,

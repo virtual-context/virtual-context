@@ -10499,39 +10499,63 @@ CREATE TABLE IF NOT EXISTS request_captures (
         tenant_id: str,
         actor_id: str,
         *,
-        limit: int = 120,
+        limit: int = 500,
     ) -> list[ActorTurnSource]:
-        """Enumerate exact, audience-proved canonical user rows for one actor."""
+        """Enumerate exact user rows, applying ``limit`` per audience.
+
+        Results are also globally bounded, with rank-first ordering so the
+        newest row from each audience is selected before any audience's second.
+        """
         actor_id = (actor_id or "").strip()
         cap = max(0, int(limit))
+        total_cap = max(cap, 2_000)
         if not actor_id or cap <= 0:
             return []
         rows = self._get_conn().execute(
-            """SELECT ct.*, owner.lifecycle_epoch AS _owner_epoch,
-                      audience.lifecycle_epoch AS _audience_epoch
-                 FROM canonical_turns ct
-                 JOIN conversations owner
-                   ON owner.conversation_id = ct.conversation_id
-                 JOIN conversations audience
-                   ON audience.conversation_id =
-                      ct.audience_conversation_id
-                WHERE ct.sender_actor_id = ?
-                  AND owner.tenant_id = ?
-                  AND audience.tenant_id = ?
-                  AND owner.phase NOT IN ('deleted', 'merged')
-                  AND audience.phase <> 'deleted'
-                  AND ct.audience_attribution_version = ?
-                  AND ct.audience_conversation_id <> ''
-                  AND ct.user_content <> ''
+            """WITH ranked AS (
+                   SELECT ct.*,
+                          owner.lifecycle_epoch AS _owner_epoch,
+                          audience.lifecycle_epoch AS _audience_epoch,
+                          ROW_NUMBER() OVER (
+                              PARTITION BY ct.audience_conversation_id
+                              ORDER BY
+                                  COALESCE(
+                                      NULLIF(ct.created_at, ''),
+                                      NULLIF(ct.first_seen_at, ''),
+                                      NULLIF(ct.updated_at, ''),
+                                      ''
+                                  ) DESC,
+                                  ct.sort_key DESC,
+                                  ct.canonical_turn_id DESC
+                          ) AS _audience_rank
+                     FROM canonical_turns ct
+                     JOIN conversations owner
+                       ON owner.conversation_id = ct.conversation_id
+                     JOIN conversations audience
+                       ON audience.conversation_id =
+                          ct.audience_conversation_id
+                    WHERE ct.sender_actor_id = ?
+                      AND owner.tenant_id = ?
+                      AND audience.tenant_id = ?
+                      AND owner.phase NOT IN ('deleted', 'merged')
+                      AND audience.phase <> 'deleted'
+                      AND ct.audience_attribution_version = ?
+                      AND ct.audience_conversation_id <> ''
+                      AND ct.user_content <> ''
+               )
+               SELECT *
+                 FROM ranked
+                WHERE _audience_rank <= ?
                 ORDER BY
+                    _audience_rank,
                     COALESCE(
-                        NULLIF(ct.created_at, ''),
-                        NULLIF(ct.first_seen_at, ''),
-                        NULLIF(ct.updated_at, ''),
+                        NULLIF(created_at, ''),
+                        NULLIF(first_seen_at, ''),
+                        NULLIF(updated_at, ''),
                         ''
                     ) DESC,
-                    ct.sort_key DESC,
-                    ct.canonical_turn_id DESC
+                    sort_key DESC,
+                    canonical_turn_id DESC
                 LIMIT ?""",
             (
                 actor_id,
@@ -10539,6 +10563,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 tenant_id,
                 AUDIENCE_ATTRIBUTION_VERSION,
                 cap,
+                total_cap,
             ),
         ).fetchall()
         return [

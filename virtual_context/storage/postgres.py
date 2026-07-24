@@ -10870,39 +10870,65 @@ class PostgresStore(ContextStore):
         tenant_id: str,
         actor_id: str,
         *,
-        limit: int = 120,
+        limit: int = 500,
     ) -> list[ActorTurnSource]:
-        """Enumerate exact, audience-proved canonical user rows for one actor."""
+        """Enumerate exact, audience-proved canonical user rows for one actor.
+
+        ``limit`` is applied per audience. Curation partitions audiences before
+        either model sees them, so a globally applied cap would let a busy
+        guild silently crowd all DM evidence (or the reverse) out of a card.
+        A separate total bound of ``max(limit, 2_000)`` caps actors present in
+        very many audiences; rank-first ordering shares that bound fairly.
+        """
         actor_id = (actor_id or "").strip()
         cap = max(0, int(limit))
+        total_cap = max(cap, 2_000)
         if not actor_id or cap <= 0:
             return []
         with self.pool.connection() as conn:
             rows = conn.execute(
-                """SELECT ct.*, owner.lifecycle_epoch AS _owner_epoch,
-                          audience.lifecycle_epoch AS _audience_epoch
-                     FROM canonical_turns ct
-                     JOIN conversations owner
-                       ON owner.conversation_id = ct.conversation_id
-                     JOIN conversations audience
-                       ON audience.conversation_id =
-                          ct.audience_conversation_id
-                    WHERE ct.sender_actor_id = %s
-                      AND owner.tenant_id = %s
-                      AND audience.tenant_id = %s
-                      AND owner.phase NOT IN ('deleted', 'merged')
-                      AND audience.phase <> 'deleted'
-                      AND ct.audience_attribution_version = %s
-                      AND ct.audience_conversation_id <> ''
-                      AND ct.user_content <> ''
+                """WITH ranked AS (
+                       SELECT ct.*,
+                              owner.lifecycle_epoch AS _owner_epoch,
+                              audience.lifecycle_epoch AS _audience_epoch,
+                              ROW_NUMBER() OVER (
+                                  PARTITION BY ct.audience_conversation_id
+                                  ORDER BY
+                                      COALESCE(
+                                          ct.created_at,
+                                          ct.first_seen_at,
+                                          ct.updated_at
+                                      ) DESC NULLS LAST,
+                                      ct.sort_key DESC,
+                                      ct.canonical_turn_id DESC
+                              ) AS _audience_rank
+                         FROM canonical_turns ct
+                         JOIN conversations owner
+                           ON owner.conversation_id = ct.conversation_id
+                         JOIN conversations audience
+                           ON audience.conversation_id =
+                              ct.audience_conversation_id
+                        WHERE ct.sender_actor_id = %s
+                          AND owner.tenant_id = %s
+                          AND audience.tenant_id = %s
+                          AND owner.phase NOT IN ('deleted', 'merged')
+                          AND audience.phase <> 'deleted'
+                          AND ct.audience_attribution_version = %s
+                          AND ct.audience_conversation_id <> ''
+                          AND ct.user_content <> ''
+                   )
+                   SELECT *
+                     FROM ranked
+                    WHERE _audience_rank <= %s
                     ORDER BY
+                        _audience_rank,
                         COALESCE(
-                            ct.created_at,
-                            ct.first_seen_at,
-                            ct.updated_at
+                            created_at,
+                            first_seen_at,
+                            updated_at
                         ) DESC NULLS LAST,
-                        ct.sort_key DESC,
-                        ct.canonical_turn_id DESC
+                        sort_key DESC,
+                        canonical_turn_id DESC
                     LIMIT %s""",
                 (
                     actor_id,
@@ -10910,6 +10936,7 @@ class PostgresStore(ContextStore):
                     tenant_id,
                     AUDIENCE_ATTRIBUTION_VERSION,
                     cap,
+                    total_cap,
                 ),
             ).fetchall()
         return [
