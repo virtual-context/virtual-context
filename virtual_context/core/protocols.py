@@ -423,6 +423,9 @@ class FactStore(Protocol):
     def list_actor_turn_sources(
         self, tenant_id: str, actor_id: str, *, limit: int = 500,
     ) -> list: ...
+    def list_actor_card_carryovers(
+        self, tenant_id: str, actor_id: str,
+    ) -> list: ...
     def get_actor_profile(self, tenant_id: str, actor_id: str): ...
     def mark_actor_card_dirty(
         self, tenant_id: str, actor_id: str, *, build_input_hash: str = "",
