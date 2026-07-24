@@ -135,7 +135,10 @@ class ContextAssembler:
     # emitted as JSON scalars by the standard encoder and cannot close the
     # wrapper or open a new system section. Structural exclusion is the
     # guarantee here; the wording is only orientation for the reader.
-    _CARD_OPEN = '<actor-card mode="influence-only" quote="forbidden">'
+    _CARD_OPEN = (
+        '<actor-card mode="influence-only" quote="forbidden" '
+        'precedence="newer-conversation-wins">'
+    )
     _CARD_CLOSE = "</actor-card>"
 
     @staticmethod
@@ -177,8 +180,9 @@ class ContextAssembler:
         """Read, cap, and render the requester's card.
 
         Returns ``(text, tokens, surviving_entries)``. Every failure mode —
-        gate off, unknown requester, unproved audience, dirty card, no store —
-        returns ``("", 0, [])`` and is indistinguishable from today.
+        gate off, unknown requester, unproved audience, invalid card, no store
+        — returns ``("", 0, [])`` and is indistinguishable from today. A card
+        awaiting an additive refresh remains the last known-good version.
         """
         if not self.config.actor_card_enabled:
             # Ships dark: no profile or card read, no budget key, and rendered

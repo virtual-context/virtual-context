@@ -1475,8 +1475,17 @@ class ActorProfile:
     first_seen_at: str = ""
     last_seen_at: str = ""
     card_built_at: str | None = None
+    # ``card_dirty`` means newer additive evidence is waiting to be folded
+    # into the cache.  The last successfully built card remains trustworthy
+    # and may still be served while that refresh is pending.
     card_dirty: bool = False
+    # Destructive provenance changes (delete, merge, actor/audience rewrite)
+    # make the previous card unsafe to serve until a clean rebuild succeeds.
+    card_invalid: bool = False
     card_input_hash: str = ""
+    # Transient rebuild CAS marker.  Kept separate from ``card_input_hash`` so
+    # an in-flight refresh never overwrites the version of the last good card.
+    card_build_marker: str = ""
 
 
 @dataclass

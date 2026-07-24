@@ -2013,6 +2013,57 @@ CREATE TABLE IF NOT EXISTS request_captures (
         conversation and the validated pre-alias audience origin of every
         contributing fact.
         """
+        profile_table_existed = self._table_exists(conn, "actor_profiles")
+        existing_profile_columns = (
+            {
+                row[1]
+                for row in conn.execute(
+                    "PRAGMA table_info(actor_profiles)"
+                ).fetchall()
+            }
+            if profile_table_existed
+            else set()
+        )
+        # Forward-add the state split before recreating triggers below; an
+        # existing actor_profiles table otherwise makes the CREATE TABLE in the
+        # script a no-op and the trigger DDL would reference missing columns.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS actor_profiles (
+                tenant_id TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                platform TEXT NOT NULL DEFAULT '',
+                display_name TEXT NOT NULL DEFAULT '',
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                card_built_at TEXT NULL,
+                card_dirty INTEGER NOT NULL DEFAULT 0,
+                card_invalid INTEGER NOT NULL DEFAULT 0,
+                card_input_hash TEXT NOT NULL DEFAULT '',
+                card_build_marker TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (tenant_id, actor_id)
+            )
+        """)
+        self._add_column_if_missing(
+            conn,
+            "actor_profiles",
+            "card_invalid",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
+        self._add_column_if_missing(
+            conn,
+            "actor_profiles",
+            "card_build_marker",
+            "TEXT NOT NULL DEFAULT ''",
+        )
+        if (
+            profile_table_existed
+            and "card_invalid" not in existing_profile_columns
+        ):
+            conn.execute(
+                """UPDATE actor_profiles
+                      SET card_invalid = CASE
+                          WHEN card_dirty <> 0 THEN 1 ELSE 0 END"""
+            )
         conn.executescript(f"""
             CREATE TABLE IF NOT EXISTS actor_profiles (
                 tenant_id TEXT NOT NULL,
@@ -2023,7 +2074,9 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 last_seen_at TEXT NOT NULL,
                 card_built_at TEXT NULL,
                 card_dirty INTEGER NOT NULL DEFAULT 0,
+                card_invalid INTEGER NOT NULL DEFAULT 0,
                 card_input_hash TEXT NOT NULL DEFAULT '',
+                card_build_marker TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY (tenant_id, actor_id)
             );
 
@@ -2107,7 +2160,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
             WHEN NEW.sender_actor_id <> '' AND NEW.user_content <> ''
             BEGIN
                 UPDATE actor_profiles
-                   SET card_dirty = 1, card_input_hash = ''
+                   SET card_dirty = 1, card_build_marker = ''
                  WHERE actor_id = NEW.sender_actor_id
                    AND tenant_id = (
                        SELECT tenant_id
@@ -2124,7 +2177,8 @@ CREATE TABLE IF NOT EXISTS request_captures (
             FOR EACH ROW
             BEGIN
                 UPDATE actor_profiles
-                   SET card_dirty = 1, card_input_hash = ''
+                   SET card_dirty = 1, card_invalid = 1,
+                       card_build_marker = ''
                  WHERE actor_id = OLD.sender_actor_id
                    AND OLD.sender_actor_id <> ''
                    AND tenant_id = (
@@ -2133,7 +2187,8 @@ CREATE TABLE IF NOT EXISTS request_captures (
                         WHERE conversation_id = OLD.conversation_id
                    );
                 UPDATE actor_profiles
-                   SET card_dirty = 1, card_input_hash = ''
+                   SET card_dirty = 1, card_invalid = 1,
+                       card_build_marker = ''
                  WHERE (tenant_id, actor_id) IN (
                        SELECT e.tenant_id, e.actor_id
                          FROM actor_card_entries e
@@ -2163,7 +2218,8 @@ CREATE TABLE IF NOT EXISTS request_captures (
             FOR EACH ROW
             BEGIN
                 UPDATE actor_profiles
-                   SET card_dirty = 1, card_input_hash = ''
+                   SET card_dirty = 1, card_invalid = 1,
+                       card_build_marker = ''
                  WHERE actor_id = OLD.sender_actor_id
                    AND OLD.sender_actor_id <> ''
                    AND tenant_id = (
@@ -2172,7 +2228,8 @@ CREATE TABLE IF NOT EXISTS request_captures (
                         WHERE conversation_id = OLD.conversation_id
                    );
                 UPDATE actor_profiles
-                   SET card_dirty = 1, card_input_hash = ''
+                   SET card_dirty = 1, card_invalid = 1,
+                       card_build_marker = ''
                  WHERE actor_id = NEW.sender_actor_id
                    AND NEW.sender_actor_id <> ''
                    AND tenant_id = (
@@ -2181,7 +2238,8 @@ CREATE TABLE IF NOT EXISTS request_captures (
                         WHERE conversation_id = NEW.conversation_id
                    );
                 UPDATE actor_profiles
-                   SET card_dirty = 1, card_input_hash = ''
+                   SET card_dirty = 1, card_invalid = 1,
+                       card_build_marker = ''
                  WHERE (tenant_id, actor_id) IN (
                        SELECT e.tenant_id, e.actor_id
                          FROM actor_card_entries e
@@ -8513,7 +8571,9 @@ CREATE TABLE IF NOT EXISTS request_captures (
 
             report["cards_invalidated"] = self._invalidate_actor_cards(conn, owner)
             conn.execute(
-                """UPDATE actor_profiles SET card_dirty = 1, card_input_hash = ''
+                """UPDATE actor_profiles
+                      SET card_dirty = 1, card_invalid = 1,
+                          card_build_marker = ''
                     WHERE tenant_id = ? AND actor_id IN (
                         SELECT DISTINCT sender_actor_id FROM canonical_turns
                          WHERE conversation_id = ?
@@ -8795,7 +8855,9 @@ CREATE TABLE IF NOT EXISTS request_captures (
                     "actor-id normalization lost its lifecycle compare-and-set"
                 )
             conn.execute(
-                """UPDATE actor_profiles SET card_dirty = 1, card_input_hash = ''
+                """UPDATE actor_profiles
+                      SET card_dirty = 1, card_invalid = 1,
+                          card_build_marker = ''
                     WHERE tenant_id = ? AND actor_id IN (
                       SELECT DISTINCT sender_actor_id FROM canonical_turns
                        WHERE conversation_id = ?
@@ -10272,7 +10334,8 @@ CREATE TABLE IF NOT EXISTS request_captures (
         for actor_id in sorted(actor_ids):
             cur = conn.execute(
                 """UPDATE actor_profiles
-                      SET card_dirty = 1, card_input_hash = ''
+                      SET card_dirty = 1, card_invalid = 1,
+                          card_build_marker = ''
                     WHERE tenant_id = ? AND actor_id = ?""",
                 (tenant_id, actor_id),
             )
@@ -10594,7 +10657,9 @@ CREATE TABLE IF NOT EXISTS request_captures (
             platform=row["platform"] or "", display_name=row["display_name"] or "",
             first_seen_at=row["first_seen_at"], last_seen_at=row["last_seen_at"],
             card_built_at=row["card_built_at"], card_dirty=bool(row["card_dirty"]),
+            card_invalid=bool(row["card_invalid"]),
             card_input_hash=row["card_input_hash"] or "",
+            card_build_marker=row["card_build_marker"] or "",
         )
 
     def mark_actor_card_dirty(
@@ -10607,7 +10672,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
         conn = self._get_conn()
         cur = conn.execute(
             """UPDATE actor_profiles
-                  SET card_dirty = 1, card_input_hash = ?
+                  SET card_dirty = 1, card_build_marker = ?
                 WHERE tenant_id = ? AND actor_id = ?""",
             (build_input_hash or "", tenant_id, actor_id),
         )
@@ -10644,7 +10709,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
         conn.execute("BEGIN IMMEDIATE")
         try:
             prof = conn.execute(
-                """SELECT card_dirty, card_input_hash FROM actor_profiles
+                """SELECT card_dirty, card_build_marker FROM actor_profiles
                     WHERE tenant_id = ? AND actor_id = ?""",
                 (tenant_id, actor_id),
             ).fetchone()
@@ -10653,7 +10718,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 return 0
             if expected_build_marker is not None and (
                 not bool(prof["card_dirty"])
-                or (prof["card_input_hash"] or "")
+                or (prof["card_build_marker"] or "")
                 != expected_build_marker
             ):
                 conn.execute("ROLLBACK")
@@ -10914,7 +10979,9 @@ CREATE TABLE IF NOT EXISTS request_captures (
 
             conn.execute(
                 """UPDATE actor_profiles
-                      SET card_built_at = ?, card_dirty = 0, card_input_hash = ?
+                      SET card_built_at = ?, card_dirty = 0,
+                          card_invalid = 0, card_input_hash = ?,
+                          card_build_marker = ''
                     WHERE tenant_id = ? AND actor_id = ?""",
                 (now, input_hash or "", tenant_id, actor_id),
             )
@@ -11121,14 +11188,16 @@ CREATE TABLE IF NOT EXISTS request_captures (
             return None
 
         prof = conn.execute(
-            """SELECT display_name, card_built_at, card_dirty, card_input_hash
+            """SELECT display_name, card_built_at, card_dirty,
+                      card_invalid, card_input_hash
                  FROM actor_profiles
                 WHERE tenant_id = ? AND actor_id = ?""",
             (tenant_id, actor_id),
         ).fetchone()
-        if prof is None or int(prof["card_dirty"] or 0):
-            # A dirty card is unreadable. That is what makes delete and merge
-            # invalidation safe without any post-commit callback.
+        if prof is None or int(prof["card_invalid"] or 0):
+            # Destructive provenance changes fail closed. Additive new turns
+            # only set card_dirty, so the last known-good card stays available
+            # while a refresh is pending.
             return None
 
         cross_kinds = _sql_in_list(CARD_CROSS_CONTEXT_KINDS)
@@ -11288,7 +11357,8 @@ CREATE TABLE IF NOT EXISTS request_captures (
         for tenant_id, actor_id in sorted(profiles):
             conn.execute(
                 """UPDATE actor_profiles
-                      SET card_dirty = 1, card_input_hash = ''
+                      SET card_dirty = 1, card_invalid = 1,
+                          card_build_marker = ''
                     WHERE tenant_id = ? AND actor_id = ?""",
                 (tenant_id, actor_id),
             )
