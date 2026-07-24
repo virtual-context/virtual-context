@@ -14,8 +14,12 @@ import math
 from collections import OrderedDict
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 from ..types import TagStats
+
+if TYPE_CHECKING:
+    from ..types import EngineStateSnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -366,6 +370,157 @@ class SessionStateProvider:
                            conversation_id[:12], exc_info=True)
             self._degraded = True
             return None
+
+    def advance_observation_checkpoint(
+        self,
+        conversation_id: str,
+        *,
+        last_completed_turn: int,
+        last_indexed_turn: int | None = None,
+        turn_tag_entry: dict | None = None,
+        max_retries: int = 4,
+    ) -> int | None:
+        """Atomically merge one observed-turn checkpoint into shared state.
+
+        Ambient Discord observations can arrive on a different cloud worker
+        while a prepare request is in flight. Saving that worker's entire
+        cached ``SessionState`` would either be rejected as stale or overwrite
+        unrelated newer fields. This narrow transaction reloads the current
+        blob under ``WATCH`` and changes only monotonic turn markers plus the
+        optional canonical tag-index entry.
+
+        The canonical row is already durable before this method runs. A
+        transaction failure therefore affects immediate cross-worker
+        freshness only; callers log and return a retryable error without
+        rolling back conversation data.
+        """
+        if not conversation_id:
+            return None
+        completed = int(last_completed_turn)
+        indexed = (
+            completed
+            if last_indexed_turn is None
+            else int(last_indexed_turn)
+        )
+        retries = max(1, min(10, int(max_retries or 1)))
+        key = self._key(conversation_id)
+        entry = (
+            dict(turn_tag_entry)
+            if isinstance(turn_tag_entry, dict)
+            else None
+        )
+
+        def _entry_turn_number(item: dict) -> int:
+            if not isinstance(item, dict):
+                return -1
+            try:
+                return int(item.get("turn_number", -1))
+            except (TypeError, ValueError):
+                return -1
+
+        for attempt in range(1, retries + 1):
+            try:
+                with self._redis.pipeline() as pipe:
+                    pipe.watch(key)
+                    current_raw = pipe.get(key)
+                    if current_raw:
+                        state = SessionState.from_json(current_raw)
+                    else:
+                        state = (
+                            self._load_from_store(conversation_id)
+                            or SessionState()
+                        )
+                    if state.deleted:
+                        logger.info(
+                            "Observation checkpoint rejected for %s — "
+                            "tombstoned",
+                            conversation_id[:12],
+                        )
+                        return None
+
+                    changed = False
+                    if completed > int(state.last_completed_turn):
+                        state.last_completed_turn = completed
+                        changed = True
+                    if indexed > int(state.last_indexed_turn):
+                        state.last_indexed_turn = indexed
+                        changed = True
+
+                    if entry is not None:
+                        canonical_id = str(
+                            entry.get("canonical_turn_id") or ""
+                        ).strip()
+                        try:
+                            entry_turn = int(entry.get("turn_number"))
+                        except (TypeError, ValueError):
+                            entry_turn = -1
+                        existing_ids = {
+                            str(item.get("canonical_turn_id") or "").strip()
+                            for item in state.turn_tag_entries
+                            if isinstance(item, dict)
+                        }
+                        existing_turn_ids = {
+                            str(item.get("canonical_turn_id") or "").strip()
+                            for item in state.turn_tag_entries
+                            if (
+                                isinstance(item, dict)
+                                and _entry_turn_number(item) == entry_turn
+                            )
+                        }
+                        if canonical_id and canonical_id not in existing_ids:
+                            if (
+                                entry_turn >= 0
+                                and existing_turn_ids
+                                and canonical_id not in existing_turn_ids
+                            ):
+                                logger.warning(
+                                    "Observation checkpoint tag-index "
+                                    "conflict conv=%s turn=%d stored=%s "
+                                    "incoming=%s",
+                                    conversation_id[:12],
+                                    entry_turn,
+                                    ",".join(sorted(existing_turn_ids))[:48],
+                                    canonical_id[:24],
+                                )
+                            else:
+                                state.turn_tag_entries.append(entry)
+                                state.turn_tag_entries.sort(
+                                    key=_entry_turn_number,
+                                )
+                                changed = True
+
+                    if not changed:
+                        try:
+                            pipe.unwatch()
+                        except Exception:
+                            pass
+                        return int(state.version or 0)
+
+                    state.version = int(state.version or 0) + 1
+                    pipe.multi()
+                    pipe.set(key, state.to_json())
+                    pipe.execute()
+
+                self._degraded = False
+                self._save_to_store(conversation_id, state)
+                return state.version
+            except Exception as exc:
+                if (
+                    exc.__class__.__name__ == "WatchError"
+                    and attempt < retries
+                ):
+                    continue
+                logger.warning(
+                    "Observation checkpoint advance failed for %s "
+                    "(attempt %d/%d)",
+                    conversation_id[:12],
+                    attempt,
+                    retries,
+                    exc_info=True,
+                )
+                self._degraded = True
+                return None
+        return None
 
     def load_payload_token_cache(self, conversation_id: str, *, scope: str = "inbound"):
         """Load the segmented inbound token cache for a conversation.

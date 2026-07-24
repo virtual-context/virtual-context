@@ -53,6 +53,14 @@ _STABLE_CHANNEL_KEY_RE = re.compile(
     r'^(?:sk:)?agent:[^:]+:[^:]+:(?:channel|group):([^:]+)$'
 )
 
+# A guild-scoped stable route is itself a shared-conversation declaration.
+# Its OpenClaw payload history is necessarily channel-local, so fresh messages
+# from sibling channels must be mirrored from canonical storage even when the
+# owner has no legacy conversation_aliases rows.
+_STABLE_DISCORD_GUILD_KEY_RE = re.compile(
+    r'^(?:sk:)?agent:[^:]+:discord:guild:[^:]+$'
+)
+
 
 # Patterns for stub content detection (media attachments, image placeholders, etc.)
 _STUB_PATTERNS = [
@@ -237,18 +245,21 @@ class VirtualContextEngine:
         self._init_store_view(_raw_store)
 
         # Cross-channel-mirror Tier 1 gate (see spec §1.1). Set the
-        # cached participation bool BEFORE any delegate construction
+        # cached shared-history bool BEFORE any delegate construction
         # that might inspect it. Tier 0 == "off" means the gate is
-        # disabled and we MUST NOT call ``has_any_alias`` at all so
-        # cloud's allowlist surface and any DB-roundtrip cost stay
-        # out of the construction path on the dominant unattached
-        # path. We do not catch broad ``Exception`` around the call
-        # in merge mode — a broken store / missing allowlist / DB
-        # outage that hides mirror loss as a stale ``False`` would be
-        # worse than failing fast at engine construction.
+        # disabled and we MUST NOT call ``has_any_alias`` at all. A stable
+        # Discord guild route is intrinsically shared across channel-local
+        # OpenClaw histories and therefore participates without needing a
+        # legacy alias row. Other routes retain the indexed alias check. We do
+        # not catch broad ``Exception`` around that call in merge mode — a
+        # broken store / missing allowlist / DB outage that hides mirror loss
+        # as a stale ``False`` would be worse than failing fast.
         if getattr(self.config.assembler, "protected_window_db_source", "off") == "merge":
             self._is_merge_participant = bool(
-                self._store.has_any_alias(self.config.conversation_id)
+                _STABLE_DISCORD_GUILD_KEY_RE.fullmatch(
+                    self.config.conversation_id,
+                )
+                or self._store.has_any_alias(self.config.conversation_id)
             )
         else:
             self._is_merge_participant = False
@@ -2303,6 +2314,115 @@ class VirtualContextEngine:
             conversation_history,
             last_completed_turn=turn_number,
         )
+
+    def persist_observed_message(
+        self,
+        *,
+        content: str,
+        source_message_id: str,
+        audience_conversation_id: str,
+        origin_channel_id: str,
+        origin_channel_label: str = "",
+        sender: str = "",
+        sender_actor_id: str,
+        observed_at: str = "",
+        reply_target_message_id: str = "",
+        reply_subject_actor_id: str = "",
+        reply_subject_label: str = "",
+        reply_target_body: str = "",
+    ):
+        """Persist an ambient human message as a standalone canonical turn.
+
+        The reconciler owns the durable/idempotent write.  This wrapper keeps
+        the current engine's in-memory tag index and shared-session staleness
+        marker coherent with that write, so the very next request cannot take
+        the protected-window ``tier2_equal`` shortcut and miss a peer-channel
+        observation that just arrived.
+
+        Ambient observations intentionally use the deterministic ``_general``
+        tag.  No model call occurs on the Discord receive hook; normal
+        compaction and actor-card admission remain the semantic policy layer.
+        """
+        result = self._ingest_reconciler.ingest_observation(
+            self.config.conversation_id,
+            content=content,
+            source_message_id=source_message_id,
+            audience_conversation_id=audience_conversation_id,
+            origin_channel_id=origin_channel_id,
+            origin_channel_label=origin_channel_label,
+            sender=sender,
+            sender_actor_id=sender_actor_id,
+            observed_at=observed_at,
+            reply_target_message_id=reply_target_message_id,
+            reply_subject_actor_id=reply_subject_actor_id,
+            reply_subject_label=reply_subject_label,
+            reply_target_body=reply_target_body,
+            expected_lifecycle_epoch=int(self._engine_state.lifecycle_epoch),
+        )
+        if not result.rows:
+            return result
+
+        row = result.rows[0]
+        raw_turn_number = getattr(row, "turn_group_number", -1)
+        turn_number = (
+            int(raw_turn_number)
+            if raw_turn_number is not None
+            else -1
+        )
+        if turn_number < 0 or not getattr(row, "tagged_at", None):
+            # A matching normal prepare/ingest row can be observed during a
+            # race but still be awaiting its ordinary tagger.  That path owns
+            # the index/marker; claiming it here would mark incomplete work as
+            # indexed.
+            return result
+
+        by_canonical = self._turn_tag_index.get_tags_for_canonical_turn(
+            row.canonical_turn_id,
+        )
+        by_turn = self._turn_tag_index.get_tags_for_logical_turn(turn_number)
+        if by_canonical is None and by_turn is None:
+            combined = f"{row.user_content} {row.assistant_content}"
+            self._turn_tag_index.append(TurnTagEntry(
+                turn_number=turn_number,
+                canonical_turn_id=row.canonical_turn_id,
+                message_hash=hashlib.sha256(
+                    combined.encode("utf-8"),
+                ).hexdigest()[:16],
+                tags=list(row.tags or []) or [row.primary_tag or "_general"],
+                primary_tag=row.primary_tag or "_general",
+                timestamp=self._parse_turn_timestamp(
+                    row.last_seen_at,
+                    row.first_seen_at,
+                    row.updated_at,
+                    row.created_at,
+                ),
+                session_date=row.session_date or "",
+                fact_signals=list(row.fact_signals or []),
+                sender=row.sender or "",
+                code_refs=list(row.code_refs or []),
+            ))
+        elif (
+            by_canonical is None
+            and by_turn is not None
+            and by_turn.canonical_turn_id != row.canonical_turn_id
+        ):
+            logger.warning(
+                "OBSERVATION_INDEX_CONFLICT conv=%s turn=%d stored=%s incoming=%s",
+                self.config.conversation_id[:12],
+                turn_number,
+                (by_turn.canonical_turn_id or "")[:12],
+                (row.canonical_turn_id or "")[:12],
+            )
+
+        # In provider mode this updates the in-memory markers; the cloud caller
+        # immediately persists the resulting SessionState to Redis.  Library
+        # mode writes the normal engine checkpoint directly.
+        self._save_state(
+            None,
+            last_completed_turn=turn_number,
+            last_indexed_turn=turn_number,
+        )
+        return result
 
     def _reset_restored_state(self) -> None:
         self._turn_tag_index = TurnTagIndex()
