@@ -6,6 +6,7 @@ leakage (a private DM shaping a public answer) is the same severity. These
 tests pin both structurally, at the store, so no prompt wording is load-bearing.
 """
 import json
+import sqlite3
 import uuid
 from datetime import datetime, timezone
 
@@ -2963,6 +2964,72 @@ def test_additive_turn_keeps_last_good_card_served_while_refresh_is_pending(stor
         "t1", OPTICS, owner_conversation_id="dm",
         audience_conversation_id="dm", audience_channel_id="chan-dm",
     )) == ["prefers terse answers", "private DM goal"]
+
+
+def test_mixed_version_dirty_rows_are_invalidated_once(tmp_path):
+    path = tmp_path / "mixed-version-cards.db"
+    with sqlite3.connect(path) as conn:
+        conn.execute("""
+            CREATE TABLE actor_profiles (
+                tenant_id TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                platform TEXT NOT NULL DEFAULT '',
+                display_name TEXT NOT NULL DEFAULT '',
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                card_built_at TEXT NULL,
+                card_dirty INTEGER NOT NULL DEFAULT 0,
+                card_invalid INTEGER NOT NULL DEFAULT 0,
+                card_input_hash TEXT NOT NULL DEFAULT '',
+                card_build_marker TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (tenant_id, actor_id)
+            )
+        """)
+        conn.execute(
+            """INSERT INTO actor_profiles
+                   (tenant_id, actor_id, first_seen_at, last_seen_at,
+                    card_built_at, card_dirty, card_invalid)
+               VALUES ('t1', ?, ?, ?, ?, 1, 0)""",
+            (OPTICS, _now(), _now(), _now()),
+        )
+
+    migrated = SQLiteStore(db_path=str(path))
+    conn = migrated._get_conn()
+    row = conn.execute(
+        """SELECT card_dirty, card_invalid, card_build_marker
+             FROM actor_profiles WHERE actor_id = ?""",
+        (OPTICS,),
+    ).fetchone()
+    assert tuple(row) == (1, 1, "")
+    version = conn.execute(
+        """SELECT version FROM actor_card_schema_migrations
+            WHERE name = 'dirty-invalid-split'"""
+    ).fetchone()
+    assert version[0] == 1
+
+    # Once the semantic cutover is persisted, split-aware additive dirt is
+    # not reclassified as destructive on a later schema check.
+    conn.execute(
+        """UPDATE actor_profiles
+              SET card_dirty = 1, card_invalid = 0
+            WHERE actor_id = ?""",
+        (OPTICS,),
+    )
+    conn.commit()
+    migrated._ensure_actor_card_schema(conn)
+    assert conn.execute(
+        "SELECT card_invalid FROM actor_profiles WHERE actor_id = ?",
+        (OPTICS,),
+    ).fetchone()[0] == 0
+
+
+def test_dirty_invalid_cutover_is_stamped_on_fresh_database(tmp_path):
+    fresh = SQLiteStore(db_path=str(tmp_path / "fresh-cards.db"))
+    version = fresh._get_conn().execute(
+        """SELECT version FROM actor_card_schema_migrations
+            WHERE name = 'dirty-invalid-split'"""
+    ).fetchone()
+    assert version[0] == 1
 
 
 def test_refresh_re_admits_existing_cross_context_entry_instead_of_silent_drop(

@@ -2013,17 +2013,6 @@ CREATE TABLE IF NOT EXISTS request_captures (
         conversation and the validated pre-alias audience origin of every
         contributing fact.
         """
-        profile_table_existed = self._table_exists(conn, "actor_profiles")
-        existing_profile_columns = (
-            {
-                row[1]
-                for row in conn.execute(
-                    "PRAGMA table_info(actor_profiles)"
-                ).fetchall()
-            }
-            if profile_table_existed
-            else set()
-        )
         # Forward-add the state split before recreating triggers below; an
         # existing actor_profiles table otherwise makes the CREATE TABLE in the
         # script a no-op and the trigger DDL would reference missing columns.
@@ -2055,14 +2044,35 @@ CREATE TABLE IF NOT EXISTS request_captures (
             "card_build_marker",
             "TEXT NOT NULL DEFAULT ''",
         )
-        if (
-            profile_table_existed
-            and "card_invalid" not in existing_profile_columns
-        ):
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS actor_card_schema_migrations (
+                name TEXT PRIMARY KEY,
+                version INTEGER NOT NULL
+            )
+        """)
+        migration = conn.execute(
+            """SELECT version FROM actor_card_schema_migrations
+                WHERE name = ?""",
+            ("dirty-invalid-split",),
+        ).fetchone()
+        if migration is None or int(migration[0] or 0) < 1:
+            # A forward-added column does not prove that every intervening
+            # writer understood its semantics. Fail closed for dirty rows from
+            # that mixed-version window, then persist the semantic cutover so
+            # later split-aware additive dirt remains readable.
             conn.execute(
                 """UPDATE actor_profiles
-                      SET card_invalid = CASE
-                          WHEN card_dirty <> 0 THEN 1 ELSE 0 END"""
+                      SET card_invalid = 1, card_build_marker = ''
+                    WHERE card_dirty <> 0"""
+            )
+            conn.execute(
+                """INSERT INTO actor_card_schema_migrations (name, version)
+                   VALUES (?, 1)
+                   ON CONFLICT(name) DO UPDATE SET version = MAX(
+                       actor_card_schema_migrations.version,
+                       excluded.version
+                   )""",
+                ("dirty-invalid-split",),
             )
         conn.executescript(f"""
             CREATE TABLE IF NOT EXISTS actor_profiles (

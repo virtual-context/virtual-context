@@ -1988,20 +1988,6 @@ class PostgresStore(ContextStore):
         what makes deletion and audience policy possible at all.
         """
         with self.pool.connection() as conn:
-            profile_table_existed = bool(conn.execute(
-                """SELECT to_regclass(
-                           current_schema() || '.actor_profiles'
-                       ) AS relation"""
-            ).fetchone()["relation"])
-            existing_profile_columns = {
-                row["column_name"]
-                for row in conn.execute(
-                    """SELECT column_name
-                         FROM information_schema.columns
-                        WHERE table_schema = current_schema()
-                          AND table_name = 'actor_profiles'"""
-                ).fetchall()
-            }
             conn.execute(f"""
                 CREATE TABLE IF NOT EXISTS actor_profiles (
                     tenant_id TEXT NOT NULL,
@@ -2028,18 +2014,43 @@ class PostgresStore(ContextStore):
                    ADD COLUMN IF NOT EXISTS card_build_marker
                    TEXT NOT NULL DEFAULT ''"""
             )
-            # Existing dirty rows predate the distinction between additive
-            # refresh and destructive invalidation. Preserve the old
-            # fail-closed behavior for those ambiguous rows; fresh canonical
-            # inserts below are explicitly refresh-only.
-            if (
-                profile_table_existed
-                and "card_invalid" not in existing_profile_columns
-            ):
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS actor_card_schema_migrations (
+                    name TEXT PRIMARY KEY,
+                    version INTEGER NOT NULL
+                )
+            """)
+            # Column existence cannot prove that every writer which has run
+            # against this database understood the dirty/invalid split. An
+            # older binary can run after the columns were forward-added and
+            # still set only card_dirty for destructive evidence changes.
+            # Serialize and persist the semantic cutover independently of the
+            # physical schema, conservatively invalidating every ambiguous
+            # dirty row exactly once.
+            conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                ("virtual-context:actor-card:dirty-invalid-split",),
+            ).fetchone()
+            migration = conn.execute(
+                """SELECT version FROM actor_card_schema_migrations
+                    WHERE name = %s FOR UPDATE""",
+                ("dirty-invalid-split",),
+            ).fetchone()
+            if migration is None or int(migration["version"] or 0) < 1:
                 conn.execute(
                     """UPDATE actor_profiles
-                          SET card_invalid = CASE
-                              WHEN card_dirty <> 0 THEN 1 ELSE 0 END"""
+                          SET card_invalid = 1, card_build_marker = ''
+                        WHERE card_dirty <> 0"""
+                )
+                conn.execute(
+                    """INSERT INTO actor_card_schema_migrations (name, version)
+                       VALUES (%s, 1)
+                       ON CONFLICT (name) DO UPDATE
+                           SET version = GREATEST(
+                               actor_card_schema_migrations.version,
+                               EXCLUDED.version
+                           )""",
+                    ("dirty-invalid-split",),
                 )
             conn.execute(f"""
                 CREATE TABLE IF NOT EXISTS actor_card_entries (
