@@ -933,6 +933,30 @@ class CompositeStore:
             return 0
         return int(replacer(conversation_id, anchors) or 0)
 
+    def apply_canonical_turn_anchor_delta(
+        self,
+        conversation_id: str,
+        *,
+        insert: list[tuple[int, str, str]],
+        delete: list[tuple[int, str, str]],
+    ) -> int:
+        applier = getattr(
+            self._segments, "apply_canonical_turn_anchor_delta", None,
+        )
+        if not callable(applier):
+            return 0
+        return int(
+            applier(conversation_id, insert=insert, delete=delete) or 0
+        )
+
+    def count_canonical_turn_anchors(self, conversation_id: str) -> int:
+        counter = getattr(self._segments, "count_canonical_turn_anchors", None)
+        if not callable(counter):
+            # Negative sentinel: an unknown count can never match a derived
+            # prior set, so the caller keeps the full rebuild.
+            return -1
+        return int(counter(conversation_id))
+
     def get_canonical_turn_anchor_positions(
         self,
         conversation_id: str,
