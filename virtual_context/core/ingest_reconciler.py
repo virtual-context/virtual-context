@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -113,6 +114,14 @@ def _row_reply_edge(row: "CanonicalTurnRow") -> dict:
 
 _ANCHOR_WINDOW_SIZES = (3, 4, 5)
 
+# Per-ingest phase instrumentation. The batch ingest path is dominated by
+# work proportional to what is already stored rather than to what arrived,
+# so the three phases that scale with conversation size are timed
+# separately: loading the stored rows, aligning the payload against them,
+# and republishing the anchor index. Emitted as flat key=value pairs on one
+# line, and only past a threshold, so small conversations add no log
+# volume.
+_INGEST_BREAKDOWN_LOG_THRESHOLD_MS = 500.0
 
 
 def _build_anchor_rows(rows: list[CanonicalTurnRow]) -> list[tuple[int, str, str]]:
@@ -767,7 +776,10 @@ class IngestReconciler:
                 expected=expected_lifecycle_epoch,
                 observed=self._store.get_lifecycle_epoch(conversation_id),
             )
+            phase_timings: dict[str, float] = {}
+            _t_load = time.perf_counter()
             existing = self._store.get_all_canonical_turns(conversation_id)
+            phase_timings["load_ms"] = (time.perf_counter() - _t_load) * 1000.0
             result = self._ingest_prepared_turns_locked(
                 conversation_id,
                 prepared_turns=prepared_turns,
@@ -775,6 +787,10 @@ class IngestReconciler:
                 existing=existing,
                 allow_short_overlap=allow_short_overlap,
                 expected_lifecycle_epoch=expected_lifecycle_epoch,
+                phase_timings=phase_timings,
+            )
+            self._log_ingest_breakdown(
+                conversation_id, len(existing), phase_timings,
             )
             # Commit-time check: a resurrect could have raced DURING our writes
             # (the Python-level merge lock doesn't serialize against external
@@ -808,6 +824,7 @@ class IngestReconciler:
         existing: list[CanonicalTurnRow],
         allow_short_overlap: bool = True,
         expected_lifecycle_epoch: int | None = None,
+        phase_timings: dict[str, float] | None = None,
     ) -> CanonicalIngestResult:
         if not prepared_turns:
             logger.info(
@@ -828,12 +845,15 @@ class IngestReconciler:
             )
             return CanonicalIngestResult("empty_payload", 0, 0, 0, 0, 0, batch=batch, rows=[])
 
+        _t_align = time.perf_counter()
         alignment = self._find_alignment(
             conversation_id,
             existing,
             prepared_turns,
             allow_short_overlap=allow_short_overlap,
         )
+        if phase_timings is not None:
+            phase_timings["align_ms"] = (time.perf_counter() - _t_align) * 1000.0
         merge_mode = alignment.merge_mode if alignment else "no_overlap_append"
         if alignment is None and existing and prepared_turns:
             logger.warning(
@@ -1145,12 +1165,14 @@ class IngestReconciler:
                     conversation_id[:12],
                     exc_info=True,
                 )
+        _t_anchor = time.perf_counter()
+        _anchor_rows = -1
         try:
             # ``existing`` is the sequence this call started from: overlap
             # rows are fast-skipped rather than rewritten, and the rows
             # written above are new, so it still describes exactly what was
             # persisted before this batch.
-            self._refresh_persisted_anchors(
+            _anchor_rows = self._refresh_persisted_anchors(
                 conversation_id, previous_rows=existing,
             )
         except Exception:
@@ -1159,6 +1181,9 @@ class IngestReconciler:
                 conversation_id[:12],
                 exc_info=True,
             )
+        if phase_timings is not None:
+            phase_timings["anchors_ms"] = (time.perf_counter() - _t_anchor) * 1000.0
+            phase_timings["anchor_rows_written"] = float(_anchor_rows)
         return CanonicalIngestResult(
             merge_mode=merge_mode,
             turns_written=turns_written,
@@ -1929,6 +1954,38 @@ class IngestReconciler:
             if anchors:
                 return anchors
         return build_anchor_index(existing, window_size)
+
+    @staticmethod
+    def _log_ingest_breakdown(
+        conversation_id: str,
+        existing_rows: int,
+        phase_timings: dict[str, float],
+    ) -> None:
+        """Emit one flat key=value line for a size-proportional ingest.
+
+        Gated on a total threshold so the common small-conversation ingest
+        stays silent. ``anchor_rows_written`` is reported alongside the
+        timings because the anchor phase's cost tracks rows written far
+        more closely than it tracks conversation length.
+        """
+        if not phase_timings:
+            return
+        total_ms = sum(
+            value for key, value in phase_timings.items() if key.endswith("_ms")
+        )
+        if total_ms < _INGEST_BREAKDOWN_LOG_THRESHOLD_MS:
+            return
+        logger.info(
+            "INGEST_BREAKDOWN conv=%s rows=%d total=%.1fms load_ms=%.1f "
+            "align_ms=%.1f anchors_ms=%.1f anchor_rows_written=%d",
+            conversation_id[:12] if conversation_id else "none",
+            existing_rows,
+            total_ms,
+            phase_timings.get("load_ms", -1.0),
+            phase_timings.get("align_ms", -1.0),
+            phase_timings.get("anchors_ms", -1.0),
+            int(phase_timings.get("anchor_rows_written", -1)),
+        )
 
     def _refresh_persisted_anchors(
         self,
