@@ -942,6 +942,26 @@ class ContextStore(ABC):
     ) -> int:
         return 0
 
+    def apply_canonical_turn_anchor_delta(
+        self,
+        conversation_id: str,
+        *,
+        insert: list[tuple[int, str, str]],
+        delete: list[tuple[int, str, str]],
+    ) -> int:
+        return 0
+
+    def count_canonical_turn_anchors(self, conversation_id: str) -> int:
+        """Persisted anchor row count, or a negative sentinel if unknown.
+
+        Callers use this to decide whether an incremental anchor delta is
+        safe to apply. A backend that cannot really count must report a
+        value no row count can equal, so the caller falls back to a full
+        rebuild rather than writing a delta against an unverified prior
+        state.
+        """
+        return -1
+
     def get_canonical_turn_anchor_positions(
         self,
         conversation_id: str,

@@ -242,6 +242,14 @@ class SegmentStore(Protocol):
         conversation_id: str,
         anchors: list[tuple[int, str, str]],
     ) -> int: ...
+    def apply_canonical_turn_anchor_delta(
+        self,
+        conversation_id: str,
+        *,
+        insert: list[tuple[int, str, str]],
+        delete: list[tuple[int, str, str]],
+    ) -> int: ...
+    def count_canonical_turn_anchors(self, conversation_id: str) -> int: ...
     def get_canonical_turn_anchor_positions(
         self,
         conversation_id: str,

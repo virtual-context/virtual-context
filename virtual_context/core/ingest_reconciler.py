@@ -111,6 +111,40 @@ def _row_reply_edge(row: "CanonicalTurnRow") -> dict:
     }
 
 
+_ANCHOR_WINDOW_SIZES = (3, 4, 5)
+
+
+
+def _build_anchor_rows(rows: list[CanonicalTurnRow]) -> list[tuple[int, str, str]]:
+    """Build the complete anchor set for an ordered canonical row sequence.
+
+    The anchor set is a pure function of the row ORDER plus each row's
+    ``turn_hash`` and ``canonical_turn_id``. No other column participates,
+    which is why a sequence can be compared against its own successor
+    without loading content.
+
+    Both the full rebuild and the incremental delta derive their sets from
+    this one function, so the two can never measure the conversation with
+    different rulers.
+    """
+    anchors: list[tuple[int, str, str]] = []
+    for window_size in _ANCHOR_WINDOW_SIZES:
+        if len(rows) < window_size:
+            continue
+        for start in range(0, len(rows) - window_size + 1):
+            start_turn_id = rows[start].canonical_turn_id
+            if not start_turn_id:
+                continue
+            anchors.append(
+                (
+                    window_size,
+                    compute_anchor_hash(rows, start, window_size),
+                    start_turn_id,
+                )
+            )
+    return anchors
+
+
 class IngestReconciler:
     """Merges inbound turns into canonical turn storage."""
 
@@ -226,7 +260,13 @@ class IngestReconciler:
                                 first_seen_at=row.first_seen_at,
                                 last_seen_at=row.last_seen_at,
                             )
-                        self._refresh_persisted_anchors(conversation_id)
+                        # Every matched row kept its turn_hash (that is what
+                        # the match proved) and no row was added or removed,
+                        # so the anchor set is provably unchanged and the
+                        # delta resolves to zero writes.
+                        self._refresh_persisted_anchors(
+                            conversation_id, previous_rows=existing,
+                        )
                         return CanonicalIngestResult(
                             merge_mode="exact_resend",
                             turns_written=0,
@@ -354,7 +394,9 @@ class IngestReconciler:
                         turns_inserted=0,
                         batch_id=batch_id,
                     )
-                    self._refresh_persisted_anchors(conversation_id)
+                    self._refresh_persisted_anchors(
+                        conversation_id, previous_rows=existing,
+                    )
                     return CanonicalIngestResult(
                         merge_mode="tail_append",
                         turns_written=1,
@@ -1104,7 +1146,13 @@ class IngestReconciler:
                     exc_info=True,
                 )
         try:
-            self._refresh_persisted_anchors(conversation_id)
+            # ``existing`` is the sequence this call started from: overlap
+            # rows are fast-skipped rather than rewritten, and the rows
+            # written above are new, so it still describes exactly what was
+            # persisted before this batch.
+            self._refresh_persisted_anchors(
+                conversation_id, previous_rows=existing,
+            )
         except Exception:
             logger.warning(
                 "CANONICAL_TURN_ANCHOR_REFRESH_FAILED: conv=%s",
@@ -1882,24 +1930,70 @@ class IngestReconciler:
                 return anchors
         return build_anchor_index(existing, window_size)
 
-    def _refresh_persisted_anchors(self, conversation_id: str) -> None:
+    def _refresh_persisted_anchors(
+        self,
+        conversation_id: str,
+        *,
+        previous_rows: list[CanonicalTurnRow] | None = None,
+    ) -> int:
+        """Bring the persisted anchor set in line with the stored rows.
+
+        A full rebuild rewrites every anchor the conversation owns: one
+        per window start per window size, so roughly 3N rows deleted and
+        3N re-inserted on every single ingest. Appending a turn creates
+        exactly one new window start per window size and invalidates
+        none, so the rebuild writes back an almost entirely identical
+        set. The cost is dominated by that write, not by the hashing.
+
+        When the caller can name the row sequence that was persisted
+        BEFORE this ingest, the anchor set required by each sequence is
+        derived in memory and only the difference is written. Hashing
+        both sequences is far cheaper than rewriting the table.
+
+        The delta is sound only if the store actually holds the set that
+        ``previous_rows`` implies. That precondition is checked with the
+        same ``_build_anchor_rows`` ruler that produces the delta, and
+        any disagreement (anchors never built, a torn write, a
+        concurrent writer) falls back to the full rebuild, which is what
+        self-heals a diverged set. Callers that cannot name the prior
+        sequence simply omit it and keep the rebuild.
+
+        Returns the number of anchor rows written (inserted plus deleted),
+        which is the write amplification this method is responsible for.
+        """
         saver = getattr(self._store, "replace_canonical_turn_anchors", None)
         if not callable(saver):
-            return
+            return 0
         rows = self._store.get_all_canonical_turns(conversation_id)
-        anchors: list[tuple[int, str, str]] = []
-        for window_size in (3, 4, 5):
-            if len(rows) < window_size:
-                continue
-            for start in range(0, len(rows) - window_size + 1):
-                start_turn_id = rows[start].canonical_turn_id
-                if not start_turn_id:
-                    continue
-                anchors.append(
-                    (
-                        window_size,
-                        compute_anchor_hash(rows, start, window_size),
-                        start_turn_id,
+        desired = _build_anchor_rows(rows)
+        if previous_rows is not None:
+            applier = getattr(
+                self._store, "apply_canonical_turn_anchor_delta", None,
+            )
+            counter = getattr(self._store, "count_canonical_turn_anchors", None)
+            if callable(applier) and callable(counter):
+                prior = _build_anchor_rows(previous_rows)
+                try:
+                    stored_count = int(counter(conversation_id) or 0)
+                except Exception:
+                    logger.warning(
+                        "CANONICAL_TURN_ANCHOR_COUNT_FAILED: conv=%s",
+                        conversation_id[:12],
+                        exc_info=True,
                     )
-                )
-        saver(conversation_id, anchors)
+                    stored_count = -1
+                if stored_count == len(prior):
+                    prior_set = set(prior)
+                    desired_set = set(desired)
+                    to_insert = [a for a in desired if a not in prior_set]
+                    to_delete = [a for a in prior if a not in desired_set]
+                    if not to_insert and not to_delete:
+                        return 0
+                    applier(
+                        conversation_id,
+                        insert=to_insert,
+                        delete=to_delete,
+                    )
+                    return len(to_insert) + len(to_delete)
+        saver(conversation_id, desired)
+        return len(desired)

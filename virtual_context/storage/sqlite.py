@@ -9533,6 +9533,61 @@ CREATE TABLE IF NOT EXISTS request_captures (
         self._commit_if_unlocked(conn)
         return len(rows)
 
+    def apply_canonical_turn_anchor_delta(
+        self,
+        conversation_id: str,
+        *,
+        insert: list[tuple[int, str, str]],
+        delete: list[tuple[int, str, str]],
+    ) -> int:
+        """Apply an anchor set difference without rewriting the whole set.
+
+        Anchors are identified by the exact
+        ``(window_size, anchor_hash, start_turn_id)`` triple, so a window
+        whose content changed is expressed as one delete of the superseded
+        triple plus one insert of its replacement. Deletes run first so an
+        apply can never leave a duplicate behind. Both statements are
+        scoped to ``conversation_id``.
+        """
+        conn = self._get_conn()
+        deletions = [
+            (conversation_id, anchor_hash, start_turn_id, int(window_size))
+            for window_size, anchor_hash, start_turn_id in delete
+            if anchor_hash and start_turn_id
+        ]
+        if deletions:
+            conn.executemany(
+                """DELETE FROM canonical_turn_anchors
+                   WHERE conversation_id = ?
+                     AND anchor_hash = ?
+                     AND start_turn_id = ?
+                     AND window_size = ?""",
+                deletions,
+            )
+        insertions = [
+            (conversation_id, anchor_hash, start_turn_id, int(window_size))
+            for window_size, anchor_hash, start_turn_id in insert
+            if anchor_hash and start_turn_id
+        ]
+        if insertions:
+            conn.executemany(
+                """INSERT INTO canonical_turn_anchors
+                   (conversation_id, anchor_hash, start_turn_id, window_size)
+                   VALUES (?, ?, ?, ?)""",
+                insertions,
+            )
+        self._commit_if_unlocked(conn)
+        return len(insertions)
+
+    def count_canonical_turn_anchors(self, conversation_id: str) -> int:
+        """COUNT of persisted anchor rows for the conversation."""
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT COUNT(*) FROM canonical_turn_anchors WHERE conversation_id = ?",
+            (conversation_id,),
+        ).fetchone()
+        return int(row[0]) if row else 0
+
     def get_canonical_turn_anchor_positions(
         self,
         conversation_id: str,

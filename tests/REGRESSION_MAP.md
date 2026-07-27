@@ -392,6 +392,20 @@ Use `pytest -m regression` to run all regression tests.
 - **Fix**: The precondition counts coverage over the conversation's row tail INCLUDING tagged rows. The pair walker gains a hydrate fast-path: pairs whose backing rows are all tagged (matched by per-message `turn_hash`) get their TurnTagIndex entries from the stored row tags, consuming the strict cursor without invoking the tag generator or rewriting rows. Half-tagged pairs fall through to the normal tagger (idempotent). Supporting fix: the canonical-turn full-row loaders now SELECT `covered_ingestible_entries` so legacy combined rows (coverage 2) count correctly.
 - **Tests**: `test_strict_tagging_tagged_rows.py` — prod-signature repro, hydration tag fidelity, zero-tagger-call full hydration, untagged-tail still tagged, half-tagged fall-through, missing-rows and stale-epoch invariants preserved.
 
+### BUG-044 — Anchor refresh rewrites the whole conversation's anchor table on every ingest
+
+- **Symptom**: Ingest cost grows linearly with stored conversation size and is independent of what the caller sent. A 15-message request against a 9,173-row conversation costs the same as a 490 KB one. On the largest production conversation the prepare path exceeded the client's timeout often enough that a quarter of prepares were abandoned before a response was sent.
+- **Root cause**: `_refresh_persisted_anchors` rebuilt the complete anchor set on every call and persisted it through `replace_canonical_turn_anchors`, which is a `DELETE` of every anchor row for the conversation followed by a re-INSERT of the entire rebuilt set. The set holds one row per window start per window size (3, 4, 5), so roughly 3N rows are deleted and 3N re-inserted per ingest. Appending a turn creates exactly one new window start per window size and invalidates none, so nearly the whole rewrite was writing back byte-identical rows. Measured on a 9,200-row conversation: 27,597 anchor rows rewritten, of which 6 were new and 0 removed. Both ingest fast paths (`exact_resend`, `tail_append`) paid it too, and on `exact_resend` the anchor set is provably unchanged, making the entire rewrite dead work.
+- **Fix**: `_build_anchor_rows` extracted so the rebuild and the delta derive their sets with one ruler. `_refresh_persisted_anchors` accepts the row sequence persisted before the ingest, derives the required anchor set for both sequences in memory, and writes only the difference through the new `apply_canonical_turn_anchor_delta` store surface, which deletes and inserts exact `(window_size, anchor_hash, start_turn_id)` triples scoped to the conversation. Because the delta is derived from the caller's prior sequence rather than from a read of stored anchors, it is applied only when `count_canonical_turn_anchors` agrees with the derived prior set; any disagreement (anchors never built, a torn write, a concurrent writer) falls back to the full rebuild, preserving the self-healing property the unconditional rebuild provided. Callers that cannot name the prior sequence keep the rebuild.
+- **Tests**:
+  - `test_ingest_anchor_incremental.py::test_incremental_delta_matches_full_rebuild` (the identity property across append, interior insert, prefix insert, in-place modification, interior removal, tail shrink, shrink below window size, and wholesale replacement)
+  - `test_ingest_anchor_incremental.py::test_incremental_result_is_order_independent` (both temporal orderings converge on the canonical rebuild)
+  - `test_ingest_anchor_incremental.py::test_append_writes_bounded_anchor_rows_not_whole_conversation` (an append writes 3 anchors regardless of conversation length; a full-conversation rewrite fails this)
+  - `test_ingest_anchor_incremental.py::test_unchanged_sequence_writes_nothing` (a resend that changes no row issues no anchor write)
+  - `test_ingest_anchor_incremental.py::test_diverged_store_falls_back_to_full_rebuild`
+  - `test_ingest_anchor_incremental.py::test_anchor_hashes_still_resolve_windows_after_delta` (post-delta digests still map to their start row, and superseded digests do not survive)
+  - `test_ingest_anchor_incremental.py::test_sqlite_delta_write_matches_rebuild_write` (the SQL delta leaves the same table state as the wholesale replace)
+
 ### BUG-043 — RRF's missing-signal penalty buries embedding-only candidates below the fused top-K
 
 - **Symptom**: On analog queries with no keyword overlap, the tag the embedding signal surfaces most strongly lands far outside the fused top-K (embedding candidates observed at fused rank 15-33 while the selection cut is 10), because RRF penalizes every candidate absent from the idf/bm25 signals. The context-augmented embedding signal (BUG-042) surfaces the right tag but fusion then discards it.
@@ -479,3 +493,4 @@ Use `pytest -m regression` to run all regression tests.
 | `test_tag_summary_materialization.py` | BUG-041 |
 | `test_embedding_context_guard.py` | BUG-042 |
 | `test_embedding_reserved_seats.py` | BUG-043 |
+| `test_ingest_anchor_incremental.py` | BUG-044 |

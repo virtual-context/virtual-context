@@ -9722,6 +9722,66 @@ class PostgresStore(ContextStore):
                 )
             return len(rows)
 
+    def apply_canonical_turn_anchor_delta(
+        self,
+        conversation_id: str,
+        *,
+        insert: list[tuple[int, str, str]],
+        delete: list[tuple[int, str, str]],
+    ) -> int:
+        """Apply an anchor set difference without rewriting the whole set.
+
+        Anchors are identified by the exact
+        ``(window_size, anchor_hash, start_turn_id)`` triple, so a window
+        whose content changed is expressed as one delete of the superseded
+        triple plus one insert of its replacement. Deletes run first so an
+        apply can never leave a duplicate behind. Both statements are
+        scoped to ``conversation_id`` and served by
+        ``idx_canonical_turn_anchors_lookup``.
+        """
+        deletions = [
+            (conversation_id, anchor_hash, start_turn_id, int(window_size))
+            for window_size, anchor_hash, start_turn_id in delete
+            if anchor_hash and start_turn_id
+        ]
+        insertions = [
+            (conversation_id, anchor_hash, start_turn_id, int(window_size))
+            for window_size, anchor_hash, start_turn_id in insert
+            if anchor_hash and start_turn_id
+        ]
+        if not deletions and not insertions:
+            return 0
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                if deletions:
+                    cur.executemany(
+                        """DELETE FROM canonical_turn_anchors
+                           WHERE conversation_id = %s
+                             AND anchor_hash = %s
+                             AND start_turn_id = %s
+                             AND window_size = %s""",
+                        deletions,
+                    )
+                if insertions:
+                    cur.executemany(
+                        """INSERT INTO canonical_turn_anchors
+                           (conversation_id, anchor_hash, start_turn_id, window_size)
+                           VALUES (%s, %s, %s, %s)""",
+                        insertions,
+                    )
+        return len(insertions)
+
+    def count_canonical_turn_anchors(self, conversation_id: str) -> int:
+        """COUNT of persisted anchor rows for the conversation."""
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM canonical_turn_anchors WHERE conversation_id = %s",
+                (conversation_id,),
+            ).fetchone()
+        if row is None:
+            return 0
+        return int(row[0] if not hasattr(row, "keys") else list(row.values())[0])
+
     def get_canonical_turn_anchor_positions(
         self,
         conversation_id: str,
