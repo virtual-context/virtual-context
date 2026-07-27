@@ -114,6 +114,13 @@ def _row_reply_edge(row: "CanonicalTurnRow") -> dict:
 
 _ANCHOR_WINDOW_SIZES = (3, 4, 5)
 
+# The alignment search consults the same window sizes that get persisted,
+# largest first so the longest corroborated overlap is preferred. Deriving
+# it from _ANCHOR_WINDOW_SIZES keeps the two in step: a size persisted but
+# never searched is wasted storage, and a size searched but never
+# persisted silently loses every match it should have found.
+_ALIGNMENT_WINDOW_SIZES = tuple(reversed(_ANCHOR_WINDOW_SIZES))
+
 # Per-ingest phase instrumentation. The batch ingest path is dominated by
 # work proportional to what is already stored rather than to what arrived,
 # so the three phases that scale with conversation size are timed
@@ -1581,7 +1588,7 @@ class IngestReconciler:
                         )
 
         best: _Alignment | None = None
-        for window_size in (5, 4, 3):
+        for window_size in _ALIGNMENT_WINDOW_SIZES:
             existing_index = self._load_existing_anchor_index(
                 conversation_id,
                 existing,

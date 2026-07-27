@@ -31,6 +31,8 @@ import pytest
 
 from virtual_context.core.canonical_turns import compute_anchor_hash
 from virtual_context.core.ingest_reconciler import (
+    _ALIGNMENT_WINDOW_SIZES,
+    _ANCHOR_WINDOW_SIZES,
     IngestReconciler,
     _build_anchor_rows,
 )
@@ -223,7 +225,9 @@ def test_append_writes_bounded_anchor_rows_not_whole_conversation():
     reconciler._refresh_persisted_anchors("c", previous_rows=before_rows)
 
     # One appended row creates exactly one new window per window size.
-    assert store.rows_inserted == 3
+    # Derived from the constant rather than written as a literal, so the
+    # assertion keeps measuring the invariant if the window set changes.
+    assert store.rows_inserted == len(_ANCHOR_WINDOW_SIZES)
     assert store.rows_deleted == 0
     assert store.full_rebuilds == 1, "the append must not trigger a rebuild"
 
@@ -347,6 +351,39 @@ def test_sqlite_delta_is_scoped_to_its_conversation(tmp_path: Path):
 
     assert store.count_canonical_turn_anchors("c") == 0
     assert store.count_canonical_turn_anchors("other") == len(set(theirs))
+
+
+@pytest.mark.regression("BUG-044")
+def test_alignment_searches_every_persisted_window_size():
+    """The aligner must consult exactly the window sizes that are stored.
+
+    The two sets used to be written out independently. A size persisted
+    but never searched is wasted storage; a size searched but never
+    persisted silently finds nothing, and because ``_find_alignment``
+    falls through to ``no_overlap_append`` rather than raising, that loss
+    shows up as duplicated history rather than as an error.
+    """
+    rows = _rows(_BASE)
+    store = _AnchorStore(rows)
+    reconciler = _reconciler(store)
+
+    requested: list[int] = []
+
+    def _record(conversation_id, existing, window_size):
+        requested.append(window_size)
+        return {}
+
+    reconciler._load_existing_anchor_index = _record
+
+    # Incoming shares no hash with the stored rows, so the search cannot
+    # short-circuit and has to try every window size it knows about.
+    incoming = _rows(["z1", "z2", "z3", "z4", "z5", "z6"])
+    assert reconciler._find_alignment("c", rows, incoming) is None
+
+    assert sorted(requested) == sorted(_ANCHOR_WINDOW_SIZES)
+    assert requested == list(_ALIGNMENT_WINDOW_SIZES)
+    # Largest first: a longer corroborated window outranks a shorter one.
+    assert requested == sorted(requested, reverse=True)
 
 
 def _stored_anchor_set(store: SQLiteStore) -> set[tuple[int, str, str]]:
