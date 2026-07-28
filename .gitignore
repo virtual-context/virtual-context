@@ -69,3 +69,7 @@ extraneous/paper/*.png
 
 # Riptide artifacts (cloud-synced)
 .humanlayer/tasks/
+
+# Unrelated local content kept in the working tree, never packaged
+discord-native-poker/
+discord-native-poker.zip
