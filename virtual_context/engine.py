@@ -2128,7 +2128,9 @@ class VirtualContextEngine:
         *,
         source_audience_conversation_id: str = "",
         user_turn_metadata: dict | None = None,
-    ) -> None:
+        completed_user_message: Message | None = None,
+        completed_assistant_message: Message | None = None,
+    ) -> str:
         """Durably record the latest completed user/assistant pair before indexing catches up.
 
         ``source_audience_conversation_id`` is the request's PROVED audience —
@@ -2138,15 +2140,49 @@ class VirtualContextEngine:
         wrote it. ``user_turn_metadata`` carries adapter provenance outside
         conversational text and is merged onto the latest user half before
         the same attribution helpers used by batch ingestion run.
+
+        REST prepare and ingest may be served by different workers, while
+        server-scoped conversations deliberately share one state object across
+        channels.  A caller that still owns the request therefore may supply
+        ``completed_user_message`` and ``completed_assistant_message``.  That
+        exact pair is persisted instead of guessing it from a mutable shared
+        history tail.  The full history remains the source of the logical turn
+        number and checkpoint state.
+
+        Returns the durable actor id only when the completed user row was
+        accepted into canonical storage. Person-card consolidation is not a
+        post-persist side effect; canonical writes only dirty the cache, and a
+        later successful compaction consolidates affected actors.
         """
         grouped = pair_messages_into_turns(list(conversation_history))
         if not grouped:
-            return
+            return ""
         latest_turn = grouped[-1]
-        assistant_messages = [msg for msg in latest_turn.messages if msg.role == "assistant"]
+        explicit_pair = (
+            completed_user_message is not None
+            or completed_assistant_message is not None
+        )
+        if explicit_pair:
+            if (
+                completed_user_message is None
+                or completed_assistant_message is None
+                or completed_user_message.role != "user"
+                or completed_assistant_message.role != "assistant"
+            ):
+                raise ValueError(
+                    "completed turn override requires one user and one assistant message"
+                )
+            user_messages = [completed_user_message]
+            assistant_messages = [completed_assistant_message]
+        else:
+            user_messages = [
+                msg for msg in latest_turn.messages if msg.role == "user"
+            ]
+            assistant_messages = [
+                msg for msg in latest_turn.messages if msg.role == "assistant"
+            ]
         if not assistant_messages:
-            return
-        user_messages = [msg for msg in latest_turn.messages if msg.role == "user"]
+            return ""
         turn_number = len(grouped) - 1
         user_msg = Message(
             role="user",
@@ -2203,6 +2239,7 @@ class VirtualContextEngine:
         # Only the user half. An assistant row is never newly labeled with a
         # human actor, even though it may legitimately own a channel.
         user_actor_id = get_actor_id(user_msg.metadata, _actor_key)
+        accepted_actor_id = ""
         # The user half's durable reply edge, derived exactly as the payload
         # reconcile derives it. The audience inside it is the caller's proved
         # value; an empty one versions to 0 so an unproved route stays
@@ -2235,6 +2272,12 @@ class VirtualContextEngine:
                 code_refs=list(entry.code_refs or []) if entry else [],
                 expected_lifecycle_epoch=self._engine_state.lifecycle_epoch,
             )
+            if user_actor_id and any(
+                (row.sender_actor_id or "").strip() == user_actor_id
+                and bool((row.user_content or "").strip())
+                for row in result.rows
+            ):
+                accepted_actor_id = user_actor_id
             if entry is not None and result.rows:
                 entry.canonical_turn_id = result.rows[0].canonical_turn_id or entry.canonical_turn_id
         except StaleConversationWriteError as exc:
@@ -2243,7 +2286,7 @@ class VirtualContextEngine:
                 self.config.conversation_id[:12],
                 exc,
             )
-            return
+            return ""
         except LifecycleEpochMismatch as exc:
             # Lifecycle drift — the conversation was deleted/resurrected while
             # we were preparing the write. Log and return; the caller will
@@ -2254,7 +2297,7 @@ class VirtualContextEngine:
                 self.config.conversation_id[:12],
                 exc,
             )
-            return
+            return ""
         except (ValueError, TypeError, json.JSONDecodeError, AttributeError) as exc:
             # Structural failures (malformed entry, encoding errors) that are
             # genuinely per-turn and should not crash subsequent turns, but
@@ -2267,11 +2310,12 @@ class VirtualContextEngine:
                 exc,
                 exc_info=True,
             )
-            return
+            return ""
         self._save_state(
             conversation_history,
             last_completed_turn=turn_number,
         )
+        return accepted_actor_id
 
     def _reset_restored_state(self) -> None:
         self._turn_tag_index = TurnTagIndex()
@@ -3721,6 +3765,26 @@ class VirtualContextEngine:
                 )
                 report["failed"] += 1
         return report
+
+    def refresh_actor_card(self, actor_id: str) -> int:
+        """Explicitly refresh one dirty actor card from canonical evidence.
+
+        Normal request traffic never calls this maintenance surface. Card work
+        is scheduled by the successful compaction boundary; this method remains
+        available for deliberate operator repair. The store's build marker and
+        atomic replacement reject a result if newer evidence or destructive
+        provenance changes race the model calls.
+        """
+        actor_id = (actor_id or "").strip()
+        if not actor_id:
+            return 0
+        profile = self._store.get_actor_profile(
+            self.config.tenant_id,
+            actor_id,
+        )
+        if profile is None or not profile.card_dirty:
+            return 0
+        return self._compaction._rebuild_actor_card(actor_id)
 
     def backfill_senders(
         self,

@@ -3088,7 +3088,11 @@ class ProxyState:
 
     def _drain_background_work(self) -> None:
         """Wait for queued tag/compaction work without propagating old failures."""
-        for attr in ("_pending_tag", "_pending_compact", "_pending_split"):
+        for attr in (
+            "_pending_tag",
+            "_pending_compact",
+            "_pending_split",
+        ):
             while True:
                 future = getattr(self, attr, None)
                 if future is None:
@@ -3109,7 +3113,11 @@ class ProxyState:
     def _request_background_stop(self) -> None:
         """Signal queued/running background work to stop without dropping handles."""
         self._compaction_cancelled.set()
-        for attr in ("_pending_tag", "_pending_compact", "_pending_split"):
+        for attr in (
+            "_pending_tag",
+            "_pending_compact",
+            "_pending_split",
+        ):
             future = getattr(self, attr, None)
             if future is None:
                 continue
@@ -3126,7 +3134,11 @@ class ProxyState:
     def _cancel_background_work(self) -> None:
         """Cancel queued tag/compaction futures without blocking on completion."""
         self._compaction_cancelled.set()
-        for attr in ("_pending_tag", "_pending_compact", "_pending_split"):
+        for attr in (
+            "_pending_tag",
+            "_pending_compact",
+            "_pending_split",
+        ):
             future = getattr(self, attr, None)
             if future is None:
                 continue

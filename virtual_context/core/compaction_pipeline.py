@@ -11,6 +11,7 @@ import json
 import logging
 import math
 import time
+from collections import Counter
 from collections.abc import Callable
 from datetime import datetime
 from typing import TYPE_CHECKING
@@ -18,6 +19,7 @@ from typing import TYPE_CHECKING
 from .engine_utils import extract_turn_pairs
 from .store import ContextStore
 from .turn_tag_index import TurnTagIndex
+from ..types import LLMProviderError
 
 if TYPE_CHECKING:
     from .compactor import DomainCompactor
@@ -25,6 +27,9 @@ if TYPE_CHECKING:
     from .semantic_search import SemanticSearchManager
     from .telemetry import TelemetryLedger
     from ..types import (
+        ActorCardEntry,
+        ActorCardEntrySource,
+        ActorRoster,
         CompactionReport,
         CompactionResult,
         CompactionSignal,
@@ -37,6 +42,82 @@ if TYPE_CHECKING:
     )
 
 logger = logging.getLogger(__name__)
+
+_ACTOR_CARD_CITATION_LIMIT = 16
+
+
+class _ActorCardAdmissionError(RuntimeError):
+    """Validation failure that preserves a hashable, non-logged response."""
+
+    def __init__(self, message: str, response_text: str = "") -> None:
+        super().__init__(message)
+        self.response_text = response_text
+
+
+class _ActorCardCoverageError(_ActorCardAdmissionError):
+    """A deterministic curator/admission judgment disagreement."""
+
+
+class _EmptyResponseFallbackProvider:
+    """Use a second model for refusal fallback and coverage adjudication."""
+
+    def __init__(
+        self,
+        primary,
+        fallback,
+        *,
+        primary_model: str,
+        fallback_model: str,
+        stage: str = "admission",
+    ) -> None:
+        self._primary = primary
+        self._fallback = fallback
+        self._primary_model = primary_model
+        self._fallback_model = fallback_model
+        self._stage = stage
+
+    def complete(self, **kwargs):
+        text, usage, _source = self.complete_with_source(**kwargs)
+        return text, usage
+
+    def complete_with_source(self, **kwargs):
+        """Complete and report which independent model supplied the result."""
+        try:
+            text, usage = self._primary.complete(**kwargs)
+        except LLMProviderError as exc:
+            logger.warning(
+                "ACTOR_CARD_%s_FALLBACK primary_model=%s "
+                "fallback_model=%s reason=provider_error status=%s",
+                self._stage.upper(),
+                self._primary_model,
+                self._fallback_model,
+                exc.status_code,
+            )
+            fallback_text, fallback_usage = self._fallback.complete(**kwargs)
+            return fallback_text, fallback_usage, "fallback"
+        if isinstance(text, str) and text.strip():
+            return text, usage, "primary"
+        logger.warning(
+            "ACTOR_CARD_%s_FALLBACK primary_model=%s "
+            "fallback_model=%s reason=empty_response",
+            self._stage.upper(),
+            self._primary_model,
+            self._fallback_model,
+        )
+        fallback_text, fallback_usage = self._fallback.complete(**kwargs)
+        return fallback_text, fallback_usage, "fallback"
+
+    def complete_fallback(self, **kwargs):
+        """Call the independent fallback directly for a coverage tiebreak."""
+        text, usage = self._fallback.complete(**kwargs)
+        if not isinstance(text, str) or not text.strip():
+            logger.warning(
+                "ACTOR_CARD_%s_FALLBACK_EMPTY model=%s",
+                self._stage.upper(),
+                self._fallback_model,
+            )
+        return text, usage
+
 
 # Lazy-import for _is_stub_content from engine to avoid circular imports.
 _is_stub_content_fn: Callable[[str], bool] | None = None
@@ -163,8 +244,109 @@ class CompactionPipeline:
             except Exception as e:
                 logger.warning("Failed to embed fact %s: %s", fact.id, e)
 
+    def _due_actor_card_rebuilds(self, *, limit: int = 25) -> list[str]:
+        """Read the bounded retry queue for transient card-build failures."""
+        if not getattr(
+            self._config.assembler,
+            "actor_card_enabled",
+            False,
+        ):
+            return []
+        getter = getattr(
+            self._store,
+            "list_due_actor_card_rebuilds",
+            None,
+        )
+        if not callable(getter):
+            return []
+        from datetime import datetime, timezone
+
+        try:
+            return list(getter(
+                self._config.tenant_id,
+                due_at=datetime.now(timezone.utc).isoformat(),
+                limit=max(0, int(limit)),
+            ))
+        except Exception:
+            logger.warning(
+                "actor card retry queue read failed",
+                exc_info=True,
+            )
+            return []
+
+    def _consolidate_actor_cards_after_compaction(
+        self,
+        actor_ids: set[str],
+        *,
+        disable_replacement_passes: bool = False,
+    ) -> int:
+        """Run dedicated person-card work at the successful compaction boundary.
+
+        Ordinary canonical ingestion only dirties a card.  The model-backed
+        curator/admission workflow belongs here, after the compaction's
+        segments, facts, canonical markers, tag summaries, and retrieval
+        snapshots have all committed.  Actor ids are coalesced across every
+        segment so one compaction performs at most one rebuild attempt per
+        affected person.
+
+        Recovery/backlog compactions run this phase too.  They still rewrite
+        derived facts and can therefore invalidate a card's provenance; if
+        they skipped consolidation, that card would remain unavailable until
+        some unrelated future compaction.  A card failure is isolated from the
+        already-successful compaction and remains dirty for a later retry.
+        """
+        candidates = {
+            (actor_id or "").strip()
+            for actor_id in actor_ids
+            if (actor_id or "").strip()
+        }
+        dispatch = (
+            "recovery" if disable_replacement_passes else "ordinary"
+        )
+        # A previous transient provider failure must not strand a since-silent
+        # actor forever.  Any successful compaction services a bounded
+        # tenant-local retry queue after its stored backoff expires.
+        candidates.update(self._due_actor_card_rebuilds(limit=25))
+        attempted = 0
+        for actor_id in sorted(candidates):
+            attempted += 1
+            started = time.monotonic()
+            logger.info(
+                "ACTOR_CARD_COMPACTION_CONSOLIDATION actor=%s "
+                "status=begin dispatch=%s",
+                actor_id[:24],
+                dispatch,
+            )
+            try:
+                written = self._rebuild_actor_card(actor_id)
+            except Exception:
+                logger.warning(
+                    "ACTOR_CARD_COMPACTION_CONSOLIDATION actor=%s "
+                    "status=failed elapsed_ms=%d",
+                    actor_id[:24],
+                    int((time.monotonic() - started) * 1000),
+                    exc_info=True,
+                )
+                continue
+            logger.info(
+                "ACTOR_CARD_COMPACTION_CONSOLIDATION actor=%s "
+                "status=complete written=%d elapsed_ms=%d",
+                actor_id[:24],
+                written,
+                int((time.monotonic() - started) * 1000),
+            )
+        return attempted
+
     def _rebuild_actor_card(self, actor_id: str, *, force: bool = False) -> int:
-        """Curate and atomically replace one actor's rebuildable card cache."""
+        """Curate and atomically replace one actor's rebuildable card cache.
+
+        Facts are useful compact evidence, but they are not the membership
+        criterion for a person card. Exact actor-authored canonical turns are
+        also supplied so a substantive contributor can receive a meaningful
+        card even when the fact extractor emitted nothing. A separate model
+        independently judges substantive coverage and semantically admits each
+        immutable candidate before the atomic replacement.
+        """
         if (
             not force
             and not getattr(self._config.assembler, "actor_card_enabled", False)
@@ -180,173 +362,1802 @@ class CompactionPipeline:
             CARD_KINDS,
             CARD_SCOPE_CROSS_CONTEXT,
             CARD_SCOPE_SAME_CONVERSATION,
-            CARD_SENSITIVITIES,
             CARD_SENSITIVITY_NORMAL,
             ActorCardEntry,
             ActorCardEntrySource,
         )
 
         tenant_id = self._config.tenant_id
-        sources = list(self._store.list_actor_facts(
-            tenant_id,
-            actor_id,
-            limit=int(self._config.assembler.actor_card_fact_limit),
-        ))
-        hash_payload = [
-            {
-                "id": source.fact.id,
-                "subject": source.fact.subject,
-                "verb": source.fact.verb,
-                "object": source.fact.object,
-                "what": source.fact.what,
-                "status": source.fact.status,
-                "superseded_by": source.fact.superseded_by,
-                "author_version": source.fact.author_attribution_version,
-                "author_role": source.fact.author_source_role,
-            }
-            for source in sources
-        ]
-        input_hash = hashlib.sha256(json.dumps(
-            {"policy": 1, "facts": hash_payload},
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")).hexdigest()
+
+        def _read_inputs() -> tuple[list, list, list, str]:
+            configured_curation_model = (
+                getattr(
+                    self._config.assembler,
+                    "actor_card_curation_model",
+                    "",
+                )
+                or ""
+            ).strip()
+            curation_fallback_model = (
+                getattr(
+                    self._config.assembler,
+                    "actor_card_curation_fallback_model",
+                    "",
+                )
+                or ""
+            ).strip()
+            admission_model = (
+                getattr(
+                    self._config.assembler,
+                    "actor_card_admission_model",
+                    "",
+                )
+                or ""
+            ).strip()
+            admission_fallback_model = (
+                getattr(
+                    self._config.assembler,
+                    "actor_card_admission_fallback_model",
+                    "",
+                )
+                or ""
+            ).strip()
+            facts = list(self._store.list_actor_facts(
+                tenant_id,
+                actor_id,
+                limit=int(self._config.assembler.actor_card_fact_limit),
+            ))
+            turns = list(self._store.list_actor_turn_sources(
+                tenant_id,
+                actor_id,
+                limit=int(getattr(
+                    self._config.assembler,
+                    "actor_card_turn_limit",
+                    500,
+                )),
+            ))
+            carryover_getter = getattr(
+                self._store,
+                "list_actor_card_carryovers",
+                None,
+            )
+            carryovers = (
+                list(carryover_getter(tenant_id, actor_id))
+                if callable(carryover_getter)
+                else []
+            )
+            fact_payload = [
+                {
+                    "id": source.fact.id,
+                    "subject": source.fact.subject,
+                    "verb": source.fact.verb,
+                    "object": source.fact.object,
+                    "what": source.fact.what,
+                    "status": source.fact.status,
+                    "superseded_by": source.fact.superseded_by,
+                    "fact_type": source.fact.fact_type,
+                    "mentioned_at": source.fact.mentioned_at.isoformat(),
+                    "session_date": source.fact.session_date,
+                    "author_version": (
+                        source.fact.author_attribution_version
+                    ),
+                    "author_role": source.fact.author_source_role,
+                }
+                for source in facts
+            ]
+            turn_payload = [
+                {
+                    "id": source.turn.canonical_turn_id,
+                    "owner": source.owner_conversation_id,
+                    "audience": source.audience_conversation_id,
+                    "channel": source.audience_channel_id,
+                    "content": source.turn.user_content,
+                    "created_at": (
+                        source.turn.created_at
+                        or source.turn.first_seen_at
+                        or ""
+                    ),
+                    "owner_epoch": source.owner_lifecycle_epoch,
+                    "audience_epoch": source.audience_lifecycle_epoch,
+                }
+                for source in turns
+            ]
+            carryover_payload = [
+                {
+                    "entry": {
+                        "id": entry.id,
+                        "kind": entry.kind,
+                        "body": entry.body,
+                        "confidence": entry.confidence,
+                        "scope": entry.audience_scope,
+                    },
+                    "sources": sorted([
+                        {
+                            "owner": source.owner_conversation_id,
+                            "audience": source.audience_conversation_id,
+                            "channel": source.audience_channel_id,
+                            "fact_id": source.fact_id,
+                            "turn_id": source.canonical_turn_id,
+                        }
+                        for source in sources
+                    ], key=lambda item: json.dumps(
+                        item,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )),
+                }
+                for entry, sources in carryovers
+            ]
+            curation_model = configured_curation_model or (
+                getattr(self._compactor, "model_name", "")
+                or getattr(
+                    getattr(self._compactor, "llm", None),
+                    "model",
+                    "",
+                )
+                or type(getattr(self._compactor, "llm", None)).__name__
+            )
+            digest = hashlib.sha256(json.dumps(
+                {
+                    "policy": 12,
+                    "curation_model": curation_model,
+                    "curation_fallback_model": curation_fallback_model,
+                    "admission_model": admission_model,
+                    "admission_fallback_model": admission_fallback_model,
+                    "prompt_max_chars": int(getattr(
+                        self._config.assembler,
+                        "actor_card_prompt_max_chars",
+                        192_000,
+                    )),
+                    "facts": fact_payload,
+                    "turns": turn_payload,
+                    "carryovers": carryover_payload,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")).hexdigest()
+            return facts, turns, carryovers, digest
+
+        (
+            fact_sources,
+            turn_sources,
+            carryover_entries,
+            input_hash,
+        ) = _read_inputs()
         profile = self._store.get_actor_profile(tenant_id, actor_id)
         if profile is None:
             return 0
+        if not force:
+            status_getter = getattr(
+                self._store,
+                "get_actor_card_rebuild_status",
+                None,
+            )
+            status = (
+                status_getter(tenant_id, actor_id)
+                if callable(status_getter)
+                else None
+            )
+            failed_outcomes = {
+                "model_error",
+                "invalid_response",
+                "rejected_all",
+                "admission_error",
+                "coverage_disagreement",
+                "coverage_gap",
+                "stale_or_rejected_write",
+            }
+            if (
+                status
+                and (status.get("input_hash") or "") == input_hash
+                and status.get("outcome") in failed_outcomes
+            ):
+                failures = int(status.get("failure_count") or 0)
+                if failures >= 3:
+                    logger.error(
+                        "ACTOR_CARD_REBUILD_SUPPRESSED actor=%s "
+                        "input_hash=%s failures=%d reason=terminal",
+                        actor_id[:24],
+                        input_hash[:16],
+                        failures,
+                    )
+                    return 0
+                retry_raw = status.get("next_retry_at") or ""
+                try:
+                    retry_at = datetime.fromisoformat(
+                        str(retry_raw).replace("Z", "+00:00")
+                    )
+                except (TypeError, ValueError):
+                    retry_at = None
+                if retry_at is not None and retry_at > datetime.now(timezone.utc):
+                    logger.info(
+                        "ACTOR_CARD_REBUILD_SUPPRESSED actor=%s "
+                        "input_hash=%s failures=%d reason=backoff",
+                        actor_id[:24],
+                        input_hash[:16],
+                        failures,
+                    )
+                    return 0
         if profile.card_input_hash == input_hash and not profile.card_dirty:
             return 0
-        if not self._store.mark_actor_card_dirty(tenant_id, actor_id):
+        build_marker = (
+            f"building:{input_hash}:{time.time_ns()}:{id(self)}"
+        )
+        if not self._store.mark_actor_card_dirty(
+            tenant_id,
+            actor_id,
+            build_input_hash=build_marker,
+        ):
             return 0
+        # Re-enumerate only after the unique build marker is installed. A
+        # mutation before the marker is therefore included; a mutation after
+        # it clears the marker and makes the transactional replacement fail.
+        (
+            fact_sources,
+            turn_sources,
+            carryover_entries,
+            input_hash,
+        ) = _read_inputs()
 
-        source_by_id = {source.fact.id: source for source in sources}
-        raw_entries: list = []
-        if sources:
-            prompt_facts = [
-                {
-                    "id": source.fact.id,
-                    "fact": source.fact.format_for_prompt(),
-                    "author_role": source.fact.author_source_role,
-                }
+        fact_source_by_audience_id = {
+            (source.audience_conversation_id, source.fact.id): source
+            for source in fact_sources
+        }
+        turn_source_by_audience_id = {
+            (
+                source.audience_conversation_id,
+                source.turn.canonical_turn_id,
+            ): source
+            for source in turn_sources
+        }
+        raw_entries: list[tuple[str, dict, set[str]]] = []
+        curator_substantive_by_audience: dict[str, bool] = {}
+        fact_sources_by_audience: dict[str, list] = {}
+        turn_sources_by_audience: dict[str, list] = {}
+        for source in fact_sources:
+            fact_sources_by_audience.setdefault(
+                source.audience_conversation_id,
+                [],
+            ).append(source)
+        for source in turn_sources:
+            turn_sources_by_audience.setdefault(
+                source.audience_conversation_id,
+                [],
+            ).append(source)
+        audience_ids = sorted(
+            set(fact_sources_by_audience)
+            | set(turn_sources_by_audience)
+            | {
+                (source.audience_conversation_id or "").strip()
+                for _entry, sources in carryover_entries
                 for source in sources
-            ]
-            system = (
-                "Curate durable interaction patterns, not a fact scrapbook. "
-                "Return JSON only with an entries array. Each entry needs kind, "
-                "body, confidence, sensitivity, and fact_ids. Kinds are "
-                "communication_pref, active_goal, relevant_history, interaction_style."
+                if (source.audience_conversation_id or "").strip()
+            }
+        )
+        response_text = ""
+        admission_response_text = ""
+        parsed_entries = True
+        model_exception: Exception | None = None
+        admission_exception: Exception | None = None
+        curation_responses: list[str] = []
+        try:
+            for audience_id in audience_ids:
+                (
+                    partition_response,
+                    partition_substantive,
+                    _coverage_reason,
+                    partition_entries,
+                    visible_turn_ids,
+                ) = self._curate_actor_card_partition(
+                    fact_sources_by_audience.get(audience_id, []),
+                    turn_sources_by_audience.get(audience_id, []),
+                )
+                curation_responses.append(partition_response)
+                curator_substantive_by_audience[audience_id] = (
+                    partition_substantive
+                )
+                raw_entries.extend(
+                    (audience_id, item, visible_turn_ids)
+                    for item in partition_entries
+                )
+            response_text = json.dumps(
+                curation_responses,
+                separators=(",", ":"),
             )
-            user = json.dumps({
-                "facts": prompt_facts,
-                "limits": {
-                    "entries_per_kind": int(
-                        self._config.assembler.actor_card_entries_per_kind
-                    ),
-                    "body_chars": CARD_ENTRY_BODY_MAX_CHARS,
-                },
-            }, separators=(",", ":"))
-            response_text, _usage = self._compactor.llm.complete(
-                system=system,
-                user=user,
-                max_tokens=self._config.compactor.max_summary_tokens,
-            )
-            parsed = self._compactor._parse_response(response_text)
-            if isinstance(parsed.get("entries"), list):
-                raw_entries = parsed["entries"]
+        except Exception as exc:
+            parsed_entries = False
+            response_text = getattr(exc, "response_text", "")
+            if not isinstance(exc, _ActorCardAdmissionError):
+                model_exception = exc
 
         now = datetime.now(timezone.utc).isoformat()
-        per_kind: dict[str, int] = {}
+        # Every audience is curated independently and receives the configured
+        # per-kind budget in its own prompt. Enforce the same boundary here:
+        # a busy DM must not consume a guild's quota (or vice versa) and turn
+        # an otherwise substantive partition into a terminal coverage gap.
+        per_audience_kind: dict[tuple[str, str], int] = {}
         normalized: list[tuple[ActorCardEntry, list[ActorCardEntrySource]]] = []
-        for item in raw_entries:
+        normalized_by_audience: dict[
+            str,
+            list[tuple[ActorCardEntry, list[ActorCardEntrySource]]],
+        ] = {}
+        normalized_entries_by_key: dict[tuple, ActorCardEntry] = {}
+        rejected: Counter[str] = Counter()
+        for audience_id, item, prompt_turn_ids in raw_entries:
             if not isinstance(item, dict):
+                rejected["entry_not_object"] += 1
                 continue
             kind = item.get("kind")
             body = item.get("body")
-            sensitivity = item.get("sensitivity", CARD_SENSITIVITY_NORMAL)
             confidence = item.get("confidence")
             fact_ids = item.get("fact_ids")
-            if kind not in CARD_KINDS or sensitivity not in CARD_SENSITIVITIES:
+            turn_ids = item.get("turn_ids")
+            if set(item) != {
+                "kind",
+                "body",
+                "confidence",
+                "fact_ids",
+                "turn_ids",
+            }:
+                rejected["invalid_entry_shape"] += 1
                 continue
-            if per_kind.get(kind, 0) >= int(
-                self._config.assembler.actor_card_entries_per_kind
-            ):
+            if kind not in CARD_KINDS:
+                rejected["invalid_kind"] += 1
                 continue
+            quota_key = (audience_id, kind)
             if not isinstance(body, str) or not body.strip():
+                rejected["invalid_body"] += 1
                 continue
             body = body.strip()
             if (
                 len(body) > CARD_ENTRY_BODY_MAX_CHARS
                 or any(ord(ch) < 32 or ord(ch) == 127 for ch in body)
             ):
+                rejected["invalid_body"] += 1
                 continue
             if isinstance(confidence, bool) or not isinstance(
                 confidence, (int, float)
             ):
+                rejected["invalid_confidence"] += 1
                 continue
             confidence = float(confidence)
             if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+                rejected["invalid_confidence"] += 1
                 continue
-            if not isinstance(fact_ids, list) or not fact_ids:
+            if not isinstance(fact_ids, list):
+                rejected["invalid_fact_ids"] += 1
                 continue
-            if any(
-                not isinstance(fid, str) or fid not in source_by_id
-                for fid in fact_ids
+            if not isinstance(turn_ids, list):
+                rejected["invalid_turn_ids"] += 1
+                continue
+            if any(not isinstance(fid, str) for fid in fact_ids):
+                rejected["invalid_fact_ids"] += 1
+                continue
+            if any(not isinstance(turn_id, str) for turn_id in turn_ids):
+                rejected["invalid_turn_ids"] += 1
+                continue
+
+            # Some otherwise schema-compliant curators copy a canonical turn
+            # id into both citation arrays. IDs are opaque, so repair only the
+            # case that is structurally provable from this exact partition:
+            # an id placed in the wrong namespace must resolve as a visible
+            # source in the other namespace under the same audience. Truly
+            # unknown or cross-audience ids still reject the whole entry.
+            normalized_fact_ids: list[str] = []
+            normalized_turn_ids: list[str] = []
+
+            def _valid_fact_id(source_id: str) -> bool:
+                return (
+                    audience_id,
+                    source_id,
+                ) in fact_source_by_audience_id
+
+            def _valid_turn_id(source_id: str) -> bool:
+                return bool(
+                    source_id in prompt_turn_ids
+                    and (
+                        audience_id,
+                        source_id,
+                    ) in turn_source_by_audience_id
+                )
+
+            unknown_fact_id = False
+            for source_id in dict.fromkeys(fact_ids):
+                if _valid_fact_id(source_id):
+                    normalized_fact_ids.append(source_id)
+                elif _valid_turn_id(source_id):
+                    normalized_turn_ids.append(source_id)
+                else:
+                    unknown_fact_id = True
+                    break
+            if unknown_fact_id:
+                rejected["unknown_or_cross_audience_fact_id"] += 1
+                continue
+
+            unknown_turn_id = False
+            for source_id in dict.fromkeys(turn_ids):
+                if _valid_turn_id(source_id):
+                    normalized_turn_ids.append(source_id)
+                elif _valid_fact_id(source_id):
+                    normalized_fact_ids.append(source_id)
+                else:
+                    unknown_turn_id = True
+                    break
+            if unknown_turn_id:
+                rejected["unknown_or_cross_audience_turn_id"] += 1
+                continue
+
+            fact_ids = list(dict.fromkeys(normalized_fact_ids))
+            turn_ids = list(dict.fromkeys(normalized_turn_ids))
+            # Citation order has no semantics. Canonicalize it before both
+            # bounding and identity so even over-limit reordered copies retain
+            # the same exact source subset and cannot evade deduplication.
+            fact_ids = sorted(fact_ids)
+            turn_ids = sorted(turn_ids)
+            if (
+                len(fact_ids) + len(turn_ids)
+                > _ACTOR_CARD_CITATION_LIMIT
             ):
+                remaining = _ACTOR_CARD_CITATION_LIMIT
+                fact_ids = fact_ids[:remaining]
+                remaining -= len(fact_ids)
+                turn_ids = turn_ids[:remaining]
+                rejected["citations_trimmed"] += 1
+            if not fact_ids and not turn_ids:
+                rejected["missing_citations"] += 1
                 continue
-            fact_ids = list(dict.fromkeys(fact_ids))
 
             scope = (
                 CARD_SCOPE_CROSS_CONTEXT
-                if sensitivity == CARD_SENSITIVITY_NORMAL
-                and kind in CARD_CROSS_CONTEXT_KINDS
+                if kind in CARD_CROSS_CONTEXT_KINDS
                 else CARD_SCOPE_SAME_CONVERSATION
             )
             digest = hashlib.sha256(json.dumps(
-                [actor_id, kind, body, fact_ids], separators=(",", ":"),
+                [actor_id, kind, body, fact_ids, turn_ids],
+                separators=(",", ":"),
             ).encode("utf-8")).hexdigest()[:32]
             entry = ActorCardEntry(
                 id=f"card-{digest}", tenant_id=tenant_id, actor_id=actor_id,
                 kind=kind, body=body, confidence=confidence,
-                sensitivity=sensitivity, audience_scope=scope,
+                # Retained only for schema compatibility. Sensitivity is not
+                # part of curation, admission, scoping, or serving policy.
+                sensitivity=CARD_SENSITIVITY_NORMAL, audience_scope=scope,
                 created_at=now, updated_at=now,
             )
+            semantic_key = (
+                audience_id,
+                kind,
+                body,
+                tuple(fact_ids),
+                tuple(turn_ids),
+            )
+            existing_entry = normalized_entries_by_key.get(semantic_key)
+            if existing_entry is not None:
+                # Duplicate model candidates are one immutable claim. Keep the
+                # strongest confidence regardless of curator output order.
+                existing_entry.confidence = max(
+                    existing_entry.confidence,
+                    entry.confidence,
+                )
+                rejected["duplicate_entry"] += 1
+                continue
+            if per_audience_kind.get(quota_key, 0) >= int(
+                self._config.assembler.actor_card_entries_per_kind
+            ):
+                rejected["per_kind_limit"] += 1
+                continue
             entry_sources = [
                 ActorCardEntrySource(
                     entry_id=entry.id,
                     tenant_id=tenant_id,
-                    owner_conversation_id=source_by_id[fid].owner_conversation_id,
-                    audience_conversation_id=(
-                        source_by_id[fid].audience_conversation_id
+                    owner_conversation_id=(
+                        fact_source_by_audience_id[
+                            (audience_id, fid)
+                        ].owner_conversation_id
                     ),
-                    audience_channel_id=source_by_id[fid].audience_channel_id,
+                    audience_conversation_id=(
+                        fact_source_by_audience_id[
+                            (audience_id, fid)
+                        ].audience_conversation_id
+                    ),
+                    audience_channel_id=(
+                        fact_source_by_audience_id[
+                            (audience_id, fid)
+                        ].audience_channel_id
+                    ),
                     fact_id=fid,
                 )
                 for fid in fact_ids
             ]
+            entry_sources.extend(
+                ActorCardEntrySource(
+                    entry_id=entry.id,
+                    tenant_id=tenant_id,
+                    owner_conversation_id=(
+                        turn_source_by_audience_id[
+                            (audience_id, turn_id)
+                        ].owner_conversation_id
+                    ),
+                    audience_conversation_id=(
+                        turn_source_by_audience_id[
+                            (audience_id, turn_id)
+                        ].audience_conversation_id
+                    ),
+                    audience_channel_id=(
+                        turn_source_by_audience_id[
+                            (audience_id, turn_id)
+                        ].audience_channel_id
+                    ),
+                    canonical_turn_id=turn_id,
+                )
+                for turn_id in turn_ids
+            )
+            normalized_entries_by_key[semantic_key] = entry
             normalized.append((entry, entry_sources))
-            per_kind[kind] = per_kind.get(kind, 0) + 1
+            normalized_by_audience.setdefault(audience_id, []).append(
+                (entry, entry_sources)
+            )
+            per_audience_kind[quota_key] = (
+                per_audience_kind.get(quota_key, 0) + 1
+            )
+
+        # A fresh curator is allowed to propose better identity/style entries,
+        # but omission is not a deletion decision.  Re-submit every currently
+        # active cross-context entry to semantic admission with its immutable
+        # body and exact sources.  Same-conversation goals/history deliberately
+        # retain replacement semantics: they are the rotating working set.
+        existing_entry_ids_by_audience: dict[str, set[str]] = {}
+        fresh_entry_ids = {
+            entry.id for entry, _sources in normalized
+        }
+        for entry, entry_sources in carryover_entries:
+            if (
+                entry.kind not in CARD_CROSS_CONTEXT_KINDS
+                or entry.audience_scope != CARD_SCOPE_CROSS_CONTEXT
+                or not entry_sources
+            ):
+                logger.error(
+                    "ACTOR_CARD_CARRYOVER_INVALID actor=%s entry=%s "
+                    "kind=%s scope=%s sources=%d",
+                    actor_id[:24],
+                    entry.id,
+                    entry.kind,
+                    entry.audience_scope,
+                    len(entry_sources),
+                )
+                raise RuntimeError(
+                    "actor card carryover violated the cross-context boundary"
+                )
+            audiences = {
+                (source.audience_conversation_id or "").strip()
+                for source in entry_sources
+            }
+            if "" in audiences or len(audiences) != 1:
+                # Never put evidence from two privacy audiences in one model
+                # prompt.  Failing the refresh leaves the last-good card
+                # served; silently dropping it would recreate the bug this
+                # path exists to prevent.
+                logger.error(
+                    "ACTOR_CARD_CARRYOVER_AUDIENCE_INVALID actor=%s "
+                    "entry=%s audience_count=%d",
+                    actor_id[:24],
+                    entry.id,
+                    len(audiences),
+                )
+                raise RuntimeError(
+                    "actor card carryover has ambiguous source audience"
+                )
+            audience_id = next(iter(audiences))
+            existing_entry_ids_by_audience.setdefault(
+                audience_id,
+                set(),
+            ).add(entry.id)
+            if entry.id in fresh_entry_ids:
+                continue
+            normalized.append((entry, entry_sources))
+            normalized_by_audience.setdefault(audience_id, []).append(
+                (entry, entry_sources)
+            )
+
+        basic_accepted_count = len(normalized)
+        independently_substantive = False
+        coverage_gap = False
+        if parsed_entries and (
+            fact_sources or turn_sources or carryover_entries
+        ):
+            try:
+                admitted_entries: list[
+                    tuple[ActorCardEntry, list[ActorCardEntrySource]]
+                ] = []
+                admission_responses: list[str] = []
+                for audience_id in audience_ids:
+                    (
+                        partition_admitted,
+                        partition_response,
+                        admission_rejections,
+                        partition_substantive,
+                    ) = self._admit_actor_card_entries(
+                        actor_id,
+                        audience_id,
+                        fact_sources_by_audience.get(audience_id, []),
+                        turn_sources_by_audience.get(audience_id, []),
+                        normalized_by_audience.get(audience_id, []),
+                        curator_substantive=(
+                            curator_substantive_by_audience[audience_id]
+                        ),
+                        existing_entry_ids=(
+                            existing_entry_ids_by_audience.get(
+                                audience_id,
+                                set(),
+                            )
+                        ),
+                    )
+                    # Carryovers do not bypass the configured per-kind cap.
+                    # When admission leaves more than the cap, retain an
+                    # already-admitted stable entry before a fresh equivalent;
+                    # the prompt asks the model to reject redundant candidates,
+                    # so this is only the deterministic last line of defense.
+                    cap = int(
+                        self._config.assembler.actor_card_entries_per_kind
+                    )
+                    limited: list[
+                        tuple[ActorCardEntry, list[ActorCardEntrySource]]
+                    ] = []
+                    by_kind: dict[
+                        str,
+                        list[
+                            tuple[
+                                ActorCardEntry,
+                                list[ActorCardEntrySource],
+                            ]
+                        ],
+                    ] = {}
+                    for item in partition_admitted:
+                        by_kind.setdefault(item[0].kind, []).append(item)
+                    existing_ids = existing_entry_ids_by_audience.get(
+                        audience_id,
+                        set(),
+                    )
+                    for kind in sorted(by_kind):
+                        ranked = sorted(
+                            by_kind[kind],
+                            key=lambda item: (
+                                0 if item[0].id in existing_ids else 1,
+                                -float(item[0].confidence or 0.0),
+                                item[0].updated_at or "",
+                                item[0].id,
+                            ),
+                        )
+                        limited.extend(ranked[:max(0, cap)])
+                        if len(ranked) > max(0, cap):
+                            rejected["post_admission_per_kind_limit"] += (
+                                len(ranked) - max(0, cap)
+                            )
+                    partition_admitted = limited
+                    admitted_entries.extend(partition_admitted)
+                    admission_responses.append(partition_response)
+                    rejected.update(admission_rejections)
+                    independently_substantive = (
+                        independently_substantive
+                        or partition_substantive
+                    )
+                    privacy_only_rejection = bool(
+                        normalized_by_audience.get(audience_id)
+                    ) and (
+                        admission_rejections.get(
+                            "semantic_explicit_privacy_request",
+                            0,
+                        )
+                        == len(normalized_by_audience[audience_id])
+                        == sum(admission_rejections.values())
+                    )
+                    coverage_gap = (
+                        coverage_gap
+                        or (
+                            partition_substantive
+                            and not partition_admitted
+                            and not privacy_only_rejection
+                        )
+                    )
+                normalized = admitted_entries
+                admission_response_text = json.dumps(
+                    admission_responses,
+                    separators=(",", ":"),
+                )
+            except Exception as exc:
+                admission_exception = exc
+                admission_response_text = getattr(
+                    exc, "response_text", "",
+                )
+
+        response_hash = (
+            hashlib.sha256(json.dumps(
+                {
+                    "curation": response_text,
+                    "admission": admission_response_text,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")).hexdigest()
+            if response_text or admission_response_text
+            else ""
+        )
+
+        def _record_status(outcome: str, *, written_count: int = 0) -> None:
+            recorder = getattr(
+                self._store, "record_actor_card_rebuild_status", None,
+            )
+            if callable(recorder):
+                try:
+                    recorder(
+                        tenant_id,
+                        actor_id,
+                        attempted_at=now,
+                        input_hash=input_hash,
+                        source_count=len(fact_sources) + len(turn_sources),
+                        raw_entry_count=len(raw_entries),
+                        accepted_entry_count=len(normalized),
+                        rejected_counts=dict(sorted(rejected.items())),
+                        outcome=outcome,
+                        response_hash=response_hash,
+                        written_count=written_count,
+                    )
+                except Exception:
+                    logger.warning(
+                        "actor card rebuild status write failed actor=%s",
+                        actor_id[:24],
+                        exc_info=True,
+                    )
+
+        if not parsed_entries:
+            outcome = "model_error" if model_exception is not None else "invalid_response"
+            _record_status(outcome)
+            logger.warning(
+                "ACTOR_CARD_REBUILD actor=%s sources=%d outcome=%s "
+                "response_hash=%s error_type=%s",
+                actor_id[:24],
+                len(fact_sources) + len(turn_sources),
+                outcome,
+                response_hash[:16],
+                type(model_exception).__name__ if model_exception is not None else "",
+            )
+            raise RuntimeError(
+                "actor card curation failed"
+                if model_exception is not None
+                else "actor card curation response has no valid entries array"
+            ) from model_exception
+
+        if raw_entries and not basic_accepted_count:
+            _record_status("rejected_all")
+            logger.warning(
+                "ACTOR_CARD_REBUILD actor=%s sources=%d raw=%d accepted=0 "
+                "outcome=rejected_all rejected=%s response_hash=%s",
+                actor_id[:24],
+                len(fact_sources) + len(turn_sources),
+                len(raw_entries),
+                json.dumps(dict(sorted(rejected.items())), separators=(",", ":")),
+                response_hash[:16],
+            )
+            raise RuntimeError("actor card curation rejected every model entry")
+
+        if admission_exception is not None:
+            admission_outcome = (
+                "coverage_disagreement"
+                if isinstance(
+                    admission_exception,
+                    _ActorCardCoverageError,
+                )
+                else "admission_error"
+            )
+            _record_status(admission_outcome)
+            logger.warning(
+                "ACTOR_CARD_REBUILD actor=%s sources=%d raw=%d "
+                "basic_accepted=%d outcome=%s error_type=%s "
+                "response_hash=%s",
+                actor_id[:24],
+                len(fact_sources) + len(turn_sources),
+                len(raw_entries),
+                basic_accepted_count,
+                admission_outcome,
+                type(admission_exception).__name__,
+                response_hash[:16],
+            )
+            raise RuntimeError("actor card semantic admission failed") from (
+                admission_exception
+            )
+        if coverage_gap:
+            _record_status("coverage_gap")
+            raise RuntimeError(
+                "actor card coverage gate found a substantive actor "
+                "without an admitted entry"
+            )
 
         expected_epochs: dict[str, int] = {}
-        for source in sources:
+        for source in [*fact_sources, *turn_sources]:
             expected_epochs[source.owner_conversation_id] = (
                 source.owner_lifecycle_epoch
             )
             expected_epochs[source.audience_conversation_id] = (
                 source.audience_lifecycle_epoch
             )
+        epoch_getter = getattr(self._store, "get_lifecycle_epoch", None)
+        if carryover_entries and not callable(epoch_getter):
+            raise RuntimeError(
+                "actor card carryover cannot prove lifecycle epochs"
+            )
+        for _entry, entry_sources in carryover_entries:
+            for source in entry_sources:
+                for conversation_id in (
+                    source.owner_conversation_id,
+                    source.audience_conversation_id,
+                ):
+                    if conversation_id not in expected_epochs:
+                        expected_epochs[conversation_id] = int(
+                            epoch_getter(conversation_id)
+                        )
         written = self._store.replace_actor_card(
             tenant_id,
             actor_id,
             normalized,
             input_hash=input_hash,
             expected_source_epochs=expected_epochs,
+            expected_build_marker=build_marker,
         )
         refreshed = self._store.get_actor_profile(tenant_id, actor_id)
         if refreshed is None or refreshed.card_dirty or (
             refreshed.card_input_hash != input_hash
         ):
-            return 0
+            _record_status("stale_or_rejected_write", written_count=written)
+            raise RuntimeError("actor card replacement did not commit cleanly")
+        outcome = (
+            (
+                "clean_empty_filtered"
+                if basic_accepted_count and not normalized
+                else "clean_empty"
+            )
+            if not normalized
+            else ("partial" if rejected else "written")
+        )
+        _record_status(outcome, written_count=written)
+        logger.info(
+            "ACTOR_CARD_REBUILD actor=%s sources=%d raw=%d accepted=%d "
+            "written=%d outcome=%s rejected=%s response_hash=%s",
+            actor_id[:24],
+            len(fact_sources) + len(turn_sources),
+            len(raw_entries),
+            len(normalized),
+            written,
+            outcome,
+            json.dumps(dict(sorted(rejected.items())), separators=(",", ":")),
+            response_hash[:16],
+        )
         return written
+
+    @staticmethod
+    def _actor_card_prompt_turns(
+        turn_sources: list,
+        *,
+        max_chars: int = 96_000,
+    ) -> list[dict]:
+        """Render a bounded, deterministic set of actor-authored messages.
+
+        Discord messages are normally small, but canonical ingestion is also
+        used by API callers. Individual and aggregate bounds prevent one actor
+        from turning card curation into an unbounded model call. A truncated
+        message remains visibly marked so neither model can treat it as exact
+        evidence for a dropped qualifier.
+        """
+        rendered: list[dict] = []
+        used = 0
+        for source in turn_sources:
+            content = (source.turn.user_content or "").strip()
+            if not content:
+                continue
+            truncated = len(content) > 4_000
+            if truncated:
+                content = (
+                    content[:1_940]
+                    + "\n...[middle omitted; do not infer omitted text]...\n"
+                    + content[-1_940:]
+                )
+            item = {
+                "id": source.turn.canonical_turn_id,
+                "timestamp": (
+                    source.turn.created_at
+                    or source.turn.first_seen_at
+                    or ""
+                ),
+                "audience_conversation_id": (
+                    source.audience_conversation_id
+                ),
+                "audience_channel_id": source.audience_channel_id,
+                "content": content,
+                "truncated": truncated,
+            }
+            cost = len(json.dumps(item, separators=(",", ":")))
+            if used + cost > max(0, int(max_chars)):
+                break
+            rendered.append(item)
+            used += cost
+        return rendered
+
+    def _curate_actor_card_partition(
+        self,
+        fact_sources: list,
+        turn_sources: list,
+    ) -> tuple[str, bool, str, list, set[str]]:
+        """Curate one audience partition without exposing another audience."""
+        from ..types import CARD_ENTRY_BODY_MAX_CHARS
+
+        prompt_facts = [
+            {
+                "id": source.fact.id,
+                "fact": source.fact.format_for_prompt(),
+                "author_role": source.fact.author_source_role,
+                "status": source.fact.status,
+                "fact_type": source.fact.fact_type,
+                "mentioned_at": source.fact.mentioned_at.isoformat(),
+                "session_date": source.fact.session_date,
+            }
+            for source in fact_sources
+        ]
+        prompt_turns = self._actor_card_prompt_turns(
+            turn_sources,
+            max_chars=int(getattr(
+                self._config.assembler,
+                "actor_card_prompt_max_chars",
+                192_000,
+            )),
+        )
+        prompt_turn_ids = {item["id"] for item in prompt_turns}
+        system = (
+            "Curate a compact person card from exact messages and facts "
+            "authored by one actor in one policy audience. The card is for "
+            "durable interaction continuity, not a fact scrapbook or a "
+            "transcript. Independently decide whether the actor contributed "
+            "substantive interaction. Substantive means at least one "
+            "informative message that reveals a useful ongoing goal, durable "
+            "preference/style, or a meaningful topic the actor has discussed "
+            "with the agent. Greetings, bot invocation checks, memory/"
+            "preference probes, and isolated trivia questions are not "
+            "substantive. Return JSON only with exactly: substantive, "
+            "coverage_reason, and entries. substantive must be boolean. "
+            "coverage_reason must be exactly one of \"substantive\", "
+            "\"greeting_only\", \"one_off_trivia\", \"bot_meta_or_test\", "
+            "\"no_durable_context\", or \"insufficient_evidence\". It must be "
+            "\"substantive\" exactly when substantive is true. entries must "
+            "be an array. A substantive actor must receive at least one entry; "
+            "a non-substantive actor must receive none. Each entry must contain "
+            "exactly kind, body, confidence, fact_ids, and turn_ids. kind must "
+            "be exactly one of \"communication_pref\", \"active_goal\", "
+            "\"relevant_history\", or \"interaction_style\". confidence must "
+            "be a number from 0 through 1. fact_ids "
+            "and turn_ids must be arrays, may individually be empty, and "
+            "together must cite at least one provided id that fully supports "
+            f"the body. Use at most {_ACTOR_CARD_CITATION_LIMIT} citation ids "
+            "total per entry. Put "
+            "fact ids only in fact_ids and turn ids only in turn_ids; never "
+            "copy an id into both arrays. Obey entries_per_kind as a hard "
+            "maximum. Use a neutral concise body and do not invent identity "
+            "or intent. Every body must be self-contained and unambiguous when "
+            "read without the surrounding transcript; include essential "
+            "referents such as the specific medication, goal, preference, or "
+            "discussion topic. Write natural person-facing language, not a "
+            "serialization of subject/verb/object fields, ontology names, or "
+            "tag labels. Preserve every material qualifier from the source, "
+            "including exceptions, exclusions, uncertainty, frequency, "
+            "timing, and scope. Do not turn a qualified statement into a "
+            "broader or more certain claim. Do not promote temporary, "
+            "test-only, one-turn, session-only, or channel-only instructions "
+            "into communication_pref or interaction_style. Do not retain a "
+            "preference or goal that later evidence stopped, replaced, "
+            "completed, or contradicted. Use message timestamps, mentioned_at, "
+            "and status to resolve conflicts, with the newest applicable "
+            "evidence winning. A communication preference or interaction "
+            "style is durable only when explicitly stated as lasting or "
+            "consistently supported by repeated natural interactions. Use "
+            "relevant_history for concise, useful continuity about a "
+            "meaningful topic this actor actually discussed with the agent "
+            "when no narrower durable preference or goal is justified. "
+            "An isolated, underspecified follow-up whose missing referent "
+            "cannot be recovered from the supplied evidence is insufficient "
+            "for relevant_history, even if it sounds important. Subject matter "
+            "must never determine admission: medical, sexual, financial, "
+            "location, credential, and other topics are evaluated by the same "
+            "durability and evidence rules as every other topic. Do not omit "
+            "or soften a candidate because of its subject. If the actor "
+            "explicitly and unambiguously asks that particular information "
+            "not be retained or reused, do not propose it for the card. Do not "
+            "infer such a request from the topic, from a DM, or from context."
+        )
+        user = json.dumps({
+            "facts": prompt_facts,
+            "turns": prompt_turns,
+            "limits": {
+                "entries_per_kind": int(
+                    self._config.assembler.actor_card_entries_per_kind
+                ),
+                "body_chars": CARD_ENTRY_BODY_MAX_CHARS,
+            },
+        }, separators=(",", ":"))
+        valid_coverage_reasons = {
+            "substantive",
+            "greeting_only",
+            "one_off_trivia",
+            "bot_meta_or_test",
+            "no_durable_context",
+            "insufficient_evidence",
+        }
+
+        def _parse_curation(text: str) -> dict:
+            try:
+                parsed = self._compactor._parse_response(text)
+            except Exception as exc:
+                raise _ActorCardAdmissionError(
+                    "actor card curation response is not valid JSON",
+                    text,
+                ) from exc
+            if (
+                not isinstance(parsed, dict)
+                or set(parsed)
+                != {"substantive", "coverage_reason", "entries"}
+                or not isinstance(parsed.get("substantive"), bool)
+                or not isinstance(parsed.get("coverage_reason"), str)
+                or not isinstance(parsed.get("entries"), list)
+                or parsed["coverage_reason"] not in valid_coverage_reasons
+                or parsed["substantive"]
+                != (parsed["coverage_reason"] == "substantive")
+                or parsed["substantive"] != bool(parsed["entries"])
+            ):
+                raise _ActorCardAdmissionError(
+                    "actor card curation response has invalid coverage shape",
+                    text,
+                )
+            return parsed
+
+        request_kwargs = {
+            "system": system,
+            "user": user,
+            "max_tokens": max(
+                2000,
+                min(
+                    4000,
+                    2 * int(self._config.compactor.max_summary_tokens),
+                ),
+            ),
+        }
+        provider = self._actor_card_curation_provider()
+        complete_with_source = getattr(provider, "complete_with_source", None)
+        if callable(complete_with_source):
+            response_text, _usage, curation_source = complete_with_source(
+                **request_kwargs,
+            )
+        else:
+            response_text, _usage = provider.complete(**request_kwargs)
+            curation_source = "provider"
+
+        try:
+            parsed = _parse_curation(response_text)
+        except _ActorCardAdmissionError as primary_exc:
+            complete_fallback = getattr(provider, "complete_fallback", None)
+            if (
+                curation_source == "fallback"
+                or not callable(complete_fallback)
+            ):
+                raise
+            logger.warning(
+                "ACTOR_CARD_CURATION_FALLBACK reason=invalid_response "
+                "response_hash=%s",
+                hashlib.sha256(
+                    response_text.encode("utf-8")
+                ).hexdigest()[:16],
+            )
+            fallback_text = ""
+            try:
+                fallback_text, _usage = complete_fallback(**request_kwargs)
+                parsed = _parse_curation(fallback_text)
+            except Exception as fallback_exc:
+                combined = json.dumps(
+                    {
+                        "primary": primary_exc.response_text,
+                        "fallback": (
+                            getattr(fallback_exc, "response_text", "")
+                            or fallback_text
+                        ),
+                    },
+                    separators=(",", ":"),
+                )
+                raise _ActorCardAdmissionError(
+                    "actor card curation primary and fallback responses "
+                    "were invalid",
+                    combined,
+                ) from fallback_exc
+            response_text = fallback_text
+        return (
+            response_text,
+            parsed["substantive"],
+            parsed["coverage_reason"],
+            parsed["entries"],
+            prompt_turn_ids,
+        )
+
+    def _actor_card_provider_for_model(self, selected_model: str):
+        """Create a zero-temperature provider through the configured gateway."""
+        base = self._compactor.llm
+        from ..providers.anthropic import AnthropicProvider
+        from ..providers.generic_openai import GenericOpenAIProvider
+
+        if isinstance(base, GenericOpenAIProvider):
+            return GenericOpenAIProvider(
+                base_url=base.base_url,
+                model=selected_model,
+                temperature=0.0,
+                api_key=base.api_key,
+                reasoning_effort="low",
+            )
+        if isinstance(base, AnthropicProvider):
+            return AnthropicProvider(
+                api_key=base.api_key,
+                model=selected_model,
+                temperature=0.0,
+            )
+        raise RuntimeError(
+            "actor-card model override is unsupported by "
+            f"{type(base).__name__}"
+        )
+
+    def _actor_card_curation_provider(self):
+        """Build the optional dedicated curator and malformed-response fallback."""
+        override = getattr(
+            self, "_actor_card_curation_provider_override", None,
+        )
+        if override is not None:
+            return override
+        model = (
+            getattr(
+                self._config.assembler,
+                "actor_card_curation_model",
+                "",
+            )
+            or ""
+        ).strip()
+        if not model:
+            return self._compactor.llm
+        fallback_model = (
+            getattr(
+                self._config.assembler,
+                "actor_card_curation_fallback_model",
+                "",
+            )
+            or ""
+        ).strip()
+        primary = self._actor_card_provider_for_model(model)
+        if fallback_model and fallback_model != model:
+            return _EmptyResponseFallbackProvider(
+                primary,
+                self._actor_card_provider_for_model(fallback_model),
+                primary_model=model,
+                fallback_model=fallback_model,
+                stage="curation",
+            )
+        return primary
+
+    def _actor_card_admission_provider(self):
+        """Build the dedicated semantic admission provider.
+
+        The curation model may be deliberately cheap. Admission is a separate
+        safety boundary over immutable candidates and actor-authored evidence;
+        it cannot invent or rewrite card bodies.
+        """
+        override = getattr(
+            self, "_actor_card_admission_provider_override", None,
+        )
+        if override is not None:
+            return override
+        model = (
+            getattr(
+                self._config.assembler,
+                "actor_card_admission_model",
+                "",
+            )
+            or ""
+        ).strip()
+        if not model:
+            return None
+        fallback_model = (
+            getattr(
+                self._config.assembler,
+                "actor_card_admission_fallback_model",
+                "",
+            )
+            or ""
+        ).strip()
+        primary = self._actor_card_provider_for_model(model)
+        if fallback_model and fallback_model != model:
+            return _EmptyResponseFallbackProvider(
+                primary,
+                self._actor_card_provider_for_model(fallback_model),
+                primary_model=model,
+                fallback_model=fallback_model,
+            )
+        return primary
+
+    def _actor_card_evidence_segments(
+        self,
+        actor_id: str,
+        audience_conversation_id: str,
+        sources: list,
+        candidate_fact_ids: set[str],
+        *,
+        max_chars: int = 64_000,
+    ) -> tuple[list[dict], set[tuple[str, str]]]:
+        """Return bounded actor-authored turns from candidate-cited segments.
+
+        Selection is provenance-based: canonical actor ids and segment source
+        mappings decide which messages are evidence. Message text is never
+        regex-classified. Uncited segments remain available to the admission
+        model as compact facts, not as unrelated raw conversation text.
+        """
+        from ..types import AUDIENCE_ATTRIBUTION_VERSION
+
+        source_by_id = {
+            source.fact.id: source
+            for source in sources
+            if source.audience_conversation_id == audience_conversation_id
+        }
+        candidate_refs = {
+            (
+                source_by_id[fact_id].owner_conversation_id,
+                source_by_id[fact_id].fact.segment_ref,
+            )
+            for fact_id in candidate_fact_ids
+            if fact_id in source_by_id
+            and source_by_id[fact_id].fact.segment_ref
+        }
+        owner_rows: dict[str, dict[str, object]] = {}
+        for owner in sorted({
+            source.owner_conversation_id for source in sources
+        }):
+            owner_rows[owner] = {
+                row.canonical_turn_id: row
+                for row in self._store.get_all_canonical_turns(owner)
+            }
+
+        by_ref: dict[tuple[str, str], dict] = {}
+        for source in sources:
+            ref = source.fact.segment_ref
+            ref_key = (source.owner_conversation_id, ref)
+            if (
+                not ref
+                or ref_key not in candidate_refs
+                or ref_key in by_ref
+            ):
+                continue
+            segment = self._store.get_segment(
+                ref,
+                conversation_id=source.owner_conversation_id,
+            )
+            if segment is None:
+                continue
+            messages: list[dict] = []
+            try:
+                newest_time = float(segment.end_timestamp.timestamp())
+            except (AttributeError, TypeError, ValueError, OSError):
+                newest_time = float("-inf")
+            for canonical_id in list(
+                segment.metadata.canonical_turn_ids or []
+            ):
+                row = owner_rows.get(
+                    source.owner_conversation_id, {},
+                ).get(canonical_id)
+                content = (row.user_content or "").strip() if row else ""
+                if (
+                    row is None
+                    or row.sender_actor_id != actor_id
+                    or row.audience_conversation_id
+                    != audience_conversation_id
+                    or int(row.audience_attribution_version or 0)
+                    != AUDIENCE_ATTRIBUTION_VERSION
+                    or not content
+                ):
+                    continue
+                if len(content) > 1200:
+                    content = (
+                        content[:580]
+                        + "\n...[middle truncated]...\n"
+                        + content[-580:]
+                    )
+                messages.append({
+                    "turn": row.turn_number,
+                    "timestamp": (
+                        row.created_at or row.first_seen_at or ""
+                    ),
+                    "content": content,
+                })
+            if messages:
+                by_ref[ref_key] = {
+                    "owner_conversation_id": source.owner_conversation_id,
+                    "segment_ref": ref,
+                    "messages": messages,
+                    "_newest_time": newest_time,
+                }
+
+        ordered = sorted(
+            by_ref.values(),
+            key=lambda item: (
+                -item["_newest_time"],
+                item["owner_conversation_id"],
+                item["segment_ref"],
+            ),
+        )
+        admitted: list[dict] = []
+        admitted_refs: set[tuple[str, str]] = set()
+        used = 0
+        for item in ordered:
+            public = {
+                "owner_conversation_id": item["owner_conversation_id"],
+                "segment_ref": item["segment_ref"],
+                "messages": item["messages"],
+            }
+            cost = len(json.dumps(public, separators=(",", ":")))
+            if used + cost > max_chars:
+                continue
+            admitted.append(public)
+            admitted_refs.add((
+                item["owner_conversation_id"],
+                item["segment_ref"],
+            ))
+            used += cost
+        return admitted, admitted_refs
+
+    def _admit_actor_card_entries(
+        self,
+        actor_id: str,
+        audience_conversation_id: str,
+        fact_sources: list,
+        turn_sources: list,
+        normalized: list[tuple["ActorCardEntry", list["ActorCardEntrySource"]]],
+        *,
+        curator_substantive: bool,
+        existing_entry_ids: set[str] | None = None,
+    ) -> tuple[
+        list[tuple["ActorCardEntry", list["ActorCardEntrySource"]]],
+        str,
+        Counter[str],
+        bool,
+    ]:
+        """Independently check coverage and admit immutable candidates."""
+
+        provider = self._actor_card_admission_provider()
+        if provider is None:
+            raise RuntimeError(
+                "actor-card semantic admission model is not configured"
+            )
+        existing_entry_ids = set(existing_entry_ids or ())
+
+        candidate_fact_ids = {
+            source.fact_id
+            for _entry, entry_sources in normalized
+            for source in entry_sources
+            if source.fact_id
+        }
+        evidence_segments, evidence_refs = (
+            self._actor_card_evidence_segments(
+                actor_id,
+                audience_conversation_id,
+                fact_sources,
+                candidate_fact_ids,
+            )
+        )
+        fact_source_by_id = {
+            source.fact.id: source for source in fact_sources
+        }
+        turn_source_by_id = {
+            source.turn.canonical_turn_id: source
+            for source in turn_sources
+        }
+        actor_turns = self._actor_card_prompt_turns(
+            turn_sources,
+            max_chars=int(getattr(
+                self._config.assembler,
+                "actor_card_prompt_max_chars",
+                192_000,
+            )),
+        )
+        visible_turn_ids = {turn["id"] for turn in actor_turns}
+        candidates: list[dict] = []
+        eligible: dict[
+            str, tuple["ActorCardEntry", list["ActorCardEntrySource"]]
+        ] = {}
+        rejection_counts: Counter[str] = Counter()
+        for entry, entry_sources in normalized:
+            fact_ids = [
+                source.fact_id for source in entry_sources
+                if source.fact_id
+            ]
+            turn_ids = [
+                source.canonical_turn_id for source in entry_sources
+                if source.canonical_turn_id
+            ]
+            refs = {
+                (
+                    fact_source_by_id[fact_id].owner_conversation_id,
+                    fact_source_by_id[fact_id].fact.segment_ref,
+                )
+                for fact_id in fact_ids
+                if fact_id in fact_source_by_id
+            }
+            is_existing = entry.id in existing_entry_ids
+            if (
+                not is_existing
+                and refs
+                and not refs.issubset(evidence_refs)
+            ):
+                rejection_counts["evidence_unavailable"] += 1
+                continue
+            if any(
+                turn_id not in turn_source_by_id
+                or turn_id not in visible_turn_ids
+                for turn_id in turn_ids
+            ) and not is_existing:
+                rejection_counts["evidence_unavailable"] += 1
+                continue
+            if not fact_ids and not turn_ids:
+                rejection_counts["evidence_unavailable"] += 1
+                continue
+            eligible[entry.id] = (entry, entry_sources)
+            candidates.append({
+                "candidate_id": entry.id,
+                "origin": "existing" if is_existing else "fresh",
+                "kind": entry.kind,
+                "body": entry.body,
+                "proposed_confidence": entry.confidence,
+                "fact_ids": fact_ids,
+                "turn_ids": turn_ids,
+                "source_segments": [
+                    {
+                        "owner_conversation_id": owner,
+                        "segment_ref": ref,
+                    }
+                    for owner, ref in sorted(refs)
+                ],
+            })
+
+        compact_facts = [{
+            "id": source.fact.id,
+            "owner_conversation_id": source.owner_conversation_id,
+            "segment_ref": source.fact.segment_ref,
+            "fact": source.fact.format_for_prompt(),
+            "status": source.fact.status,
+            "mentioned_at": source.fact.mentioned_at.isoformat(),
+        } for source in fact_sources]
+        system = (
+            "You are the conservative semantic admission gate for a person "
+            "card. Candidate bodies are immutable: you may admit or reject "
+            "them, but you may not invent, rewrite, or merge candidates. Use "
+            "only actor-authored facts and source "
+            "messages. All bounded actor turns and compact facts are supplied "
+            "so later evidence can revoke or replace a candidate. "
+            "Independently decide whether this actor contributed substantive "
+            "interaction; do not defer to the curator's claim. Substantive "
+            "means at least one informative message that reveals a useful "
+            "ongoing goal, durable preference/style, or a meaningful topic "
+            "the actor discussed with the agent. Greetings, bot invocation "
+            "checks, memory/preference probes, and isolated trivia questions "
+            "are not substantive. A substantive actor must finish with at "
+            "least one admitted card entry; relevant_history is appropriate "
+            "for useful topic continuity when no narrower entry is justified. "
+            "Return JSON only with exactly substantive, coverage_reason, and "
+            "decisions. substantive must be boolean. coverage_reason must be "
+            "exactly one of \"substantive\", \"greeting_only\", "
+            "\"one_off_trivia\", \"bot_meta_or_test\", "
+            "\"no_durable_context\", or \"insufficient_evidence\", and must "
+            "be \"substantive\" exactly when substantive is true. "
+            "Return exactly one decision for every candidate, with "
+            "exactly candidate_id, admit, and reason. admit must be a boolean. "
+            "reason must be exactly one of "
+            "\"durable\", \"temporary\", \"test_probe\", "
+            "\"stopped_or_replaced\", \"completed\", \"contradicted\", "
+            "\"insufficient_evidence\", \"not_durable\", "
+            "\"not_person_card\", \"redundant\", or "
+            "\"explicit_privacy_request\". Use reason "
+            "\"durable\" if and only if admit is true. "
+            "Candidate origin is either fresh or existing. An existing "
+            "candidate is an immutable entry that a prior independent "
+            "admission accepted from its cited evidence. Curator omission is "
+            "not evidence against it. Re-admit an existing candidate unless "
+            "later actor-authored evidence explicitly stops, replaces, "
+            "completes, or contradicts it, or a materially better fresh "
+            "candidate makes it redundant. When fresh and existing candidates "
+            "substantially overlap, prefer the existing candidate for "
+            "continuity unless the fresh one materially corrects, updates, or "
+            "better preserves the evidence; reject the other as redundant or "
+            "stopped_or_replaced. Do not admit redundant copies. "
+            "Reject temporary, test/probe, one-turn, session-only, "
+            "channel-only, stopped, replaced, completed, or contradicted "
+            "material. Later source messages revoke or replace earlier "
+            "material. Requested answer prefixes and memory-system tests are "
+            "not durable identity preferences. A communication preference or "
+            "interaction style is admissible only when a source message "
+            "explicitly establishes durability beyond the current test, "
+            "session, and channel, or when consistent natural evidence appears "
+            "across distinct actor-authored messages or interactions, ideally "
+            "spread over time. Repeated test instructions do not establish a "
+            "pattern. The immutable candidate body itself "
+            "must be self-contained and unambiguous without relying on the "
+            "surrounding segment; reject with insufficient_evidence when an "
+            "essential referent (such as which medication, goal, or "
+            "preference) is omitted. The body must be fully entailed by the "
+            "cited actor-authored messages. Compact fact fields and tags help "
+            "locate evidence but cannot independently justify body text. "
+            "Full entailment requires preserving every material qualifier in "
+            "the source, including exceptions, exclusions, uncertainty, "
+            "frequency, timing, and scope. Reject with insufficient_evidence "
+            "if the immutable body drops a qualifier, broadens the statement, "
+            "or increases its certainty. For example, source text like "
+            "\"good blood pressure, excluding stressful events\" does not "
+            "entail the unqualified body \"has good blood pressure.\" "
+            "Reject with not_person_card when a body exposes internal "
+            "ontology/tag language or serializes a machine fact triple rather "
+            "than stating a natural person fact. Subject matter must never "
+            "determine admission: medical, sexual, financial, location, "
+            "credential, and other topics are evaluated by the same durability "
+            "and evidence rules as every other topic. Do not omit, soften, or "
+            "reject a candidate because of its subject. Use "
+            "explicit_privacy_request only when actor-authored evidence "
+            "explicitly and unambiguously asks that the cited information not "
+            "be retained or reused; never infer privacy from the topic, from a "
+            "DM, or from context. A visibly truncated turn cannot prove a "
+            "claim whose qualifier may be in omitted text. When uncertain, "
+            "reject."
+        )
+        user = json.dumps({
+            "curator_substantive_claim": curator_substantive,
+            "candidates": candidates,
+            "facts": compact_facts,
+            "actor_turns": actor_turns,
+            "evidence_segments": evidence_segments,
+        }, separators=(",", ":"))
+        request_kwargs = {
+            "system": system,
+            "user": user,
+            "max_tokens": max(
+                800,
+                min(
+                    4000,
+                    300 + 250 * len(candidates),
+                ),
+            ),
+        }
+        complete_with_source = getattr(provider, "complete_with_source", None)
+        if callable(complete_with_source):
+            response_text, _usage, admission_source = complete_with_source(
+                **request_kwargs,
+            )
+        else:
+            response_text, _usage = provider.complete(**request_kwargs)
+            admission_source = "provider"
+
+        def _parse_admission(
+            text: str,
+        ) -> tuple[bool, dict[str, dict]]:
+            try:
+                parsed = self._compactor._parse_response(text)
+            except Exception as exc:
+                raise _ActorCardAdmissionError(
+                    "actor-card admission response is not valid JSON",
+                    text,
+                ) from exc
+            if (
+                not isinstance(parsed, dict)
+                or set(parsed)
+                != {"substantive", "coverage_reason", "decisions"}
+                or not isinstance(parsed["substantive"], bool)
+                or not isinstance(parsed["coverage_reason"], str)
+                or not isinstance(parsed["decisions"], list)
+            ):
+                raise _ActorCardAdmissionError(
+                    "actor-card admission response has invalid coverage shape",
+                    text,
+                )
+            independently_substantive = parsed["substantive"]
+            valid_coverage_reasons = {
+                "substantive",
+                "greeting_only",
+                "one_off_trivia",
+                "bot_meta_or_test",
+                "no_durable_context",
+                "insufficient_evidence",
+            }
+            if (
+                parsed["coverage_reason"] not in valid_coverage_reasons
+                or independently_substantive
+                != (parsed["coverage_reason"] == "substantive")
+            ):
+                raise _ActorCardAdmissionError(
+                    "actor-card admission response has invalid coverage decision",
+                    text,
+                )
+            decisions: dict[str, dict] = {}
+            valid_reasons = {
+                "durable",
+                "temporary",
+                "test_probe",
+                "stopped_or_replaced",
+                "completed",
+                "contradicted",
+                "insufficient_evidence",
+                "not_durable",
+                "not_person_card",
+                "redundant",
+                "explicit_privacy_request",
+            }
+            for decision in parsed["decisions"]:
+                if (
+                    not isinstance(decision, dict)
+                    or set(decision) != {"candidate_id", "admit", "reason"}
+                    or not isinstance(decision.get("candidate_id"), str)
+                    or not isinstance(decision.get("admit"), bool)
+                    or decision.get("reason") not in valid_reasons
+                    or (
+                        bool(decision.get("admit"))
+                        != (decision.get("reason") == "durable")
+                    )
+                    or decision["candidate_id"] in decisions
+                ):
+                    raise _ActorCardAdmissionError(
+                        "actor-card admission response contains an invalid decision",
+                        text,
+                    )
+                decisions[decision["candidate_id"]] = decision
+            if set(decisions) != set(eligible):
+                raise _ActorCardAdmissionError(
+                    "actor-card admission response does not cover every candidate",
+                    text,
+                )
+            return independently_substantive, decisions
+
+        try:
+            independently_substantive, decisions = _parse_admission(
+                response_text,
+            )
+        except _ActorCardAdmissionError as primary_exc:
+            complete_fallback = getattr(provider, "complete_fallback", None)
+            if (
+                admission_source == "fallback"
+                or not callable(complete_fallback)
+            ):
+                raise
+            logger.warning(
+                "ACTOR_CARD_ADMISSION_FALLBACK reason=invalid_response "
+                "response_hash=%s",
+                hashlib.sha256(
+                    response_text.encode("utf-8")
+                ).hexdigest()[:16],
+            )
+            fallback_text = ""
+            try:
+                fallback_text, _usage = complete_fallback(**request_kwargs)
+                independently_substantive, decisions = _parse_admission(
+                    fallback_text,
+                )
+            except Exception as fallback_exc:
+                combined = json.dumps(
+                    {
+                        "primary": primary_exc.response_text,
+                        "fallback": (
+                            getattr(fallback_exc, "response_text", "")
+                            or fallback_text
+                        ),
+                    },
+                    separators=(",", ":"),
+                )
+                raise _ActorCardAdmissionError(
+                    "actor-card admission primary and fallback responses "
+                    "were invalid",
+                    combined,
+                ) from fallback_exc
+            response_text = json.dumps(
+                {
+                    "primary": response_text,
+                    "fallback": fallback_text,
+                    "selected": "fallback",
+                },
+                separators=(",", ":"),
+            )
+            admission_source = "fallback"
+        if independently_substantive != curator_substantive:
+            primary_substantive = independently_substantive
+            complete_fallback = getattr(provider, "complete_fallback", None)
+            if (
+                admission_source == "fallback"
+                or not callable(complete_fallback)
+            ):
+                raise _ActorCardCoverageError(
+                    "actor-card curator and admission coverage decisions disagree",
+                    response_text,
+                )
+            adjudication_text = ""
+            try:
+                adjudication_text, _usage = complete_fallback(**request_kwargs)
+                adjudicated_substantive, adjudicated_decisions = (
+                    _parse_admission(adjudication_text)
+                )
+            except Exception as exc:
+                combined = json.dumps(
+                    {
+                        "primary": response_text,
+                        "adjudicator": (
+                            getattr(exc, "response_text", "")
+                            or adjudication_text
+                        ),
+                        "selected": "error",
+                        "error_type": type(exc).__name__,
+                    },
+                    separators=(",", ":"),
+                )
+                raise _ActorCardAdmissionError(
+                    "actor-card coverage adjudicator failed",
+                    combined,
+                ) from exc
+            # With boolean coverage and an initial disagreement, the third
+            # judgment necessarily agrees with either the curator or the
+            # primary admission model. Select that two-of-three result and
+            # its internally consistent candidate decisions.
+            selected = "primary"
+            if adjudicated_substantive == curator_substantive:
+                independently_substantive = adjudicated_substantive
+                decisions = adjudicated_decisions
+                selected = "curator_fallback"
+            logger.warning(
+                "ACTOR_CARD_COVERAGE_ADJUDICATED curator=%s primary=%s "
+                "fallback=%s selected=%s",
+                curator_substantive,
+                primary_substantive,
+                adjudicated_substantive,
+                selected,
+            )
+            response_text = json.dumps(
+                {
+                    "primary": response_text,
+                    "adjudicator": adjudication_text,
+                    "selected": selected,
+                },
+                separators=(",", ":"),
+            )
+
+        admitted: list[
+            tuple["ActorCardEntry", list["ActorCardEntrySource"]]
+        ] = []
+        for candidate_id, (entry, entry_sources) in eligible.items():
+            decision = decisions[candidate_id]
+            if candidate_id in existing_entry_ids:
+                logger.info(
+                    "ACTOR_CARD_CARRYOVER_DECISION actor=%s audience=%s "
+                    "entry=%s admit=%s reason=%s",
+                    actor_id[:24],
+                    audience_conversation_id[:48],
+                    candidate_id,
+                    bool(decision["admit"]),
+                    decision["reason"],
+                )
+            if not decision["admit"]:
+                rejection_counts[
+                    f"semantic_{decision['reason']}"
+                ] += 1
+                continue
+            admitted.append((entry, entry_sources))
+        if not independently_substantive and admitted:
+            raise _ActorCardAdmissionError(
+                "non-substantive actor cannot have an admitted card entry",
+                response_text,
+            )
+        return (
+            admitted,
+            response_text,
+            rejection_counts,
+            independently_substantive,
+        )
 
     def _physical_rows_by_group(self) -> dict[int, list["CanonicalTurnRow"]]:
         """Physical canonical rows of this conversation, grouped by turn group.
@@ -954,6 +2765,7 @@ class CompactionPipeline:
         )
 
         # Phase 2+3: Compact + Store (25-75%)
+        actor_card_candidates: set[str] = set()
         results = self._compact_and_store(
             segments,
             len(compact_messages),
@@ -962,6 +2774,7 @@ class CompactionPipeline:
             generated_by_turn_id=generated_by_turn_id,
             operation_id=operation_id,
             disable_replacement_passes=disable_replacement_passes,
+            actor_card_candidates=actor_card_candidates,
         )
 
         compacted_turn_ids = [
@@ -1002,6 +2815,10 @@ class CompactionPipeline:
 
         self._refresh_shared_retrieval_snapshots()
         self._prewarm_context_hint(operation_id)
+        self._consolidate_actor_cards_after_compaction(
+            actor_card_candidates,
+            disable_replacement_passes=disable_replacement_passes,
+        )
 
         return report
 
@@ -1310,6 +3127,7 @@ class CompactionPipeline:
         generated_by_turn_id: str = "",
         operation_id: str | None = None,
         disable_replacement_passes: bool = False,
+        actor_card_candidates: set[str] | None = None,
     ) -> list[CompactionResult]:
         """Two-pass compact and store.
 
@@ -1726,6 +3544,11 @@ class CompactionPipeline:
             progress_callback=_compactor_progress,
         )
 
+        # Coalesce person-card work across every segment in this compaction.
+        # One actor can appear in many segments; rebuilding after each one
+        # wastes model calls and lets an early rebuild observe only part of the
+        # just-written evidence.
+        card_actors_to_rebuild: set[str] = set()
         for seg_idx, result in enumerate(results):
             seg = compactable[seg_idx]
             new_turn_range = segment_turn_ranges.get(seg.id)
@@ -1850,6 +3673,16 @@ class CompactionPipeline:
 
             all_results.append(result)
             stored_done = seg_idx + 1
+            card_actors_to_rebuild.update(
+                (physical_by_id[canonical_id].sender_actor_id or "").strip()
+                for canonical_id in (
+                    stored.metadata.canonical_turn_ids or []
+                )
+                if canonical_id in physical_by_id
+                and (
+                    physical_by_id[canonical_id].sender_actor_id or ""
+                ).strip()
+            )
 
             _emit_progress(
                 stored_done,
@@ -1864,11 +3697,11 @@ class CompactionPipeline:
             _seg_ref = stored.ref
             _existing_facts_before = self._store.get_facts_by_segment(_seg_ref)
             if result.facts or _existing_facts_before:
-                _actors_to_rebuild = {
+                card_actors_to_rebuild.update({
                     (fact.author_actor_id or "").strip()
                     for fact in [*_existing_facts_before, *result.facts]
                     if (fact.author_actor_id or "").strip()
-                }
+                })
                 for fact in result.facts:
                     fact.segment_ref = _seg_ref
                     fact.conversation_id = self._config.conversation_id
@@ -1912,18 +3745,6 @@ class CompactionPipeline:
                             operation_id=operation_id,
                             guard_kwargs=self._compaction_guard_kwargs(operation_id),
                         )
-                    for actor_id in sorted(_actors_to_rebuild):
-                        try:
-                            self._rebuild_actor_card(actor_id)
-                        except Exception:
-                            # replace_facts_for_segment already dirtied the
-                            # profile in the same transaction. A failed
-                            # curation therefore leaves the old entries
-                            # auditable but unreadable.
-                            logger.warning(
-                                "actor card rebuild failed actor=%s",
-                                actor_id[:24], exc_info=True,
-                            )
                 _superseded_count = 0
                 _links_count = 0
                 # C2R gate (fencing plan §7.2 #7/#8): backlog-sweeper
@@ -1976,5 +3797,8 @@ class CompactionPipeline:
                     superseded_count=_superseded_count,
                     links_count=_links_count,
                 )
+
+        if actor_card_candidates is not None:
+            actor_card_candidates.update(card_actors_to_rebuild)
 
         return all_results

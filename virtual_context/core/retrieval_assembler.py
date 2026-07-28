@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 
 from .engine_utils import get_recent_context
 from .hint_builder import build_autonomous_hint, build_supervised_hint, build_default_hint
+from .protected_window import _slice_payload_prefix_preserving_db_recent
 from .store import ContextStore
 from .turn_tag_index import TurnTagIndex
 
@@ -92,6 +93,8 @@ class RetrievalAssembler:
         self._last_retrieval_result: RetrievalResult | None = None
         self._last_conversation_history: list[Message] | None = None
         self._last_model_name: str = ""
+        self._last_request_roles = None
+        self._last_speaker_context = None
         self._presented_segment_refs: set[str] = set()
         self._context_hint_cache_key: str = ""
         self._context_hint_cache_value: str = ""
@@ -207,6 +210,7 @@ class RetrievalAssembler:
         _gate_read_ms: float = 0.0
         _gate_merged_rows: int = 0
         _gate_budget_evictions: int = 0
+        _history_already_sliced = False
         _gate_mode = getattr(
             self.config.assembler, "protected_window_db_source", "off",
         )
@@ -219,6 +223,17 @@ class RetrievalAssembler:
                     _merge_protected_window,
                 )
 
+                # The watermark belongs to payload-owned history. Compute its
+                # view before any DB rows are introduced so dedup can only
+                # suppress a canonical row when the payload twin will remain
+                # model-visible. Applying the offset after merge lets an
+                # about-to-be-removed payload user suppress its DB copy while
+                # the sibling DB assistant survives (BUG-045).
+                _gate_payload_offset = self._engine_state.history_offset(
+                    len(conversation_history),
+                    total_turns_indexed=_tti_count_at_entry,
+                    watermark=self._engine_state.flushed_prefix_messages,
+                )
                 _anchor_turn = _last_already_canonical_turn_number(
                     conversation_history,
                 )
@@ -252,11 +267,25 @@ class RetrievalAssembler:
                         _gate_outcome = "tier2_legacy_fallthrough"
                     else:
                         if _redis_int == _anchor_int:
-                            _gate_outcome = "tier2_equal"
+                            # Equality only proves the canonical marker has not
+                            # advanced beyond the payload anchor. It does not
+                            # make a conversation-scoped watermark safe to
+                            # apply to channel-local payload history. If the
+                            # offset will remove anything, Tier 3 must provide
+                            # the canonical replacement before assembly.
+                            _gate_outcome = (
+                                "tier3_db_read_payload_offset"
+                                if _gate_payload_offset > 0
+                                else "tier2_equal"
+                            )
                         else:
                             _gate_outcome = "tier3_db_read"
 
-                if _gate_outcome in ("tier2_legacy_fallthrough", "tier3_db_read"):
+                if _gate_outcome in (
+                    "tier2_legacy_fallthrough",
+                    "tier3_db_read",
+                    "tier3_db_read_payload_offset",
+                ):
                     _gate_stage = time.monotonic()
                     try:
                         _db_recent_rows = self._store.get_recent_canonical_turns(
@@ -274,15 +303,41 @@ class RetrievalAssembler:
                         (time.monotonic() - _gate_stage) * 1000.0, 2,
                     )
                     if _db_recent_rows:
-                        _pre_len = len(conversation_history)
+                        _payload_view = (
+                            _slice_payload_prefix_preserving_db_recent(
+                                conversation_history,
+                                _gate_payload_offset,
+                            )
+                        )
+                        _pre_len = len(_payload_view)
                         conversation_history = _merge_protected_window(
-                            payload_history=conversation_history,
+                            payload_history=_payload_view,
                             db_recent_rows=_db_recent_rows,
                             mode="merge",
+                            dedup_origin_channel_id=(
+                                (
+                                    getattr(
+                                        request_roles,
+                                        "origin_channel_id",
+                                        "",
+                                    )
+                                    or ""
+                                ).strip()
+                                if request_roles is not None
+                                else ""
+                            ),
                         )
                         _gate_merged_rows = max(
                             0, len(conversation_history) - _pre_len,
                         )
+                    else:
+                        # A unified-conversation watermark is not proof that
+                        # channel-local payload rows are disposable. If Tier 3
+                        # cannot supply their canonical replacement, preserve
+                        # the unsliced payload. Duplicate context is safer than
+                        # silently erasing the only visible instruction.
+                        conversation_history = list(conversation_history)
+                    _history_already_sliced = True
         # End cross-channel-mirror gate.
 
         # Determine active tags from recent tag results
@@ -318,13 +373,26 @@ class RetrievalAssembler:
         # calculation from earlier-in-method reads.
         _snapshot_stage = time.monotonic()
         _total_turns = _tti_count_at_entry
-        _offset = self._engine_state.history_offset(
-            len(conversation_history), total_turns_indexed=_total_turns,
-            watermark=_ft,
-        )
-        snapshot = self._monitor.build_snapshot(
-            conversation_history[_offset:]
-        )
+        if _history_already_sliced:
+            uncompacted = list(conversation_history)
+        else:
+            _payload_history_len = sum(
+                1
+                for history_message in conversation_history
+                if not (
+                    isinstance(history_message.metadata, dict)
+                    and history_message.metadata.get("source") == "db_recent"
+                )
+            )
+            _offset = self._engine_state.history_offset(
+                _payload_history_len, total_turns_indexed=_total_turns,
+                watermark=_ft,
+            )
+            uncompacted = _slice_payload_prefix_preserving_db_recent(
+                conversation_history,
+                _offset,
+            )
+        snapshot = self._monitor.build_snapshot(uncompacted)
         utilization = snapshot.total_tokens / snapshot.budget_tokens if snapshot.budget_tokens > 0 else 0.0
         _note("history_snapshot", _snapshot_stage)
 
@@ -390,8 +458,8 @@ class RetrievalAssembler:
                 if tag in query_tags:
                     entry.last_accessed_turn = _tti_count_at_entry
 
-        # Assemble enriched context -- only pass uncompacted messages
-        uncompacted = conversation_history[_offset:]
+        # Assemble enriched context -- only pass uncompacted payload messages,
+        # while retaining the complete DB-recovered protected window.
         _assemble_stage = time.monotonic()
         assembled = self._assembler.assemble(
             core_context=core_context,
@@ -569,8 +637,13 @@ class RetrievalAssembler:
 
         # Cache for reassemble_context() -- used after paging tool execution
         self._last_retrieval_result = retrieval_result
-        self._last_conversation_history = conversation_history
+        # Cache the exact assembly view. Re-applying a conversation-scoped
+        # watermark during paging reassembly can remove channel-local rows a
+        # second time and recreate the half-turn loss fixed above.
+        self._last_conversation_history = list(uncompacted)
         self._last_model_name = model_name
+        self._last_request_roles = request_roles
+        self._last_speaker_context = speaker_context
         self._presented_segment_refs = set(assembled.presented_segment_refs)
 
         return assembled
@@ -601,9 +674,10 @@ class RetrievalAssembler:
 
         ws_param, full_segments_param = self._load_working_set_segments()
 
-        _hist = history or []
-        _tti = len(self._turn_tag_index.entries) if self._turn_tag_index else None
-        uncompacted = _hist[self._engine_state.history_offset(len(_hist), total_turns_indexed=_tti):]
+        # ``on_message_inbound`` caches the already-sliced, already-merged
+        # request view. Paging reassembly must be byte-for-byte faithful to
+        # that protected window rather than applying the watermark again.
+        uncompacted = list(history or [])
         assembled = self._assembler.assemble(
             core_context=core_context,
             retrieval_result=rr,
@@ -612,6 +686,8 @@ class RetrievalAssembler:
             context_hint=context_hint,
             working_set=ws_param,
             full_segments=full_segments_param,
+            request_roles=self._last_request_roles,
+            speaker_context=self._last_speaker_context,
         )
         return assembled.prepend_text
 

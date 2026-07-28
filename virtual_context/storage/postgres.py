@@ -19,6 +19,7 @@ from ..core.canonical_turns import (
     HASH_VERSION,
     compute_turn_hash_from_raw,
     generate_canonical_turn_id,
+    select_recent_logical_turn_rows,
     utcnow_iso,
 )
 from ..core.progress_snapshot import (
@@ -56,13 +57,13 @@ from ..types import (
     CARD_KINDS,
     CARD_SCOPES,
     CARD_SENSITIVITIES,
-    CARD_SENSITIVITY_NORMAL,
     RESERVED_SPEAKER_HANDLES,
     ActorCard,
     ActorCardEntry,
     ActorCardEntrySource,
     ActorFactSource,
     ActorProfile,
+    ActorTurnSource,
     SpeakerHandleAssignment,
     SpeakerHandleCandidate,
     is_valid_speaker_handle,
@@ -1986,7 +1987,9 @@ class PostgresStore(ContextStore):
             # silent privacy failure: delete/merge invalidation would have
             # nothing to invalidate.
             for table in ("actor_profiles", "actor_card_entries",
-                          "actor_card_entry_sources"):
+                          "actor_card_entry_sources",
+                          "actor_card_turn_sources",
+                          "actor_card_rebuild_status"):
                 hit = conn.execute(
                     "SELECT to_regclass(%s) AS reg", (f"public.{table}",),
                 ).fetchone()
@@ -2042,10 +2045,60 @@ class PostgresStore(ContextStore):
                     last_seen_at TEXT NOT NULL,
                     card_built_at TEXT NULL,
                     card_dirty INTEGER NOT NULL DEFAULT 0,
+                    card_invalid INTEGER NOT NULL DEFAULT 0,
                     card_input_hash TEXT NOT NULL DEFAULT '',
+                    card_build_marker TEXT NOT NULL DEFAULT '',
                     PRIMARY KEY (tenant_id, actor_id)
                 )
             """)
+            conn.execute(
+                """ALTER TABLE actor_profiles
+                   ADD COLUMN IF NOT EXISTS card_invalid
+                   INTEGER NOT NULL DEFAULT 0"""
+            )
+            conn.execute(
+                """ALTER TABLE actor_profiles
+                   ADD COLUMN IF NOT EXISTS card_build_marker
+                   TEXT NOT NULL DEFAULT ''"""
+            )
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS actor_card_schema_migrations (
+                    name TEXT PRIMARY KEY,
+                    version INTEGER NOT NULL
+                )
+            """)
+            # Column existence cannot prove that every writer which has run
+            # against this database understood the dirty/invalid split. An
+            # older binary can run after the columns were forward-added and
+            # still set only card_dirty for destructive evidence changes.
+            # Serialize and persist the semantic cutover independently of the
+            # physical schema, conservatively invalidating every ambiguous
+            # dirty row exactly once.
+            conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                ("virtual-context:actor-card:dirty-invalid-split",),
+            ).fetchone()
+            migration = conn.execute(
+                """SELECT version FROM actor_card_schema_migrations
+                    WHERE name = %s FOR UPDATE""",
+                ("dirty-invalid-split",),
+            ).fetchone()
+            if migration is None or int(migration["version"] or 0) < 1:
+                conn.execute(
+                    """UPDATE actor_profiles
+                          SET card_invalid = 1, card_build_marker = ''
+                        WHERE card_dirty <> 0"""
+                )
+                conn.execute(
+                    """INSERT INTO actor_card_schema_migrations (name, version)
+                       VALUES (%s, 1)
+                       ON CONFLICT (name) DO UPDATE
+                           SET version = GREATEST(
+                               actor_card_schema_migrations.version,
+                               EXCLUDED.version
+                           )""",
+                    ("dirty-invalid-split",),
+                )
             conn.execute(f"""
                 CREATE TABLE IF NOT EXISTS actor_card_entries (
                     id TEXT PRIMARY KEY,
@@ -2098,6 +2151,196 @@ class PostgresStore(ContextStore):
             conn.execute(
                 """CREATE INDEX IF NOT EXISTS idx_actor_card_sources_fact
                    ON actor_card_entry_sources(fact_id)"""
+            )
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS actor_card_turn_sources (
+                    entry_id TEXT NOT NULL,
+                    tenant_id TEXT NOT NULL,
+                    owner_conversation_id TEXT NOT NULL,
+                    audience_conversation_id TEXT NOT NULL,
+                    audience_channel_id TEXT NOT NULL DEFAULT '',
+                    canonical_turn_id UUID NOT NULL,
+                    PRIMARY KEY (entry_id, canonical_turn_id),
+                    FOREIGN KEY (entry_id, tenant_id)
+                        REFERENCES actor_card_entries(id, tenant_id)
+                        ON DELETE CASCADE,
+                    FOREIGN KEY (canonical_turn_id)
+                        REFERENCES canonical_turns(canonical_turn_id)
+                        ON DELETE CASCADE
+                )
+            """)
+            conn.execute(
+                """CREATE INDEX IF NOT EXISTS idx_actor_card_turn_sources_owner
+                   ON actor_card_turn_sources(
+                       tenant_id, owner_conversation_id
+                   )"""
+            )
+            conn.execute(
+                """CREATE INDEX IF NOT EXISTS idx_actor_card_turn_sources_audience
+                   ON actor_card_turn_sources(
+                       tenant_id, audience_conversation_id
+                   )"""
+            )
+            conn.execute(
+                """CREATE INDEX IF NOT EXISTS idx_actor_card_turn_sources_turn
+                   ON actor_card_turn_sources(canonical_turn_id)"""
+            )
+            conn.execute("""
+                CREATE OR REPLACE FUNCTION
+                    vc_dirty_actor_card_on_canonical_insert()
+                RETURNS trigger
+                LANGUAGE plpgsql
+                AS $$
+                BEGIN
+                    IF NEW.sender_actor_id <> ''
+                       AND NEW.user_content <> '' THEN
+                        UPDATE actor_profiles p
+                           SET card_dirty = 1, card_build_marker = ''
+                          FROM conversations c
+                         WHERE c.conversation_id = NEW.conversation_id
+                           AND c.phase <> 'deleted'
+                           AND p.tenant_id = c.tenant_id
+                           AND p.actor_id = NEW.sender_actor_id;
+                    END IF;
+                    RETURN NEW;
+                END;
+                $$
+            """)
+            conn.execute(
+                """DROP TRIGGER IF EXISTS
+                       trg_dirty_actor_card_on_canonical_insert
+                   ON canonical_turns"""
+            )
+            conn.execute("""
+                CREATE TRIGGER trg_dirty_actor_card_on_canonical_insert
+                AFTER INSERT ON canonical_turns
+                FOR EACH ROW
+                EXECUTE FUNCTION vc_dirty_actor_card_on_canonical_insert()
+            """)
+            conn.execute("""
+                CREATE OR REPLACE FUNCTION
+                    vc_invalidate_actor_card_turn_source()
+                RETURNS trigger
+                LANGUAGE plpgsql
+                AS $$
+                BEGIN
+                    -- PostgreSQL fires an UPDATE OF trigger when a column is
+                    -- named in SET even if its value did not change. Canonical
+                    -- tagging re-upserts the request-owned row and names these
+                    -- identity/evidence columns, so treat an exact no-op as
+                    -- the additive reconciliation it is. Otherwise every
+                    -- normal live turn invalidates (and can delete) the card
+                    -- entry that just cited it.
+                    IF TG_OP = 'UPDATE'
+                       AND OLD.conversation_id
+                           IS NOT DISTINCT FROM NEW.conversation_id
+                       AND OLD.user_content
+                           IS NOT DISTINCT FROM NEW.user_content
+                       AND OLD.sender_actor_id
+                           IS NOT DISTINCT FROM NEW.sender_actor_id
+                       AND OLD.audience_conversation_id
+                           IS NOT DISTINCT FROM NEW.audience_conversation_id
+                       AND OLD.audience_attribution_version
+                           IS NOT DISTINCT FROM
+                               NEW.audience_attribution_version
+                       AND OLD.origin_channel_id
+                           IS NOT DISTINCT FROM NEW.origin_channel_id
+                       AND OLD.created_at
+                           IS NOT DISTINCT FROM NEW.created_at
+                       AND OLD.first_seen_at
+                           IS NOT DISTINCT FROM NEW.first_seen_at THEN
+                        RETURN NEW;
+                    END IF;
+
+                    UPDATE actor_profiles p
+                       SET card_dirty = 1, card_invalid = 1,
+                           card_build_marker = ''
+                      FROM conversations c
+                     WHERE c.conversation_id = OLD.conversation_id
+                       AND p.tenant_id = c.tenant_id
+                       AND p.actor_id = OLD.sender_actor_id
+                       AND OLD.sender_actor_id <> '';
+
+                    IF TG_OP = 'UPDATE' THEN
+                        UPDATE actor_profiles p
+                           SET card_dirty = 1, card_invalid = 1,
+                               card_build_marker = ''
+                          FROM conversations c
+                         WHERE c.conversation_id = NEW.conversation_id
+                           AND p.tenant_id = c.tenant_id
+                           AND p.actor_id = NEW.sender_actor_id
+                           AND NEW.sender_actor_id <> '';
+                    END IF;
+
+                    UPDATE actor_profiles p
+                       SET card_dirty = 1, card_invalid = 1,
+                           card_build_marker = ''
+                      FROM actor_card_entries e,
+                           actor_card_turn_sources s
+                     WHERE s.canonical_turn_id = OLD.canonical_turn_id
+                       AND e.id = s.entry_id
+                       AND e.tenant_id = s.tenant_id
+                       AND p.tenant_id = e.tenant_id
+                       AND p.actor_id = e.actor_id;
+
+                    DELETE FROM actor_card_entries e
+                     USING actor_card_turn_sources s
+                     WHERE s.canonical_turn_id = OLD.canonical_turn_id
+                       AND e.id = s.entry_id
+                       AND e.tenant_id = s.tenant_id;
+
+                    IF TG_OP = 'DELETE' THEN
+                        RETURN OLD;
+                    END IF;
+                    RETURN NEW;
+                END;
+                $$
+            """)
+            conn.execute(
+                """DROP TRIGGER IF EXISTS
+                       trg_invalidate_actor_card_turn_source
+                   ON canonical_turns"""
+            )
+            conn.execute("""
+                CREATE TRIGGER trg_invalidate_actor_card_turn_source
+                BEFORE DELETE OR UPDATE OF
+                    conversation_id, user_content, sender_actor_id,
+                    audience_conversation_id, audience_attribution_version,
+                    origin_channel_id, created_at, first_seen_at
+                ON canonical_turns
+                FOR EACH ROW
+                EXECUTE FUNCTION vc_invalidate_actor_card_turn_source()
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS actor_card_rebuild_status (
+                    tenant_id TEXT NOT NULL,
+                    actor_id TEXT NOT NULL,
+                    attempted_at TEXT NOT NULL,
+                    input_hash TEXT NOT NULL DEFAULT '',
+                    source_count INTEGER NOT NULL DEFAULT 0,
+                    raw_entry_count INTEGER NOT NULL DEFAULT 0,
+                    accepted_entry_count INTEGER NOT NULL DEFAULT 0,
+                    rejected_counts_json TEXT NOT NULL DEFAULT '{}',
+                    outcome TEXT NOT NULL,
+                    response_hash TEXT NOT NULL DEFAULT '',
+                    written_count INTEGER NOT NULL DEFAULT 0,
+                    failure_count INTEGER NOT NULL DEFAULT 0,
+                    next_retry_at TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (tenant_id, actor_id),
+                    FOREIGN KEY (tenant_id, actor_id)
+                        REFERENCES actor_profiles(tenant_id, actor_id)
+                        ON DELETE CASCADE
+                )
+            """)
+            conn.execute(
+                """ALTER TABLE actor_card_rebuild_status
+                   ADD COLUMN IF NOT EXISTS
+                       failure_count INTEGER NOT NULL DEFAULT 0"""
+            )
+            conn.execute(
+                """ALTER TABLE actor_card_rebuild_status
+                   ADD COLUMN IF NOT EXISTS
+                       next_retry_at TEXT NOT NULL DEFAULT ''"""
             )
 
     def _ensure_speaker_handle_schema(self) -> None:
@@ -8598,7 +8841,9 @@ class PostgresStore(ContextStore):
 
                 report["cards_invalidated"] = self._invalidate_actor_cards(conn, owner)
                 conn.execute(
-                    """UPDATE actor_profiles SET card_dirty = 1, card_input_hash = ''
+                    """UPDATE actor_profiles
+                          SET card_dirty = 1, card_invalid = 1,
+                              card_build_marker = ''
                         WHERE tenant_id = %s AND actor_id IN (
                             SELECT DISTINCT sender_actor_id FROM canonical_turns
                              WHERE conversation_id = %s
@@ -8812,6 +9057,12 @@ class PostgresStore(ContextStore):
                            OR audience_conversation_id = %s""",
                     (owner, owner),
                 )
+                derived_counts["actor_card_turn_sources"] = _count(
+                    """SELECT COUNT(*) AS n FROM actor_card_turn_sources
+                        WHERE owner_conversation_id = %s
+                           OR audience_conversation_id = %s""",
+                    (owner, owner),
+                )
                 report = {
                     "platform": platform_name,
                     "sender_rows_to_normalize": sender_rows,
@@ -8870,7 +9121,9 @@ class PostgresStore(ContextStore):
                         "actor-id normalization lost its lifecycle compare-and-set"
                     )
                 conn.execute(
-                    """UPDATE actor_profiles SET card_dirty = 1, card_input_hash = ''
+                    """UPDATE actor_profiles
+                          SET card_dirty = 1, card_invalid = 1,
+                              card_build_marker = ''
                         WHERE tenant_id = %s AND actor_id IN (
                           SELECT DISTINCT sender_actor_id FROM canonical_turns
                            WHERE conversation_id = %s
@@ -9488,15 +9741,20 @@ class PostgresStore(ContextStore):
     ) -> list[CanonicalTurnRow]:
         """Tier 3 cross-channel-mirror lookup.
 
-        Single indexed query against ``canonical_turns_ordinal`` ordered
-        by ``sort_key DESC`` with ``LIMIT``. No ``tagged_at`` filter —
-        fresh peer-channel rows whose tagger has not caught up must
-        still surface in the protected window. ``conversation_id`` is
-        already indexed via ``idx_canonical_turns_conv_order``.
+        Return the newest ``limit`` *logical turn groups*, preserving every
+        physical row in each selected group. Split user/assistant storage must
+        never let a row-level LIMIT strand one half at the window boundary.
+        Legacy rows without a group number count as singleton groups. No
+        ``tagged_at`` filter is applied — fresh peer-channel rows whose tagger
+        has not caught up must still surface in the protected window.
         """
         if limit <= 0:
             return []
         with self.pool.connection() as conn:
+            # One logical turn has at most two physical rows. Over-fetch by
+            # one additional row so a DESC boundary beginning on an assistant
+            # half is discarded rather than returned without its user half.
+            physical_limit = int(limit) * 2 + 1
             rows = conn.execute(
                 """SELECT canonical_turn_id, conversation_id, turn_number, turn_group_number,
                           sort_key, turn_hash, hash_version,
@@ -9512,13 +9770,18 @@ class PostgresStore(ContextStore):
                           tagged_at, compacted_at,
                           first_seen_at, last_seen_at,
                           source_batch_id, created_at, updated_at
-                   FROM canonical_turns_ordinal
-                   WHERE conversation_id = %s
-                   ORDER BY sort_key DESC
-                   LIMIT %s""",
-                (conversation_id, int(limit)),
+                     FROM canonical_turns_ordinal
+                    WHERE conversation_id = %s
+                   ORDER BY sort_key DESC, created_at DESC,
+                            canonical_turn_id DESC
+                    LIMIT %s
+                """,
+                (conversation_id, physical_limit),
             ).fetchall()
-            return [_row_to_canonical_turn(row) for row in rows]
+            return select_recent_logical_turn_rows(
+                [_row_to_canonical_turn(row) for row in rows],
+                limit=int(limit),
+            )
 
     def has_any_alias(self, conversation_id: str) -> bool:
         """Tier 1 cross-channel-mirror lookup.
@@ -10624,10 +10887,10 @@ class PostgresStore(ContextStore):
                         conn.execute("INSERT INTO fact_tags (fact_id, tag) VALUES (%s, %s)", (fact.id, tag))
                     count += 1
 
-                # Dirty the union of outgoing and incoming authors, in the SAME
-                # transaction as the replacement. Marking cards dirty only after
-                # the facts were replaced would leave a crash window in which
-                # stale card content stays readable; readers serve no dirty card.
+                # Invalidate the union of outgoing and incoming authors in the
+                # SAME transaction as this destructive replacement. Delaying
+                # invalidation would leave a crash window in which a card could
+                # serve evidence whose fact source was already replaced.
                 incoming_authors = {
                     (f.author_actor_id or "").strip()
                     for f in facts
@@ -10662,7 +10925,9 @@ class PostgresStore(ContextStore):
             return 0
         tenant_id = row["tenant_id"] or ""
         result = conn.execute(
-            """UPDATE actor_profiles SET card_dirty = 1
+            """UPDATE actor_profiles
+                  SET card_dirty = 1, card_invalid = 1,
+                      card_build_marker = ''
                 WHERE tenant_id = %s AND actor_id = ANY(%s)""",
             (tenant_id, actor_ids),
         )
@@ -10735,8 +11000,8 @@ class PostgresStore(ContextStore):
                 conn.execute(
                     """INSERT INTO actor_profiles
                            (tenant_id, actor_id, platform, display_name,
-                            first_seen_at, last_seen_at)
-                       VALUES (%s, %s, %s, %s, %s, %s)
+                            first_seen_at, last_seen_at, card_dirty)
+                       VALUES (%s, %s, %s, %s, %s, %s, 1)
                        ON CONFLICT (tenant_id, actor_id) DO UPDATE SET
                            last_seen_at = EXCLUDED.last_seen_at,
                            display_name = CASE
@@ -10874,6 +11139,95 @@ class PostgresStore(ContextStore):
                     break
             return out
 
+    def list_actor_turn_sources(
+        self,
+        tenant_id: str,
+        actor_id: str,
+        *,
+        limit: int = 500,
+    ) -> list[ActorTurnSource]:
+        """Enumerate exact, audience-proved canonical user rows for one actor.
+
+        ``limit`` is applied per audience. Curation partitions audiences before
+        either model sees them, so a globally applied cap would let a busy
+        guild silently crowd all DM evidence (or the reverse) out of a card.
+        A separate total bound of ``max(limit, 2_000)`` caps actors present in
+        very many audiences; rank-first ordering shares that bound fairly.
+        """
+        actor_id = (actor_id or "").strip()
+        cap = max(0, int(limit))
+        total_cap = max(cap, 2_000)
+        if not actor_id or cap <= 0:
+            return []
+        with self.pool.connection() as conn:
+            rows = conn.execute(
+                """WITH ranked AS (
+                       SELECT ct.*,
+                              owner.lifecycle_epoch AS _owner_epoch,
+                              audience.lifecycle_epoch AS _audience_epoch,
+                              ROW_NUMBER() OVER (
+                                  PARTITION BY ct.audience_conversation_id
+                                  ORDER BY
+                                      COALESCE(
+                                          ct.created_at,
+                                          ct.first_seen_at,
+                                          ct.updated_at
+                                      ) DESC NULLS LAST,
+                                      ct.sort_key DESC,
+                                      ct.canonical_turn_id DESC
+                              ) AS _audience_rank
+                         FROM canonical_turns ct
+                         JOIN conversations owner
+                           ON owner.conversation_id = ct.conversation_id
+                         JOIN conversations audience
+                           ON audience.conversation_id =
+                              ct.audience_conversation_id
+                        WHERE ct.sender_actor_id = %s
+                          AND owner.tenant_id = %s
+                          AND audience.tenant_id = %s
+                          AND owner.phase NOT IN ('deleted', 'merged')
+                          AND audience.phase <> 'deleted'
+                          AND ct.audience_attribution_version = %s
+                          AND ct.audience_conversation_id <> ''
+                          AND ct.user_content <> ''
+                   )
+                   SELECT *
+                     FROM ranked
+                    WHERE _audience_rank <= %s
+                    ORDER BY
+                        _audience_rank,
+                        COALESCE(
+                            created_at,
+                            first_seen_at,
+                            updated_at
+                        ) DESC NULLS LAST,
+                        sort_key DESC,
+                        canonical_turn_id DESC
+                    LIMIT %s""",
+                (
+                    actor_id,
+                    tenant_id,
+                    tenant_id,
+                    AUDIENCE_ATTRIBUTION_VERSION,
+                    cap,
+                    total_cap,
+                ),
+            ).fetchall()
+        return [
+            ActorTurnSource(
+                turn=_row_to_canonical_turn(row),
+                tenant_id=tenant_id,
+                owner_conversation_id=row["conversation_id"] or "",
+                audience_conversation_id=(
+                    row["audience_conversation_id"] or ""
+                ),
+                audience_channel_id=row["origin_channel_id"] or "",
+                owner_lifecycle_epoch=int(row["_owner_epoch"] or 0),
+                audience_lifecycle_epoch=int(row["_audience_epoch"] or 0),
+            )
+            for row in rows or ()
+        ]
+
     def get_actor_profile(self, tenant_id: str, actor_id: str) -> ActorProfile | None:
         with self.pool.connection() as conn:
             row = conn.execute(
@@ -10892,15 +11246,24 @@ class PostgresStore(ContextStore):
                 _dt_to_str(row["card_built_at"]) if row["card_built_at"] else None
             ),
             card_dirty=bool(row["card_dirty"]),
+            card_invalid=bool(row["card_invalid"]),
             card_input_hash=row["card_input_hash"] or "",
+            card_build_marker=row["card_build_marker"] or "",
         )
 
-    def mark_actor_card_dirty(self, tenant_id: str, actor_id: str) -> bool:
+    def mark_actor_card_dirty(
+        self,
+        tenant_id: str,
+        actor_id: str,
+        *,
+        build_input_hash: str = "",
+    ) -> bool:
         with self.pool.connection() as conn:
             cur = conn.execute(
-                """UPDATE actor_profiles SET card_dirty = 1
+                """UPDATE actor_profiles
+                      SET card_dirty = 1, card_build_marker = %s
                     WHERE tenant_id = %s AND actor_id = %s""",
-                (tenant_id, actor_id),
+                (build_input_hash or "", tenant_id, actor_id),
             )
             return int(cur.rowcount or 0) == 1
 
@@ -10912,6 +11275,7 @@ class PostgresStore(ContextStore):
         *,
         input_hash: str = "",
         expected_source_epochs: dict[str, int] | None = None,
+        expected_build_marker: str | None = None,
     ) -> int:
         """Atomically replace an actor's card and clear its dirty flag.
 
@@ -10959,11 +11323,18 @@ class PostgresStore(ContextStore):
                     ).fetchone()
 
                 prof = conn.execute(
-                    """SELECT 1 FROM actor_profiles
+                    """SELECT card_dirty, card_build_marker
+                         FROM actor_profiles
                         WHERE tenant_id = %s AND actor_id = %s FOR UPDATE""",
                     (tenant_id, actor_id),
                 ).fetchone()
                 if prof is None:
+                    return 0
+                if expected_build_marker is not None and (
+                    not bool(prof["card_dirty"])
+                    or (prof["card_build_marker"] or "")
+                    != expected_build_marker
+                ):
                     return 0
 
                 # Stale-writer fence: every conversation this card is about to
@@ -10997,36 +11368,98 @@ class PostgresStore(ContextStore):
                         return 0
                     normalized_sources: list[ActorCardEntrySource] = []
                     for src in sources:
-                        fact_row = conn.execute(
-                            """SELECT f.*, c.lifecycle_epoch AS _owner_epoch
-                                 FROM facts f
-                                 JOIN conversations c
-                                   ON c.conversation_id = f.conversation_id
-                                WHERE f.id = %s AND f.author_actor_id = %s
-                                  AND f.superseded_by IS NULL
-                                  AND c.tenant_id = %s
-                                  AND c.phase NOT IN ('deleted', 'merged')""",
-                            (src.fact_id, actor_id, tenant_id),
-                        ).fetchone()
-                        if fact_row is None:
+                        fact_id = (src.fact_id or "").strip()
+                        turn_id = (src.canonical_turn_id or "").strip()
+                        if bool(fact_id) == bool(turn_id):
                             return 0
-                        fact = self._row_to_fact(fact_row)
-                        derived = self._fact_audience(conn, fact)
-                        if derived is None:
-                            return 0
-                        audience_id, channel_id = derived
-                        audience_row = conn.execute(
-                            """SELECT lifecycle_epoch FROM conversations
-                                WHERE conversation_id = %s AND tenant_id = %s
-                                  AND phase <> 'deleted'""",
-                            (audience_id, tenant_id),
-                        ).fetchone()
-                        owner_id = fact.conversation_id
-                        owner_epoch = int(fact_row["_owner_epoch"] or 0)
-                        audience_epoch = (
-                            int(audience_row["lifecycle_epoch"] or 0)
-                            if audience_row is not None else -1
-                        )
+                        if fact_id:
+                            fact_row = conn.execute(
+                                """SELECT f.*,
+                                          c.lifecycle_epoch AS _owner_epoch
+                                     FROM facts f
+                                     JOIN conversations c
+                                       ON c.conversation_id =
+                                          f.conversation_id
+                                    WHERE f.id = %s
+                                      AND f.author_actor_id = %s
+                                      AND f.superseded_by IS NULL
+                                      AND c.tenant_id = %s
+                                      AND c.phase NOT IN (
+                                          'deleted', 'merged'
+                                      )""",
+                                (fact_id, actor_id, tenant_id),
+                            ).fetchone()
+                            if fact_row is None:
+                                return 0
+                            fact = self._row_to_fact(fact_row)
+                            derived = self._fact_audience(conn, fact)
+                            if derived is None:
+                                return 0
+                            audience_id, channel_id = derived
+                            audience_row = conn.execute(
+                                """SELECT lifecycle_epoch
+                                     FROM conversations
+                                    WHERE conversation_id = %s
+                                      AND tenant_id = %s
+                                      AND phase <> 'deleted'""",
+                                (audience_id, tenant_id),
+                            ).fetchone()
+                            owner_id = fact.conversation_id
+                            owner_epoch = int(
+                                fact_row["_owner_epoch"] or 0
+                            )
+                            audience_epoch = (
+                                int(audience_row["lifecycle_epoch"] or 0)
+                                if audience_row is not None else -1
+                            )
+                        else:
+                            turn_row = conn.execute(
+                                """SELECT ct.*,
+                                          owner.lifecycle_epoch
+                                              AS _owner_epoch,
+                                          audience.lifecycle_epoch
+                                              AS _audience_epoch
+                                     FROM canonical_turns ct
+                                     JOIN conversations owner
+                                       ON owner.conversation_id =
+                                          ct.conversation_id
+                                     JOIN conversations audience
+                                       ON audience.conversation_id =
+                                          ct.audience_conversation_id
+                                    WHERE ct.canonical_turn_id = %s
+                                      AND ct.sender_actor_id = %s
+                                      AND ct.user_content <> ''
+                                      AND ct.audience_attribution_version = %s
+                                      AND owner.tenant_id = %s
+                                      AND audience.tenant_id = %s
+                                      AND owner.phase NOT IN (
+                                          'deleted', 'merged'
+                                      )
+                                      AND audience.phase <> 'deleted'""",
+                                (
+                                    turn_id,
+                                    actor_id,
+                                    AUDIENCE_ATTRIBUTION_VERSION,
+                                    tenant_id,
+                                    tenant_id,
+                                ),
+                            ).fetchone()
+                            if turn_row is None:
+                                return 0
+                            owner_id = turn_row["conversation_id"] or ""
+                            audience_id = (
+                                turn_row["audience_conversation_id"] or ""
+                            )
+                            channel_id = (
+                                turn_row["origin_channel_id"] or ""
+                            )
+                            owner_epoch = int(
+                                turn_row["_owner_epoch"] or 0
+                            )
+                            audience_epoch = int(
+                                turn_row["_audience_epoch"] or 0
+                            )
+                            audience_row = turn_row
                         if (
                             audience_row is None
                             or expected.get(owner_id) != owner_epoch
@@ -11044,7 +11477,8 @@ class PostgresStore(ContextStore):
                             owner_conversation_id=owner_id,
                             audience_conversation_id=audience_id,
                             audience_channel_id=channel_id,
-                            fact_id=fact.id,
+                            fact_id=fact_id,
+                            canonical_turn_id=turn_id,
                         ))
                     normalized_entries.append((entry, normalized_sources))
                 entries_with_sources = normalized_entries
@@ -11098,36 +11532,319 @@ class PostgresStore(ContextStore):
                             WHERE entry_id = %s AND tenant_id = %s""",
                         (entry.id, tenant_id),
                     )
+                    conn.execute(
+                        """DELETE FROM actor_card_turn_sources
+                            WHERE entry_id = %s AND tenant_id = %s""",
+                        (entry.id, tenant_id),
+                    )
                     for src in sources:
-                        # Provenance is set from the authoritative fact row by
-                        # the caller; a model- or caller-supplied conversation
-                        # id is never accepted here.
-                        conn.execute(
-                            """INSERT INTO actor_card_entry_sources
-                                   (entry_id, tenant_id, owner_conversation_id,
-                                    audience_conversation_id,
-                                    audience_channel_id, fact_id)
-                               VALUES (%s,%s,%s,%s,%s,%s)
-                               ON CONFLICT (entry_id, fact_id) DO UPDATE SET
-                                   owner_conversation_id=EXCLUDED.owner_conversation_id,
-                                   audience_conversation_id=EXCLUDED.audience_conversation_id,
-                                   audience_channel_id=EXCLUDED.audience_channel_id""",
-                            (
-                                entry.id, tenant_id, src.owner_conversation_id,
-                                src.audience_conversation_id,
-                                src.audience_channel_id or "", src.fact_id,
-                            ),
-                        )
+                        # Provenance is re-derived from the authoritative fact
+                        # or canonical row above; caller/model conversation ids
+                        # are never trusted.
+                        if src.fact_id:
+                            conn.execute(
+                                """INSERT INTO actor_card_entry_sources
+                                       (entry_id, tenant_id,
+                                        owner_conversation_id,
+                                        audience_conversation_id,
+                                        audience_channel_id, fact_id)
+                                   VALUES (%s,%s,%s,%s,%s,%s)
+                                   ON CONFLICT (entry_id, fact_id)
+                                   DO UPDATE SET
+                                       owner_conversation_id =
+                                           EXCLUDED.owner_conversation_id,
+                                       audience_conversation_id =
+                                           EXCLUDED.audience_conversation_id,
+                                       audience_channel_id =
+                                           EXCLUDED.audience_channel_id""",
+                                (
+                                    entry.id,
+                                    tenant_id,
+                                    src.owner_conversation_id,
+                                    src.audience_conversation_id,
+                                    src.audience_channel_id or "",
+                                    src.fact_id,
+                                ),
+                            )
+                        else:
+                            conn.execute(
+                                """INSERT INTO actor_card_turn_sources
+                                       (entry_id, tenant_id,
+                                        owner_conversation_id,
+                                        audience_conversation_id,
+                                        audience_channel_id,
+                                        canonical_turn_id)
+                                   VALUES (%s,%s,%s,%s,%s,%s)
+                                   ON CONFLICT (
+                                       entry_id, canonical_turn_id
+                                   ) DO UPDATE SET
+                                       owner_conversation_id =
+                                           EXCLUDED.owner_conversation_id,
+                                       audience_conversation_id =
+                                           EXCLUDED.audience_conversation_id,
+                                       audience_channel_id =
+                                           EXCLUDED.audience_channel_id""",
+                                (
+                                    entry.id,
+                                    tenant_id,
+                                    src.owner_conversation_id,
+                                    src.audience_conversation_id,
+                                    src.audience_channel_id or "",
+                                    src.canonical_turn_id,
+                                ),
+                            )
                     written += 1
 
                 conn.execute(
                     """UPDATE actor_profiles
                           SET card_built_at = %s, card_dirty = 0,
-                              card_input_hash = %s
+                              card_invalid = 0, card_input_hash = %s,
+                              card_build_marker = ''
                         WHERE tenant_id = %s AND actor_id = %s""",
                     (now, input_hash or "", tenant_id, actor_id),
                 )
                 return written
+
+    def record_actor_card_rebuild_status(
+        self,
+        tenant_id: str,
+        actor_id: str,
+        *,
+        attempted_at: str,
+        input_hash: str,
+        source_count: int,
+        raw_entry_count: int,
+        accepted_entry_count: int,
+        rejected_counts: dict[str, int],
+        outcome: str,
+        response_hash: str,
+        written_count: int,
+    ) -> None:
+        with self.pool.connection() as conn:
+            conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 1))",
+                (f"{tenant_id}\x1f{actor_id}",),
+            ).fetchone()
+            previous = conn.execute(
+                """SELECT input_hash, failure_count
+                     FROM actor_card_rebuild_status
+                    WHERE tenant_id = %s AND actor_id = %s""",
+                (tenant_id, actor_id),
+            ).fetchone()
+            failed_outcomes = {
+                "model_error",
+                "invalid_response",
+                "rejected_all",
+                "admission_error",
+                "coverage_disagreement",
+                "coverage_gap",
+                "stale_or_rejected_write",
+            }
+            if outcome in failed_outcomes:
+                if outcome in {"coverage_disagreement", "coverage_gap"}:
+                    failure_count = 3
+                else:
+                    failure_count = (
+                        int(previous["failure_count"] or 0) + 1
+                        if previous is not None
+                        and (previous["input_hash"] or "") == input_hash
+                        else 1
+                    )
+                attempted = (
+                    _str_to_dt(attempted_at)
+                    or datetime.now(timezone.utc)
+                )
+                next_retry_at = _dt_to_str(
+                    attempted
+                    + timedelta(seconds=min(
+                        3600,
+                        30 * (2 ** max(0, failure_count - 1)),
+                    ))
+                )
+            else:
+                failure_count = 0
+                next_retry_at = ""
+            conn.execute(
+                """INSERT INTO actor_card_rebuild_status
+                       (tenant_id, actor_id, attempted_at, input_hash,
+                        source_count, raw_entry_count, accepted_entry_count,
+                        rejected_counts_json, outcome, response_hash,
+                        written_count, failure_count, next_retry_at)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                   ON CONFLICT (tenant_id, actor_id) DO UPDATE SET
+                       attempted_at = EXCLUDED.attempted_at,
+                       input_hash = EXCLUDED.input_hash,
+                       source_count = EXCLUDED.source_count,
+                       raw_entry_count = EXCLUDED.raw_entry_count,
+                       accepted_entry_count = EXCLUDED.accepted_entry_count,
+                       rejected_counts_json = EXCLUDED.rejected_counts_json,
+                       outcome = EXCLUDED.outcome,
+                       response_hash = EXCLUDED.response_hash,
+                       written_count = EXCLUDED.written_count,
+                       failure_count = EXCLUDED.failure_count,
+                       next_retry_at = EXCLUDED.next_retry_at""",
+                (
+                    tenant_id, actor_id, attempted_at, input_hash,
+                    max(0, int(source_count)), max(0, int(raw_entry_count)),
+                    max(0, int(accepted_entry_count)),
+                    json.dumps(
+                        rejected_counts, sort_keys=True, separators=(",", ":"),
+                    ),
+                    outcome, response_hash, max(0, int(written_count)),
+                    failure_count, next_retry_at,
+                ),
+            )
+
+    def get_actor_card_rebuild_status(
+        self, tenant_id: str, actor_id: str,
+    ) -> dict | None:
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                """SELECT * FROM actor_card_rebuild_status
+                    WHERE tenant_id = %s AND actor_id = %s""",
+                (tenant_id, actor_id),
+            ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        try:
+            result["rejected_counts"] = json.loads(
+                result.pop("rejected_counts_json") or "{}"
+            )
+        except (TypeError, ValueError):
+            result["rejected_counts"] = {}
+            result.pop("rejected_counts_json", None)
+        return result
+
+    def list_due_actor_card_rebuilds(
+        self,
+        tenant_id: str,
+        *,
+        due_at: str,
+        limit: int = 25,
+    ) -> list[str]:
+        """Return transiently failed dirty cards whose backoff has elapsed."""
+        cap = max(0, int(limit))
+        if cap <= 0:
+            return []
+        with self.pool.connection() as conn:
+            rows = conn.execute(
+                """SELECT p.actor_id
+                     FROM actor_profiles p
+                     JOIN actor_card_rebuild_status s
+                       ON s.tenant_id = p.tenant_id
+                      AND s.actor_id = p.actor_id
+                    WHERE p.tenant_id = %s
+                      AND p.card_dirty = 1
+                      AND s.failure_count > 0
+                      AND s.failure_count < 3
+                      AND s.next_retry_at <> ''
+                      AND s.next_retry_at <= %s
+                    ORDER BY s.next_retry_at, p.actor_id
+                    LIMIT %s""",
+                (tenant_id, due_at, cap),
+            ).fetchall()
+        return [str(row["actor_id"]) for row in rows]
+
+    def list_actor_card_carryovers(
+        self,
+        tenant_id: str,
+        actor_id: str,
+    ) -> list[tuple[ActorCardEntry, list[ActorCardEntrySource]]]:
+        """Read active durable identity/style entries for explicit re-admission.
+
+        This is an internal refresh read, not a request-serving read.  The
+        pipeline partitions each entry by its proved source audience, and the
+        atomic replacement path re-validates every fact/turn and lifecycle
+        epoch before a carried entry can commit.
+        """
+        actor_id = (actor_id or "").strip()
+        if not actor_id:
+            return []
+        cross_kinds = _sql_in_list(CARD_CROSS_CONTEXT_KINDS)
+        with self.pool.connection() as conn:
+            rows = conn.execute(
+                f"""SELECT e.* FROM actor_card_entries e
+                     WHERE e.tenant_id = %s
+                       AND e.actor_id = %s
+                       AND e.superseded_by IS NULL
+                       AND e.audience_scope = 'cross_context'
+                       AND e.kind IN ({cross_kinds})
+                       AND (
+                         EXISTS (
+                           SELECT 1 FROM actor_card_entry_sources fs
+                            WHERE fs.entry_id = e.id
+                              AND fs.tenant_id = e.tenant_id
+                         )
+                         OR EXISTS (
+                           SELECT 1 FROM actor_card_turn_sources ts
+                            WHERE ts.entry_id = e.id
+                              AND ts.tenant_id = e.tenant_id
+                         )
+                       )
+                     ORDER BY e.kind, e.confidence DESC, e.updated_at, e.id""",
+                (tenant_id, actor_id),
+            ).fetchall()
+            out: list[
+                tuple[ActorCardEntry, list[ActorCardEntrySource]]
+            ] = []
+            for row in rows:
+                source_rows = conn.execute(
+                    """SELECT owner_conversation_id,
+                              audience_conversation_id,
+                              audience_channel_id, fact_id,
+                              '' AS canonical_turn_id
+                         FROM actor_card_entry_sources
+                        WHERE entry_id = %s AND tenant_id = %s
+                        UNION ALL
+                       SELECT owner_conversation_id,
+                              audience_conversation_id,
+                              audience_channel_id, '' AS fact_id,
+                              canonical_turn_id::text AS canonical_turn_id
+                         FROM actor_card_turn_sources
+                        WHERE entry_id = %s AND tenant_id = %s
+                        ORDER BY fact_id, canonical_turn_id""",
+                    (row["id"], tenant_id, row["id"], tenant_id),
+                ).fetchall()
+                sources = [
+                    ActorCardEntrySource(
+                        entry_id=row["id"],
+                        tenant_id=tenant_id,
+                        owner_conversation_id=(
+                            source["owner_conversation_id"] or ""
+                        ),
+                        audience_conversation_id=(
+                            source["audience_conversation_id"] or ""
+                        ),
+                        audience_channel_id=(
+                            source["audience_channel_id"] or ""
+                        ),
+                        fact_id=source["fact_id"] or "",
+                        canonical_turn_id=(
+                            source["canonical_turn_id"] or ""
+                        ),
+                    )
+                    for source in source_rows
+                ]
+                if not sources:
+                    continue
+                out.append((
+                    ActorCardEntry(
+                        id=row["id"],
+                        tenant_id=tenant_id,
+                        actor_id=actor_id,
+                        kind=row["kind"],
+                        body=row["body"],
+                        confidence=float(row["confidence"] or 0.0),
+                        sensitivity=row["sensitivity"],
+                        audience_scope=row["audience_scope"],
+                        superseded_by=row["superseded_by"],
+                        created_at=row["created_at"],
+                        updated_at=row["updated_at"],
+                    ),
+                    sources,
+                ))
+        return out
 
     def get_actor_card(
         self,
@@ -11140,7 +11857,7 @@ class PostgresStore(ContextStore):
     ) -> ActorCard | None:
         """Read one clean, policy-filtered card.
 
-        This method owns the clean/superseded/privacy/audience predicates so no
+        This method owns the clean/superseded/audience predicates so no
         caller can fetch an unsafe superset and filter it afterwards.
 
         The audience is the validated PRE-ALIAS route, not the resolved owner:
@@ -11177,51 +11894,69 @@ class PostgresStore(ContextStore):
                 return None
 
             prof = conn.execute(
-                """SELECT display_name, card_built_at, card_dirty, card_input_hash
+                """SELECT display_name, card_built_at, card_dirty,
+                          card_invalid, card_input_hash
                      FROM actor_profiles
                     WHERE tenant_id = %s AND actor_id = %s""",
                 (tenant_id, actor_id),
             ).fetchone()
-            if prof is None or int(prof["card_dirty"] or 0):
-                # A dirty card is unreadable. That is what makes delete and
-                # merge invalidation safe without any post-commit callback.
+            if prof is None or int(prof["card_invalid"] or 0):
+                # Destructive provenance changes fail closed. Additive new
+                # turns only set card_dirty, so the last known-good card stays
+                # available while a refresh is pending.
                 return None
 
             cross_kinds = _sql_in_list(CARD_CROSS_CONTEXT_KINDS)
             # The audience predicate runs in SQL, before the return:
             #   * cross_context is allowed only for the policy-granted kinds;
             #   * same_conversation requires EVERY source to carry this exact
-            #     audience id, and — when the request has a durable channel —
-            #     this exact channel. An empty source channel is unknown, not
-            #     wildcard, so it fails closed.
+            #     audience id. Channels inside one guild conversation are
+            #     provenance, not privacy boundaries.
+            #
+            # The legacy sensitivity column is intentionally not a serving
+            # gate. Subject matter does not determine whether a grounded card
+            # entry can reach the model.
             rows = conn.execute(
                 f"""SELECT e.* FROM actor_card_entries e
                      WHERE e.tenant_id = %s
                        AND e.actor_id = %s
                        AND e.superseded_by IS NULL
-                       AND e.sensitivity = %s
+                       AND (
+                         EXISTS (
+                           SELECT 1 FROM actor_card_entry_sources fs
+                            WHERE fs.entry_id = e.id
+                              AND fs.tenant_id = e.tenant_id
+                         )
+                         OR EXISTS (
+                           SELECT 1 FROM actor_card_turn_sources ts
+                            WHERE ts.entry_id = e.id
+                              AND ts.tenant_id = e.tenant_id
+                         )
+                       )
                        AND (
                          (e.audience_scope = 'cross_context'
                           AND e.kind IN ({cross_kinds}))
                          OR (
                            e.audience_scope = 'same_conversation'
-                           AND EXISTS (SELECT 1 FROM actor_card_entry_sources s
-                                        WHERE s.entry_id = e.id)
                            AND NOT EXISTS (
-                             SELECT 1 FROM actor_card_entry_sources s
-                              WHERE s.entry_id = e.id
-                                AND (
-                                  s.audience_conversation_id <> %s
-                                  OR (%s <> '' AND s.audience_channel_id <> %s)
-                                )
+                             SELECT 1 FROM actor_card_entry_sources fs
+                                WHERE fs.entry_id = e.id
+                                  AND fs.tenant_id = e.tenant_id
+                                AND fs.audience_conversation_id <> %s
+                           )
+                           AND NOT EXISTS (
+                             SELECT 1 FROM actor_card_turn_sources ts
+                              WHERE ts.entry_id = e.id
+                                AND ts.tenant_id = e.tenant_id
+                                AND ts.audience_conversation_id <> %s
                            )
                          )
                        )
                      ORDER BY e.kind, e.confidence DESC, e.updated_at, e.id""",
                 (
-                    tenant_id, actor_id, CARD_SENSITIVITY_NORMAL,
+                    tenant_id, actor_id,
                     audience_conversation_id,
-                    audience_channel_id or "", audience_channel_id or "",
+                    audience_conversation_id,
                 ),
             ).fetchall()
             if not rows:
@@ -11275,7 +12010,17 @@ class PostgresStore(ContextStore):
         """
         affected = conn.execute(
             """SELECT DISTINCT s.tenant_id, e.actor_id, s.entry_id
-                 FROM actor_card_entry_sources s
+                 FROM (
+                       SELECT entry_id, tenant_id,
+                              owner_conversation_id,
+                              audience_conversation_id
+                         FROM actor_card_entry_sources
+                       UNION ALL
+                       SELECT entry_id, tenant_id,
+                              owner_conversation_id,
+                              audience_conversation_id
+                         FROM actor_card_turn_sources
+                 ) s
                  JOIN actor_card_entries e
                    ON e.id = s.entry_id AND e.tenant_id = s.tenant_id
                 WHERE s.owner_conversation_id = %s
@@ -11292,12 +12037,17 @@ class PostgresStore(ContextStore):
             (entry_ids,),
         )
         conn.execute(
+            "DELETE FROM actor_card_turn_sources WHERE entry_id = ANY(%s)",
+            (entry_ids,),
+        )
+        conn.execute(
             "DELETE FROM actor_card_entries WHERE id = ANY(%s)", (entry_ids,),
         )
         for tenant_id, actor_id in profiles:
             conn.execute(
                 """UPDATE actor_profiles
-                      SET card_dirty = 1, card_input_hash = ''
+                      SET card_dirty = 1, card_invalid = 1,
+                          card_build_marker = ''
                     WHERE tenant_id = %s AND actor_id = %s""",
                 (tenant_id, actor_id),
             )

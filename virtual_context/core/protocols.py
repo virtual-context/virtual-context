@@ -434,8 +434,16 @@ class FactStore(Protocol):
     def list_actor_facts(
         self, tenant_id: str, actor_id: str, *, limit: int = 60,
     ) -> list: ...
+    def list_actor_turn_sources(
+        self, tenant_id: str, actor_id: str, *, limit: int = 500,
+    ) -> list: ...
+    def list_actor_card_carryovers(
+        self, tenant_id: str, actor_id: str,
+    ) -> list: ...
     def get_actor_profile(self, tenant_id: str, actor_id: str): ...
-    def mark_actor_card_dirty(self, tenant_id: str, actor_id: str) -> bool: ...
+    def mark_actor_card_dirty(
+        self, tenant_id: str, actor_id: str, *, build_input_hash: str = "",
+    ) -> bool: ...
     def replace_actor_card(
         self,
         tenant_id: str,
@@ -444,7 +452,29 @@ class FactStore(Protocol):
         *,
         input_hash: str = "",
         expected_source_epochs: dict[str, int] | None = None,
+        expected_build_marker: str | None = None,
     ) -> int: ...
+    def record_actor_card_rebuild_status(
+        self,
+        tenant_id: str,
+        actor_id: str,
+        *,
+        attempted_at: str,
+        input_hash: str,
+        source_count: int,
+        raw_entry_count: int,
+        accepted_entry_count: int,
+        rejected_counts: dict[str, int],
+        outcome: str,
+        response_hash: str,
+        written_count: int,
+    ) -> None: ...
+    def get_actor_card_rebuild_status(
+        self, tenant_id: str, actor_id: str,
+    ) -> dict | None: ...
+    def list_due_actor_card_rebuilds(
+        self, tenant_id: str, *, due_at: str, limit: int = 25,
+    ) -> list[str]: ...
     def get_actor_card(
         self,
         tenant_id: str,
