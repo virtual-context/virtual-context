@@ -933,6 +933,17 @@ class CompositeStore:
             return 0
         return int(replacer(conversation_id, anchors) or 0)
 
+    def get_canonical_turn_reconcile_rows(
+        self,
+        conversation_id: str,
+    ):
+        loader = getattr(
+            self._segments, "get_canonical_turn_reconcile_rows", None,
+        )
+        if not callable(loader):
+            return None
+        return loader(conversation_id)
+
     def apply_canonical_turn_anchor_delta(
         self,
         conversation_id: str,

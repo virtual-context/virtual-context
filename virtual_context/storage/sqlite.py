@@ -34,7 +34,7 @@ from ..core.progress_snapshot import (
     ProgressSnapshot,
 )
 from ..core.store import ContextStore
-from ..types import AUDIENCE_ATTRIBUTION_VERSION, ChunkEmbedding, ConversationStats, DepthLevel, EngineStateSnapshot, Fact, FactLink, FactSignal, CanonicalTurnChunkEmbedding, CanonicalTurnRow, LinkedFact, QuoteResult, SegmentMetadata, SourceProvenance, SpeakerRetrievalContext, StoredSegment, StoredSummary, TagStats, TagSummary, TemporalStatus, TurnTagEntry, WorkingSetEntry, channel_excerpt_prefix, strip_channel_hash
+from ..types import AUDIENCE_ATTRIBUTION_VERSION, ChunkEmbedding, ConversationStats, DepthLevel, EngineStateSnapshot, Fact, FactLink, FactSignal, CanonicalTurnChunkEmbedding, CanonicalTurnReconcileRow, CanonicalTurnRow, LinkedFact, QuoteResult, SegmentMetadata, SourceProvenance, SpeakerRetrievalContext, StoredSegment, StoredSummary, TagStats, TagSummary, TemporalStatus, TurnTagEntry, WorkingSetEntry, channel_excerpt_prefix, strip_channel_hash
 from ..types import (
     CARD_CROSS_CONTEXT_KINDS,
     CARD_KINDS,
@@ -663,6 +663,51 @@ def _fact_author_col(row: sqlite3.Row, name: str) -> str:
     if name not in row.keys():
         return ""
     return row[name] or ""
+
+
+def _row_to_reconcile_row(row) -> CanonicalTurnReconcileRow:
+    """Map a projected result row to the reconciliation projection.
+
+    Deliberately does not accept a full canonical row: the projection is
+    produced by its own SELECT so the content columns are never fetched,
+    and building one from a full row would defeat the point.
+    """
+    def _text(name: str) -> str:
+        value = row[name]
+        return str(value) if value is not None else ""
+
+    def _int(name: str, default: int = 0) -> int:
+        value = row[name]
+        return int(value) if value is not None else default
+
+    return CanonicalTurnReconcileRow(
+        conversation_id=_text("conversation_id"),
+        canonical_turn_id=_text("canonical_turn_id"),
+        turn_number=_int("turn_number", -1),
+        turn_group_number=_int("turn_group_number", -1),
+        sort_key=float(row["sort_key"]) if row["sort_key"] is not None else 0.0,
+        turn_hash=_text("turn_hash"),
+        session_date=_text("session_date"),
+        sender=_text("sender"),
+        origin_channel_id=_text("origin_channel_id"),
+        origin_channel_label=_text("origin_channel_label"),
+        sender_actor_id=_text("sender_actor_id"),
+        source_message_id=_text("source_message_id"),
+        reply_target_message_id=_text("reply_target_message_id"),
+        reply_subject_actor_id=_text("reply_subject_actor_id"),
+        reply_subject_label=_text("reply_subject_label"),
+        reply_target_body=_text("reply_target_body"),
+        reply_attribution_version=_int("reply_attribution_version"),
+        audience_conversation_id=_text("audience_conversation_id"),
+        audience_attribution_version=_int("audience_attribution_version"),
+        first_seen_at=row["first_seen_at"],
+        last_seen_at=row["last_seen_at"],
+        source_batch_id=(
+            str(row["source_batch_id"]) if row["source_batch_id"] else None
+        ),
+        has_user_content=bool(row["has_user_content"]),
+        has_assistant_content=bool(row["has_assistant_content"]),
+    )
 
 
 def _row_to_canonical_turn(row: sqlite3.Row) -> CanonicalTurnRow:
@@ -9156,6 +9201,48 @@ CREATE TABLE IF NOT EXISTS request_captures (
         conversation_id: str,
     ) -> list[CanonicalTurnRow]:
         return self._load_canonical_turn_rows(conversation_id)
+
+    # ASCII whitespace, matching what Python's ``str.strip()`` removes. The
+    # presence flags below stand in for ``(value or "").strip()`` checks in
+    # the reconciler, so the two must trim the same characters: the default
+    # single-argument TRIM strips spaces only, which would report a row
+    # holding just a newline as carrying content.
+    _WS_TRIM_SQL = (
+        "char(32)||char(9)||char(10)||char(11)||char(12)||char(13)"
+    )
+
+    def get_canonical_turn_reconcile_rows(
+        self,
+        conversation_id: str,
+    ) -> list[CanonicalTurnReconcileRow]:
+        """Load canonical turns projected to the columns reconciliation reads.
+
+        Same rows and same order as ``get_all_canonical_turns``, without
+        the content and normalized-text columns. Those are the widest part
+        of a row and reconciliation never reads them, only whether user or
+        assistant text is present at all.
+        """
+        conn = self._get_conn()
+        rows = conn.execute(
+            f"""SELECT canonical_turn_id, conversation_id, turn_number,
+                      turn_group_number, sort_key, turn_hash,
+                      session_date, sender,
+                      origin_channel_id, origin_channel_label, sender_actor_id,
+                      source_message_id, reply_target_message_id,
+                      reply_subject_actor_id, reply_subject_label,
+                      reply_target_body, reply_attribution_version,
+                      audience_conversation_id, audience_attribution_version,
+                      first_seen_at, last_seen_at, source_batch_id,
+                      (trim(coalesce(user_content, ''), {self._WS_TRIM_SQL}) <> '')
+                          AS has_user_content,
+                      (trim(coalesce(assistant_content, ''), {self._WS_TRIM_SQL}) <> '')
+                          AS has_assistant_content
+               FROM canonical_turns_ordinal
+               WHERE conversation_id = ?
+               ORDER BY sort_key, canonical_turn_id""",
+            (conversation_id,),
+        ).fetchall()
+        return [_row_to_reconcile_row(row) for row in rows]
 
     def count_canonical_turns(self, conversation_id: str) -> int:
         """Indexed COUNT of canonical_turn rows under the literal id."""

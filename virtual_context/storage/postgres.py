@@ -35,6 +35,7 @@ from ..types import (
     FactLink,
     FactSignal,
     CanonicalTurnChunkEmbedding,
+    CanonicalTurnReconcileRow,
     CanonicalTurnRow,
     LinkedFact,
     QuoteResult,
@@ -818,6 +819,51 @@ def _row_to_summary(row: dict, tags: list[str]) -> StoredSummary:
         created_at=_str_to_dt(row["created_at"]),
         start_timestamp=_str_to_dt(row["start_timestamp"]),
         end_timestamp=_str_to_dt(row["end_timestamp"]),
+    )
+
+
+def _row_to_reconcile_row(row: dict) -> CanonicalTurnReconcileRow:
+    """Map a projected result row to the reconciliation projection.
+
+    Deliberately does not accept a full canonical row: the projection is
+    produced by its own SELECT so the content columns are never fetched,
+    and building one from a full row would defeat the point.
+    """
+    def _text(name: str) -> str:
+        value = row.get(name)
+        return str(value) if value is not None else ""
+
+    def _int(name: str, default: int = 0) -> int:
+        value = row.get(name)
+        return int(value) if value is not None else default
+
+    return CanonicalTurnReconcileRow(
+        conversation_id=_text("conversation_id"),
+        canonical_turn_id=_text("canonical_turn_id"),
+        turn_number=_int("turn_number", -1),
+        turn_group_number=_int("turn_group_number", -1),
+        sort_key=float(row.get("sort_key") or 0.0),
+        turn_hash=_text("turn_hash"),
+        session_date=_text("session_date"),
+        sender=_text("sender"),
+        origin_channel_id=_text("origin_channel_id"),
+        origin_channel_label=_text("origin_channel_label"),
+        sender_actor_id=_text("sender_actor_id"),
+        source_message_id=_text("source_message_id"),
+        reply_target_message_id=_text("reply_target_message_id"),
+        reply_subject_actor_id=_text("reply_subject_actor_id"),
+        reply_subject_label=_text("reply_subject_label"),
+        reply_target_body=_text("reply_target_body"),
+        reply_attribution_version=_int("reply_attribution_version"),
+        audience_conversation_id=_text("audience_conversation_id"),
+        audience_attribution_version=_int("audience_attribution_version"),
+        first_seen_at=row.get("first_seen_at"),
+        last_seen_at=row.get("last_seen_at"),
+        source_batch_id=(
+            str(row.get("source_batch_id")) if row.get("source_batch_id") else None
+        ),
+        has_user_content=bool(row.get("has_user_content")),
+        has_assistant_content=bool(row.get("has_assistant_content")),
     )
 
 
@@ -9351,6 +9397,47 @@ class PostgresStore(ContextStore):
         conversation_id: str,
     ) -> list[CanonicalTurnRow]:
         return self._load_canonical_turn_rows(conversation_id)
+
+    # ASCII whitespace, matching what Python's ``str.strip()`` removes. The
+    # presence flags below stand in for ``(value or "").strip()`` checks in
+    # the reconciler, so the two must trim the same characters: the default
+    # single-argument BTRIM strips spaces only, which would report a row
+    # holding just a newline as carrying content.
+    _WS_TRIM_SQL = r"E' \t\n\r\f\v'"
+
+    def get_canonical_turn_reconcile_rows(
+        self,
+        conversation_id: str,
+    ) -> list[CanonicalTurnReconcileRow]:
+        """Load canonical turns projected to the columns reconciliation reads.
+
+        Same rows and same order as ``get_all_canonical_turns``, without
+        the content and normalized-text columns. Those are the widest part
+        of a row and are stored out of line, so fetching them dominates
+        the cost of a load that never reads them, only whether user or
+        assistant text is present at all.
+        """
+        with self.pool.connection() as conn:
+            rows = conn.execute(
+                f"""SELECT canonical_turn_id, conversation_id, turn_number,
+                          turn_group_number, sort_key, turn_hash,
+                          session_date, sender,
+                          origin_channel_id, origin_channel_label, sender_actor_id,
+                          source_message_id, reply_target_message_id,
+                          reply_subject_actor_id, reply_subject_label,
+                          reply_target_body, reply_attribution_version,
+                          audience_conversation_id, audience_attribution_version,
+                          first_seen_at, last_seen_at, source_batch_id,
+                          (btrim(coalesce(user_content, ''), {self._WS_TRIM_SQL}) <> '')
+                              AS has_user_content,
+                          (btrim(coalesce(assistant_content, ''), {self._WS_TRIM_SQL}) <> '')
+                              AS has_assistant_content
+                   FROM canonical_turns_ordinal
+                   WHERE conversation_id = %s
+                   ORDER BY sort_key, canonical_turn_id""",
+                (conversation_id,),
+            ).fetchall()
+        return [_row_to_reconcile_row(row) for row in rows]
 
     def count_canonical_turns(self, conversation_id: str) -> int:
         """Indexed COUNT of canonical_turn rows under the literal id."""

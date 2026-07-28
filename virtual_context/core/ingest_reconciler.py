@@ -215,7 +215,7 @@ class IngestReconciler:
                 if name in user_reply_edge
             })
         with self._conversation_merge_lock(conversation_id):
-            existing = self._store.get_all_canonical_turns(conversation_id)
+            existing = self._load_reconcile_rows(conversation_id)
             prepared = [
                 self._prepare_message_row(
                     conversation_id,
@@ -270,9 +270,18 @@ class IngestReconciler:
                             row.first_seen_at = existing_row.first_seen_at or row.first_seen_at
                             row.last_seen_at = utcnow_iso()
                             self._preserve_existing_enrichment(row, existing_row)
+                            # Carry the stored ordinal onto the returned row.
+                            # Consumers stamp ``turn_number`` onto payload
+                            # messages and skip the -1 sentinel, so a prepared
+                            # row that never learned its position would silently
+                            # stop anchoring the protected window.
+                            ordinal = self._ordinal_for_row(
+                                existing, existing_row.canonical_turn_id,
+                            )
+                            row.turn_number = ordinal
                             self._write_turn(
                                 row,
-                                turn_number=self._ordinal_for_row(existing, existing_row.canonical_turn_id),
+                                turn_number=ordinal,
                                 first_seen_at=row.first_seen_at,
                                 last_seen_at=row.last_seen_at,
                             )
@@ -290,7 +299,7 @@ class IngestReconciler:
                             turns_appended=0,
                             turns_prepended=0,
                             turns_inserted=0,
-                            rows=recent,
+                            rows=prepared,
                         )
             # Prepare-then-ingest flow: the pair's user half is normally
             # already persisted as the conversation's LAST row by the
@@ -345,7 +354,7 @@ class IngestReconciler:
                         tail.canonical_turn_id
                         and tail_candidate_sender
                         and not (tail.sender or "").strip()
-                        and (tail.user_content or "").strip()
+                        and self._row_has_user_content(tail)
                     ):
                         self._upgrade_empty_senders(
                             conversation_id,
@@ -361,7 +370,7 @@ class IngestReconciler:
                         tail.canonical_turn_id
                         and tail_candidate_actor
                         and not (tail.sender_actor_id or "").strip()
-                        and (tail.user_content or "").strip()
+                        and self._row_has_user_content(tail)
                     ):
                         self._upgrade_empty_actors(
                             conversation_id,
@@ -785,7 +794,7 @@ class IngestReconciler:
             )
             phase_timings: dict[str, float] = {}
             _t_load = time.perf_counter()
-            existing = self._store.get_all_canonical_turns(conversation_id)
+            existing = self._load_reconcile_rows(conversation_id)
             phase_timings["load_ms"] = (time.perf_counter() - _t_load) * 1000.0
             result = self._ingest_prepared_turns_locked(
                 conversation_id,
@@ -1342,7 +1351,7 @@ class IngestReconciler:
 
     @staticmethod
     def _preserve_existing_enrichment(
-        row: CanonicalTurnRow, existing_row: CanonicalTurnRow,
+        row: CanonicalTurnRow, existing_row,
     ) -> None:
         # Re-ingest of an already-stored turn constructs a new prepared row
         # from the incoming payload and overwrites the stored row. When the
@@ -1869,12 +1878,31 @@ class IngestReconciler:
             # Store lacks the bulk shift: per-row upserts in descending key
             # order. The delta puts every shifted key above the current
             # maximum, so each single-row write lands in free space.
+            #
+            # This path rewrites whole rows, so it needs the content that
+            # reconciliation itself never reads. When the rows in hand are
+            # the projection, re-read the full rows for the shift. The extra
+            # load only happens on a store that already lacks the bulk
+            # shift, and writing a projected row here would blank content.
+            full_rows: dict[str, CanonicalTurnRow] = {}
+            if any(not hasattr(r, "user_content") for r in existing):
+                full_rows = {
+                    r.canonical_turn_id: r
+                    for r in self._store.get_all_canonical_turns(conversation_id)
+                    if r.canonical_turn_id
+                }
             for row in sorted(
                 (r for r in existing if r.sort_key >= right_key),
                 key=lambda r: r.sort_key,
                 reverse=True,
             ):
                 row.sort_key = float(row.sort_key) + delta
+                # Keep the caller's in-memory mirror moving in lockstep even
+                # though the write below may go through a different object.
+                writable = full_rows.get(row.canonical_turn_id, row)
+                if writable is not row:
+                    writable.sort_key = row.sort_key
+                row = writable
                 # Direct save (not _write_turn): content is unchanged, so
                 # re-embedding the shifted rows would be pure waste.
                 self._store.save_canonical_turn(
@@ -1943,7 +1971,39 @@ class IngestReconciler:
             return False
         return datetime.now(timezone.utc) - seen_at <= timedelta(minutes=10)
 
-    def _ordinal_for_row(self, rows: list[CanonicalTurnRow], canonical_turn_id: str) -> int:
+    def _load_reconcile_rows(self, conversation_id: str) -> list:
+        """Load stored rows for reconciliation, projected where possible.
+
+        Reconciliation reads hashes, sort keys, identity and provenance
+        columns, plus whether each half carries text. It never reads the
+        text, which is the widest part of a row. Backends that can supply
+        the projection do; the rest fall back to the full row load, which
+        is a superset and therefore always safe.
+        """
+        loader = getattr(self._store, "get_canonical_turn_reconcile_rows", None)
+        if callable(loader):
+            rows = loader(conversation_id)
+            # None means "not supported", which is not the same answer as an
+            # empty conversation. Only a list is a real result.
+            if rows is not None:
+                return list(rows)
+        return list(self._store.get_all_canonical_turns(conversation_id))
+
+    @staticmethod
+    def _row_has_user_content(row) -> bool:
+        """Whether a stored row carries user text.
+
+        Reads the projection's precomputed flag when present, otherwise
+        inspects the content directly. Both spellings must agree, so the
+        SQL that builds the flag trims the same characters ``str.strip()``
+        does.
+        """
+        flag = getattr(row, "has_user_content", None)
+        if flag is not None:
+            return bool(flag)
+        return bool((getattr(row, "user_content", "") or "").strip())
+
+    def _ordinal_for_row(self, rows: list, canonical_turn_id: str) -> int:
         for idx, row in enumerate(rows):
             if row.canonical_turn_id == canonical_turn_id:
                 return idx
@@ -2028,7 +2088,7 @@ class IngestReconciler:
         saver = getattr(self._store, "replace_canonical_turn_anchors", None)
         if not callable(saver):
             return 0
-        rows = self._store.get_all_canonical_turns(conversation_id)
+        rows = self._load_reconcile_rows(conversation_id)
         desired = _build_anchor_rows(rows)
         if previous_rows is not None:
             applier = getattr(

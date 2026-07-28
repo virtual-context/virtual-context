@@ -242,6 +242,10 @@ class SegmentStore(Protocol):
         conversation_id: str,
         anchors: list[tuple[int, str, str]],
     ) -> int: ...
+    def get_canonical_turn_reconcile_rows(
+        self,
+        conversation_id: str,
+    ) -> list | None: ...
     def apply_canonical_turn_anchor_delta(
         self,
         conversation_id: str,
