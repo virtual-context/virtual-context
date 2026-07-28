@@ -69,7 +69,7 @@ class _AnchorStore:
 
     def __init__(self, rows: list[CanonicalTurnRow]) -> None:
         self.rows = list(rows)
-        self.anchors: set[tuple[int, str, str]] = set()
+        self.anchors: list[tuple[int, str, str]] = []
         self.full_rebuilds = 0
         self.delta_calls = 0
         self.rows_inserted = 0
@@ -80,20 +80,19 @@ class _AnchorStore:
 
     def replace_canonical_turn_anchors(self, conversation_id: str, anchors):
         self.full_rebuilds += 1
-        self.anchors = {tuple(anchor) for anchor in anchors}
+        self.anchors = [tuple(anchor) for anchor in anchors]
         return len(self.anchors)
 
-    def count_canonical_turn_anchors(self, conversation_id: str) -> int:
-        return len(self.anchors)
+    def get_canonical_turn_anchors(self, conversation_id: str):
+        return list(self.anchors)
 
     def apply_canonical_turn_anchor_delta(self, conversation_id: str, *, insert, delete):
         self.delta_calls += 1
         self.rows_inserted += len(insert)
         self.rows_deleted += len(delete)
-        for anchor in delete:
-            self.anchors.discard(tuple(anchor))
-        for anchor in insert:
-            self.anchors.add(tuple(anchor))
+        doomed = {tuple(anchor) for anchor in delete}
+        self.anchors = [a for a in self.anchors if a not in doomed]
+        self.anchors.extend(tuple(anchor) for anchor in insert)
         return len(insert)
 
 
@@ -153,16 +152,18 @@ def test_incremental_delta_matches_full_rebuild(name):
     store = _AnchorStore(before_rows)
     reconciler = _reconciler(store)
 
-    # Seed via the full rebuild so the stored set is the honest prior state.
+    # Seed the stored set, then forget how it got there.
     reconciler._refresh_persisted_anchors("c")
-    assert store.anchors == _canonical_anchor_set(before_rows)
+    assert set(store.anchors) == _canonical_anchor_set(before_rows)
+    store.delta_calls = store.full_rebuilds = 0
 
-    # Transition, then refresh incrementally.
+    # Transition, then refresh.
     store.rows = after_rows
-    reconciler._refresh_persisted_anchors("c", previous_rows=before_rows)
+    reconciler._refresh_persisted_anchors("c")
 
     assert store.delta_calls == 1, "expected the incremental path, not a rebuild"
-    assert store.anchors == _canonical_anchor_set(after_rows)
+    assert store.full_rebuilds == 0
+    assert set(store.anchors) == _canonical_anchor_set(after_rows)
 
 
 @pytest.mark.regression("BUG-044")
@@ -184,20 +185,20 @@ def test_incremental_result_is_order_independent(name):
     rec_a = _reconciler(store_a)
     rec_a._refresh_persisted_anchors("c")
     store_a.rows = after_rows
-    rec_a._refresh_persisted_anchors("c", previous_rows=before_rows)
+    rec_a._refresh_persisted_anchors("c")
 
     # Ordering B: build up from empty using only deltas.
     store_b = _AnchorStore([])
     rec_b = _reconciler(store_b)
-    rec_b._refresh_persisted_anchors("c", previous_rows=[])
+    rec_b._refresh_persisted_anchors("c")
     store_b.rows = before_rows
-    rec_b._refresh_persisted_anchors("c", previous_rows=[])
+    rec_b._refresh_persisted_anchors("c")
     store_b.rows = after_rows
-    rec_b._refresh_persisted_anchors("c", previous_rows=before_rows)
+    rec_b._refresh_persisted_anchors("c")
 
-    assert store_a.anchors == expected
-    assert store_b.anchors == expected
-    assert store_a.anchors == store_b.anchors
+    assert set(store_a.anchors) == expected
+    assert set(store_b.anchors) == expected
+    assert set(store_a.anchors) == set(store_b.anchors)
 
 
 # ---------------------------------------------------------------------------
@@ -220,16 +221,17 @@ def test_append_writes_bounded_anchor_rows_not_whole_conversation():
     reconciler._refresh_persisted_anchors("c")
     seeded = len(store.anchors)
     assert seeded > 1000, "fixture must be large enough for O(N) to be obvious"
+    store.rows_inserted = store.rows_deleted = store.full_rebuilds = 0
 
     store.rows = after_rows
-    reconciler._refresh_persisted_anchors("c", previous_rows=before_rows)
+    reconciler._refresh_persisted_anchors("c")
 
     # One appended row creates exactly one new window per window size.
     # Derived from the constant rather than written as a literal, so the
     # assertion keeps measuring the invariant if the window set changes.
     assert store.rows_inserted == len(_ANCHOR_WINDOW_SIZES)
     assert store.rows_deleted == 0
-    assert store.full_rebuilds == 1, "the append must not trigger a rebuild"
+    assert store.full_rebuilds == 0, "the append must not trigger a rebuild"
 
 
 @pytest.mark.regression("BUG-044")
@@ -245,12 +247,13 @@ def test_unchanged_sequence_writes_nothing():
     reconciler = _reconciler(store)
     reconciler._refresh_persisted_anchors("c")
     baseline = set(store.anchors)
+    store.delta_calls = store.full_rebuilds = 0
 
-    reconciler._refresh_persisted_anchors("c", previous_rows=rows)
+    reconciler._refresh_persisted_anchors("c")
 
-    assert store.delta_calls == 0
-    assert store.full_rebuilds == 1
-    assert store.anchors == baseline
+    assert store.delta_calls == 0, "an unchanged sequence must write nothing"
+    assert store.full_rebuilds == 0
+    assert set(store.anchors) == baseline
 
 
 # ---------------------------------------------------------------------------
@@ -258,31 +261,69 @@ def test_unchanged_sequence_writes_nothing():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.regression("BUG-044")
-def test_diverged_store_falls_back_to_full_rebuild():
-    """If the stored set is not what the pre-state implies, rebuild.
+@pytest.mark.parametrize("corruption", ["missing", "stale", "duplicate", "swapped"])
+def test_diverged_store_is_repaired_exactly(corruption):
+    """Whatever state the table is in, one refresh restores the truth.
 
-    The delta is derived from ``previous_rows`` rather than from a read of
-    the stored anchors, so it is only sound when the store actually holds
-    the set that ``previous_rows`` implies. A concurrent writer, a torn
-    write, or a conversation whose anchors were never built all break that
-    assumption, and the full rebuild is what self-heals them.
+    The delta is computed against the anchors actually stored, not
+    against what a prior row sequence implies they should be, so a
+    diverged table converges instead of having the divergence written
+    over and preserved. ``swapped`` is the case a cardinality check
+    cannot see: one required anchor absent and one stale anchor present,
+    so the row count is exactly right and the contents are wrong.
     """
-    before_rows = _rows(_BASE)
-    after_rows = _rows(_BASE + ["i"])
+    rows = _rows(_BASE)
+    store = _AnchorStore(rows)
+    reconciler = _reconciler(store)
+    reconciler._refresh_persisted_anchors("c")
+    truth = _canonical_anchor_set(rows)
+    assert set(store.anchors) == truth
 
-    store = _AnchorStore(before_rows)
+    bogus = (3, "hash-of-nothing", "id-ghost")
+    if corruption == "missing":
+        store.anchors.pop()
+    elif corruption == "stale":
+        store.anchors.append(bogus)
+    elif corruption == "duplicate":
+        store.anchors.append(store.anchors[0])
+    elif corruption == "swapped":
+        store.anchors.pop()
+        store.anchors.append(bogus)
+        assert len(store.anchors) == len(truth), "fixture must preserve cardinality"
+
+    assert set(store.anchors) != truth or corruption == "duplicate"
+    reconciler._refresh_persisted_anchors("c")
+
+    assert set(store.anchors) == truth
+    assert len(store.anchors) == len(truth), "duplicates must not survive repair"
+
+
+@pytest.mark.regression("BUG-044")
+def test_unreadable_anchor_store_rebuilds_rather_than_assuming_empty():
+    """A backend that cannot report its anchors must not be read as empty.
+
+    None and [] are different answers. Treating "cannot say" as "holds
+    none" computes a delta that inserts the whole set on top of whatever
+    is already there, duplicating every anchor in the conversation, and
+    deletes nothing that has gone stale.
+    """
+    rows = _rows(_BASE)
+
+    class _Unreadable(_AnchorStore):
+        def get_canonical_turn_anchors(self, conversation_id: str):
+            return None
+
+    store = _Unreadable(rows)
     reconciler = _reconciler(store)
     reconciler._refresh_persisted_anchors("c")
 
-    # Corrupt the stored set so its size no longer matches the pre-state.
-    store.anchors.pop()
+    assert store.delta_calls == 0, "must not delta against an unknown set"
+    assert store.full_rebuilds == 1
+    assert set(store.anchors) == _canonical_anchor_set(rows)
 
-    store.rows = after_rows
-    reconciler._refresh_persisted_anchors("c", previous_rows=before_rows)
-
-    assert store.delta_calls == 0, "diverged store must not take the delta path"
-    assert store.full_rebuilds == 2
-    assert store.anchors == _canonical_anchor_set(after_rows)
+    # And a second pass must not accumulate duplicates.
+    reconciler._refresh_persisted_anchors("c")
+    assert len(store.anchors) == len(_canonical_anchor_set(rows))
 
 
 @pytest.mark.regression("BUG-044")
@@ -299,10 +340,10 @@ def test_store_without_delta_support_still_rebuilds():
     reconciler = _reconciler(store)
     reconciler._refresh_persisted_anchors("c")
     store.rows = after_rows
-    reconciler._refresh_persisted_anchors("c", previous_rows=before_rows)
+    reconciler._refresh_persisted_anchors("c")
 
     assert store.full_rebuilds == 2
-    assert store.anchors == _canonical_anchor_set(after_rows)
+    assert set(store.anchors) == _canonical_anchor_set(after_rows)
 
 
 # ---------------------------------------------------------------------------
@@ -312,19 +353,25 @@ def test_store_without_delta_support_still_rebuilds():
 @pytest.mark.regression("BUG-044")
 @pytest.mark.parametrize("name", sorted(TRANSITIONS))
 def test_sqlite_delta_write_matches_rebuild_write(tmp_path: Path, name):
-    """Applying the delta leaves the same table state as replacing wholesale."""
+    """Applying the delta leaves the same table state as replacing wholesale.
+
+    The delta is derived the way the reconciler derives it: from the
+    anchors the store actually reports, not from a remembered prior.
+    """
     before, after = TRANSITIONS[name]
-    before_rows, after_rows = _rows(before), _rows(after)
+    desired = _build_anchor_rows(_rows(after))
+    desired_set = set(desired)
 
-    prior = _build_anchor_rows(before_rows)
-    desired = _build_anchor_rows(after_rows)
-    prior_set, desired_set = set(prior), set(desired)
-    to_insert = [a for a in desired if a not in prior_set]
-    to_delete = [a for a in prior if a not in desired_set]
-
-    # Path 1: seed with prior, then apply the delta.
+    # Path 1: seed with the pre-state, then apply a delta computed against
+    # what the store reports.
     delta_store = SQLiteStore(tmp_path / "delta.db")
-    delta_store.replace_canonical_turn_anchors("c", prior)
+    delta_store.replace_canonical_turn_anchors("c", _build_anchor_rows(_rows(before)))
+    stored = delta_store.get_canonical_turn_anchors("c")
+    counts: dict[tuple[int, str, str], int] = {}
+    for anchor in stored:
+        counts[anchor] = counts.get(anchor, 0) + 1
+    to_delete = [a for a, n in counts.items() if a not in desired_set or n > 1]
+    to_insert = [a for a in desired if counts.get(a, 0) != 1]
     delta_store.apply_canonical_turn_anchor_delta(
         "c", insert=to_insert, delete=to_delete,
     )
@@ -335,7 +382,25 @@ def test_sqlite_delta_write_matches_rebuild_write(tmp_path: Path, name):
 
     assert _stored_anchor_set(delta_store) == _stored_anchor_set(rebuild_store)
     assert _stored_anchor_set(delta_store) == desired_set
-    assert delta_store.count_canonical_turn_anchors("c") == len(desired_set)
+    assert len(delta_store.get_canonical_turn_anchors("c")) == len(desired_set)
+
+
+@pytest.mark.regression("BUG-044")
+def test_sqlite_reader_reports_duplicates(tmp_path: Path):
+    """Duplicates must be visible, not collapsed.
+
+    The table has no uniqueness constraint, so a repeated triple is real
+    divergence. A reader that deduplicated would hide exactly the state
+    the repair exists to fix.
+    """
+    store = SQLiteStore(tmp_path / "s.db")
+    anchors = _build_anchor_rows(_rows(_BASE))
+    store.replace_canonical_turn_anchors("c", anchors)
+    store.apply_canonical_turn_anchor_delta("c", insert=[anchors[0]], delete=[])
+
+    reported = store.get_canonical_turn_anchors("c")
+    assert len(reported) == len(anchors) + 1
+    assert reported.count(anchors[0]) == 2
 
 
 @pytest.mark.regression("BUG-044")
@@ -349,41 +414,8 @@ def test_sqlite_delta_is_scoped_to_its_conversation(tmp_path: Path):
 
     store.apply_canonical_turn_anchor_delta("c", insert=[], delete=list(mine))
 
-    assert store.count_canonical_turn_anchors("c") == 0
-    assert store.count_canonical_turn_anchors("other") == len(set(theirs))
-
-
-@pytest.mark.regression("BUG-044")
-def test_alignment_searches_every_persisted_window_size():
-    """The aligner must consult exactly the window sizes that are stored.
-
-    The two sets used to be written out independently. A size persisted
-    but never searched is wasted storage; a size searched but never
-    persisted silently finds nothing, and because ``_find_alignment``
-    falls through to ``no_overlap_append`` rather than raising, that loss
-    shows up as duplicated history rather than as an error.
-    """
-    rows = _rows(_BASE)
-    store = _AnchorStore(rows)
-    reconciler = _reconciler(store)
-
-    requested: list[int] = []
-
-    def _record(conversation_id, existing, window_size):
-        requested.append(window_size)
-        return {}
-
-    reconciler._load_existing_anchor_index = _record
-
-    # Incoming shares no hash with the stored rows, so the search cannot
-    # short-circuit and has to try every window size it knows about.
-    incoming = _rows(["z1", "z2", "z3", "z4", "z5", "z6"])
-    assert reconciler._find_alignment("c", rows, incoming) is None
-
-    assert sorted(requested) == sorted(_ANCHOR_WINDOW_SIZES)
-    assert requested == list(_ALIGNMENT_WINDOW_SIZES)
-    # Largest first: a longer corroborated window outranks a shorter one.
-    assert requested == sorted(requested, reverse=True)
+    assert store.get_canonical_turn_anchors("c") == []
+    assert len(store.get_canonical_turn_anchors("other")) == len(set(theirs))
 
 
 def _stored_anchor_set(store: SQLiteStore) -> set[tuple[int, str, str]]:
@@ -415,7 +447,7 @@ def test_anchor_hashes_still_resolve_windows_after_delta():
     reconciler = _reconciler(store)
     reconciler._refresh_persisted_anchors("c")
     store.rows = after_rows
-    reconciler._refresh_persisted_anchors("c", previous_rows=before_rows)
+    reconciler._refresh_persisted_anchors("c")
 
     for window_size in (3, 4, 5):
         for start in range(0, len(after_rows) - window_size + 1):

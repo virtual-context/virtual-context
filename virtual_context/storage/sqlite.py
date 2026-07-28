@@ -9658,14 +9658,23 @@ CREATE TABLE IF NOT EXISTS request_captures (
         self._commit_if_unlocked(conn)
         return len(insertions)
 
-    def count_canonical_turn_anchors(self, conversation_id: str) -> int:
-        """COUNT of persisted anchor rows for the conversation."""
+    def get_canonical_turn_anchors(
+        self, conversation_id: str,
+    ) -> list[tuple[int, str, str]]:
+        """Every persisted anchor for the conversation, duplicates included.
+
+        Duplicates are returned rather than collapsed: the table carries
+        no uniqueness constraint, so a repeated triple is real divergence
+        and the caller has to be able to see it in order to repair it.
+        """
         conn = self._get_conn()
-        row = conn.execute(
-            "SELECT COUNT(*) FROM canonical_turn_anchors WHERE conversation_id = ?",
+        rows = conn.execute(
+            """SELECT window_size, anchor_hash, start_turn_id
+               FROM canonical_turn_anchors
+               WHERE conversation_id = ?""",
             (conversation_id,),
-        ).fetchone()
-        return int(row[0]) if row else 0
+        ).fetchall()
+        return [(int(r[0]), str(r[1]), str(r[2])) for r in rows]
 
     def get_canonical_turn_anchor_positions(
         self,

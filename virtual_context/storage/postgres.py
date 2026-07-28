@@ -9852,16 +9852,35 @@ class PostgresStore(ContextStore):
                     )
         return len(insertions)
 
-    def count_canonical_turn_anchors(self, conversation_id: str) -> int:
-        """COUNT of persisted anchor rows for the conversation."""
+    def get_canonical_turn_anchors(
+        self, conversation_id: str,
+    ) -> list[tuple[int, str, str]]:
+        """Every persisted anchor for the conversation, duplicates included.
+
+        Duplicates are returned rather than collapsed: the table carries
+        no uniqueness constraint, so a repeated triple is real divergence
+        and the caller has to be able to see it in order to repair it.
+        ``start_turn_id`` is rendered as text so it compares against the
+        identifiers the engine holds in memory.
+        """
         with self.pool.connection() as conn:
-            row = conn.execute(
-                "SELECT COUNT(*) FROM canonical_turn_anchors WHERE conversation_id = %s",
+            rows = conn.execute(
+                """SELECT window_size, anchor_hash, start_turn_id::text AS start_turn_id
+                   FROM canonical_turn_anchors
+                   WHERE conversation_id = %s""",
                 (conversation_id,),
-            ).fetchone()
-        if row is None:
-            return 0
-        return int(row[0] if not hasattr(row, "keys") else list(row.values())[0])
+            ).fetchall()
+        out: list[tuple[int, str, str]] = []
+        for row in rows:
+            if hasattr(row, "keys"):
+                out.append((
+                    int(row["window_size"]),
+                    str(row["anchor_hash"]),
+                    str(row["start_turn_id"]),
+                ))
+            else:
+                out.append((int(row[0]), str(row[1]), str(row[2])))
+        return out
 
     def get_canonical_turn_anchor_positions(
         self,
