@@ -6,7 +6,7 @@ import fnmatch
 import json
 import logging
 import time
-from typing import Callable
+from typing import Callable, NamedTuple
 
 from ..types import (
     CompactionResult,
@@ -27,6 +27,26 @@ from .llm_utils import format_code_ref, normalize_code_refs, normalize_tag, pars
 from .telemetry import TelemetryLedger
 
 logger = logging.getLogger(__name__)
+
+
+class SegmentSummaryRequest(NamedTuple):
+    """A fully constructed segment-summarize request, before any LLM call.
+
+    ``system``/``prompt``/``max_tokens`` are exactly what compaction sends;
+    ``target_tokens``, ``conversation_text``, ``original_tokens``, and
+    ``normalized_code_refs`` are the derived values compaction computes
+    alongside them. Built only by
+    ``DomainCompactor.build_segment_summary_request`` so every caller
+    summarizes a segment with the same request compaction would issue.
+    """
+
+    system: str
+    prompt: str
+    max_tokens: int
+    target_tokens: int
+    conversation_text: str
+    original_tokens: int
+    normalized_code_refs: list[dict]
 
 TAG_SUMMARY_ROLLUP_PROMPT = """\
 You are summarizing all stored context about the tag "{tag}".
@@ -546,23 +566,24 @@ class DomainCompactor:
         _sys.stderr.flush()
         return results
 
-    def _compact_one(
+    def build_segment_summary_request(
         self,
         segment: TaggedSegment,
         fact_signals: list[FactSignal] | None = None,
         code_refs: list[dict] | None = None,
         prev_context: str = "",
-        roster: "ActorRoster | None" = None,
-    ) -> CompactionResult:
+    ) -> "SegmentSummaryRequest":
+        """The exact summarize request compaction would issue for *segment*.
+
+        Extracted so callers other than ``_compact_one`` can summarize a
+        segment with byte-identical prompts, system string, and token
+        bounds. This method is pure construction: no LLM call, no logging,
+        no fallback handling. Callers own their own failure semantics;
+        ``_compact_one`` keeps the source-text fallback behavior pinned by
+        the characterization tests.
+        """
         conversation_text = self._format_conversation(segment.messages)
         original_tokens = self.token_counter(conversation_text)
-
-        # DIAGNOSTIC: log compactor input for each segment
-        logger.info(
-            "COMPACTOR_INPUT ref=%s tag=%s tokens=%d text_preview=\"%s\"",
-            segment.id[:8], segment.primary_tag, original_tokens,
-            conversation_text[:300].replace("\n", "\\n"),
-        )
 
         target_tokens = max(
             self.config.min_summary_tokens,
@@ -670,6 +691,44 @@ class DomainCompactor:
                 " ONLY summarize content inside <segment_to_summarize> tags."
                 " NEVER include information from <context_for_pronoun_resolution_only> in your summary."
             )
+
+        return SegmentSummaryRequest(
+            system=system,
+            prompt=prompt,
+            max_tokens=self.config.max_summary_tokens + self.config.llm_token_overhead,
+            target_tokens=target_tokens,
+            conversation_text=conversation_text,
+            original_tokens=original_tokens,
+            normalized_code_refs=normalized_refs,
+        )
+
+    def _compact_one(
+        self,
+        segment: TaggedSegment,
+        fact_signals: list[FactSignal] | None = None,
+        code_refs: list[dict] | None = None,
+        prev_context: str = "",
+        roster: "ActorRoster | None" = None,
+    ) -> CompactionResult:
+        request = self.build_segment_summary_request(
+            segment,
+            fact_signals=fact_signals,
+            code_refs=code_refs,
+            prev_context=prev_context,
+        )
+        conversation_text = request.conversation_text
+        original_tokens = request.original_tokens
+        target_tokens = request.target_tokens
+        normalized_refs = request.normalized_code_refs
+        system = request.system
+        prompt = request.prompt
+
+        # DIAGNOSTIC: log compactor input for each segment
+        logger.info(
+            "COMPACTOR_INPUT ref=%s tag=%s tokens=%d text_preview=\"%s\"",
+            segment.id[:8], segment.primary_tag, original_tokens,
+            conversation_text[:300].replace("\n", "\\n"),
+        )
 
         try:
             t0 = time.time()
