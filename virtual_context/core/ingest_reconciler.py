@@ -2099,11 +2099,11 @@ class IngestReconciler:
         The cost is dominated by that write, not by deriving the set.
 
         So the required set is derived, the stored set is READ, and only
-        the difference between them is written -- when that path is
-        enabled. It is off by default (see ``_INCREMENTAL_ANCHOR_WRITES``),
-        because the read-modify-write races across processes, so the
-        rebuild is what normally runs and the rest of this describes the
-        path as it will behave once the write is idempotent.
+        the difference between them is written -- on stores that declare
+        ``reconcile_excludes_concurrent_writers``. The delta is a
+        read-modify-write, so it is only taken where the reconcile it
+        runs inside genuinely excludes other workers; a store that does
+        not make that claim gets the full rebuild below.
 
         Reading the stored set matters more than it looks. Deriving what
         the store "should" already hold from the caller's pre-ingest rows

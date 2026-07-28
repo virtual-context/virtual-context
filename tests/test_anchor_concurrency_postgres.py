@@ -1,11 +1,12 @@
 """Does the reconcile lock actually serialize the anchor refresh?
 
-Incremental anchor writes ship disabled because the write is a
-read-modify-write and a review concluded nothing serializes it across
-workers, so two workers could interleave and leave an anchor set
-belonging to neither. That conclusion rests on the merge lock being
-process-local, which is true of the SQLite implementation: `BEGIN
-IMMEDIATE` plus a thread-local depth counter.
+Incremental anchor writes are gated per backend: a store opts in by
+declaring that its reconcile excludes concurrent writers, and only
+Postgres claims it. The write is a read-modify-write, so the claim is
+load-bearing — a backend whose reconcile does not genuinely exclude
+would let two workers interleave and leave an anchor set belonging to
+neither. SQLite declines the claim (its prevailing read idiom commits
+on block exit, ending the reconcile from inside it).
 
 **Postgres is different.** `PostgresStore.conversation_reconcile` opens a
 transaction, takes `SELECT ... FOR UPDATE` on the conversation's
