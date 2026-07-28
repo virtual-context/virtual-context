@@ -73,7 +73,12 @@ def summarize_segment_once(
     except Exception as e:  # noqa: BLE001 - the boundary this type exists for
         return ProviderFailure(error=f"{type(e).__name__}: {e}")
     parsed = parse_llm_json(response_text)
-    summary = parsed.get("summary")
+    # parse_llm_json returns the PARSED VALUE for any valid JSON, not
+    # only objects: a bare list, string, number, boolean, or null comes
+    # back as itself. Every non-mapping shape is Malformed; assuming a
+    # mapping here would let one odd-but-valid response crash the caller
+    # instead of being counted.
+    summary = parsed.get("summary") if isinstance(parsed, dict) else None
     if isinstance(summary, str) and summary.strip():
         return Generated(summary=summary, usage=usage or {})
     return Malformed(raw_text=response_text, usage=usage or {})
