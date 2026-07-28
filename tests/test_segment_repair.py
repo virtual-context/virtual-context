@@ -110,6 +110,15 @@ def test_raw_error_page_is_malformed_never_generated(ts):
         json.dumps({"summary": "   \n\t "}),
         "```json\n{\"summary\":",  # truncated fence fragment
         "{}",
+        # Valid JSON whose top level is not an object: parse succeeds
+        # and returns the bare value, which must classify as Malformed,
+        # never crash the caller.
+        "[]",
+        '["a", "b"]',
+        '"just a JSON string"',
+        "42",
+        "true",
+        "null",
     ],
 )
 def test_unusable_summary_shapes_are_malformed(ts, response):
