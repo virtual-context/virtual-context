@@ -617,6 +617,7 @@ def test_proxy_roles_come_from_the_active_entry_and_validated_audience(tmp_path)
     assert roles.subject_actor_id == BIGTEX_ACTOR
     assert roles.reply_target_message_id == "m1"
     assert roles.audience_conversation_id == GUILD_KEY
+    assert roles.origin_channel_id == "15249"
     assert roles.audience_channel_id == "15249"
 
 
@@ -645,8 +646,42 @@ def test_proxy_roles_can_scope_speaker_reads_to_the_conversation(tmp_path):
     )
 
     assert roles.audience_conversation_id == GUILD_KEY
+    # Speaker-card scoping may deliberately widen to the whole conversation,
+    # but the physical group channel remains request provenance for the
+    # ephemeral cross-channel recent tail.
+    assert roles.origin_channel_id == "15249"
     assert roles.audience_channel_id == ""
     assert roles.audience_channel_label == "#p3ptides"
+
+
+def test_proxy_roles_keep_dm_origin_channel_empty(tmp_path):
+    """A direct-message envelope must fail the raw guild-tail request gate."""
+    store = SQLiteStore(tmp_path / "dm-origin-roles.db")
+    store.upsert_conversation(tenant_id="t1", conversation_id=GUILD_KEY)
+    raw = _conv_info(
+        OPTICS,
+        chat_id="direct:998877",
+        message_id="dm-message",
+    ) + "hello privately"
+    text, metadata = _extract_envelope_metadata(raw)
+    active = Message(role="user", content=text, metadata=metadata)
+    engine = SimpleNamespace(
+        config=SimpleNamespace(conversation_id=GUILD_KEY, tenant_id="t1"),
+        _store=store,
+    )
+    engine._ingest_reconciler = _reconciler(store)
+
+    roles = _roles_for_active_user(
+        SimpleNamespace(engine=engine),
+        active,
+        "hello privately",
+        inbound_conversation_id=GUILD_KEY,
+        audience_conversation_id=GUILD_KEY,
+    )
+
+    assert roles.requester_actor_id == OPTICS_ACTOR
+    assert roles.origin_channel_id == ""
+    assert roles.audience_channel_id == ""
 
 
 def test_conversation_scope_resolves_a_unique_reply_label_across_channels(tmp_path):

@@ -304,11 +304,12 @@ class ContextStore(ABC):
     ) -> list[CanonicalTurnRow]:
         """Tier 3 cross-channel-mirror lookup.
 
-        Returns at most ``limit`` rows from ``canonical_turns`` for
-        ``conversation_id``, ordered by ``sort_key DESC`` so the
-        caller sees the most recent rows first. Filtering by
-        ``tagged_at`` is intentionally NOT applied — see the
-        cross-channel-mirror spec §1.2 ``tagged_at`` decision.
+        Returns every physical row belonging to the newest ``limit`` logical
+        turn groups for ``conversation_id``, ordered by ``sort_key DESC`` so
+        the caller sees the most recent rows first. Split user/assistant rows
+        are atomic at the window boundary. Filtering by ``tagged_at`` is
+        intentionally NOT applied — fresh peer-channel rows must surface
+        before the tagger catches up.
 
         Backends that do not host canonical_turns (filesystem,
         secondary graph stores) return ``[]`` defensively.
@@ -759,12 +760,49 @@ class ContextStore(ABC):
         """
         return []
 
+    def list_actor_turn_sources(
+        self,
+        tenant_id: str,
+        actor_id: str,
+        *,
+        limit: int = 500,
+    ) -> list:
+        """Enumerate exact canonical user rows eligible as card evidence.
+
+        The backend must prove tenant ownership, actor attribution, audience
+        attribution, and owner/audience lifecycle epochs before returning a
+        row. Unknown or legacy provenance fails closed. ``limit`` is a
+        per-audience bound so one policy audience cannot starve another.
+        """
+        return []
+
+    def list_actor_card_carryovers(
+        self,
+        tenant_id: str,
+        actor_id: str,
+    ) -> list:
+        """Return active cross-context entries with their exact sources.
+
+        This is an internal refresh surface, not a serving read.  It exists so
+        a model curator's omission cannot silently delete a previously admitted
+        durable identity/style entry.  Backends must tenant-scope both entries
+        and sources; the normal replacement fence re-validates every source
+        before committing a carried entry.
+        """
+        return []
+
     def get_actor_profile(self, tenant_id: str, actor_id: str):
         """Return the tenant-scoped profile/cache state, or ``None``."""
         return None
 
-    def mark_actor_card_dirty(self, tenant_id: str, actor_id: str) -> bool:
-        """Make a card unreadable before a changed-input curation call."""
+    def mark_actor_card_dirty(
+        self,
+        tenant_id: str,
+        actor_id: str,
+        *,
+        build_input_hash: str = "",
+    ) -> bool:
+        """Make a card unreadable and optionally stamp a build CAS marker."""
         return False
 
     def replace_actor_card(
@@ -775,9 +813,43 @@ class ContextStore(ABC):
         *,
         input_hash: str = "",
         expected_source_epochs: dict[str, int] | None = None,
+        expected_build_marker: str | None = None,
     ) -> int:
         """Atomically replace an actor's card and clear its dirty flag."""
         return 0
+
+    def record_actor_card_rebuild_status(
+        self,
+        tenant_id: str,
+        actor_id: str,
+        *,
+        attempted_at: str,
+        input_hash: str,
+        source_count: int,
+        raw_entry_count: int,
+        accepted_entry_count: int,
+        rejected_counts: dict[str, int],
+        outcome: str,
+        response_hash: str,
+        written_count: int,
+    ) -> None:
+        """Persist the latest bounded rebuild diagnostic for one actor."""
+
+    def get_actor_card_rebuild_status(
+        self, tenant_id: str, actor_id: str,
+    ) -> dict | None:
+        """Return the latest bounded rebuild diagnostic for one actor."""
+        return None
+
+    def list_due_actor_card_rebuilds(
+        self,
+        tenant_id: str,
+        *,
+        due_at: str,
+        limit: int = 25,
+    ) -> list[str]:
+        """Return dirty actors whose transient-failure backoff has elapsed."""
+        return []
 
     def get_actor_card(
         self,

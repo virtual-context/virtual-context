@@ -71,6 +71,7 @@ def _seed_turn(
     assistant_content: str = "a",
     sort_key: float | None = None,
     tagged_at: str | None = None,
+    turn_group_number: int = -1,
 ) -> None:
     store.save_canonical_turn(
         conversation_id,
@@ -81,6 +82,7 @@ def _seed_turn(
         tags=["topic"],
         sort_key=sort_key,
         tagged_at=tagged_at,
+        turn_group_number=turn_group_number,
     )
 
 
@@ -94,6 +96,71 @@ def test_get_recent_limit_honored(store: SQLiteStore) -> None:
         _seed_turn(store, "conv-1", i)
     rows = store.get_recent_canonical_turns("conv-1", limit=2)
     assert len(rows) == 2
+
+
+@pytest.mark.regression("BUG-045")
+def test_get_recent_limit_preserves_complete_split_groups(store: SQLiteStore) -> None:
+    for group in range(4):
+        _seed_turn(
+            store,
+            "conv-1",
+            group * 2,
+            user_content=f"user-{group}",
+            assistant_content="",
+            turn_group_number=group,
+        )
+        _seed_turn(
+            store,
+            "conv-1",
+            group * 2 + 1,
+            user_content="",
+            assistant_content=f"assistant-{group}",
+            turn_group_number=group,
+        )
+
+    rows = store.get_recent_canonical_turns("conv-1", limit=3)
+
+    assert len(rows) == 6
+    assert {row.turn_group_number for row in rows} == {1, 2, 3}
+    for group in (1, 2, 3):
+        group_rows = [row for row in rows if row.turn_group_number == group]
+        assert len(group_rows) == 2
+        assert any(row.user_content == f"user-{group}" for row in group_rows)
+        assert any(
+            row.assistant_content == f"assistant-{group}"
+            for row in group_rows
+        )
+
+
+@pytest.mark.regression("BUG-045")
+def test_get_recent_limit_does_not_conflate_reused_group_number(
+    store: SQLiteStore,
+) -> None:
+    groups = (7, 8, 7)
+    for logical_index, group_number in enumerate(groups):
+        _seed_turn(
+            store,
+            "conv-1",
+            logical_index * 2,
+            user_content=f"user-{logical_index}",
+            assistant_content="",
+            turn_group_number=group_number,
+        )
+        _seed_turn(
+            store,
+            "conv-1",
+            logical_index * 2 + 1,
+            user_content="",
+            assistant_content=f"assistant-{logical_index}",
+            turn_group_number=group_number,
+        )
+
+    rows = store.get_recent_canonical_turns("conv-1", limit=1)
+
+    assert {row.user_content for row in rows if row.user_content} == {"user-2"}
+    assert {
+        row.assistant_content for row in rows if row.assistant_content
+    } == {"assistant-2"}
 
 
 def test_get_recent_ordered_desc_by_sort_key(store: SQLiteStore) -> None:

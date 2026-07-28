@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from typing import TYPE_CHECKING
 
 from .protocols import FactLinkStore, FactStore, SearchStore, SegmentStore, StateStore
 from ..types import (
@@ -24,6 +25,9 @@ from ..types import (
     TagStats,
     TagSummary,
 )
+
+if TYPE_CHECKING:
+    from .compaction_fence import CompactionFenceMode
 
 
 class CompositeStore:
@@ -1108,13 +1112,39 @@ class CompositeStore:
             return list(fn(tenant_id, actor_id, limit=limit))
         return []
 
+    def list_actor_turn_sources(
+        self, tenant_id: str, actor_id: str, *, limit: int = 500,
+    ) -> list:
+        fn = getattr(self._facts, "list_actor_turn_sources", None)
+        if callable(fn):
+            return list(fn(tenant_id, actor_id, limit=limit))
+        return []
+
+    def list_actor_card_carryovers(
+        self, tenant_id: str, actor_id: str,
+    ) -> list:
+        fn = getattr(self._facts, "list_actor_card_carryovers", None)
+        if callable(fn):
+            return list(fn(tenant_id, actor_id))
+        return []
+
     def get_actor_profile(self, tenant_id: str, actor_id: str):
         fn = getattr(self._facts, "get_actor_profile", None)
         return fn(tenant_id, actor_id) if callable(fn) else None
 
-    def mark_actor_card_dirty(self, tenant_id: str, actor_id: str) -> bool:
+    def mark_actor_card_dirty(
+        self,
+        tenant_id: str,
+        actor_id: str,
+        *,
+        build_input_hash: str = "",
+    ) -> bool:
         fn = getattr(self._facts, "mark_actor_card_dirty", None)
-        return bool(fn(tenant_id, actor_id)) if callable(fn) else False
+        return bool(fn(
+            tenant_id,
+            actor_id,
+            build_input_hash=build_input_hash,
+        )) if callable(fn) else False
 
     def replace_actor_card(
         self,
@@ -1124,6 +1154,7 @@ class CompositeStore:
         *,
         input_hash: str = "",
         expected_source_epochs: dict[str, int] | None = None,
+        expected_build_marker: str | None = None,
     ) -> int:
         fn = getattr(self._facts, "replace_actor_card", None)
         if callable(fn):
@@ -1133,8 +1164,58 @@ class CompositeStore:
                 entries_with_sources,
                 input_hash=input_hash,
                 expected_source_epochs=expected_source_epochs,
+                expected_build_marker=expected_build_marker,
             ))
         return 0
+
+    def record_actor_card_rebuild_status(
+        self,
+        tenant_id: str,
+        actor_id: str,
+        *,
+        attempted_at: str,
+        input_hash: str,
+        source_count: int,
+        raw_entry_count: int,
+        accepted_entry_count: int,
+        rejected_counts: dict[str, int],
+        outcome: str,
+        response_hash: str,
+        written_count: int,
+    ) -> None:
+        fn = getattr(self._facts, "record_actor_card_rebuild_status", None)
+        if callable(fn):
+            fn(
+                tenant_id,
+                actor_id,
+                attempted_at=attempted_at,
+                input_hash=input_hash,
+                source_count=source_count,
+                raw_entry_count=raw_entry_count,
+                accepted_entry_count=accepted_entry_count,
+                rejected_counts=rejected_counts,
+                outcome=outcome,
+                response_hash=response_hash,
+                written_count=written_count,
+            )
+
+    def get_actor_card_rebuild_status(
+        self, tenant_id: str, actor_id: str,
+    ) -> dict | None:
+        fn = getattr(self._facts, "get_actor_card_rebuild_status", None)
+        return fn(tenant_id, actor_id) if callable(fn) else None
+
+    def list_due_actor_card_rebuilds(
+        self,
+        tenant_id: str,
+        *,
+        due_at: str,
+        limit: int = 25,
+    ) -> list[str]:
+        fn = getattr(self._facts, "list_due_actor_card_rebuilds", None)
+        if callable(fn):
+            return list(fn(tenant_id, due_at=due_at, limit=limit))
+        return []
 
     def get_actor_card(
         self,

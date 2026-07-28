@@ -3,7 +3,8 @@
 Skipped unless a Postgres DSN is configured. Keeps the two SQL backends in
 lockstep on the invariants that are privacy boundaries rather than features:
 tenant scoping, audience scoping (a private DM must not shape a public answer),
-cross-actor isolation, dirty-card unreadability, and delete invalidation.
+cross-actor isolation, additive last-good retention, and fail-closed destructive
+invalidation.
 """
 
 from __future__ import annotations
@@ -132,10 +133,17 @@ class World:
         )
 
 
-def _entry(entry_id, kind, body, *, scope=CARD_SCOPE_SAME_CONVERSATION):
+def _entry(
+    entry_id,
+    kind,
+    body,
+    *,
+    scope=CARD_SCOPE_SAME_CONVERSATION,
+    sensitivity="normal",
+):
     return ActorCardEntry(
         id=entry_id, kind=kind, body=body, confidence=0.9,
-        sensitivity="normal", audience_scope=scope,
+        sensitivity=sensitivity, audience_scope=scope,
     )
 
 
@@ -144,6 +152,17 @@ def _source(entry_id, tenant, owner, audience, fact_id, channel=""):
         entry_id=entry_id, tenant_id=tenant, owner_conversation_id=owner,
         audience_conversation_id=audience, audience_channel_id=channel,
         fact_id=fact_id,
+    )
+
+
+def _turn_source(entry_id, tenant, owner, audience, turn_id, channel=""):
+    return ActorCardEntrySource(
+        entry_id=entry_id,
+        tenant_id=tenant,
+        owner_conversation_id=owner,
+        audience_conversation_id=audience,
+        audience_channel_id=channel,
+        canonical_turn_id=turn_id,
     )
 
 
@@ -169,6 +188,37 @@ def _bodies(card):
     return sorted(e.body for e in card.entries) if card else None
 
 
+def test_pg_first_observed_actor_starts_dirty_for_compaction(store):
+    """A first profile is created after its first row's INSERT trigger fired."""
+    w = World(store)
+
+    profile = store.get_actor_profile(w.tenant, w.optics)
+
+    assert profile is not None
+    assert profile.card_dirty is True
+    assert profile.card_invalid is False
+    assert profile.card_input_hash == ""
+
+
+def test_pg_repeat_profile_sighting_does_not_redirty_clean_card(store):
+    w = World(store)
+    _build(w)
+    before = store.get_actor_profile(w.tenant, w.optics)
+    assert before is not None and before.card_dirty is False
+
+    assert store.upsert_actor_profile_from_turn(
+        w.guild,
+        w.optics,
+        "Optics",
+        seen_at=_now(),
+    )
+    after = store.get_actor_profile(w.tenant, w.optics)
+
+    assert after is not None
+    assert after.card_dirty is False
+    assert after.card_input_hash == "h1"
+
+
 def test_pg_list_actor_facts_derives_audience_and_is_tenant_scoped(store):
     w = World(store)
     got = {
@@ -181,6 +231,130 @@ def test_pg_list_actor_facts_derives_audience_and_is_tenant_scoped(store):
         w.f_guild: (w.guild, w.guild, "chan-guild"),
     }
     assert store.list_actor_facts("someone-else", w.optics, limit=10) == []
+
+
+def test_pg_list_actor_turn_sources_is_tenant_and_audience_scoped(store):
+    w = World(store)
+    got = {
+        source.turn.canonical_turn_id: (
+            source.owner_conversation_id,
+            source.audience_conversation_id,
+            source.audience_channel_id,
+        )
+        for source in store.list_actor_turn_sources(
+            w.tenant,
+            w.optics,
+            limit=1,
+        )
+    }
+    assert got == {
+        w.ct_dm: (w.dm, w.dm, "chan-dm"),
+        w.ct_guild: (w.guild, w.guild, "chan-guild"),
+    }
+    assert store.list_actor_turn_sources(
+        "someone-else",
+        w.optics,
+        limit=10,
+    ) == []
+
+
+def test_pg_turn_sourced_card_delete_is_synchronously_invalidated(store):
+    w = World(store)
+    entry_id = _uid("turn-entry")
+    assert store.replace_actor_card(
+        w.tenant,
+        w.optics,
+        [(
+            _entry(
+                entry_id,
+                "relevant_history",
+                "Has discussed a private DM topic with Vast.",
+            ),
+            [_turn_source(
+                entry_id,
+                w.tenant,
+                w.dm,
+                w.dm,
+                w.ct_dm,
+                "chan-dm",
+            )],
+        )],
+        input_hash="turn-source",
+        expected_source_epochs={w.dm: 1},
+    ) == 1
+
+    with store.pool.connection() as conn:
+        conn.execute(
+            """DELETE FROM canonical_turns
+                WHERE canonical_turn_id = %s""",
+            (w.ct_dm,),
+        )
+        assert conn.execute(
+            """SELECT 1 FROM actor_card_entries WHERE id = %s""",
+            (entry_id,),
+        ).fetchone() is None
+    profile = store.get_actor_profile(w.tenant, w.optics)
+    assert profile is not None and profile.card_dirty is True
+
+
+def test_pg_rebuild_failure_backoff_status_round_trips(store):
+    w = World(store)
+    store.mark_actor_card_dirty(
+        w.tenant,
+        w.optics,
+        build_input_hash="building:same-input",
+    )
+    kwargs = {
+        "attempted_at": _now(),
+        "input_hash": "same-input",
+        "source_count": 2,
+        "raw_entry_count": 0,
+        "accepted_entry_count": 0,
+        "rejected_counts": {},
+        "outcome": "invalid_response",
+        "response_hash": "response",
+        "written_count": 0,
+    }
+    store.record_actor_card_rebuild_status(
+        w.tenant,
+        w.optics,
+        **kwargs,
+    )
+    first = store.get_actor_card_rebuild_status(w.tenant, w.optics)
+    assert first is not None
+    assert first["failure_count"] == 1
+    assert first["next_retry_at"]
+    assert store.list_due_actor_card_rebuilds(
+        w.tenant,
+        due_at="2000-01-01T00:00:00+00:00",
+    ) == []
+    assert store.list_due_actor_card_rebuilds(
+        w.tenant,
+        due_at="9999-01-01T00:00:00+00:00",
+    ) == [w.optics]
+
+    store.record_actor_card_rebuild_status(
+        w.tenant,
+        w.optics,
+        **kwargs,
+    )
+    second = store.get_actor_card_rebuild_status(w.tenant, w.optics)
+    assert second is not None
+    assert second["failure_count"] == 2
+
+    store.record_actor_card_rebuild_status(
+        w.tenant,
+        w.optics,
+        **{**kwargs, "outcome": "written", "written_count": 1},
+    )
+    clean = store.get_actor_card_rebuild_status(w.tenant, w.optics)
+    assert clean is not None
+    assert clean["failure_count"] == 0
+    assert clean["next_retry_at"] == ""
+    assert store.list_due_actor_card_rebuilds(
+        w.tenant,
+        due_at="9999-01-01T00:00:00+00:00",
+    ) == []
 
 
 def test_pg_dm_entry_is_not_served_in_the_guild(store):
@@ -209,14 +383,50 @@ def test_pg_cross_tenant_card_read_is_refused(store):
     ) is None
 
 
-def test_pg_channel_mismatch_fails_closed(store):
+def test_pg_channels_share_same_conversation_card(store):
     w = World(store)
     _build(w)
     card = store.get_actor_card(
         w.tenant, w.optics, owner_conversation_id=w.dm,
         audience_conversation_id=w.dm, audience_channel_id="chan-other",
     )
-    assert "private DM goal" not in (_bodies(card) or [])
+    assert "private DM goal" in (_bodies(card) or [])
+
+
+def test_pg_legacy_high_sensitivity_metadata_does_not_hide_card(store):
+    w = World(store)
+    entry_id = _uid("legacy-high")
+    assert w.store.replace_actor_card(
+        w.tenant,
+        w.optics,
+        [(
+            _entry(
+                entry_id,
+                CARD_KIND_ACTIVE_GOAL,
+                "medical goal",
+                sensitivity="high",
+            ),
+            [_source(
+                entry_id,
+                w.tenant,
+                w.guild,
+                w.guild,
+                w.f_guild,
+                "chan-guild",
+            )],
+        )],
+        input_hash="legacy-high",
+        expected_source_epochs={w.guild: 1},
+    ) == 1
+
+    card = w.store.get_actor_card(
+        w.tenant,
+        w.optics,
+        owner_conversation_id=w.guild,
+        audience_conversation_id=w.guild,
+        audience_channel_id="chan-other",
+    )
+    assert _bodies(card) == ["medical goal"]
 
 
 def test_pg_delete_conversation_removes_its_contribution(store):

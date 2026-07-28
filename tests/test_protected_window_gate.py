@@ -16,7 +16,12 @@ import pytest
 
 from virtual_context.config import load_config
 from virtual_context.engine import VirtualContextEngine
-from virtual_context.types import Message
+from virtual_context.types import (
+    CanonicalTurnRow,
+    Message,
+    RequestRoles,
+    build_user_turn_metadata,
+)
 
 
 def _make_config(tmp_path, *, mode: str = "merge", conversation_id: str | None = None):
@@ -61,6 +66,13 @@ def _stamped(role: str, content: str, *, canonical_turn_id: str, turn_number: in
 
 def _unstamped(role: str, content: str) -> Message:
     return Message(role=role, content=content)
+
+
+def _replayed_pairs(assembled) -> list[tuple[str, str]]:
+    return [
+        (message.role, message.content)
+        for message in assembled.recent_conversation_messages
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -250,6 +262,569 @@ def test_tier3_db_read_exception_degrades_gracefully(tmp_path):
     # Must not raise — gate degrades to no-merge.
     assembled = eng.on_message_inbound("next", history)
     assert assembled is not None
+
+
+def test_tier3_compass_tail_is_model_visible_but_absent_from_returned_roles(tmp_path):
+    """Pin the real gate -> assembler seam behind the original regression."""
+    eng = _make_participant_engine(tmp_path)
+    assembler = eng._retrieval
+    fake_provider = MagicMock()
+    fake_provider.get_marker.return_value = None
+    assembler._session_state_provider = fake_provider
+    fake_store = MagicMock(wraps=eng._store)
+    fake_store.get_recent_canonical_turns.return_value = [
+        CanonicalTurnRow(
+            conversation_id="target-1",
+            canonical_turn_id="pref-1",
+            turn_number=8,
+            turn_group_number=4,
+            sort_key=8.0,
+            user_content='For future replies, begin with "Compass:".',
+            sender="optics",
+            sender_actor_id="actor:discord:42",
+            origin_channel_id="chan-a",
+            origin_channel_label="#alpha",
+            audience_conversation_id="source-a",
+        ),
+    ]
+    assembler._store = fake_store
+    active = Message(role="user", content="Name one moon of Mars.")
+    roles = RequestRoles(
+        requester_actor_id="actor:discord:42",
+        owner_conversation_id="target-1",
+        audience_conversation_id="source-b",
+        origin_channel_id="chan-b",
+    )
+
+    assembled = eng.on_message_inbound(
+        active.content,
+        [active],
+        request_roles=roles,
+    )
+
+    assert assembled.recent_conversation_text == ""
+    assert _replayed_pairs(assembled) == [
+        ("user", 'For future replies, begin with "Compass:".'),
+    ]
+    assert "Compass:" not in assembled.prepend_text
+    assert [(m.role, m.content) for m in assembled.conversation_history] == [
+        ("user", "Name one moon of Mars."),
+    ]
+
+
+@pytest.mark.regression("BUG-044")
+def test_tier3_db_pair_survives_payload_compaction_offset(tmp_path):
+    """BUG-044: payload watermarks must not split a recovered DB turn group.
+
+    This pins the live Discord shape: seven stamped channel-local messages,
+    one trailing active request, and a two-row cross-channel DB group. The
+    flushed watermark equals the payload-owned message count. Applying that
+    offset to the post-merge list discards the recovered user instruction at
+    index 7 while leaving its assistant acknowledgement at index 8.
+    """
+    eng = _make_participant_engine(tmp_path)
+    assembler = eng._retrieval
+    fake_provider = MagicMock()
+    fake_provider.get_marker.return_value = None
+    assembler._session_state_provider = fake_provider
+    fake_store = MagicMock(wraps=eng._store)
+    fake_store.get_recent_canonical_turns.return_value = [
+        CanonicalTurnRow(
+            conversation_id="target-1",
+            canonical_turn_id="pref-user",
+            turn_number=8,
+            turn_group_number=4,
+            sort_key=8.0,
+            user_content='For future replies, begin with "test3:".',
+            sender="optics",
+            sender_actor_id="actor:discord:42",
+            source_message_id="discord-pref",
+            origin_channel_id="chan-a",
+            origin_channel_label="#alpha",
+            audience_conversation_id="source-a",
+        ),
+        CanonicalTurnRow(
+            conversation_id="target-1",
+            canonical_turn_id="pref-assistant",
+            turn_number=9,
+            turn_group_number=4,
+            sort_key=9.0,
+            assistant_content="test3: Understood.",
+        ),
+    ]
+    assembler._store = fake_store
+    eng._engine_state.flushed_prefix_messages = 8
+
+    history = [
+        _stamped(
+            "user" if index % 2 == 0 else "assistant",
+            f"old local message {index}",
+            canonical_turn_id=f"local-{index}",
+            turn_number=index,
+        )
+        for index in range(7)
+    ]
+    active = Message(role="user", content="How are you?")
+    history.append(active)
+    roles = RequestRoles(
+        requester_actor_id="actor:discord:42",
+        owner_conversation_id="target-1",
+        audience_conversation_id="source-b",
+        origin_channel_id="chan-b",
+    )
+
+    assembled = eng.on_message_inbound(
+        active.content,
+        history,
+        request_roles=roles,
+    )
+
+    assert assembled.recent_conversation_text == ""
+    assert _replayed_pairs(assembled) == [
+        ("user", 'For future replies, begin with "test3:".'),
+        ("assistant", "test3: Understood."),
+    ]
+    assert [(m.role, m.content) for m in assembled.conversation_history] == [
+        ("user", "How are you?"),
+    ]
+    assert all(
+        (m.metadata or {}).get("source") != "db_recent"
+        for m in assembled.conversation_history
+    )
+    reassembled = eng._retrieval.reassemble_context()
+    assert reassembled == assembled.prepend_text
+    assert "test3:" not in reassembled
+
+
+@pytest.mark.regression("BUG-045")
+def test_tier3_payload_duplicate_cannot_suppress_db_user_before_offset(tmp_path):
+    """A completed payload duplicate must not strand the DB assistant half.
+
+    This is the exact second live Discord shape behind BUG-045.  The previous
+    guild turn is still present in the in-memory payload when Tier 3 reads the
+    same split canonical group.  Source-message dedup suppresses the DB user
+    half, then the payload watermark consumes the payload copy of that user
+    instruction.  Without group-aware replacement, only the DB assistant
+    acknowledgement reaches ``recent-conversation``.
+    """
+    eng = _make_participant_engine(tmp_path)
+    assembler = eng._retrieval
+    fake_provider = MagicMock()
+    fake_provider.get_marker.return_value = None
+    assembler._session_state_provider = fake_provider
+    fake_store = MagicMock(wraps=eng._store)
+    fake_store.get_recent_canonical_turns.return_value = [
+        CanonicalTurnRow(
+            conversation_id="target-1",
+            canonical_turn_id="pref-user",
+            turn_number=1072,
+            turn_group_number=566,
+            sort_key=1073000.0,
+            user_content='For future replies, begin with "GuildProof73:".',
+            sender="optics",
+            sender_actor_id="actor:discord:42",
+            source_message_id="discord-pref",
+            origin_channel_id="chan-a",
+            origin_channel_label="#alpha",
+            audience_conversation_id="target-1",
+        ),
+        CanonicalTurnRow(
+            conversation_id="target-1",
+            canonical_turn_id="pref-assistant",
+            turn_number=1073,
+            turn_group_number=566,
+            sort_key=1074000.0,
+            assistant_content="GuildProof73: Understood.",
+        ),
+    ]
+    assembler._store = fake_store
+    eng._engine_state.flushed_prefix_messages = 2
+
+    payload_user = Message(
+        role="user",
+        content='For future replies, begin with "GuildProof73:".',
+        metadata=build_user_turn_metadata(
+            sender_name="optics",
+            sender_actor_id="actor:discord:42",
+            source_message_id="discord-pref",
+            origin_channel_id="chan-a",
+            origin_channel_label="#alpha",
+        ),
+    )
+    payload_assistant = Message(
+        role="assistant",
+        content="GuildProof73: Understood.",
+    )
+    active = Message(role="user", content="In one sentence, how are you?")
+    roles = RequestRoles(
+        requester_actor_id="actor:discord:42",
+        owner_conversation_id="target-1",
+        audience_conversation_id="target-1",
+        origin_channel_id="chan-b",
+    )
+
+    assembled = eng.on_message_inbound(
+        active.content,
+        [payload_user, payload_assistant, active],
+        request_roles=roles,
+    )
+
+    assert assembled.recent_conversation_text == ""
+    assert _replayed_pairs(assembled) == [
+        ("user", 'For future replies, begin with "GuildProof73:".'),
+        ("assistant", "GuildProof73: Understood."),
+    ]
+    assert [(message.role, message.content) for message in assembled.conversation_history] == [
+        ("user", "In one sentence, how are you?"),
+    ]
+
+
+@pytest.mark.regression("BUG-046")
+def test_other_channel_engine_history_cannot_suppress_canonical_recent_pair(tmp_path):
+    """Retained unified-engine history is not necessarily in the client body.
+
+    Discord sessions send channel-local payloads, but every channel in a
+    unified guild reuses one engine state. The immediately preceding turn
+    from channel A can therefore be present in ``conversation_history`` while
+    absent from the model-visible channel-B payload. It must not suppress the
+    canonical copy that provides cross-channel continuity.
+    """
+    eng = _make_participant_engine(tmp_path)
+    assembler = eng._retrieval
+    fake_provider = MagicMock()
+    fake_provider.get_marker.return_value = None
+    assembler._session_state_provider = fake_provider
+    fake_store = MagicMock(wraps=eng._store)
+    fake_store.get_recent_canonical_turns.return_value = [
+        CanonicalTurnRow(
+            conversation_id="target-1",
+            canonical_turn_id="pref-user",
+            turn_number=1080,
+            turn_group_number=570,
+            sort_key=1081000.0,
+            user_content='Keep replies concise and begin with "LiveGuild83:".',
+            sender="optics",
+            sender_actor_id="actor:discord:42",
+            source_message_id="discord-pref",
+            origin_channel_id="chan-a",
+            origin_channel_label="#alpha",
+            audience_conversation_id="target-1",
+        ),
+        CanonicalTurnRow(
+            conversation_id="target-1",
+            canonical_turn_id="pref-assistant",
+            turn_number=1081,
+            turn_group_number=570,
+            sort_key=1082000.0,
+            assistant_content="LiveGuild83: Understood.",
+        ),
+    ]
+    assembler._store = fake_store
+
+    retained_user = Message(
+        role="user",
+        content='Keep replies concise and begin with "LiveGuild83:".',
+        metadata={
+            **build_user_turn_metadata(
+                sender_name="optics",
+                sender_actor_id="actor:discord:42",
+                source_message_id="discord-pref",
+                origin_channel_id="chan-a",
+                origin_channel_label="#alpha",
+            ),
+            "canonical_turn_id": "pref-user",
+            "turn_number": 1080,
+        },
+    )
+    retained_assistant = Message(
+        role="assistant",
+        content="LiveGuild83: Understood.",
+        metadata={
+            **build_user_turn_metadata(origin_channel_id="chan-a"),
+            "canonical_turn_id": "pref-assistant",
+            "turn_number": 1081,
+        },
+    )
+    active = Message(
+        role="user",
+        content="Name one moon of Mars.",
+        metadata=build_user_turn_metadata(
+            source_message_id="discord-probe",
+            origin_channel_id="chan-b",
+        ),
+    )
+    roles = RequestRoles(
+        requester_actor_id="actor:discord:42",
+        owner_conversation_id="target-1",
+        audience_conversation_id="target-1",
+        origin_channel_id="chan-b",
+    )
+
+    assembled = eng.on_message_inbound(
+        active.content,
+        [retained_user, retained_assistant, active],
+        request_roles=roles,
+    )
+
+    assert assembled.recent_conversation_text == ""
+    assert _replayed_pairs(assembled) == [
+        ("user", 'Keep replies concise and begin with "LiveGuild83:".'),
+        ("assistant", "LiveGuild83: Understood."),
+    ]
+
+
+@pytest.mark.regression("BUG-046")
+def test_same_channel_payload_twin_still_suppresses_canonical_copy(tmp_path):
+    """Production-shaped nested channel metadata preserves native dedup."""
+    eng = _make_participant_engine(tmp_path)
+    assembler = eng._retrieval
+    fake_provider = MagicMock()
+    fake_provider.get_marker.return_value = None
+    assembler._session_state_provider = fake_provider
+    fake_store = MagicMock(wraps=eng._store)
+    fake_store.get_recent_canonical_turns.return_value = [
+        CanonicalTurnRow(
+            conversation_id="target-1",
+            canonical_turn_id="same-user",
+            turn_number=40,
+            turn_group_number=20,
+            sort_key=41000.0,
+            user_content="Same-channel prior question.",
+            source_message_id="same-source",
+            origin_channel_id="chan-a",
+            origin_channel_label="#alpha",
+            audience_conversation_id="target-1",
+        ),
+        CanonicalTurnRow(
+            conversation_id="target-1",
+            canonical_turn_id="same-assistant",
+            turn_number=41,
+            turn_group_number=20,
+            sort_key=42000.0,
+            assistant_content="Same-channel prior answer.",
+        ),
+    ]
+    assembler._store = fake_store
+
+    retained_user = Message(
+        role="user",
+        content="Same-channel prior question.",
+        metadata={
+            **build_user_turn_metadata(
+                source_message_id="same-source",
+                origin_channel_id="chan-a",
+            ),
+            "canonical_turn_id": "same-user",
+            "turn_number": 40,
+        },
+    )
+    retained_assistant = Message(
+        role="assistant",
+        content="Same-channel prior answer.",
+        metadata={
+            **build_user_turn_metadata(origin_channel_id="chan-a"),
+            "canonical_turn_id": "same-assistant",
+            "turn_number": 41,
+        },
+    )
+    active = Message(
+        role="user",
+        content="Current same-channel question.",
+        metadata=build_user_turn_metadata(
+            source_message_id="current-source",
+            origin_channel_id="chan-a",
+        ),
+    )
+    roles = RequestRoles(
+        requester_actor_id="actor:discord:42",
+        owner_conversation_id="target-1",
+        audience_conversation_id="target-1",
+        origin_channel_id="chan-a",
+    )
+
+    assembled = eng.on_message_inbound(
+        active.content,
+        [retained_user, retained_assistant, active],
+        request_roles=roles,
+    )
+
+    assert assembled.recent_conversation_text == ""
+    assert assembled.recent_conversation_messages == []
+
+
+@pytest.mark.regression("BUG-046")
+def test_same_channel_active_tail_race_still_suppresses_db_user(tmp_path):
+    """The nested source id remains reachable after channel filtering."""
+    eng = _make_participant_engine(tmp_path)
+    assembler = eng._retrieval
+    fake_provider = MagicMock()
+    fake_provider.get_marker.return_value = None
+    assembler._session_state_provider = fake_provider
+    fake_store = MagicMock(wraps=eng._store)
+    fake_store.get_recent_canonical_turns.return_value = [
+        CanonicalTurnRow(
+            conversation_id="target-1",
+            canonical_turn_id="active-user",
+            turn_number=42,
+            turn_group_number=21,
+            sort_key=43000.0,
+            user_content="Current same-channel question.",
+            source_message_id="current-source",
+            origin_channel_id="chan-a",
+            origin_channel_label="#alpha",
+            audience_conversation_id="target-1",
+        ),
+    ]
+    assembler._store = fake_store
+    active = Message(
+        role="user",
+        content="Current same-channel question.",
+        metadata=build_user_turn_metadata(
+            source_message_id="current-source",
+            origin_channel_id="chan-a",
+        ),
+    )
+    roles = RequestRoles(
+        requester_actor_id="actor:discord:42",
+        owner_conversation_id="target-1",
+        audience_conversation_id="target-1",
+        origin_channel_id="chan-a",
+    )
+
+    assembled = eng.on_message_inbound(
+        active.content,
+        [active],
+        request_roles=roles,
+    )
+
+    assert assembled.recent_conversation_text == ""
+    assert assembled.recent_conversation_messages == []
+    assert [(message.role, message.content) for message in assembled.conversation_history] == [
+        ("user", "Current same-channel question."),
+    ]
+
+
+@pytest.mark.regression("BUG-045")
+def test_tier2_equal_with_payload_offset_forces_canonical_replacement(tmp_path):
+    """Marker equality cannot skip Tier 3 when the payload will be sliced."""
+    eng = _make_participant_engine(tmp_path)
+    assembler = eng._retrieval
+    fake_provider = MagicMock()
+    fake_provider.get_marker.return_value = 3
+    assembler._session_state_provider = fake_provider
+    fake_store = MagicMock(wraps=eng._store)
+    fake_store.get_recent_canonical_turns.return_value = [
+        CanonicalTurnRow(
+            conversation_id="target-1",
+            canonical_turn_id="pref-user",
+            turn_number=2,
+            turn_group_number=1,
+            sort_key=3000.0,
+            user_content="Remember the cross-channel instruction.",
+            sender="optics",
+            sender_actor_id="actor:discord:42",
+            origin_channel_id="chan-a",
+            origin_channel_label="#alpha",
+            audience_conversation_id="target-1",
+        ),
+        CanonicalTurnRow(
+            conversation_id="target-1",
+            canonical_turn_id="pref-assistant",
+            turn_number=3,
+            turn_group_number=1,
+            sort_key=4000.0,
+            assistant_content="Instruction acknowledged.",
+        ),
+    ]
+    assembler._store = fake_store
+    eng._engine_state.flushed_prefix_messages = 2
+
+    active = Message(role="user", content="Use it now.")
+    history = [
+        _stamped(
+            "user",
+            "Remember the cross-channel instruction.",
+            canonical_turn_id="pref-user",
+            turn_number=2,
+        ),
+        _stamped(
+            "assistant",
+            "Instruction acknowledged.",
+            canonical_turn_id="pref-assistant",
+            turn_number=3,
+        ),
+        active,
+    ]
+    roles = RequestRoles(
+        requester_actor_id="actor:discord:42",
+        owner_conversation_id="target-1",
+        audience_conversation_id="target-1",
+        origin_channel_id="chan-b",
+    )
+
+    assembled = eng.on_message_inbound(
+        active.content,
+        history,
+        request_roles=roles,
+    )
+
+    fake_store.get_recent_canonical_turns.assert_called_once_with(
+        "target-1",
+        limit=eng.config.monitor.protected_recent_turns,
+    )
+    assert assembled.recent_conversation_text == ""
+    assert _replayed_pairs(assembled) == [
+        ("user", "Remember the cross-channel instruction."),
+        ("assistant", "Instruction acknowledged."),
+    ]
+    assert [(message.role, message.content) for message in assembled.conversation_history] == [
+        ("user", "Use it now."),
+    ]
+    assert eng._retrieval.reassemble_context() == assembled.prepend_text
+
+
+@pytest.mark.regression("BUG-045")
+def test_tier3_read_failure_preserves_unsliced_payload(tmp_path):
+    """A failed canonical replacement must not erase local payload history."""
+    eng = _make_participant_engine(tmp_path)
+    assembler = eng._retrieval
+    fake_provider = MagicMock()
+    fake_provider.get_marker.return_value = 3
+    assembler._session_state_provider = fake_provider
+    fake_store = MagicMock(wraps=eng._store)
+    fake_store.get_recent_canonical_turns.side_effect = RuntimeError(
+        "canonical store unavailable"
+    )
+    assembler._store = fake_store
+    eng._engine_state.flushed_prefix_messages = 2
+
+    active = Message(role="user", content="Use it now.")
+    history = [
+        _stamped(
+            "user",
+            "Remember the cross-channel instruction.",
+            canonical_turn_id="pref-user",
+            turn_number=2,
+        ),
+        _stamped(
+            "assistant",
+            "Instruction acknowledged.",
+            canonical_turn_id="pref-assistant",
+            turn_number=3,
+        ),
+        active,
+    ]
+
+    assembled = eng.on_message_inbound(active.content, history)
+
+    assert [
+        (message.role, message.content)
+        for message in assembled.conversation_history
+    ] == [
+        ("user", "Remember the cross-channel instruction."),
+        ("assistant", "Instruction acknowledged."),
+        ("user", "Use it now."),
+    ]
 
 
 # ---------------------------------------------------------------------------
