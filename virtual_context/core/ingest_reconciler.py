@@ -130,7 +130,7 @@ _ALIGNMENT_WINDOW_SIZES = tuple(reversed(_ANCHOR_WINDOW_SIZES))
 # volume.
 _INGEST_BREAKDOWN_LOG_THRESHOLD_MS = 500.0
 
-# Incremental anchor writes, enabled per backend rather than globally.
+# Incremental anchor writes, enabled per backend.
 #
 # Rewriting the whole anchor set costs 1,256ms of a 1,790ms ingest on a
 # 9,249-row conversation in production, 70% of it, to change three rows
@@ -159,13 +159,15 @@ _INGEST_BREAKDOWN_LOG_THRESHOLD_MS = 500.0
 # by declaring that its reconcile survives its own store calls. Anything
 # that does not answer keeps the rebuild, which is self-correcting and
 # therefore safe without the lock.
-_INCREMENTAL_ANCHOR_WRITES_DEFAULT = False
-
-
 def _incremental_anchor_writes_enabled(store) -> bool:
-    """Whether this store's reconcile is strong enough for a delta write."""
-    if _INCREMENTAL_ANCHOR_WRITES_DEFAULT:
-        return True
+    """Whether this store's reconcile is strong enough for a delta write.
+
+    The store is the only authority. There is deliberately no global
+    override: a switch that forces the delta on would contradict the
+    per-backend claim it sits above, and the one thing this gate must
+    never do is enable the delta somewhere the exclusion has not been
+    established.
+    """
     return bool(getattr(store, "reconcile_excludes_concurrent_writers", False))
 
 
