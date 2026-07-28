@@ -417,3 +417,46 @@ def test_unsupported_backend_falls_back_to_the_full_load(tmp_path: Path):
     )
     assert result.merge_mode == "exact_resend"
     assert result.turns_written == 0
+
+
+@pytest.mark.regression("BUG-045")
+def test_projection_still_triggers_the_legacy_group_backfill(tmp_path: Path):
+    """Projecting rows must not stop the one-shot turn-group recompute.
+
+    Conversations ingested before ``turn_group_number`` existed sit at -1
+    on every row and fall back to content heuristics. The full-row loader
+    detects that at read time and recomputes once. A projected loader that
+    skipped it would leave those conversations on heuristics forever, and
+    the enrichment merge would keep reading -1 and never inherit a group.
+    """
+    store = _store(tmp_path)
+    for index in range(4):
+        store.save_canonical_turn(
+            "c", index,
+            "u" if index % 2 == 0 else "",
+            "" if index % 2 == 0 else "a",
+            canonical_turn_id=f"id-{index}",
+            sort_key=float((index + 1) * 1000.0),
+            turn_hash=f"h{index}",
+            turn_group_number=-1,
+        )
+    # Read the raw table, not the full loader: the full loader performs the
+    # very backfill under test, so using it here would trigger the recompute
+    # and the precondition would assert against an already-repaired state.
+    raw = store._get_conn().execute(
+        "SELECT turn_group_number FROM canonical_turns WHERE conversation_id = ?",
+        ("c",),
+    ).fetchall()
+    assert all(row[0] < 0 for row in raw), "fixture must start out legacy"
+
+    projected = store.get_canonical_turn_reconcile_rows("c")
+
+    assert projected, "fixture must produce rows"
+    assert any(r.turn_group_number >= 0 for r in projected), (
+        "the projected loader must trigger the legacy group backfill"
+    )
+    # And the full-row loader agrees, so the two do not diverge.
+    full = store.get_all_canonical_turns("c")
+    assert [r.turn_group_number for r in projected] == [
+        r.turn_group_number for r in full
+    ]

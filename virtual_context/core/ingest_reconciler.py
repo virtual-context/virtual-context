@@ -2078,7 +2078,11 @@ class IngestReconciler:
         The cost is dominated by that write, not by deriving the set.
 
         So the required set is derived, the stored set is READ, and only
-        the difference between them is written.
+        the difference between them is written -- when that path is
+        enabled. It is off by default (see ``_INCREMENTAL_ANCHOR_WRITES``),
+        because the read-modify-write races across processes, so the
+        rebuild is what normally runs and the rest of this describes the
+        path as it will behave once the write is idempotent.
 
         Reading the stored set matters more than it looks. Deriving what
         the store "should" already hold from the caller's pre-ingest rows
@@ -2095,8 +2099,11 @@ class IngestReconciler:
         uniqueness constraint, so a triple present more than once is
         deleted and reinserted exactly once.
 
-        Returns the number of anchor rows written (inserted plus deleted),
-        which is the write amplification this method is responsible for.
+        Returns the number of anchor rows this call wrote: the size of the
+        rebuilt set when rebuilding, or inserts plus deletes when writing a
+        difference. Either way it is the write amplification this method is
+        responsible for, which is what makes a rebuild visible as such in
+        the ingest breakdown.
         """
         saver = getattr(self._store, "replace_canonical_turn_anchors", None)
         if not callable(saver):

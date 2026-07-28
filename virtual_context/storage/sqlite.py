@@ -9234,7 +9234,29 @@ CREATE TABLE IF NOT EXISTS request_captures (
                ORDER BY sort_key, canonical_turn_id""",
             (STRIP_WHITESPACE, STRIP_WHITESPACE, conversation_id),
         ).fetchall()
-        return [_row_to_reconcile_row(row) for row in rows]
+        projected = [_row_to_reconcile_row(row) for row in rows]
+        return self._backfill_groups_if_legacy(conversation_id, projected)
+
+    def _backfill_groups_if_legacy(self, conversation_id, projected):
+        """Trigger the one-shot turn-group recompute a legacy row set needs.
+
+        The full-row loader does this, and projecting the rows must not be
+        the reason it stops happening: a conversation ingested before
+        ``turn_group_number`` existed sits at -1 on every row and falls
+        back to content heuristics forever.
+        """
+        if not projected or not all(r.turn_group_number < 0 for r in projected):
+            return projected
+        try:
+            self.recompute_canonical_turn_groups(conversation_id)
+        except Exception:
+            logger.warning(
+                "Lazy turn_group_number backfill failed for %s; falling back to content heuristics",
+                conversation_id[:12],
+                exc_info=True,
+            )
+            return projected
+        return self.get_canonical_turn_reconcile_rows(conversation_id)
 
     def count_canonical_turns(self, conversation_id: str) -> int:
         """Indexed COUNT of canonical_turn rows under the literal id."""
