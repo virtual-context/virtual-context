@@ -295,3 +295,63 @@ def _ingest(store, conversation_id: str, body: dict) -> None:
         fmt=detect_format({"messages": []}),
         expected_lifecycle_epoch=store.get_lifecycle_epoch(conversation_id),
     )
+
+
+@pytest.mark.regression("BUG-047")
+def test_the_block_is_enforced_by_postgres_not_by_python(conv):
+    """Ask the database whether it is the one doing the blocking.
+
+    Every other test here uses threads as a stand-in for workers, on the
+    argument that the lock lives in a database transaction and each
+    thread holds its own connection. That argument is sound but it is
+    still an argument. This replaces it with an observation: while one
+    worker holds the reconcile and another waits, Postgres itself must
+    report an ungranted lock.
+
+    If the exclusion were an artifact of Python — a shared connection, a
+    thread-local, a coincidence of timing — ``pg_locks`` would show
+    nothing ungranted and this fails. That closes the last gap between
+    "threads" and "processes", because a server-side lock wait does not
+    care which OS process asked.
+    """
+    conversation_id, store = conv
+    holder_inside = threading.Event()
+    waiter_started = threading.Event()
+    ungranted_seen: list[int] = []
+    release = threading.Event()
+
+    def holder():
+        with store.conversation_reconcile(conversation_id):
+            holder_inside.set()
+            release.wait(timeout=_JOIN_TIMEOUT)
+
+    def waiter():
+        assert holder_inside.wait(timeout=_JOIN_TIMEOUT), "holder never entered"
+        waiter_started.set()
+        with store.conversation_reconcile(conversation_id):
+            pass
+
+    def observer():
+        assert waiter_started.wait(timeout=_JOIN_TIMEOUT), "waiter never started"
+        # Give the waiter time to reach the lock and block on it.
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            with pg_test_conn() as conn:
+                row = conn.execute(
+                    "SELECT count(*) AS n FROM pg_locks WHERE NOT granted",
+                ).fetchone()
+            count = int(row["n"] if hasattr(row, "keys") else row[0])
+            if count > 0:
+                ungranted_seen.append(count)
+                break
+            time.sleep(0.1)
+        release.set()
+
+    _run_concurrently(holder, waiter, observer)
+
+    assert ungranted_seen, (
+        "Postgres never reported an ungranted lock while one worker held "
+        "the reconcile and another waited: the exclusion is not being "
+        "enforced server-side, so these tests are not measuring what they "
+        "claim to measure"
+    )
