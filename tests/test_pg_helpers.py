@@ -26,3 +26,21 @@ def test_unset_environment_disables_the_fleet(monkeypatch):
     monkeypatch.delenv("VC_TEST_POSTGRES_URL", raising=False)
     monkeypatch.delenv("DATABASE_URL", raising=False)
     assert pg_dsn() is None
+
+
+def test_fleet_sentinel_uses_the_shared_resolver():
+    """The sentinel must resolve through pg_dsn(), not its own read.
+
+    The sentinel polices every fleet file's gate; nothing polices the
+    sentinel. A private environment read there once kept the old
+    precedence, so the fleet and the sentinel's schema-bootstrapping
+    preflight could target different databases with both variables set.
+    """
+    import pathlib
+
+    src = (pathlib.Path(__file__).parent
+           / "test_postgres_fleet_sentinel.py").read_text(encoding="utf-8")
+    assert "_PG_DSN = pg_dsn()" in src
+    module_level = src.split("def test_", 1)[0]
+    assert 'environ.get("DATABASE_URL")' not in module_level
+    assert 'environ.get("VC_TEST_POSTGRES_URL")' not in module_level

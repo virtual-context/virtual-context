@@ -27,7 +27,14 @@ import re
 
 import pytest
 
-_PG_DSN = os.environ.get("DATABASE_URL") or os.environ.get("VC_TEST_POSTGRES_URL")
+from tests.pg_helpers import pg_dsn
+
+# The sentinel resolves its DSN through the SAME resolver it polices.
+# A direct environment read here once kept a different precedence than
+# pg_dsn(), so with both variables set the fleet and this preflight
+# targeted different databases — and the preflight's schema bootstrap
+# ran against the wrong one.
+_PG_DSN = pg_dsn()
 
 #: The only sanctioned gate variables for Postgres-backed test files.
 _SANCTIONED_VARS = {"DATABASE_URL", "VC_TEST_POSTGRES_URL"}
