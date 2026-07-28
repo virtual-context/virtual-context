@@ -302,25 +302,35 @@ def _print_cascade_runbook(conversation_id: str, tags: list[str]) -> None:
     print(f"SELECT count(*) FROM tag_summary_embeddings WHERE conversation_id = {cid} AND tag IN ({tag_list});")
     print("\n# 2. Backfill (skip-existing regenerates exactly the deleted tags)")
     print("#    [shell]:")
-    print(f"virtual-context admin backfill-tag-summaries {cid_arg} --tenant-id <tenant>")
+    print(
+        f"virtual-context admin backfill-tag-summaries {cid_arg} "
+        '--tenant-id "${TENANT_ID:?set TENANT_ID}"'
+    )
     print("#    VERIFY [SQL client] (expect one fresh row per affected tag):")
     print(f"SELECT tag, updated_at FROM tag_summaries WHERE conversation_id = {cid} AND tag IN ({tag_list}) ORDER BY tag;")
-    print("\n# 3. Redis invalidation (embedding snapshot, context hints, tag stats):")
+    print("\n# 3. Redis invalidation (embedding snapshot, context hints, tag stats)")
+    print("#    [shell] (each loop STOPS on a redis-cli failure or a non-numeric")
+    print("#    reply instead of spinning; rerun after fixing connectivity):")
     print(f"redis-cli DEL {emb_key} {stats_key}")
     print("c=0; while :; do")
-    print(f"  c=$(redis-cli --raw EVAL {hint_delete_page} 0 {hint_glob} \"$c\")")
+    print(f"  c=$(redis-cli --raw EVAL {hint_delete_page} 0 {hint_glob} \"$c\") \\")
+    print('    || { echo "redis-cli failed; rerun this loop" >&2; break; }')
+    print('  case "$c" in ""|*[!0-9]*) echo "unexpected reply: $c" >&2; break;; esac')
     print('  [ "$c" = "0" ] && break')
     print("done")
-    print("#    VERIFY (expect 0, 0, and 'remaining hint keys: 0'):")
+    print("#    VERIFY [shell] (expect 0, 0, and 'remaining hint keys: 0'):")
     print(f"redis-cli EXISTS {emb_key}")
     print(f"redis-cli EXISTS {stats_key}")
     print("c=0; total=0; while :; do")
-    print(f"  out=$(redis-cli --raw EVAL {hint_count_page} 0 {hint_glob} \"$c\")")
+    print(f"  out=$(redis-cli --raw EVAL {hint_count_page} 0 {hint_glob} \"$c\") \\")
+    print('    || { echo "redis-cli failed; rerun this loop" >&2; break; }')
+    print('  case "$out" in *[!0-9\\ ]*|"") echo "unexpected reply: $out" >&2; break;; esac')
     print('  c=${out%% *}; total=$((total + ${out##* }))')
     print('  [ "$c" = "0" ] && break')
     print('done; echo "remaining hint keys: $total"')
-    print("\n# 4. Worker recycle (process-local caches have no expiry):")
-    print("#    recycle the serving workers, then VERIFY start times are post-recycle:")
+    print("\n# 4. Worker recycle (process-local caches have no expiry)")
+    print("#    recycle the serving workers, then VERIFY [shell] that start")
+    print("#    times are post-recycle:")
     print("ps -o pid,lstart,command -C python | grep -i uvicorn")
     print("# === END RUNBOOK: staleness persists until ALL FOUR steps verify ===")
 
@@ -511,8 +521,12 @@ def cmd_admin_resummarize_segments(args) -> None:
         "resume_after_ref": cursor.ref,
         "resume_cursor_frozen": cursor.frozen,
         "note": ("skipped_concurrent is NORMAL on an active conversation: "
-                 "live compaction rewrites rows mid-run; re-running is the "
-                 "intended completion path and is safe by idempotency"),
+                 "live compaction rewrites rows mid-run. COMPLETION PATH: "
+                 "malformed and rejected rows remain damaged and remain "
+                 "selected but are BEHIND resume_after_ref, so finish with a "
+                 "fresh run WITHOUT --after-ref, which re-selects them and "
+                 "every skipped_concurrent row; re-running is safe by "
+                 "idempotency"),
     }, indent=2))
     if counts["accepted"]:
         _print_cascade_runbook(conversation_id, sorted(affected_tags))

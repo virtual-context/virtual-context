@@ -197,3 +197,48 @@ def test_cascade_runbook_never_reparses_redis_keys_in_the_shell(capsys):
         assert "repeat" not in line       # ...not an in-script loop
     # The cursor loop lives client-side in the printed shell.
     assert out.count('[ "$c" = "0" ] && break') == 2
+
+
+def test_cascade_runbook_shell_sections_parse_as_shell(capsys):
+    """Every non-comment, non-SQL line of the runbook must be valid
+    shell, verified by bash -n with a hostile conversation id embedded.
+    The runbook's [shell] labels are a promise; this test enforces it,
+    including that the loops stop instead of spinning when redis-cli
+    fails (the guard lines are part of the parsed script)."""
+    import shutil
+    import subprocess
+
+    from virtual_context.cli.resummarize_cmd import _print_cascade_runbook
+
+    if shutil.which("bash") is None:
+        pytest.skip("bash not available")
+
+    _print_cascade_runbook("conv with spaces' and quote", ["legal", "court"])
+    out = capsys.readouterr().out
+    shell_lines = [
+        l for l in out.splitlines()
+        if l.strip()
+        and not l.lstrip().startswith("#")
+        and not l.startswith(("DELETE", "SELECT"))
+    ]
+    script = "\n".join(shell_lines) + "\n"
+    proc = subprocess.run(
+        ["bash", "-n"], input=script, capture_output=True, text=True,
+    )
+    assert proc.returncode == 0, f"bash -n rejected:\n{proc.stderr}\n{script}"
+    # The failure guards are present in both loops.
+    assert script.count("redis-cli failed") == 2
+    assert script.count("unexpected reply") == 2
+
+
+def test_report_note_names_the_completion_path():
+    """The operator-facing note must say that malformed/rejected rows
+    sit BEHIND the resume cursor and need a final fresh run without
+    --after-ref; the class docstring alone is not operator-visible."""
+    import inspect
+
+    from virtual_context.cli import resummarize_cmd
+
+    src = inspect.getsource(resummarize_cmd.cmd_admin_resummarize_segments)
+    assert "WITHOUT --after-ref" in src
+    assert "BEHIND resume_after_ref" in src
