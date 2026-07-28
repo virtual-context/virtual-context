@@ -942,6 +942,19 @@ class ContextStore(ABC):
     ) -> int:
         return 0
 
+    def get_canonical_turn_reconcile_rows(
+        self,
+        conversation_id: str,
+    ) -> list["CanonicalTurnReconcileRow"] | None:
+        """Projected canonical turns, or None when unsupported.
+
+        None rather than an empty list: an empty conversation and a
+        backend that cannot project are different answers, and treating
+        the second as the first would silently reconcile every payload
+        against no history.
+        """
+        return None
+
     def apply_canonical_turn_anchor_delta(
         self,
         conversation_id: str,

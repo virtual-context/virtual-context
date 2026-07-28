@@ -1756,6 +1756,57 @@ class CanonicalTurnRow:
 
 
 @dataclass
+class CanonicalTurnReconcileRow:
+    """A canonical turn projected down to what reconciliation reads.
+
+    Merging an inbound payload against stored history keys on hashes,
+    sort keys and identity columns. It never reads a stored row's text:
+    alignment compares ``turn_hash``, and the enrichment merge copies
+    provenance columns. Loading the text anyway dominates the cost of
+    every ingest, because the content columns are both the widest part
+    of a row and the part stored out of line.
+
+    This is deliberately a separate type from ``CanonicalTurnRow`` rather
+    than that row with empty text. A half-populated ``CanonicalTurnRow``
+    reaching a write path would silently blank real content, whereas a
+    row of this type raises instead. Nothing here is writable back to
+    storage, and nothing of this type is returned to callers.
+
+    The two ``has_*_content`` flags exist because reconciliation asks
+    whether a stored row carries user text (to decide whether a row is
+    the user half of a turn and may take speaker attribution) without
+    ever needing the text itself. Dropping the columns and leaving those
+    checks to read empty strings would silently answer "no" and stop
+    attribution from persisting.
+    """
+
+    conversation_id: str
+    canonical_turn_id: str = ""
+    turn_number: int = -1
+    turn_group_number: int = -1
+    sort_key: float = 0.0
+    turn_hash: str = ""
+    session_date: str = ""
+    sender: str = ""
+    origin_channel_id: str = ""
+    origin_channel_label: str = ""
+    sender_actor_id: str = ""
+    source_message_id: str = ""
+    reply_target_message_id: str = ""
+    reply_subject_actor_id: str = ""
+    reply_subject_label: str = ""
+    reply_target_body: str = ""
+    reply_attribution_version: int = 0
+    audience_conversation_id: str = ""
+    audience_attribution_version: int = 0
+    first_seen_at: str | None = None
+    last_seen_at: str | None = None
+    source_batch_id: str | None = None
+    has_user_content: bool = False
+    has_assistant_content: bool = False
+
+
+@dataclass
 class CanonicalTurnChunkEmbedding:
     """One embedded chunk from a canonical turn side."""
     conversation_id: str
