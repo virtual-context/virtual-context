@@ -232,16 +232,28 @@ def test_cascade_runbook_shell_sections_parse_as_shell(capsys):
 
 
 def test_report_note_names_the_completion_path():
-    """The operator-facing note must say that malformed/rejected rows
-    sit BEHIND the resume cursor and need a final fresh run without
-    --after-ref; the class docstring alone is not operator-visible."""
+    """The operator-facing note must state the completion path in full:
+    malformed/rejected rows processed before a cursor freeze MAY be
+    behind the resume cursor (rows classified after a freeze sit ahead
+    of it), and a final fresh run without --after-ref retries every
+    still-damaged row. The class docstring alone is not
+    operator-visible, and fragment assertions are not a pin — a
+    mutation removing half the sentence passed a fragment check."""
     import inspect
 
-    from virtual_context.cli import resummarize_cmd
+    from virtual_context.cli.resummarize_cmd import (
+        _REPORT_NOTE,
+        cmd_admin_resummarize_segments,
+    )
 
-    src = inspect.getsource(resummarize_cmd.cmd_admin_resummarize_segments)
-    assert "WITHOUT --after-ref" in src
-    # Precision matters: rows after a cursor freeze sit AHEAD of the
-    # cursor, so the note must say "may be behind", not "are behind".
-    assert "may be behind resume_after_ref" in src
-    assert "BEHIND resume_after_ref" not in src
+    assert (
+        "COMPLETION PATH: "
+        "malformed/rejected rows processed before any cursor freeze "
+        "may be behind resume_after_ref; finish with a fresh "
+        "invocation WITHOUT --after-ref to retry all still-damaged "
+        "malformed, rejected, and skipped-concurrent rows"
+    ) in _REPORT_NOTE
+    assert "BEHIND resume_after_ref" not in _REPORT_NOTE
+    # The constant is what the report actually emits.
+    src = inspect.getsource(cmd_admin_resummarize_segments)
+    assert '"note": _REPORT_NOTE' in src
