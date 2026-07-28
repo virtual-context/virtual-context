@@ -1,6 +1,6 @@
 """Shared Postgres test helper: direct seeding/assertion connection.
 
-The DATABASE_URL-gated test fleet needs an imperative connection for
+The DSN-gated test fleet needs an imperative connection for
 seeding rows and asserting on table state. The storage backend's pool
 is not a substitute: checking test connections out of the store's pool
 couples test reads to pool sizing, and ``store.close()`` in a teardown
@@ -28,12 +28,18 @@ def pg_dsn() -> str | None:
     reads the environment directly can silently honor only one
     spelling; the fleet sentinel's gate-uniformity lint enforces use
     of this resolver.
+
+    When both variables are set, ``VC_TEST_POSTGRES_URL`` wins: the
+    test-scoped name is the operator's explicit statement of which
+    database the destructive fleet may touch, and it must not be
+    silently overridden by a ``DATABASE_URL`` that happens to be
+    exported in the same shell for some other purpose.
     """
-    return os.environ.get("DATABASE_URL") or os.environ.get("VC_TEST_POSTGRES_URL")
+    return os.environ.get("VC_TEST_POSTGRES_URL") or os.environ.get("DATABASE_URL")
 
 
 def pg_test_conn():
-    """Return the shared direct connection to ``DATABASE_URL``.
+    """Return the shared direct connection to the resolved test DSN.
 
     Recreated transparently if a previous test closed it (e.g. by using
     it as a context manager, which closes on exit in psycopg 3).
