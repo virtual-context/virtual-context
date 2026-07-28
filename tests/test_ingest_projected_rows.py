@@ -85,7 +85,7 @@ def _pairs(n: int) -> dict:
 # The projection carries what reconciliation reads and nothing more.
 # ---------------------------------------------------------------------------
 
-@pytest.mark.regression("BUG-045")
+@pytest.mark.regression("BUG-048")
 def test_projection_omits_content_and_matches_row_order(tmp_path: Path):
     store = _store(tmp_path)
     rec = _reconciler(store)
@@ -106,7 +106,7 @@ def test_projection_omits_content_and_matches_row_order(tmp_path: Path):
         )
 
 
-@pytest.mark.regression("BUG-045")
+@pytest.mark.regression("BUG-048")
 def test_projection_preserves_every_field_the_enrichment_merge_reads(tmp_path: Path):
     """Whatever _preserve_existing_enrichment reads must be projected.
 
@@ -156,7 +156,7 @@ def test_projection_preserves_every_field_the_enrichment_merge_reads(tmp_path: P
 # The role gate. The flag must answer exactly what .strip() answers.
 # ---------------------------------------------------------------------------
 
-@pytest.mark.regression("BUG-045")
+@pytest.mark.regression("BUG-048")
 def test_strip_whitespace_constant_matches_python():
     """The trim set must be exactly what ``str.strip()`` removes.
 
@@ -174,7 +174,7 @@ def test_strip_whitespace_constant_matches_python():
     assert "\\" not in STRIP_WHITESPACE
 
 
-@pytest.mark.regression("BUG-045")
+@pytest.mark.regression("BUG-048")
 @pytest.mark.parametrize("codepoint", sorted(ord(c) for c in STRIP_WHITESPACE))
 def test_presence_flag_false_for_every_whitespace_character(
     tmp_path: Path, codepoint: int,
@@ -198,7 +198,7 @@ def test_presence_flag_false_for_every_whitespace_character(
     )
 
 
-@pytest.mark.regression("BUG-045")
+@pytest.mark.regression("BUG-048")
 @pytest.mark.parametrize(
     "user_text",
     [
@@ -241,7 +241,7 @@ def test_presence_flag_agrees_with_python_strip(tmp_path: Path, user_text: str):
     )
 
 
-@pytest.mark.regression("BUG-045")
+@pytest.mark.regression("BUG-048")
 def test_attribution_still_persists_through_the_projection(tmp_path: Path):
     """The role gate still lets a late-derived sender reach storage.
 
@@ -283,7 +283,7 @@ def test_attribution_still_persists_through_the_projection(tmp_path: Path):
 # Type leakage. No projected row escapes, and one reaching a write raises.
 # ---------------------------------------------------------------------------
 
-@pytest.mark.regression("BUG-045")
+@pytest.mark.regression("BUG-048")
 @pytest.mark.parametrize(
     "second_payload",
     [
@@ -330,7 +330,7 @@ def test_result_rows_never_carry_a_projected_row(tmp_path: Path, second_payload)
         assert not isinstance(row, CanonicalTurnReconcileRow)
 
 
-@pytest.mark.regression("BUG-045")
+@pytest.mark.regression("BUG-048")
 def test_exact_resend_rows_carry_the_stored_ordinal(tmp_path: Path):
     """Returned rows must keep a real turn_number, not the -1 sentinel.
 
@@ -364,7 +364,7 @@ def test_exact_resend_rows_carry_the_stored_ordinal(tmp_path: Path):
     )
 
 
-@pytest.mark.regression("BUG-045")
+@pytest.mark.regression("BUG-048")
 def test_projected_row_cannot_be_written_back(tmp_path: Path):
     """A projected row reaching a write path raises rather than blanking.
 
@@ -384,7 +384,7 @@ def test_projected_row_cannot_be_written_back(tmp_path: Path):
 # Unsupported backends keep the full load.
 # ---------------------------------------------------------------------------
 
-@pytest.mark.regression("BUG-045")
+@pytest.mark.regression("BUG-048")
 def test_unsupported_backend_falls_back_to_the_full_load(tmp_path: Path):
     """None means "cannot project", which is not the same as "no rows".
 
@@ -419,7 +419,7 @@ def test_unsupported_backend_falls_back_to_the_full_load(tmp_path: Path):
     assert result.turns_written == 0
 
 
-@pytest.mark.regression("BUG-045")
+@pytest.mark.regression("BUG-048")
 def test_projection_still_triggers_the_legacy_group_backfill(tmp_path: Path):
     """Projecting rows must not stop the one-shot turn-group recompute.
 
