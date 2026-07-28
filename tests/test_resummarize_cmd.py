@@ -241,4 +241,7 @@ def test_report_note_names_the_completion_path():
 
     src = inspect.getsource(resummarize_cmd.cmd_admin_resummarize_segments)
     assert "WITHOUT --after-ref" in src
-    assert "BEHIND resume_after_ref" in src
+    # Precision matters: rows after a cursor freeze sit AHEAD of the
+    # cursor, so the note must say "may be behind", not "are behind".
+    assert "may be behind resume_after_ref" in src
+    assert "BEHIND resume_after_ref" not in src
