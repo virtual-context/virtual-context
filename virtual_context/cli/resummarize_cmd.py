@@ -138,27 +138,41 @@ def _redis_glob_escape(value: str) -> str:
 
 
 class _ResumeCursor:
-    """The resume point for --after-ref, frozen at the first lost row.
+    """The resume point for --after-ref, frozen at the first UNDECIDED row.
 
-    A row whose provider call failed received no response and was not
-    repaired; the cursor must never move past it, even when LATER rows
-    succeed. Otherwise the sequence failure(A), success(B), failure(C),
-    breaker-trip(D) reports B as the resume point and a resume with
-    ``ref > B`` permanently skips unrepaired A. Once any provider
-    failure occurs the cursor freezes for the rest of the run; a resume
-    retries everything from the first lost row onward, which is safe
-    because repair is idempotent and repaired rows are no longer
-    selected.
+    Semantics per outcome, and why:
+
+    - provider failure (incl. the breaker-trip row): FREEZE. The row got
+      no response; a resume must retry it. The sequence failure(A),
+      success(B), failure(C), trip(D) must report a cursor before A.
+    - CAS skipped_concurrent: FREEZE. No decision landed on the row; a
+      concurrent writer moved xmin while the row may still be damaged.
+    - malformed / validator-rejected: ADVANCE. The row received a
+      response and a decision; the cursor deliberately moves past it so
+      a block of persistently rejecting rows cannot starve later damage
+      on every resumed run. Those rows remain damaged, remain selected,
+      and are re-attempted by the documented completion path: a fresh
+      run without --after-ref.
+    - accepted (CAS wrote): ADVANCE. The repair destroyed the selection
+      predicate; nothing behind the cursor is lost.
+
+    Once frozen, the cursor never moves again this run; resuming from a
+    frozen cursor retries everything from the first undecided row
+    onward, which is safe because repair is idempotent and repaired
+    rows are no longer selected.
     """
 
     def __init__(self, start: str | None):
         self.ref = start
         self.frozen = False
 
-    def on_provider_failure(self) -> None:
+    def freeze(self) -> None:
         self.frozen = True
 
-    def on_response(self, ref: str) -> None:
+    def on_provider_failure(self) -> None:
+        self.freeze()
+
+    def on_decided(self, ref: str) -> None:
         if not self.frozen:
             self.ref = ref
 
@@ -256,49 +270,59 @@ def _print_cascade_runbook(conversation_id: str, tags: list[str]) -> None:
     hint_glob = shlex.quote(
         f"vc:context_hint:{_redis_glob_escape(conversation_id)}:*",
     )
-    # Hint keys are deleted by a server-side SCAN/DEL script with the
-    # pattern passed as ARGV. Piping scan output through xargs re-parses
-    # raw key text in the shell: a quote in a key aborts xargs, a space
-    # splits one key into several DEL arguments. Keys must never transit
-    # a textual re-parse.
-    hint_delete_lua = shlex.quote(
+    # Hint keys are deleted by a server-side script processing ONE scan
+    # page per EVAL, with the cursor looped client-side. Two hazards
+    # shape this: piping scan output through xargs re-parses raw key
+    # text in the shell (a quote in a key aborts the pipeline, a space
+    # splits one key into several DEL arguments), and looping SCAN to
+    # completion INSIDE one EVAL turns an incremental scan into a
+    # blocking O(keyspace) atomic operation. So: keys never leave the
+    # server, and each EVAL touches at most one page.
+    hint_delete_page = shlex.quote(
         "redis.replicate_commands() "
-        "local cursor='0' local deleted=0 "
-        "repeat local r=redis.call('SCAN',cursor,'MATCH',ARGV[1],'COUNT',500) "
-        "cursor=r[1] "
-        "for _,k in ipairs(r[2]) do redis.call('DEL',k) deleted=deleted+1 end "
-        "until cursor=='0' return deleted",
+        "local r=redis.call('SCAN',ARGV[2],'MATCH',ARGV[1],'COUNT',500) "
+        "for _,k in ipairs(r[2]) do redis.call('DEL',k) end "
+        "return r[1]",
     )
-    hint_count_lua = shlex.quote(
-        "redis.replicate_commands() "
-        "local cursor='0' local found=0 "
-        "repeat local r=redis.call('SCAN',cursor,'MATCH',ARGV[1],'COUNT',500) "
-        "cursor=r[1] found=found+#r[2] "
-        "until cursor=='0' return found",
+    hint_count_page = shlex.quote(
+        "local r=redis.call('SCAN',ARGV[2],'MATCH',ARGV[1],'COUNT',500) "
+        "return r[1]..' '..#r[2]",
     )
-    print("\n=== CASCADE RUNBOOK (not executed; run each step, then its check) ===")
+    # Banner/commentary lines are '#'-prefixed; SQL sections are labeled
+    # for a SQL client and shell sections are valid shell, so an
+    # operator pasting a SECTION into the matching tool gets no noise.
+    print("\n# === CASCADE RUNBOOK (not executed; run each step, then its check) ===")
     print(f"# affected tags: {sorted(tags)}")
-    print("\n# 1. Two-table targeted delete (tag summaries AND their embeddings):")
+    print("\n# 1. Two-table targeted delete (tag summaries AND their embeddings)")
+    print("#    [SQL client]:")
     print(f"DELETE FROM tag_summary_embeddings WHERE conversation_id = {cid} AND tag IN ({tag_list});")
     print(f"DELETE FROM tag_summaries WHERE conversation_id = {cid} AND tag IN ({tag_list});")
-    print("#    VERIFY (expect 0 and 0):")
+    print("#    VERIFY [SQL client] (expect 0 and 0):")
     print(f"SELECT count(*) FROM tag_summaries WHERE conversation_id = {cid} AND tag IN ({tag_list});")
     print(f"SELECT count(*) FROM tag_summary_embeddings WHERE conversation_id = {cid} AND tag IN ({tag_list});")
-    print("\n# 2. Backfill (skip-existing regenerates exactly the deleted tags):")
+    print("\n# 2. Backfill (skip-existing regenerates exactly the deleted tags)")
+    print("#    [shell]:")
     print(f"virtual-context admin backfill-tag-summaries {cid_arg} --tenant-id <tenant>")
-    print("#    VERIFY (expect one fresh row per affected tag):")
+    print("#    VERIFY [SQL client] (expect one fresh row per affected tag):")
     print(f"SELECT tag, updated_at FROM tag_summaries WHERE conversation_id = {cid} AND tag IN ({tag_list}) ORDER BY tag;")
     print("\n# 3. Redis invalidation (embedding snapshot, context hints, tag stats):")
     print(f"redis-cli DEL {emb_key} {stats_key}")
-    print(f"redis-cli EVAL {hint_delete_lua} 0 {hint_glob}")
-    print("#    VERIFY (expect 0, 0, and 0):")
+    print("c=0; while :; do")
+    print(f"  c=$(redis-cli --raw EVAL {hint_delete_page} 0 {hint_glob} \"$c\")")
+    print('  [ "$c" = "0" ] && break')
+    print("done")
+    print("#    VERIFY (expect 0, 0, and 'remaining hint keys: 0'):")
     print(f"redis-cli EXISTS {emb_key}")
     print(f"redis-cli EXISTS {stats_key}")
-    print(f"redis-cli EVAL {hint_count_lua} 0 {hint_glob}")
+    print("c=0; total=0; while :; do")
+    print(f"  out=$(redis-cli --raw EVAL {hint_count_page} 0 {hint_glob} \"$c\")")
+    print('  c=${out%% *}; total=$((total + ${out##* }))')
+    print('  [ "$c" = "0" ] && break')
+    print('done; echo "remaining hint keys: $total"')
     print("\n# 4. Worker recycle (process-local caches have no expiry):")
     print("#    recycle the serving workers, then VERIFY start times are post-recycle:")
     print("ps -o pid,lstart,command -C python | grep -i uvicorn")
-    print("=== END RUNBOOK: staleness persists until ALL FOUR steps verify ===")
+    print("# === END RUNBOOK: staleness persists until ALL FOUR steps verify ===")
 
 
 def cmd_admin_resummarize_segments(args) -> None:
@@ -410,10 +434,10 @@ def cmd_admin_resummarize_segments(args) -> None:
                     continue
                 consecutive_provider_failures = 0
                 totals["calls"] += 1
-                cursor.on_response(row["ref"])
                 if isinstance(outcome, Malformed):
                     counts["malformed"] += 1
                     _usage_totals(totals, outcome.usage)
+                    cursor.on_decided(row["ref"])
                     continue
                 _usage_totals(totals, outcome.usage)
                 reject = classify_generated(
@@ -422,6 +446,7 @@ def cmd_admin_resummarize_segments(args) -> None:
                 )
                 if reject is not None:
                     rejected[reject] = rejected.get(reject, 0) + 1
+                    cursor.on_decided(row["ref"])
                     continue
 
                 new_tokens = compactor.token_counter(outcome.summary)
@@ -456,8 +481,12 @@ def cmd_admin_resummarize_segments(args) -> None:
                 if updated == 1:
                     counts["accepted"] += 1
                     affected_tags.update(segment.tags)
+                    cursor.on_decided(row["ref"])
                 elif updated == 0:
                     counts["skipped_concurrent"] += 1
+                    # No decision landed: the concurrent writer may have
+                    # left the row damaged. The cursor must not pass it.
+                    cursor.freeze()
                 else:  # pragma: no cover - PK guarantees <= 1
                     raise RuntimeError(
                         f"CAS touched {updated} rows for ref {row['ref']}",
