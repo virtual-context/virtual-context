@@ -984,6 +984,21 @@ class CompositeStore:
             return str(saver(batch) or "")
         return str(batch.get("batch_id", "") or "")
 
+    @property
+    def reconcile_excludes_concurrent_writers(self) -> bool:
+        """Whether the wrapped store's reconcile excludes other workers.
+
+        Forwarded rather than answered here: this class holds no lock of
+        its own, so the claim belongs to whatever backend it delegates
+        the reconcile to. Not forwarding would silently decline on every
+        backend, since a missing attribute reads as declining.
+        """
+        return bool(
+            getattr(
+                self._segments, "reconcile_excludes_concurrent_writers", False,
+            )
+        )
+
     def conversation_reconcile(self, conversation_id: str):
         locker = getattr(self._segments, "conversation_reconcile", None)
         if callable(locker):

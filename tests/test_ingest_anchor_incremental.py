@@ -584,3 +584,45 @@ def test_a_store_silent_on_the_capability_rebuilds():
     assert inner.delta_calls == 0, "an unproven store must not get the delta"
     assert inner.full_rebuilds == 1
     assert set(inner.anchors) == _canonical_anchor_set(rows)
+
+
+@pytest.mark.regression("BUG-047")
+@pytest.mark.parametrize("inner_claims", [True, False])
+def test_capability_survives_the_production_wrapper_chain(tmp_path, inner_claims):
+    """The claim must arrive through the wrappers production actually uses.
+
+    The reconciler never sees a bare backend. It sees
+    ``ConversationStoreView(CompositeStore(backend))``, and a wrapper
+    that fails to forward the capability silently declines it on every
+    backend — the optimization deploys, reports success, and never runs.
+    That is precisely what happened: the backend declared the claim, the
+    composite did not forward it, and the gate read False in production
+    while every direct-store test passed.
+
+    Parametrized both ways so forwarding is proven, not just presence:
+    a wrapper that hardcoded True would pass the True case and betray
+    the SQLite case.
+    """
+    from virtual_context.core.composite_store import CompositeStore
+    from virtual_context.core.conversation_store import ConversationStoreView
+    from virtual_context.core.ingest_reconciler import (
+        _incremental_anchor_writes_enabled,
+    )
+
+    inner = SQLiteStore(tmp_path / "s.db")
+    # Simulate either backend's stance on the class the composite wraps.
+    type(inner).__dict__  # ensure attribute lands on instance, not class
+    inner.reconcile_excludes_concurrent_writers = inner_claims
+
+    composite = CompositeStore(
+        segments=inner, facts=inner, fact_links=inner,
+        state=inner, search=inner,
+    )
+    view = ConversationStoreView(composite, conversation_id="c", generation=0)
+
+    assert _incremental_anchor_writes_enabled(composite) is inner_claims, (
+        "CompositeStore does not forward the capability faithfully"
+    )
+    assert _incremental_anchor_writes_enabled(view) is inner_claims, (
+        "ConversationStoreView does not forward the capability faithfully"
+    )

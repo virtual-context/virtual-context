@@ -222,7 +222,7 @@ def test_anchor_refresh_runs_inside_the_reconcile_lock(conv, monkeypatch):
 
 
 @pytest.mark.regression("BUG-047")
-def test_concurrent_ingests_converge_on_the_rebuilt_anchor_set(conv, monkeypatch):
+def test_concurrent_ingests_converge_on_the_rebuilt_anchor_set(conv):
     """End to end, with the delta ENABLED, under real contention.
 
     Two workers ingest different payloads into one conversation at the
@@ -231,11 +231,20 @@ def test_concurrent_ingests_converge_on_the_rebuilt_anchor_set(conv, monkeypatch
     shape the review said breaks: two workers whose deltas differ, where
     a cardinality check cannot see the divergence.
     """
-    from virtual_context.core import ingest_reconciler as ir
-    from virtual_context.core.ingest_reconciler import _build_anchor_rows
+    from virtual_context.core.ingest_reconciler import (
+        _build_anchor_rows,
+        _incremental_anchor_writes_enabled,
+    )
 
-    monkeypatch.setattr(ir, "_INCREMENTAL_ANCHOR_WRITES", True)
     conversation_id, store = conv
+    # No patching: the real PostgresStore declares the capability itself,
+    # and this test is only meaningful if the delta genuinely engages on
+    # the store as shipped. If this assertion fails, the declaration was
+    # removed and everything below would silently test the rebuild.
+    assert _incremental_anchor_writes_enabled(store), (
+        "PostgresStore no longer claims reconcile_excludes_concurrent_writers; "
+        "the convergence test would exercise the rebuild, not the delta"
+    )
 
     _ingest(store, conversation_id, _pairs(4))
 

@@ -101,3 +101,88 @@ def test_pg_fleet_gates_are_uniform():
         "Postgres test files must gate via tests.pg_helpers.pg_dsn(): "
         f"{offenders}"
     )
+
+
+def test_pg_fleet_files_reference_only_symbols_that_exist():
+    """ALWAYS-ON: a fleet file must not name a symbol the code lost.
+
+    The fleet skips wholesale without a DSN, so a test in it can rot
+    silently: a monkeypatch naming a renamed or deleted attribute raises
+    only when the fleet actually runs, and on a DSN-less machine the file
+    stays green-looking forever. That is the worst state for a safety
+    test — skipped and broken — and it happened: a concurrency test
+    patched a module constant that had been replaced, and the proof it
+    carried stopped running without anyone seeing a failure.
+
+    This lint runs regardless of DSN. It parses each fleet file, resolves
+    every ``monkeypatch.setattr(target, "name", ...)`` and
+    ``getattr(target, "name", ...)`` whose target is a module or class
+    imported by that file, and asserts the named attribute exists.
+    Targets it cannot resolve statically (locals, fixtures) are skipped:
+    the point is the common dangerous pattern, not a type checker.
+    """
+    import ast
+    import importlib
+    from pathlib import Path
+
+    fleet = sorted(Path(__file__).parent.glob("*postgres*.py"))
+    assert fleet, "fleet glob found nothing; the lint is misconfigured"
+    problems: list[str] = []
+
+    for path in fleet:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+
+        # alias -> importable dotted path, module-level and function-level.
+        targets: dict[str, object] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for a in node.names:
+                    try:
+                        targets[a.asname or a.name.split(".")[0]] = (
+                            importlib.import_module(a.name)
+                        )
+                    except ImportError:
+                        pass
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                for a in node.names:
+                    try:
+                        mod = importlib.import_module(node.module)
+                        obj = getattr(mod, a.name, None)
+                        if obj is None:
+                            obj = importlib.import_module(
+                                f"{node.module}.{a.name}"
+                            )
+                        targets[a.asname or a.name] = obj
+                    except ImportError:
+                        pass
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            fn = node.func
+            is_setattr = (
+                isinstance(fn, ast.Attribute) and fn.attr == "setattr"
+            ) or (isinstance(fn, ast.Name) and fn.id in ("setattr", "getattr", "delattr"))
+            if not is_setattr or len(node.args) < 2:
+                continue
+            tgt, name_node = node.args[0], node.args[1]
+            if not (
+                isinstance(tgt, ast.Name)
+                and isinstance(name_node, ast.Constant)
+                and isinstance(name_node.value, str)
+            ):
+                continue
+            resolved = targets.get(tgt.id)
+            if resolved is None:
+                continue  # a local; not statically resolvable
+            if not hasattr(resolved, name_node.value):
+                problems.append(
+                    f"{path.name}:{node.lineno}: patches "
+                    f"{tgt.id}.{name_node.value!r}, which does not exist"
+                )
+
+    assert not problems, (
+        "fleet files reference symbols the code no longer defines "
+        "(these tests would die at runtime on the fleet host while "
+        "looking skipped-green everywhere else):\n  " + "\n  ".join(problems)
+    )
