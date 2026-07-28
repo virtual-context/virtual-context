@@ -556,3 +556,52 @@ def test_five_faithful_rewordings_are_all_accepted():
     ]
     for summary in rewordings:
         assert DomainCompactor._unusable_reason(summary, source) is None, summary
+
+
+def test_summary_request_conversation_text_override(ts):
+    """The override must replace the formatted text everywhere it flows.
+
+    A caller repairing a stored segment builds the request from the stored
+    full_text; the prompt, the length-derived token target, and the
+    request's own conversation_text must all come from the override, and
+    the formatted message text must not appear anywhere.
+    """
+    compactor = DomainCompactor(
+        llm_provider=MockLLMProvider(),
+        config=CompactorConfig(
+            summary_ratio=0.15,
+            min_summary_tokens=50,
+            max_summary_tokens=500,
+        ),
+        model_name="test-model",
+    )
+    segment = TaggedSegment(
+        primary_tag="legal",
+        tags=["legal", "court"],
+        messages=[
+            Message(role="user", content="What's the court filing deadline?", timestamp=ts),
+            Message(role="assistant", content="The filing is due January 30.", timestamp=ts + timedelta(seconds=30)),
+        ],
+        token_count=50,
+        start_timestamp=ts,
+        end_timestamp=ts + timedelta(seconds=30),
+        turn_count=1,
+    )
+    formatted = compactor._format_conversation(segment.messages)
+
+    # Passing the formatted text explicitly is identical to not passing it.
+    assert compactor.build_segment_summary_request(
+        segment, conversation_text=formatted,
+    ) == compactor.build_segment_summary_request(segment)
+
+    stored = "Stored transcript bytes " * 200  # long enough to move target_tokens
+    req = compactor.build_segment_summary_request(
+        segment, conversation_text=stored,
+    )
+    assert req.conversation_text == stored
+    assert stored[:200] in req.prompt
+    assert "court filing deadline" not in req.prompt
+    assert req.original_tokens == compactor.token_counter(stored)
+    expected_target = max(50, min(500, int(req.original_tokens * 0.15)))
+    assert req.target_tokens == expected_target
+    assert str(expected_target) in req.prompt

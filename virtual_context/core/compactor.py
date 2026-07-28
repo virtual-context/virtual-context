@@ -572,6 +572,7 @@ class DomainCompactor:
         fact_signals: list[FactSignal] | None = None,
         code_refs: list[dict] | None = None,
         prev_context: str = "",
+        conversation_text: str | None = None,
     ) -> "SegmentSummaryRequest":
         """The exact summarize request compaction would issue for *segment*.
 
@@ -581,8 +582,16 @@ class DomainCompactor:
         no fallback handling. Callers own their own failure semantics;
         ``_compact_one`` keeps the source-text fallback behavior pinned by
         the characterization tests.
+
+        *conversation_text* overrides the formatting of
+        ``segment.messages``. A caller re-summarizing a STORED segment must
+        pass the stored full_text: formatting has evolved over time, so
+        re-formatting reconstructed messages is not guaranteed to reproduce
+        the text the stored summary is judged against, and the request must
+        be built from the same bytes the acceptance gate will compare with.
         """
-        conversation_text = self._format_conversation(segment.messages)
+        if conversation_text is None:
+            conversation_text = self._format_conversation(segment.messages)
         original_tokens = self.token_counter(conversation_text)
 
         target_tokens = max(
