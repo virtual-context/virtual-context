@@ -13,6 +13,7 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
+from ..core.canonical_turns import STRIP_WHITESPACE
 from ..core.store import ContextStore
 from ..core.canonical_turns import (
     HASH_VERSION,
@@ -9398,13 +9399,6 @@ class PostgresStore(ContextStore):
     ) -> list[CanonicalTurnRow]:
         return self._load_canonical_turn_rows(conversation_id)
 
-    # ASCII whitespace, matching what Python's ``str.strip()`` removes. The
-    # presence flags below stand in for ``(value or "").strip()`` checks in
-    # the reconciler, so the two must trim the same characters: the default
-    # single-argument BTRIM strips spaces only, which would report a row
-    # holding just a newline as carrying content.
-    _WS_TRIM_SQL = r"E' \t\n\r\f\v'"
-
     def get_canonical_turn_reconcile_rows(
         self,
         conversation_id: str,
@@ -9428,14 +9422,14 @@ class PostgresStore(ContextStore):
                           reply_target_body, reply_attribution_version,
                           audience_conversation_id, audience_attribution_version,
                           first_seen_at, last_seen_at, source_batch_id,
-                          (btrim(coalesce(user_content, ''), {self._WS_TRIM_SQL}) <> '')
+                          (btrim(coalesce(user_content, ''), %s) <> '')
                               AS has_user_content,
-                          (btrim(coalesce(assistant_content, ''), {self._WS_TRIM_SQL}) <> '')
+                          (btrim(coalesce(assistant_content, ''), %s) <> '')
                               AS has_assistant_content
                    FROM canonical_turns_ordinal
                    WHERE conversation_id = %s
                    ORDER BY sort_key, canonical_turn_id""",
-                (conversation_id,),
+                (STRIP_WHITESPACE, STRIP_WHITESPACE, conversation_id),
             ).fetchall()
         return [_row_to_reconcile_row(row) for row in rows]
 

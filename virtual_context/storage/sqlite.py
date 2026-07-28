@@ -33,6 +33,7 @@ from ..core.progress_snapshot import (
     ActiveEpisodeSnapshot,
     ProgressSnapshot,
 )
+from ..core.canonical_turns import STRIP_WHITESPACE
 from ..core.store import ContextStore
 from ..types import AUDIENCE_ATTRIBUTION_VERSION, ChunkEmbedding, ConversationStats, DepthLevel, EngineStateSnapshot, Fact, FactLink, FactSignal, CanonicalTurnChunkEmbedding, CanonicalTurnReconcileRow, CanonicalTurnRow, LinkedFact, QuoteResult, SegmentMetadata, SourceProvenance, SpeakerRetrievalContext, StoredSegment, StoredSummary, TagStats, TagSummary, TemporalStatus, TurnTagEntry, WorkingSetEntry, channel_excerpt_prefix, strip_channel_hash
 from ..types import (
@@ -9202,15 +9203,6 @@ CREATE TABLE IF NOT EXISTS request_captures (
     ) -> list[CanonicalTurnRow]:
         return self._load_canonical_turn_rows(conversation_id)
 
-    # ASCII whitespace, matching what Python's ``str.strip()`` removes. The
-    # presence flags below stand in for ``(value or "").strip()`` checks in
-    # the reconciler, so the two must trim the same characters: the default
-    # single-argument TRIM strips spaces only, which would report a row
-    # holding just a newline as carrying content.
-    _WS_TRIM_SQL = (
-        "char(32)||char(9)||char(10)||char(11)||char(12)||char(13)"
-    )
-
     def get_canonical_turn_reconcile_rows(
         self,
         conversation_id: str,
@@ -9233,14 +9225,14 @@ CREATE TABLE IF NOT EXISTS request_captures (
                       reply_target_body, reply_attribution_version,
                       audience_conversation_id, audience_attribution_version,
                       first_seen_at, last_seen_at, source_batch_id,
-                      (trim(coalesce(user_content, ''), {self._WS_TRIM_SQL}) <> '')
+                      (trim(coalesce(user_content, ''), ?) <> '')
                           AS has_user_content,
-                      (trim(coalesce(assistant_content, ''), {self._WS_TRIM_SQL}) <> '')
+                      (trim(coalesce(assistant_content, ''), ?) <> '')
                           AS has_assistant_content
                FROM canonical_turns_ordinal
                WHERE conversation_id = ?
                ORDER BY sort_key, canonical_turn_id""",
-            (conversation_id,),
+            (STRIP_WHITESPACE, STRIP_WHITESPACE, conversation_id),
         ).fetchall()
         return [_row_to_reconcile_row(row) for row in rows]
 
