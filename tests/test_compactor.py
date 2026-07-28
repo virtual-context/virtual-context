@@ -261,21 +261,26 @@ def test_default_prompt_requires_preserving_negation_and_intent():
     assert '"wants to remain infertile"' in DEFAULT_SUMMARY_PROMPT
 
 
-def test_compact_retries_obvious_negation_inversion(ts):
+def test_validator_no_longer_rejects_on_lexical_negation_overlap(ts):
+    """The lexical negation-inversion heuristic is deliberately gone.
+
+    It once caught a real inversion (this fixture's polarity flip is that
+    incident), but in production it rejected 36-63% of faithful summaries
+    of large or repetitive segments, because any source sentence with a
+    negative marker sharing two stemmed terms with the summary counted as
+    an inversion. Polarity protection now lives at the prompt layer, as it
+    did for the months before the heuristic existed. This test pins the
+    REMOVAL: the first response is accepted, no retry fires, and the trade
+    is documented where the old test used to assert the opposite.
+    """
     class InvertingProvider:
         def __init__(self):
             self.calls = 0
 
         def complete(self, system: str, user: str, max_tokens: int):
             self.calls += 1
-            if self.calls == 1:
-                return (
-                    '{"summary":"Reshi considered HCG because he wants fertility '
-                    'and a stronger climax.","refined_tags":[]}', {}
-                )
             return (
-                '{"summary":"Reshi wants to remain infertile and considered HCG '
-                'for a stronger climax.","refined_tags":[]}', {}
+                '{"summary":"Considered HCG.","refined_tags":[]}', {}
             )
 
     segment = TaggedSegment(
@@ -299,12 +304,22 @@ def test_compact_retries_obvious_negation_inversion(ts):
             max_summary_tokens=500,
         ),
     )
-
     result = compactor.compact([segment])[0]
+    # A concise summary that omits the negated clause but shares stemmed
+    # terms with the negative sentence is exactly what the old heuristic
+    # rejected. It must now be accepted on the first call.
+    assert provider.calls == 1, "no retry may fire on lexical overlap alone"
+    assert result.summary == "Considered HCG."
 
-    assert provider.calls == 2
-    assert "remain infertile" in result.summary
 
+def test_unusable_reason_names_degenerate_and_overshoot(ts):
+    """Rejections carry their criterion, so the next validator defect is
+    diagnosable from one log line instead of a week of archaeology."""
+    assert DomainCompactor._unusable_reason("", "source text here") == "degenerate"
+    assert DomainCompactor._unusable_reason(None, "source text here") == "degenerate"
+    long_summary = "x" * 500
+    assert DomainCompactor._unusable_reason(long_summary, "short") == "overshoot"
+    assert DomainCompactor._unusable_reason("fine summary", "a much longer source text than the summary") is None
 
 def test_custom_prompt_from_tag_rules():
     """Custom summary prompt should be used when tag matches a rule."""
@@ -483,3 +498,61 @@ class TestTagSummaryDescription:
         )
         assert len(result) == 1
         assert result[0].description == ""
+
+
+def test_faithful_summary_of_repetitive_machine_content_is_accepted():
+    """The production failure shape, as a fixture.
+
+    Large segments of near-duplicate machine records (home-automation
+    event JSON) almost always contain negative markers ("no person
+    detected"), and any faithful summary shares stemmed topic terms with
+    those sentences while containing no negation token of its own. The
+    removed heuristic rejected every such summary; measured in production
+    at 36-63% of new segments, concentrated on the largest conversations.
+    This fixture is shaped like the confirmed production specimen (real
+    conversation content stays out of a public repository); the live
+    specimen itself is re-verified operationally after deploy.
+    """
+    records = []
+    for i in range(40):
+        records.append(
+            '{"before": {"id": "1785207%03d.77-x", "camera": "cam1", '
+            '"label": "person", "stationary": false, "score": 0.58%02d}}' % (i, i)
+        )
+        if i % 7 == 3:
+            records.append(
+                "System: no person detected on camera cam1; event not retained, "
+                "snapshot won't be stored."
+            )
+    source = "\n".join(records)
+    summary = (
+        "Processed a batch of camera person-detection events from cam1, "
+        "with several events concluding as stationary detections and "
+        "snapshots stored for the retained events."
+    )
+    assert len(source) > 4000, "fixture must be in the large-segment regime"
+    assert DomainCompactor._unusable_reason(summary, source) is None, (
+        "a faithful summary of repetitive machine content must be accepted"
+    )
+
+
+def test_five_faithful_rewordings_are_all_accepted():
+    """Acceptance must not depend on wording luck.
+
+    Under the removed heuristic, three of these five faithful rewordings
+    were rejected and two passed, purely on whether the phrasing happened
+    to include a negation token. All five must be accepted.
+    """
+    source = (
+        "User: I don't want the pipeline analytics change yet.\n"
+        "Assistant: Updated the staging pipeline configuration."
+    )
+    rewordings = [
+        "Updated the staging pipeline configuration; the analytics change is on hold.",
+        "Deferred the analytics change; staging updated.",
+        "Held the analytics change; updated staging.",
+        "Decided not to apply the analytics change yet; staging updated.",
+        "The analytics change won't be applied yet; staging updated.",
+    ]
+    for summary in rewordings:
+        assert DomainCompactor._unusable_reason(summary, source) is None, summary

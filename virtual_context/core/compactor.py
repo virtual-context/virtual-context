@@ -5,7 +5,6 @@ from __future__ import annotations
 import fnmatch
 import json
 import logging
-import re
 import time
 from typing import Callable
 
@@ -682,9 +681,10 @@ class DomainCompactor:
             duration_ms = (time.time() - t0) * 1000
             self._log_usage("segment_summarize", duration_ms=duration_ms, usage=usage)
             parsed = self._parse_response(response_text)
-            if self._is_unusable_summary(
+            _reject_reason = self._unusable_reason(
                 parsed.get("summary", ""), conversation_text,
-            ):
+            )
+            if _reject_reason is not None:
                 # A tiny acknowledgement whose generated "summary" is longer
                 # than its full transcript is the production signature of
                 # preceding-context leakage.  There is no value in spending a
@@ -709,8 +709,9 @@ class DomainCompactor:
                     }
                 else:
                     logger.warning(
-                        "Degenerate or ungrounded LLM summary for segment %s; retrying once",
+                        "Unusable LLM summary for segment %s (reason=%s); retrying once",
                         segment.id,
+                        _reject_reason,
                     )
                     retry_started = time.time()
                     response_text, usage = self.llm.complete(
@@ -735,13 +736,15 @@ class DomainCompactor:
                         usage=usage,
                     )
                     parsed = self._parse_response(response_text)
-                    if self._is_unusable_summary(
+                    _retry_reason = self._unusable_reason(
                         parsed.get("summary", ""), conversation_text,
-                    ):
+                    )
+                    if _retry_reason is not None:
                         logger.warning(
-                            "Degenerate or ungrounded LLM summary persisted after retry for segment %s; "
-                            "using bounded source-text fallback",
+                            "Unusable LLM summary persisted after retry for segment %s "
+                            "(reason=%s); using bounded source-text fallback",
                             segment.id,
+                            _retry_reason,
                         )
                         parsed = {
                             "summary": conversation_text[:target_tokens * 4],
@@ -1218,21 +1221,38 @@ class DomainCompactor:
 
     @classmethod
     def _is_unusable_summary(cls, summary: object, source_text: str) -> bool:
-        """Reject malformed summaries and obvious context-import overshoot.
+        """Reject malformed summaries and obvious context-import overshoot."""
+        return cls._unusable_reason(summary, source_text) is not None
 
-        A summary longer than its complete source transcript is not compression.
-        In practice this is also a strong, deterministic signal that preceding
-        pronoun-resolution context leaked into a tiny acknowledgement segment.
-        The retry is still bounded and falls back to source text if the model
-        repeats the mistake.
+    @classmethod
+    def _unusable_reason(cls, summary: object, source_text: str) -> str | None:
+        """Why a summary is unusable, or None if it is acceptable.
+
+        Criteria: ``degenerate`` (empty, non-string, or structurally
+        broken) and ``overshoot`` (longer than its complete source, which
+        is not compression and in practice signals preceding-context
+        leakage into a tiny segment).
+
+        A third criterion, a lexical negation-inversion heuristic, was
+        removed. It rejected any summary lacking a negation token whenever
+        any source sentence carried a negative marker and shared two
+        stemmed terms, which on large or repetitive segments rejects
+        essentially every faithful summary: measured in production at
+        36-63% of new segments, each rejection costing a wasted retry call
+        before storing a raw source slice as the "summary". Its protective
+        case, a real polarity inversion, is guarded at the prompt layer
+        ("Preserve negation and intent exactly", stated in both the system
+        prompt and the retry corrective), which is the same protection the
+        system ran on for months before the heuristic existed. A semantic
+        replacement that compares the negated claim itself rather than
+        topic-term overlap is future work, not a lexical patch.
         """
         if cls._is_degenerate_summary(summary):
-            return True
+            return "degenerate"
         assert isinstance(summary, str)  # narrowed by _is_degenerate_summary
-        return (
-            cls._summary_overshoots_source(summary, source_text)
-            or cls._drops_material_negation(summary, source_text)
-        )
+        if cls._summary_overshoots_source(summary, source_text):
+            return "overshoot"
+        return None
 
     @staticmethod
     def _summary_overshoots_source(summary: object, source_text: str) -> bool:
@@ -1240,53 +1260,6 @@ class DomainCompactor:
             return False
         source = source_text.strip()
         return bool(source) and len(summary.strip()) > len(source)
-
-    @staticmethod
-    def _drops_material_negation(summary: object, source_text: str) -> bool:
-        """Detect a concise summary that appears to invert a negative claim.
-
-        This is deliberately conservative rather than pretending to be full
-        natural-language inference.  If the summary has no negative marker but
-        reuses at least two material terms from a source sentence containing a
-        negative marker, retry/fallback is safer than storing a polarity flip.
-        """
-        if not isinstance(summary, str):
-            return False
-        negative = re.compile(
-            r"\b(?:not|never|without|cannot|can't|won't|don't|doesn't|didn't|"
-            r"isn't|aren't|wasn't|weren't|shouldn't|wouldn't|couldn't)\b|"
-            r"\b(?:remain|stays?|stayed|keep|keeps|kept)\s+infertil\w*",
-            re.IGNORECASE,
-        )
-        if negative.search(summary):
-            return False
-        stop = {
-            "about", "after", "again", "also", "and", "assistant", "before",
-            "being", "conversation", "from", "have", "into", "just", "more",
-            "that", "their", "them", "then", "there", "they", "this", "user",
-            "want", "wants", "wanted", "were", "what", "when", "where", "which",
-            "with", "would", "your",
-        }
-
-        def _terms(text: str) -> set[str]:
-            terms = set()
-            for token in re.findall(r"[a-z0-9]+", text.lower()):
-                if len(token) < 3 or token in stop:
-                    continue
-                for suffix in ("ing", "ed", "es", "s"):
-                    if token.endswith(suffix) and len(token) - len(suffix) >= 4:
-                        token = token[:-len(suffix)]
-                        break
-                terms.add(token)
-            return terms
-
-        summary_terms = _terms(summary)
-        for sentence in re.split(r"[.!?\n]+", source_text):
-            if not negative.search(sentence):
-                continue
-            if len(_terms(sentence) & summary_terms) >= 2:
-                return True
-        return False
 
     def compact_tag_summaries(
         self,
