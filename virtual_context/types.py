@@ -802,6 +802,11 @@ class RequestRoles:
     # routed through a VCMERGE alias. An unproved route stays empty and reads
     # no card — silently substituting the owner is the DM-to-guild leak.
     audience_conversation_id: str = ""
+    # The physical group-channel id observed on this request before alias
+    # resolution.  Unlike ``audience_channel_id`` this is never blanked by
+    # speaker-roster scoping preferences.  A non-empty value is the proof that
+    # raw recent group history may be mirrored; DMs intentionally carry none.
+    origin_channel_id: str = ""
     audience_channel_id: str = ""
     audience_channel_label: str = ""
 
@@ -1423,6 +1428,10 @@ CARD_KINDS: tuple[str, ...] = (
     CARD_KIND_INTERACTION_STYLE,
 )
 
+# Legacy storage compatibility only. Sensitivity is not part of the person-card
+# model contract and does not affect admission, audience scope, or serving.
+# Existing databases may still contain ``high`` rows from policy <= 9, so both
+# values remain schema-valid until that column can be removed separately.
 CARD_SENSITIVITY_NORMAL = "normal"
 CARD_SENSITIVITY_HIGH = "high"
 CARD_SENSITIVITIES: tuple[str, ...] = (
@@ -1441,8 +1450,8 @@ CARD_SCOPES: tuple[str, ...] = (
     CARD_SCOPE_CROSS_CONTEXT,
 )
 
-# Only these kinds may ever be widened to cross_context, and only at normal
-# sensitivity. A goal or a piece of history never crosses contexts.
+# Only these kinds may ever be widened to cross_context. A goal or a piece of
+# history never crosses contexts.
 CARD_CROSS_CONTEXT_KINDS: tuple[str, ...] = (
     CARD_KIND_COMMUNICATION_PREF,
     CARD_KIND_INTERACTION_STYLE,
@@ -1466,8 +1475,17 @@ class ActorProfile:
     first_seen_at: str = ""
     last_seen_at: str = ""
     card_built_at: str | None = None
+    # ``card_dirty`` means newer additive evidence is waiting to be folded
+    # into the cache.  The last successfully built card remains trustworthy
+    # and may still be served while that refresh is pending.
     card_dirty: bool = False
+    # Destructive provenance changes (delete, merge, actor/audience rewrite)
+    # make the previous card unsafe to serve until a clean rebuild succeeds.
+    card_invalid: bool = False
     card_input_hash: str = ""
+    # Transient rebuild CAS marker.  Kept separate from ``card_input_hash`` so
+    # an in-flight refresh never overwrites the version of the last good card.
+    card_build_marker: str = ""
 
 
 @dataclass
@@ -1475,8 +1493,9 @@ class ActorCardEntry:
     """One curated line of a person card.
 
     The card is a CACHE, not a second source of truth: every entry is derived
-    from facts carrying that actor's ``author_actor_id`` and is fully
-    rebuildable. ``superseded_by`` mirrors the fact supersession chain.
+    from exact actor-authored canonical turns and/or facts carrying that
+    actor's ``author_actor_id`` and is fully rebuildable. ``superseded_by``
+    preserves the card replacement chain.
     """
     id: str = ""
     tenant_id: str = ""
@@ -1484,6 +1503,7 @@ class ActorCardEntry:
     kind: str = CARD_KIND_COMMUNICATION_PREF
     body: str = ""
     confidence: float = 0.0
+    # Deprecated compatibility field; always ``normal`` for policy >= 10.
     sensitivity: str = CARD_SENSITIVITY_NORMAL
     audience_scope: str = CARD_SCOPE_SAME_CONVERSATION
     superseded_by: str | None = None
@@ -1493,20 +1513,28 @@ class ActorCardEntry:
 
 @dataclass
 class ActorCardEntrySource:
-    """Normalized per-fact provenance for one card entry.
+    """Normalized provenance for one card entry.
 
     Both ids are load-bearing and distinct. ``owner_conversation_id`` is where
-    the fact is stored; ``audience_conversation_id`` is the validated pre-alias
-    route the source message actually arrived on. After a merge they differ, and
-    only the audience id may decide disclosure: comparing owners would serve
-    guild influence to a request arriving through a retained DM alias.
+    the source is stored; ``audience_conversation_id`` is the validated
+    pre-alias route the source message actually arrived on. After a merge they
+    differ, and only the audience id may decide disclosure: comparing owners
+    would serve guild influence to a request arriving through a retained DM
+    alias.
+
+    Exactly one of ``fact_id`` and ``canonical_turn_id`` is populated. Facts
+    remain useful compact evidence, while canonical-turn provenance lets a
+    substantive actor build a meaningful card even when the fact extractor did
+    not happen to promote that interaction into a standalone fact.
     """
     entry_id: str = ""
     tenant_id: str = ""
     owner_conversation_id: str = ""
     audience_conversation_id: str = ""
-    audience_channel_id: str = ""   # "" means unknown, which fails closed
+    # Provenance only. The audience conversation id is the disclosure boundary.
+    audience_channel_id: str = ""
     fact_id: str = ""
+    canonical_turn_id: str = ""
 
 
 @dataclass
@@ -1531,6 +1559,24 @@ class ActorFactSource:
     that was deleted.
     """
     fact: "Fact" = None  # type: ignore[assignment]
+    tenant_id: str = ""
+    owner_conversation_id: str = ""
+    audience_conversation_id: str = ""
+    audience_channel_id: str = ""
+    owner_lifecycle_epoch: int = 0
+    audience_lifecycle_epoch: int = 0
+
+
+@dataclass
+class ActorTurnSource:
+    """One exact actor-authored canonical user row eligible as card evidence.
+
+    The row remains the source of truth. Tenant, actor, audience attribution,
+    and both lifecycle epochs are verified during enumeration and verified
+    again inside the atomic card replacement transaction.
+    """
+
+    turn: "CanonicalTurnRow" = None  # type: ignore[assignment]
     tenant_id: str = ""
     owner_conversation_id: str = ""
     audience_conversation_id: str = ""
@@ -2000,6 +2046,18 @@ class AssembledContext:
     total_tokens: int = 0
     budget_breakdown: dict[str, int] = field(default_factory=dict)
     prepend_text: str = ""
+    # Ephemeral, escaped canonical tail rendered inside ``prepend_text``.
+    # This contains reference-only rows from other guild members. Exact rows
+    # authored by the current requester are carried separately below so they
+    # can retain ordinary user-message authority.
+    recent_conversation_text: str = ""
+    # Exact requester-authored canonical rows and their paired assistant
+    # replies, selected for request-local native-role replay. The proxy injects
+    # these only into the outbound enriched copy after the raw ingest body has
+    # been captured; they never enter ``conversation_history`` or canonical
+    # persistence.
+    recent_conversation_messages: list[Message] = field(default_factory=list)
+    recent_conversation_message_tokens: int = 0
     # Rendered requester person card, influence-only. Surfaced so its cost is
     # measurable rather than inferred. Empty with the gate off.
     actor_card_text: str = ""
@@ -2206,13 +2264,35 @@ class AssemblerConfig:
     # Person cards. SHIPS DARK: with the gate off, no profile or card read is
     # performed, no budget key is added, and rendered output is byte-identical.
     # YAML keys: assembly.actor_card_enabled, assembly.actor_card_max_tokens,
-    # assembly.actor_card_fact_limit, assembly.actor_card_entries_per_kind.
+    # assembly.actor_card_fact_limit, assembly.actor_card_turn_limit,
+    # assembly.actor_card_prompt_max_chars,
+    # assembly.actor_card_entries_per_kind, assembly.actor_card_curation_model,
+    # assembly.actor_card_curation_fallback_model,
+    # assembly.actor_card_admission_model,
+    # assembly.actor_card_admission_fallback_model.
     actor_card_enabled: bool = False
     actor_card_max_tokens: int = 400
-    # Bounds on the curation pass: how many of an actor's facts it may read,
-    # and how many entries it may emit per kind.
+    # Bounds on the curation pass: how many facts and exact canonical messages
+    # it may read, and how many entries it may emit per kind.
     actor_card_fact_limit: int = 60
+    # Applied independently to every policy audience so a busy guild cannot
+    # crowd an actor's DM evidence (or vice versa) out of curation.
+    actor_card_turn_limit: int = 500
+    actor_card_prompt_max_chars: int = 192_000
     actor_card_entries_per_kind: int = 3
+    # Optional dedicated curator. When unset, retain the legacy behavior of
+    # using the general compaction model. Production cards should configure a
+    # stronger curator and an independent malformed-response fallback.
+    actor_card_curation_model: str = ""
+    actor_card_curation_fallback_model: str = ""
+    # Dedicated semantic admission model. Person cards fail configuration
+    # closed when the card gate is enabled without one: the cheap fact
+    # compactor is allowed to propose candidates, but it must not decide that
+    # a temporary test instruction is a durable identity preference.
+    actor_card_admission_model: str = ""
+    # Optional independent fallback for provider-level empty/refused responses.
+    # It is never used for a valid semantic rejection.
+    actor_card_admission_fallback_model: str = ""
     # Speaker roster. Independent of the actor card and SHIPS DARK: with the
     # gate off, no roster or handle-assignment read is performed, no budget
     # key is added, and rendered output and tool schemas are byte-identical.
