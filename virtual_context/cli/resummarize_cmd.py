@@ -137,6 +137,32 @@ def _redis_glob_escape(value: str) -> str:
     return re.sub(r"([\\*?\[\]])", r"\\\1", value)
 
 
+class _ResumeCursor:
+    """The resume point for --after-ref, frozen at the first lost row.
+
+    A row whose provider call failed received no response and was not
+    repaired; the cursor must never move past it, even when LATER rows
+    succeed. Otherwise the sequence failure(A), success(B), failure(C),
+    breaker-trip(D) reports B as the resume point and a resume with
+    ``ref > B`` permanently skips unrepaired A. Once any provider
+    failure occurs the cursor freezes for the rest of the run; a resume
+    retries everything from the first lost row onward, which is safe
+    because repair is idempotent and repaired rows are no longer
+    selected.
+    """
+
+    def __init__(self, start: str | None):
+        self.ref = start
+        self.frozen = False
+
+    def on_provider_failure(self) -> None:
+        self.frozen = True
+
+    def on_response(self, ref: str) -> None:
+        if not self.frozen:
+            self.ref = ref
+
+
 def _fsync_parent_dir(path: str) -> None:
     """Make a newly created file's directory entry crash-durable."""
     parent = os.path.dirname(os.path.abspath(path)) or "/"
@@ -230,6 +256,26 @@ def _print_cascade_runbook(conversation_id: str, tags: list[str]) -> None:
     hint_glob = shlex.quote(
         f"vc:context_hint:{_redis_glob_escape(conversation_id)}:*",
     )
+    # Hint keys are deleted by a server-side SCAN/DEL script with the
+    # pattern passed as ARGV. Piping scan output through xargs re-parses
+    # raw key text in the shell: a quote in a key aborts xargs, a space
+    # splits one key into several DEL arguments. Keys must never transit
+    # a textual re-parse.
+    hint_delete_lua = shlex.quote(
+        "redis.replicate_commands() "
+        "local cursor='0' local deleted=0 "
+        "repeat local r=redis.call('SCAN',cursor,'MATCH',ARGV[1],'COUNT',500) "
+        "cursor=r[1] "
+        "for _,k in ipairs(r[2]) do redis.call('DEL',k) deleted=deleted+1 end "
+        "until cursor=='0' return deleted",
+    )
+    hint_count_lua = shlex.quote(
+        "redis.replicate_commands() "
+        "local cursor='0' local found=0 "
+        "repeat local r=redis.call('SCAN',cursor,'MATCH',ARGV[1],'COUNT',500) "
+        "cursor=r[1] found=found+#r[2] "
+        "until cursor=='0' return found",
+    )
     print("\n=== CASCADE RUNBOOK (not executed; run each step, then its check) ===")
     print(f"# affected tags: {sorted(tags)}")
     print("\n# 1. Two-table targeted delete (tag summaries AND their embeddings):")
@@ -244,11 +290,11 @@ def _print_cascade_runbook(conversation_id: str, tags: list[str]) -> None:
     print(f"SELECT tag, updated_at FROM tag_summaries WHERE conversation_id = {cid} AND tag IN ({tag_list}) ORDER BY tag;")
     print("\n# 3. Redis invalidation (embedding snapshot, context hints, tag stats):")
     print(f"redis-cli DEL {emb_key} {stats_key}")
-    print(f"redis-cli --scan --pattern {hint_glob} | xargs -r redis-cli DEL")
-    print("#    VERIFY (expect 0, 0, and no keys):")
+    print(f"redis-cli EVAL {hint_delete_lua} 0 {hint_glob}")
+    print("#    VERIFY (expect 0, 0, and 0):")
     print(f"redis-cli EXISTS {emb_key}")
     print(f"redis-cli EXISTS {stats_key}")
-    print(f"redis-cli --scan --pattern {hint_glob}")
+    print(f"redis-cli EVAL {hint_count_lua} 0 {hint_glob}")
     print("\n# 4. Worker recycle (process-local caches have no expiry):")
     print("#    recycle the serving workers, then VERIFY start times are post-recycle:")
     print("ps -o pid,lstart,command -C python | grep -i uvicorn")
@@ -318,11 +364,7 @@ def cmd_admin_resummarize_segments(args) -> None:
     consecutive_provider_failures = 0
     status = "completed"
     last_ref = None
-    # The resume cursor advances only past rows that received a provider
-    # RESPONSE. A row whose call failed (including the one that trips
-    # the breaker) stays ahead of the cursor, so a resume retries it
-    # instead of silently skipping unrepaired damage.
-    resume_after_ref = args.after_ref
+    cursor = _ResumeCursor(args.after_ref)
 
     try:
         with _connect(dsn, read_only=False) as conn, \
@@ -360,6 +402,7 @@ def cmd_admin_resummarize_segments(args) -> None:
 
                 if isinstance(outcome, ProviderFailure):
                     counts["provider_failure"] += 1
+                    cursor.on_provider_failure()
                     consecutive_provider_failures += 1
                     if consecutive_provider_failures >= breaker_limit:
                         status = "aborted_provider_down"
@@ -367,7 +410,7 @@ def cmd_admin_resummarize_segments(args) -> None:
                     continue
                 consecutive_provider_failures = 0
                 totals["calls"] += 1
-                resume_after_ref = row["ref"]
+                cursor.on_response(row["ref"])
                 if isinstance(outcome, Malformed):
                     counts["malformed"] += 1
                     _usage_totals(totals, outcome.usage)
@@ -436,7 +479,8 @@ def cmd_admin_resummarize_segments(args) -> None:
         "usage": totals,
         "journal": journal_path,
         "last_attempted_ref": last_ref,
-        "resume_after_ref": resume_after_ref,
+        "resume_after_ref": cursor.ref,
+        "resume_cursor_frozen": cursor.frozen,
         "note": ("skipped_concurrent is NORMAL on an active conversation: "
                  "live compaction rewrites rows mid-run; re-running is the "
                  "intended completion path and is safe by idempotency"),

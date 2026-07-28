@@ -17,6 +17,13 @@ make the two states distinguishable:
 
 Run the fleet serially (``-n0``): the files share one database and the
 schema bootstrap DDL races under parallel workers.
+
+NOTE: this file's OWN guard lives in ``tests/test_pg_helpers.py``
+(``test_fleet_sentinel_uses_the_shared_resolver``), because a file
+cannot police itself — the uniformity lint below deliberately excludes
+this file. Running this file alone therefore shows green even if the
+module's DSN resolution regresses; mutate-and-verify against the helper
+tests, not against this file in isolation.
 """
 
 from __future__ import annotations

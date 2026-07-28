@@ -125,7 +125,52 @@ def test_cascade_runbook_escapes_redis_glob_metacharacters(capsys):
 
     _print_cascade_runbook("conv*with?glob[chars]", ["legal"])
     out = capsys.readouterr().out
-    scan_lines = [l for l in out.splitlines() if "--pattern" in l]
-    assert scan_lines
-    for line in scan_lines:
+    eval_lines = [l for l in out.splitlines() if "redis-cli EVAL" in l]
+    assert eval_lines
+    for line in eval_lines:
         assert "conv\\*with\\?glob\\[chars\\]" in line
+
+
+def test_resume_cursor_freezes_at_first_lost_row():
+    """failure(A), success(B), failure(C), breaker-trip(D): the cursor
+    must still point BEFORE A. A later success must not advance it past
+    a row that received no response and was never repaired."""
+    from virtual_context.cli.resummarize_cmd import _ResumeCursor
+
+    cursor = _ResumeCursor(None)
+    cursor.on_provider_failure()          # A: lost
+    cursor.on_response("B")               # B: success must NOT advance
+    cursor.on_provider_failure()          # C: lost
+    # D trips the breaker; no cursor call happens for it.
+    assert cursor.ref is None
+    assert cursor.frozen
+
+
+def test_resume_cursor_advances_past_responses_until_first_failure():
+    from virtual_context.cli.resummarize_cmd import _ResumeCursor
+
+    cursor = _ResumeCursor("start")
+    cursor.on_response("A")
+    cursor.on_response("B")
+    assert cursor.ref == "B"
+    cursor.on_provider_failure()
+    cursor.on_response("D")
+    assert cursor.ref == "B"
+    assert cursor.frozen
+
+
+def test_cascade_runbook_never_reparses_redis_keys_in_the_shell(capsys):
+    """Hint-key deletion must be a server-side script with the pattern
+    as ARGV: piping scan output through xargs re-parses raw key text,
+    where a quote aborts the pipeline and a space splits one key into
+    several DEL arguments."""
+    from virtual_context.cli.resummarize_cmd import _print_cascade_runbook
+
+    _print_cascade_runbook("conv with spaces' and quote", ["legal"])
+    out = capsys.readouterr().out
+    assert "xargs" not in out
+    assert "--scan" not in out
+    eval_lines = [l for l in out.splitlines() if "redis-cli EVAL" in l]
+    assert len(eval_lines) == 2  # delete script + count verify script
+    for line in eval_lines:
+        assert "ARGV[1]" in line
