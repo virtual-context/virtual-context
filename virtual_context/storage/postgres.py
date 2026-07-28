@@ -1174,6 +1174,14 @@ class PostgresStore(ContextStore):
             )
         # OFF: silent.
 
+    # The reconcile takes a row lock on conversation_lifecycle and yields
+    # inside that transaction, and every other store call checks out its
+    # own pooled connection, so nothing it invokes can end it. A second
+    # worker blocks at the lock rather than interleaving. Asserted by
+    # tests/test_anchor_concurrency_postgres.py, including a mutation that
+    # removes the lock and fails them.
+    reconcile_excludes_concurrent_writers = True
+
     @contextmanager
     def conversation_reconcile(self, conversation_id: str):
         with self.pool.connection() as conn:

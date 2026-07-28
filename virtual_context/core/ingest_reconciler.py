@@ -130,24 +130,43 @@ _ALIGNMENT_WINDOW_SIZES = tuple(reversed(_ANCHOR_WINDOW_SIZES))
 # volume.
 _INGEST_BREAKDOWN_LOG_THRESHOLD_MS = 500.0
 
-# Incremental anchor writes are OFF.
+# Incremental anchor writes, enabled per backend rather than globally.
 #
-# Writing only the anchor difference is far cheaper than rewriting the
-# whole set, but it is a read-modify-write with no cross-process lock, so
-# two workers can interleave and leave a set that belongs to neither of
-# them. The unconditional rebuild races too, but it lands one worker's
-# complete snapshot rather than a hybrid, and a hybrid is the worse
-# outcome: a stale anchor makes the aligner return a WRONG match instead
-# of a missed one, and a wrong match on a non-empty conversation appends
-# the payload as new rows, duplicating history.
+# Rewriting the whole anchor set costs 1,256ms of a 1,790ms ingest on a
+# 9,249-row conversation in production, 70% of it, to change three rows
+# on an appended turn. Writing only the difference removes that, but the
+# write is a read-modify-write, so it is only correct where the reconcile
+# it runs inside genuinely excludes other workers.
 #
-# The measured saving is real and the machinery stays, exercised by its
-# tests so it cannot rot. Turning it on needs the write made idempotent,
-# via a uniqueness constraint on (conversation_id, window_size,
-# start_turn_id), or the refresh serialized across workers. Until then
-# the cost of the rebuild is the price of a set that is always somebody's
-# complete answer.
-_INCREMENTAL_ANCHOR_WRITES = False
+# Postgres does. Its reconcile takes a row lock on conversation_lifecycle
+# and yields inside that transaction, and other store calls check out
+# their own pooled connections, so they cannot end it.
+# tests/test_anchor_concurrency_postgres.py shows a second worker
+# blocking, the refresh running inside the locked region, concurrent
+# ingests with differing payloads converging on the rebuild's answer, and
+# pg_locks reporting the block. Removing the lock fails those tests.
+#
+# SQLite does not, and this is not a gap that a flag flip fixes. Its
+# reconcile holds BEGIN IMMEDIATE, but the backend's prevailing idiom is
+# `with self._get_conn() as conn:`, and a sqlite3 connection used as a
+# context manager COMMITS ON EXIT. Twenty-one methods read that way,
+# including the lifecycle-epoch check the ingest path performs twice from
+# inside the lock, so a read ends the transaction that was supposed to be
+# excluding writers. Enabling the delta there would rest on a lock that
+# has already been released.
+#
+# Hence a capability question rather than a constant: a backend opts in
+# by declaring that its reconcile survives its own store calls. Anything
+# that does not answer keeps the rebuild, which is self-correcting and
+# therefore safe without the lock.
+_INCREMENTAL_ANCHOR_WRITES_DEFAULT = False
+
+
+def _incremental_anchor_writes_enabled(store) -> bool:
+    """Whether this store's reconcile is strong enough for a delta write."""
+    if _INCREMENTAL_ANCHOR_WRITES_DEFAULT:
+        return True
+    return bool(getattr(store, "reconcile_excludes_concurrent_writers", False))
 
 
 def _build_anchor_rows(rows: list[CanonicalTurnRow]) -> list[tuple[int, str, str]]:
@@ -2112,7 +2131,11 @@ class IngestReconciler:
         desired = _build_anchor_rows(rows)
         applier = getattr(self._store, "apply_canonical_turn_anchor_delta", None)
         reader = getattr(self._store, "get_canonical_turn_anchors", None)
-        if _INCREMENTAL_ANCHOR_WRITES and callable(applier) and callable(reader):
+        if (
+            _incremental_anchor_writes_enabled(self._store)
+            and callable(applier)
+            and callable(reader)
+        ):
             stored = None
             try:
                 stored = reader(conversation_id)

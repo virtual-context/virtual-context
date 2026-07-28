@@ -51,7 +51,7 @@ def _enable_incremental_anchor_writes(monkeypatch):
     be turned on once the write is idempotent, and that is only true if
     these tests keep running against it.
     """
-    monkeypatch.setattr(_ir, "_INCREMENTAL_ANCHOR_WRITES", True)
+    monkeypatch.setattr(_AnchorStore, "reconcile_excludes_concurrent_writers", True)
 
 
 def _rows(tokens: list[str]) -> list[CanonicalTurnRow]:
@@ -78,7 +78,14 @@ def _canonical_anchor_set(rows: list[CanonicalTurnRow]) -> set[tuple[int, str, s
 
 
 class _AnchorStore:
-    """Store exposing only the surfaces the anchor refresh touches."""
+    """Store exposing only the surfaces the anchor refresh touches.
+
+    Declines the exclusion capability by default, like a backend that has
+    not established it. Tests exercising the delta opt in explicitly, so
+    the opt-in is visible at the point it matters rather than ambient.
+    """
+
+    reconcile_excludes_concurrent_writers = False
 
     def __init__(self, rows: list[CanonicalTurnRow]) -> None:
         self.rows = list(rows)
@@ -478,7 +485,7 @@ def test_anchor_hashes_still_resolve_windows_after_delta():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.regression("BUG-047")
-def test_incremental_writes_are_off_by_default(monkeypatch):
+def test_a_store_that_declines_the_capability_rebuilds(monkeypatch):
     """With the default settings the refresh must rebuild, not diff.
 
     The delta races across workers and can leave an anchor set belonging
@@ -486,7 +493,7 @@ def test_incremental_writes_are_off_by_default(monkeypatch):
     This asserts the shipped default rather than the tested one: every
     other test in this file turns the delta on deliberately.
     """
-    monkeypatch.setattr(_ir, "_INCREMENTAL_ANCHOR_WRITES", False)
+    monkeypatch.setattr(_AnchorStore, "reconcile_excludes_concurrent_writers", False)
     rows = _rows(_BASE)
     store = _AnchorStore(rows)
     reconciler = _reconciler(store)
@@ -528,3 +535,52 @@ def test_failed_delta_insert_does_not_leave_anchors_deleted(tmp_path: Path):
     assert set(store.get_canonical_turn_anchors("c")) == before, (
         "a failed insert must not leave its deletions behind"
     )
+
+
+@pytest.mark.regression("BUG-047")
+def test_real_backends_declare_the_capability_honestly():
+    """Each backend must state whether its reconcile actually excludes.
+
+    Postgres holds a row lock on a pooled connection and other store
+    calls take their own, so nothing it invokes can end the reconcile.
+    SQLite holds BEGIN IMMEDIATE, but its prevailing read idiom commits
+    on block exit, so a read from inside the reconcile ends it. The
+    delta is only correct on the former, and the gate is a claim each
+    backend makes rather than a switch someone flips globally.
+    """
+    from virtual_context.storage.postgres import PostgresStore
+    from virtual_context.storage.sqlite import SQLiteStore
+
+    assert PostgresStore.reconcile_excludes_concurrent_writers is True
+    assert SQLiteStore.reconcile_excludes_concurrent_writers is False
+
+
+@pytest.mark.regression("BUG-047")
+def test_a_store_silent_on_the_capability_rebuilds():
+    """Silence is not consent.
+
+    A store that never mentions the capability, as a third-party backend
+    would not, gets the rebuild. The delta has to be claimed by a backend
+    that established the exclusion, never inherited by anything that
+    happens to expose the delta surfaces.
+    """
+    rows = _rows(_BASE)
+    inner = _AnchorStore(rows)
+
+    class _Silent:
+        """Delegates everything except the capability, which it lacks."""
+
+        def __getattr__(self, name):
+            if name == "reconcile_excludes_concurrent_writers":
+                raise AttributeError(name)
+            return getattr(inner, name)
+
+    store = _Silent()
+    assert not hasattr(store, "reconcile_excludes_concurrent_writers")
+
+    reconciler = _reconciler(store)
+    reconciler._refresh_persisted_anchors("c")
+
+    assert inner.delta_calls == 0, "an unproven store must not get the delta"
+    assert inner.full_rebuilds == 1
+    assert set(inner.anchors) == _canonical_anchor_set(rows)

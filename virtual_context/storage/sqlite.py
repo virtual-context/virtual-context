@@ -1058,6 +1058,14 @@ class SQLiteStore(ContextStore):
         if not self._reconcile_lock_active():
             conn.commit()
 
+    # Deliberately absent, not merely unset. The reconcile does hold
+    # BEGIN IMMEDIATE, but a sqlite3 connection used as a context manager
+    # commits when the block exits, and that idiom is how most of this
+    # backend reads. A read from inside the reconcile therefore ends it.
+    # Declaring the capability would be asserting an exclusion the
+    # backend does not currently provide.
+    reconcile_excludes_concurrent_writers = False
+
     @contextmanager
     def conversation_reconcile(self, conversation_id: str):
         conn = self._get_conn()
