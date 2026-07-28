@@ -2903,6 +2903,12 @@ def main():
     rebuild_derived_parser.add_argument("--postgres-dsn")
     rebuild_derived_parser.add_argument("--sqlite-path")
 
+    def _positive_int(value):
+        parsed = int(value)
+        if parsed < 1:
+            raise argparse.ArgumentTypeError("must be a positive integer")
+        return parsed
+
     resummarize_parser = admin_sub.add_parser(
         "resummarize-segments",
         help="Repair source-text fallback summaries in place",
@@ -2930,14 +2936,14 @@ def main():
         help="Exclusive upper bound on created_at (write time; see --since)",
     )
     resummarize_parser.add_argument(
-        "--limit", type=int, default=None,
+        "--limit", type=_positive_int, default=None,
         help="Cap ACCEPTED repairs, not attempts",
     )
     resummarize_parser.add_argument(
         "--after-ref", help="Resume strictly after this ref",
     )
     resummarize_parser.add_argument(
-        "--max-consecutive-provider-failures", type=int, default=5,
+        "--max-consecutive-provider-failures", type=_positive_int, default=5,
         help=(
             "Abort as aborted_provider_down after this many consecutive "
             "provider failures; any successful response resets the counter"
@@ -3237,7 +3243,7 @@ def main():
                 "  virtual-context admin backfill-channels [<conversation_id>] [--tenant-id <id>] [--all-convs-for-tenant] [--dry-run] [--limit N]\n"
                 "  virtual-context admin reattribute-audience <conversation_id> <from_audience> <to_audience> --tenant-id <id> [--apply] [--limit N]\n"
                 "  virtual-context admin rebuild-derived-data <conversation_id> --tenant-id <id> [--apply]\n"
-                "  virtual-context admin resummarize-segments <conversation_id> --tenant-id <id> [--apply] [--include-short] [--limit N] [--after-ref <ref>]\n"
+                "  virtual-context admin resummarize-segments <conversation_id> --tenant-id <id> [--apply] [--include-short] [--limit N] [--after-ref <ref>] [--since <ts>] [--until <ts>] [--journal <path>] [--max-consecutive-provider-failures N] [--postgres-dsn <dsn>]\n"
                 "  virtual-context admin resequence-canonical-turns <conversation_id> --tenant-id <id> [--apply]\n"
                 "  virtual-context admin normalize-canonical-actor-ids <conversation_id> --tenant-id <id> --platform <platform> [--apply]\n"
                 "  virtual-context admin reindex-canonical-turn-embeddings [<conversation_id>] [--tenant-id <id>] [--all-convs-for-tenant] [--apply] [--limit N]\n"

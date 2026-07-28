@@ -46,22 +46,27 @@ def seeded(request):
     conversation_id = f"resum-{uuid.uuid4()}"
     long_text = "Filing detail: the deadline moved to March. " * 40
     with pg_test_conn() as conn:
-        rows = {
-            "damaged": (long_text[:400], long_text),
-            "stub": (long_text, long_text),
-            "short": ("ok" * 10, ("ok" * 10) + "!" + STRIP_WHITESPACE),
-            "healthy": ("A real summary of the filing story.", long_text),
-        }
-        refs = {}
-        for name, (summary, full_text) in rows.items():
-            ref = f"{conversation_id}-{name}"
-            _seed_segment(conn, conversation_id, ref, summary, full_text)
-            refs[name] = ref
-        yield conversation_id, refs, conn
-        conn.execute(
-            "DELETE FROM segments WHERE conversation_id = %s",
-            (conversation_id,),
-        )
+        # try/finally around seeding AND the test body: the inserts are
+        # autocommitted one by one, so a failure on a later seed must
+        # still delete the earlier rows.
+        try:
+            rows = {
+                "damaged": (long_text[:400], long_text),
+                "stub": (long_text, long_text),
+                "short": ("ok" * 10, ("ok" * 10) + "!" + STRIP_WHITESPACE),
+                "healthy": ("A real summary of the filing story.", long_text),
+            }
+            refs = {}
+            for name, (summary, full_text) in rows.items():
+                ref = f"{conversation_id}-{name}"
+                _seed_segment(conn, conversation_id, ref, summary, full_text)
+                refs[name] = ref
+            yield conversation_id, refs, conn
+        finally:
+            conn.execute(
+                "DELETE FROM segments WHERE conversation_id = %s",
+                (conversation_id,),
+            )
 
 
 def _select(conn, conversation_id, include_short=False, after_ref=None):
