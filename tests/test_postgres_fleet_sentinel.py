@@ -172,6 +172,22 @@ def test_pg_fleet_files_reference_only_symbols_that_exist():
                 and isinstance(name_node.value, str)
             ):
                 continue
+            # Deliberately-optional access is not rot. A three-argument
+            # getattr supplies its own fallback, and a monkeypatch with
+            # raising=False is announcing the attribute may be absent.
+            if (
+                isinstance(fn, ast.Name)
+                and fn.id == "getattr"
+                and len(node.args) >= 3
+            ):
+                continue
+            if any(
+                kw.arg == "raising"
+                and isinstance(kw.value, ast.Constant)
+                and kw.value.value is False
+                for kw in node.keywords
+            ):
+                continue
             resolved = targets.get(tgt.id)
             if resolved is None:
                 continue  # a local; not statically resolvable

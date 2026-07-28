@@ -44,12 +44,12 @@ from virtual_context.types import CanonicalTurnRow
 
 @pytest.fixture(autouse=True)
 def _enable_incremental_anchor_writes(monkeypatch):
-    """Exercise the delta path even though production runs the rebuild.
+    """Opt the fake store into the delta, the way a capable backend does.
 
-    Incremental writes are off in production because the read-modify-write
-    races across workers. The machinery is kept and kept correct so it can
-    be turned on once the write is idempotent, and that is only true if
-    these tests keep running against it.
+    The gate is a per-backend claim: Postgres declares its reconcile
+    excludes concurrent writers and gets the delta; SQLite declines and
+    rebuilds. The fake store declines by default, so tests exercising
+    the delta opt in here, making the claim visible where it matters.
     """
     monkeypatch.setattr(_AnchorStore, "reconcile_excludes_concurrent_writers", True)
 
@@ -481,17 +481,18 @@ def test_anchor_hashes_still_resolve_windows_after_delta():
 
 
 # ---------------------------------------------------------------------------
-# Production default: the rebuild, not the delta.
+# A store that declines the claim gets the rebuild.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.regression("BUG-047")
 def test_a_store_that_declines_the_capability_rebuilds(monkeypatch):
-    """With the default settings the refresh must rebuild, not diff.
+    """A backend that does not claim exclusion must rebuild, not diff.
 
-    The delta races across workers and can leave an anchor set belonging
-    to neither writer, so it stays off until the write is idempotent.
-    This asserts the shipped default rather than the tested one: every
-    other test in this file turns the delta on deliberately.
+    Declining is what SQLite does, and what any store that has not
+    established the exclusion must do: the delta on an unexcluded
+    reconcile can leave an anchor set belonging to neither writer. Every
+    other test in this file opts the fake store in deliberately, so this
+    one opts it out to cover the declining branch.
     """
     monkeypatch.setattr(_AnchorStore, "reconcile_excludes_concurrent_writers", False)
     rows = _rows(_BASE)
