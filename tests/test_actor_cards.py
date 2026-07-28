@@ -1216,7 +1216,14 @@ def test_new_turn_during_model_call_cannot_be_lost_by_card_commit(store):
     assert status["outcome"] == "stale_or_rejected_write"
 
 
-def test_compaction_card_builder_rejects_any_unknown_fact_citation(store):
+def test_compaction_card_builder_rejects_any_unknown_fact_citation(
+    store, caplog,
+):
+    import logging as _logging
+
+    caplog.set_level(
+        _logging.DEBUG, logger="virtual_context.core.compaction_pipeline",
+    )
     from types import SimpleNamespace
 
     _dm_and_guild(store)
@@ -1264,6 +1271,18 @@ def test_compaction_card_builder_rejects_any_unknown_fact_citation(store):
         "t1", OPTICS, owner_conversation_id="dm",
         audience_conversation_id="dm", audience_channel_id="chan-dm",
     ) is None
+    # The rejection names the offending citation, so a hallucinated id,
+    # a mangled real one, and a cross-audience reference are separable
+    # from the log alone. IDs only; entry bodies never appear.
+    reject_lines = [
+        r.getMessage() for r in caplog.records
+        if "ACTOR_CARD_CITATION_REJECTED" in r.getMessage()
+    ]
+    assert len(reject_lines) == 1
+    assert "reason=unknown_or_cross_audience_fact_id" in reject_lines[0]
+    assert "source_id=invented-fact" in reject_lines[0]
+    assert "audience_id=" in reject_lines[0]
+    assert "unsupported synthesis" not in reject_lines[0]
 
 
 def test_compaction_card_builder_repairs_a_visible_turn_in_fact_ids(store):
