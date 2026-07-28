@@ -137,6 +137,20 @@ def _redis_glob_escape(value: str) -> str:
     return re.sub(r"([\\*?\[\]])", r"\\\1", value)
 
 
+#: The operator-facing completion instruction in the run report. A
+#: module-level constant so tests pin the exact runtime text rather
+#: than fragments of source.
+_REPORT_NOTE = (
+    "skipped_concurrent is NORMAL on an active conversation: "
+    "live compaction rewrites rows mid-run. COMPLETION PATH: "
+    "malformed/rejected rows processed before any cursor freeze "
+    "may be behind resume_after_ref; finish with a fresh "
+    "invocation WITHOUT --after-ref to retry all still-damaged "
+    "malformed, rejected, and skipped-concurrent rows; "
+    "re-running is safe by idempotency"
+)
+
+
 class _ResumeCursor:
     """The resume point for --after-ref, frozen at the first UNDECIDED row.
 
@@ -520,13 +534,7 @@ def cmd_admin_resummarize_segments(args) -> None:
         "last_attempted_ref": last_ref,
         "resume_after_ref": cursor.ref,
         "resume_cursor_frozen": cursor.frozen,
-        "note": ("skipped_concurrent is NORMAL on an active conversation: "
-                 "live compaction rewrites rows mid-run. COMPLETION PATH: "
-                 "malformed/rejected rows processed before any cursor freeze "
-                 "may be behind resume_after_ref; finish with a fresh "
-                 "invocation WITHOUT --after-ref to retry all still-damaged "
-                 "malformed, rejected, and skipped-concurrent rows; "
-                 "re-running is safe by idempotency"),
+        "note": _REPORT_NOTE,
     }, indent=2))
     if counts["accepted"]:
         _print_cascade_runbook(conversation_id, sorted(affected_tags))
