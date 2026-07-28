@@ -419,6 +419,89 @@ Use `pytest -m regression` to run all regression tests.
   - `test_ingest_anchor_incremental.py::test_diverged_store_falls_back_to_full_rebuild`
   - `test_ingest_anchor_incremental.py::test_anchor_hashes_still_resolve_windows_after_delta` (post-delta digests still map to their start row, and superseded digests do not survive)
   - `test_ingest_anchor_incremental.py::test_sqlite_delta_write_matches_rebuild_write` (the SQL delta leaves the same table state as the wholesale replace)
+### BUG-044 — Compaction offset splits a recovered cross-channel turn
+
+- **Symptom**: A temporary reply preference authored in one Discord guild
+  channel is acknowledged there but ignored in another channel. The outbound
+  recent-conversation block contains only the assistant acknowledgement, not
+  the authoritative user instruction.
+- **Root cause**: Tier 3 inserts `source=db_recent` rows into channel-local
+  payload history before `history_offset()` is applied. The payload-owned
+  compaction offset is then used as a raw index into the merged list, so it can
+  consume the user half of a recovered logical group while leaving the
+  assistant half.
+- **Fix**: Build the uncompacted view with a source-aware, active-tail-safe
+  slice: consume the offset from payload-owned rows only, never from DB-recent
+  rows or the trailing unstamped active-user block.
+- **Tests**:
+  - `test_protected_window_gate.py::test_tier3_db_pair_survives_payload_compaction_offset`
+
+### BUG-045 — Payload dedup suppresses the canonical user before offset
+
+- **Symptom**: A guild-wide temporary reply preference is acknowledged in its
+  source Discord channel but ignored in another channel. Canonical storage
+  contains the correctly attributed user instruction and assistant
+  acknowledgement, yet the outbound `<recent-conversation>` contains only the
+  assistant acknowledgement.
+- **Root cause**: Tier 3 dedup ran before the channel-local payload watermark.
+  The payload user suppressed its canonical duplicate by
+  `source_message_id`, then `history_offset()` removed the payload copy. The
+  unkeyed canonical assistant half survived alone. Separately, the Tier 3
+  store query limited physical rows and could split a logical group at the
+  oldest window boundary.
+- **Fix**: Slice payload-owned history before canonical merge, force Tier 3
+  when a nonzero payload offset makes a Tier-2 equality skip unsafe, and cache
+  that exact merged view for paging reassembly. Dedup uses adjacency-scoped
+  logical groups so reused historical group numbers cannot suppress unrelated
+  turns; incomplete payload fragments are replaced by the complete canonical
+  group, then recovered groups are interleaved ahead of newer stamped payload
+  turns. Legacy adjacency is never accepted as channel/audience provenance
+  proof. A failed/empty canonical read preserves the unsliced payload. SQLite
+  and Postgres select the newest N logical groups and return every physical
+  row in each.
+- **Tests**:
+  - `test_protected_window_gate.py::test_tier3_payload_duplicate_cannot_suppress_db_user_before_offset`
+  - `test_protected_window_gate.py::test_tier2_equal_with_payload_offset_forces_canonical_replacement`
+  - `test_protected_window_gate.py::test_tier3_read_failure_preserves_unsliced_payload`
+  - `test_retrieval_assembler_protected_window_merge.py::test_merge_source_match_suppresses_entire_split_db_group`
+  - `test_retrieval_assembler_protected_window_merge.py::test_merge_replaces_incomplete_payload_fragment_with_canonical_pair`
+  - `test_retrieval_assembler_protected_window_merge.py::test_merge_replacement_keeps_canonical_group_before_newer_payload`
+  - `test_retrieval_assembler_protected_window_merge.py::test_merge_complete_payload_pair_can_span_tool_scaffolding`
+  - `test_retrieval_assembler_protected_window_merge.py::test_merge_dedup_does_not_conflate_reused_group_numbers`
+  - `test_retrieval_assembler_protected_window_merge.py::test_merge_legacy_adjacency_does_not_inherit_channel_provenance`
+  - `test_sqlite_mirror_store_methods.py::test_get_recent_limit_preserves_complete_split_groups`
+  - `test_sqlite_mirror_store_methods.py::test_get_recent_limit_does_not_conflate_reused_group_number`
+  - `test_postgres_mirror_store_methods.py::test_get_recent_limit_preserves_complete_split_groups`
+  - `test_postgres_mirror_store_methods.py::test_get_recent_limit_does_not_conflate_reused_group_number`
+  - `test_recent_conversation_assembly.py::test_budget_does_not_conflate_reused_raw_group_numbers`
+  - `test_recent_conversation_assembly.py::test_budget_legacy_fallback_evicts_only_leading_contiguous_group`
+
+### BUG-046 — Retained peer-channel history suppresses the canonical copy
+
+- **Symptom**: The complete newest preference pair is correct in canonical
+  storage but absent from the next channel's `<recent-conversation>`. Older
+  groups render normally, and the preference continues to work only in the
+  channel where it was authored.
+- **Root cause**: A unified guild reuses one in-memory engine history across
+  channels, while Discord sends channel-local model payloads. Tier 3 treated
+  any matching retained engine row as proof that the current payload already
+  carried the canonical turn, so the immediately preceding peer-channel group
+  was suppressed even though it was not model-visible. An active-only ingest
+  result could also suffix-stamp that current row's identity onto older
+  completed history when the active-tail drop equaled the entire result.
+- **Fix**: When a request has a proved origin channel, only retained rows from
+  that exact channel may suppress a canonical copy; production nested channel
+  metadata is read through `get_origin_channel`, with the DB-recent top-level
+  shape as fallback. Active-tail ingest rows are removed with an empty-safe
+  helper before completed-history stamping. Requests without a proved channel
+  retain legacy dedup behavior.
+- **Tests**:
+  - `test_protected_window_gate.py::test_other_channel_engine_history_cannot_suppress_canonical_recent_pair`
+  - `test_protected_window_gate.py::test_same_channel_payload_twin_still_suppresses_canonical_copy`
+  - `test_protected_window_gate.py::test_same_channel_active_tail_race_still_suppresses_db_user`
+  - `test_canonical_turn_id_stamping.py::test_drop_active_tail_equal_to_all_rows_returns_empty`
+  - `test_canonical_turn_id_stamping.py::test_drop_active_tail_keeps_completed_prefix`
+  - `test_canonical_turn_id_stamping.py::test_drop_active_tail_zero_is_identity_view`
 
 ### BUG-043 — RRF's missing-signal penalty buries embedding-only candidates below the fused top-K
 
@@ -509,3 +592,8 @@ Use `pytest -m regression` to run all regression tests.
 | `test_embedding_reserved_seats.py` | BUG-043 |
 | `test_ingest_anchor_incremental.py` | BUG-047 |
 | `test_ingest_projected_rows.py` | BUG-048 |
+| `test_protected_window_gate.py` | BUG-044, BUG-045, BUG-046 |
+| `test_canonical_turn_id_stamping.py` | BUG-046 |
+| `test_retrieval_assembler_protected_window_merge.py` | BUG-045 |
+| `test_sqlite_mirror_store_methods.py` | BUG-045 |
+| `test_postgres_mirror_store_methods.py` | BUG-045 |

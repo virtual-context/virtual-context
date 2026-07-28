@@ -108,6 +108,33 @@ def test_completed_turn_persist_stamps_proved_audience(tmp_path):
         engine.close()
 
 
+def test_completed_turn_persist_returns_only_the_accepted_user_actor(tmp_path):
+    from virtual_context.types import build_user_turn_metadata
+
+    engine = _make_engine(tmp_path)
+    actor_id = "actor:discord:387316537012518913"
+    try:
+        history = [
+            Message(role="user", content="@Vast remember the live-test rule"),
+            Message(role="assistant", content="Understood."),
+        ]
+        accepted = engine.persist_completed_turn(
+            history,
+            source_audience_conversation_id="c",
+            user_turn_metadata=build_user_turn_metadata(
+                sender_name="optics",
+                sender_actor_id=actor_id,
+                origin_channel_id="vasttest2",
+                source_conversation_key=(
+                    "sk:agent:vast:discord:guild:1524917037191925871"
+                ),
+            ),
+        )
+        assert accepted == actor_id
+    finally:
+        engine.close()
+
+
 def test_completed_turn_persist_without_audience_is_unchanged(tmp_path):
     """Unproved audience keeps the legacy write: version 0, nothing inherited."""
     engine = _make_engine(tmp_path)

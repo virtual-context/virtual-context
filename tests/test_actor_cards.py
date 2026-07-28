@@ -6,22 +6,28 @@ leakage (a private DM shaping a public answer) is the same severity. These
 tests pin both structurally, at the store, so no prompt wording is load-bearing.
 """
 import json
+import sqlite3
 import uuid
 from datetime import datetime, timezone
 
 import pytest
 
-from virtual_context.core.compaction_pipeline import CompactionPipeline
+from virtual_context.core.compaction_pipeline import (
+    CompactionPipeline,
+    _EmptyResponseFallbackProvider,
+)
 from virtual_context.storage.sqlite import SQLiteStore
 from virtual_context.types import (
     CARD_KIND_ACTIVE_GOAL,
     CARD_KIND_COMMUNICATION_PREF,
     CARD_KIND_INTERACTION_STYLE,
+    CARD_KIND_RELEVANT_HISTORY,
     CARD_SCOPE_CROSS_CONTEXT,
     CARD_SCOPE_SAME_CONVERSATION,
     CARD_SENSITIVITY_HIGH,
     ActorCardEntry,
     ActorCardEntrySource,
+    LLMProviderError,
     SegmentMetadata,
     StoredSegment,
 )
@@ -54,6 +60,12 @@ def _conversation(store, cid, tenant="t1", phase="active", epoch=1):
 
 def _turn(store, ctid, cid, actor, audience, channel="", content="hello"):
     conn = store._get_conn()
+    sort_key = conn.execute(
+        """SELECT COALESCE(MAX(sort_key), 0) + 1
+             FROM canonical_turns
+            WHERE conversation_id = ?""",
+        (cid,),
+    ).fetchone()[0]
     conn.execute(
         """INSERT INTO canonical_turns
                (canonical_turn_id, conversation_id, turn_hash, sort_key,
@@ -61,7 +73,7 @@ def _turn(store, ctid, cid, actor, audience, channel="", content="hello"):
                 audience_conversation_id, audience_attribution_version,
                 origin_channel_id)
            VALUES (?, ?, ?, ?, ?, '', ?, ?, 1, ?)""",
-        (ctid, cid, ctid, ctid, content, actor, audience, channel),
+        (ctid, cid, ctid, sort_key, content, actor, audience, channel),
     )
     conn.commit()
 
@@ -114,6 +126,24 @@ def _source(entry_id, owner, audience, fact_id, channel="", tenant="t1"):
     )
 
 
+def _turn_source(
+    entry_id,
+    owner,
+    audience,
+    canonical_turn_id,
+    channel="",
+    tenant="t1",
+):
+    return ActorCardEntrySource(
+        entry_id=entry_id,
+        tenant_id=tenant,
+        owner_conversation_id=owner,
+        audience_conversation_id=audience,
+        audience_channel_id=channel,
+        canonical_turn_id=canonical_turn_id,
+    )
+
+
 def _dm_and_guild(store):
     """One actor speaking in a private DM and in a public guild channel."""
     _conversation(store, "dm")
@@ -146,6 +176,641 @@ def _bodies(card):
     return sorted(e.body for e in card.entries) if card else None
 
 
+def test_first_observed_actor_starts_dirty_for_compaction(store):
+    """The first canonical INSERT precedes profile creation on live ingest."""
+    _conversation(store, "guild")
+    _turn(
+        store,
+        "ct-first",
+        "guild",
+        OPTICS,
+        "guild",
+        "chan-guild",
+        content="A substantive first contribution.",
+    )
+
+    assert store.upsert_actor_profile_from_turn(
+        "guild",
+        OPTICS,
+        "Optics",
+        seen_at=_now(),
+    )
+    profile = store.get_actor_profile("t1", OPTICS)
+
+    assert profile is not None
+    assert profile.card_dirty is True
+    assert profile.card_invalid is False
+    assert profile.card_input_hash == ""
+
+
+def test_repeat_profile_sighting_does_not_redirty_a_clean_card(store):
+    """Exact resends may refresh last_seen/name without scheduling models."""
+    _dm_and_guild(store)
+    _build_dm_goal_and_cross_pref(store)
+    before = store.get_actor_profile("t1", OPTICS)
+    assert before is not None and before.card_dirty is False
+
+    assert store.upsert_actor_profile_from_turn(
+        "guild",
+        OPTICS,
+        "Optics",
+        seen_at=_now(),
+    )
+    after = store.get_actor_profile("t1", OPTICS)
+
+    assert after is not None
+    assert after.card_dirty is False
+    assert after.card_input_hash == "h1"
+
+
+def test_compaction_boundary_coalesces_affected_and_retry_actors():
+    pipeline = object.__new__(CompactionPipeline)
+    pipeline._due_actor_card_rebuilds = lambda *, limit: [
+        "actor:discord:retry",
+        OPTICS,
+    ]
+    calls = []
+    pipeline._rebuild_actor_card = lambda actor_id: (
+        calls.append(actor_id) or 1
+    )
+
+    attempted = pipeline._consolidate_actor_cards_after_compaction({
+        OPTICS,
+        BIGTEX,
+        OPTICS,
+    })
+
+    assert attempted == 3
+    assert calls == sorted({OPTICS, BIGTEX, "actor:discord:retry"})
+
+
+def test_recovery_compaction_consolidates_affected_and_due_cards():
+    pipeline = object.__new__(CompactionPipeline)
+    calls = []
+    pipeline._due_actor_card_rebuilds = lambda *, limit: [
+        "actor:discord:retry",
+    ]
+    pipeline._rebuild_actor_card = lambda actor_id: (
+        calls.append(actor_id) or 1
+    )
+
+    attempted = pipeline._consolidate_actor_cards_after_compaction(
+        {OPTICS},
+        disable_replacement_passes=True,
+    )
+
+    assert attempted == 2
+    assert calls == sorted({OPTICS, "actor:discord:retry"})
+
+
+def test_compaction_boundary_isolates_one_actor_card_failure():
+    pipeline = object.__new__(CompactionPipeline)
+    pipeline._due_actor_card_rebuilds = lambda *, limit: []
+    calls = []
+
+    def _rebuild(actor_id):
+        calls.append(actor_id)
+        if actor_id == BIGTEX:
+            raise RuntimeError("model unavailable")
+        return 1
+
+    pipeline._rebuild_actor_card = _rebuild
+    attempted = pipeline._consolidate_actor_cards_after_compaction({
+        OPTICS,
+        BIGTEX,
+    })
+
+    assert attempted == 2
+    assert calls == sorted({OPTICS, BIGTEX})
+
+
+def _curation(entries, *, substantive=None, coverage_reason=None):
+    if substantive is None:
+        substantive = bool(entries)
+    if coverage_reason is None:
+        coverage_reason = "substantive" if substantive else "no_durable_context"
+    normalized = [
+        {
+            **entry,
+            "fact_ids": list(entry.get("fact_ids", [])),
+            "turn_ids": list(entry.get("turn_ids", [])),
+        }
+        for entry in entries
+    ]
+    return {
+        "substantive": substantive,
+        "coverage_reason": coverage_reason,
+        "entries": normalized,
+    }
+
+
+def _admission(decisions, *, substantive=None, coverage_reason=None):
+    if substantive is None:
+        substantive = any(
+            decision.get("admit") is True for decision in decisions
+        )
+    if coverage_reason is None:
+        coverage_reason = "substantive" if substantive else "no_durable_context"
+    return {
+        "substantive": substantive,
+        "coverage_reason": coverage_reason,
+        "decisions": decisions,
+    }
+
+
+def _curation_for_visible_fact(kwargs, fact_id, entries):
+    visible = {
+        item["id"]
+        for item in json.loads(kwargs["user"])["facts"]
+    }
+    return _curation(entries if fact_id in visible else [])
+
+
+class _AdmitAll:
+    """Strict admission stub for tests focused on a later storage boundary."""
+
+    def complete(self, **kwargs):
+        prompt = json.loads(kwargs["user"])
+        decisions = [{
+            "candidate_id": candidate["candidate_id"],
+            "admit": True,
+            "reason": "durable",
+        } for candidate in prompt["candidates"]]
+        return json.dumps(_admission(decisions)), {}
+
+
+def _card_pipeline(
+    store,
+    curator,
+    *,
+    admission=None,
+    enabled=True,
+    admission_model="semantic-model",
+):
+    from types import SimpleNamespace
+
+    pipeline = object.__new__(CompactionPipeline)
+    pipeline._store = store
+    pipeline._config = SimpleNamespace(
+        tenant_id="t1",
+        assembler=SimpleNamespace(
+            actor_card_enabled=enabled,
+            actor_card_fact_limit=60,
+            actor_card_entries_per_kind=3,
+            actor_card_admission_model=admission_model,
+        ),
+        compactor=SimpleNamespace(max_summary_tokens=500),
+    )
+    pipeline._compactor = SimpleNamespace(
+        llm=curator,
+        _parse_response=lambda text: json.loads(text),
+    )
+    if admission is not None:
+        pipeline._actor_card_admission_provider_override = admission
+    return pipeline
+
+
+def test_actor_card_admission_fallback_only_runs_for_empty_primary():
+    class Provider:
+        def __init__(self, response):
+            self.response = response
+            self.calls = 0
+
+        def complete(self, **_kwargs):
+            self.calls += 1
+            return self.response, {"provider": self.response or "empty"}
+
+    primary = Provider('{"ok":true}')
+    fallback = Provider('{"fallback":true}')
+    provider = _EmptyResponseFallbackProvider(
+        primary,
+        fallback,
+        primary_model="primary",
+        fallback_model="fallback",
+    )
+
+    assert provider.complete_with_source(system="s", user="u", max_tokens=1) == (
+        '{"ok":true}',
+        {"provider": '{"ok":true}'},
+        "primary",
+    )
+    assert primary.calls == 1
+    assert fallback.calls == 0
+
+    assert provider.complete_fallback(system="s", user="u", max_tokens=1) == (
+        '{"fallback":true}',
+        {"provider": '{"fallback":true}'},
+    )
+    assert primary.calls == 1
+    assert fallback.calls == 1
+
+    primary.response = " \n "
+    assert provider.complete_with_source(system="s", user="u", max_tokens=1) == (
+        '{"fallback":true}',
+        {"provider": '{"fallback":true}'},
+        "fallback",
+    )
+    assert primary.calls == 2
+    assert fallback.calls == 2
+
+    class ProviderError:
+        calls = 0
+
+        def complete(self, **_kwargs):
+            self.calls += 1
+            raise LLMProviderError(
+                "content filter",
+                provider="test",
+                status_code=400,
+            )
+
+    error_primary = ProviderError()
+    error_fallback = Provider('{"fallback":true}')
+    error_provider = _EmptyResponseFallbackProvider(
+        error_primary,
+        error_fallback,
+        primary_model="primary",
+        fallback_model="fallback",
+    )
+    assert error_provider.complete(system="s", user="u", max_tokens=1) == (
+        '{"fallback":true}',
+        {"provider": '{"fallback":true}'},
+    )
+    assert error_primary.calls == 1
+    assert error_fallback.calls == 1
+
+
+def test_actor_card_admission_provider_builds_configured_fallback():
+    from types import SimpleNamespace
+
+    from virtual_context.providers.generic_openai import GenericOpenAIProvider
+
+    pipeline = object.__new__(CompactionPipeline)
+    pipeline._config = SimpleNamespace(
+        assembler=SimpleNamespace(
+            actor_card_curation_model="openai/gpt-5.4",
+            actor_card_curation_fallback_model="anthropic/claude-fable-5",
+            actor_card_admission_model="anthropic/claude-fable-5",
+            actor_card_admission_fallback_model="openai/gpt-5.4",
+        ),
+    )
+    pipeline._compactor = SimpleNamespace(
+        llm=GenericOpenAIProvider(
+            base_url="https://openrouter.ai/api/v1",
+            model="google/gemini-2.5-flash-lite",
+            api_key="test-key",
+        ),
+    )
+
+    curator = pipeline._actor_card_curation_provider()
+    assert isinstance(curator, _EmptyResponseFallbackProvider)
+    assert curator._primary.model == "openai/gpt-5.4"
+    assert curator._fallback.model == "anthropic/claude-fable-5"
+    assert curator._primary.base_url == curator._fallback.base_url
+    assert curator._primary.api_key == curator._fallback.api_key == "test-key"
+
+    provider = pipeline._actor_card_admission_provider()
+    assert isinstance(provider, _EmptyResponseFallbackProvider)
+    assert provider._primary.model == "anthropic/claude-fable-5"
+    assert provider._fallback.model == "openai/gpt-5.4"
+    assert provider._primary.base_url == provider._fallback.base_url
+    assert provider._primary.api_key == provider._fallback.api_key == "test-key"
+    assert provider._primary.temperature == provider._fallback.temperature == 0.0
+    assert (
+        provider._primary.reasoning_effort
+        == provider._fallback.reasoning_effort
+        == "low"
+    )
+
+
+def test_actor_card_curation_retries_schema_invalid_primary_with_fallback():
+    class CuratorWithFallback:
+        fallback_calls = 0
+
+        def complete_with_source(self, **_kwargs):
+            return '{"substantive":true,"coverage_reason":"substantive","entries":[', {}, "primary"
+
+        def complete_fallback(self, **_kwargs):
+            self.fallback_calls += 1
+            return json.dumps(_curation([])), {}
+
+    provider = CuratorWithFallback()
+    pipeline = _card_pipeline(None, provider, admission=_AdmitAll())
+    pipeline._actor_card_curation_provider_override = provider
+
+    response, substantive, reason, entries, visible = (
+        pipeline._curate_actor_card_partition([], [])
+    )
+
+    assert json.loads(response) == _curation([])
+    assert substantive is False
+    assert reason == "no_durable_context"
+    assert entries == []
+    assert visible == set()
+    assert provider.fallback_calls == 1
+
+
+def test_actor_card_admission_retries_schema_invalid_primary_with_fallback(
+    store,
+):
+    _single_guild_card_source(store)
+    body = "Is leading the Atlas migration."
+
+    class Curator:
+        def complete(self, **kwargs):
+            return json.dumps(_curation_for_visible_fact(
+                kwargs,
+                "f-guild",
+                [{
+                    "kind": CARD_KIND_ACTIVE_GOAL,
+                    "body": body,
+                    "confidence": 0.9,
+                    "fact_ids": ["f-guild"],
+                }],
+            )), {}
+
+    class AdmissionWithFallback:
+        primary_calls = 0
+        fallback_calls = 0
+
+        def complete_with_source(self, **_kwargs):
+            self.primary_calls += 1
+            return (
+                '{"substantive":true,"coverage_reason":"substantive",'
+                '"decisions":[',
+                {},
+                "primary",
+            )
+
+        def complete_fallback(self, **kwargs):
+            self.fallback_calls += 1
+            prompt = json.loads(kwargs["user"])
+            decisions = [{
+                "candidate_id": candidate["candidate_id"],
+                "admit": True,
+                "reason": "durable",
+            } for candidate in prompt["candidates"]]
+            return json.dumps(_admission(decisions)), {}
+
+    admission = AdmissionWithFallback()
+    pipeline = _card_pipeline(store, Curator(), admission=admission)
+
+    assert pipeline._rebuild_actor_card(OPTICS) == 1
+    assert admission.primary_calls == 1
+    assert admission.fallback_calls == 1
+    assert _bodies(store.get_actor_card(
+        "t1",
+        OPTICS,
+        owner_conversation_id="guild",
+        audience_conversation_id="guild",
+        audience_channel_id="chan-guild",
+    )) == [body]
+
+
+def test_actor_card_admission_fails_closed_when_both_responses_are_invalid(
+    store,
+):
+    _single_guild_card_source(store)
+
+    class Curator:
+        def complete(self, **kwargs):
+            return json.dumps(_curation_for_visible_fact(
+                kwargs,
+                "f-guild",
+                [{
+                    "kind": CARD_KIND_ACTIVE_GOAL,
+                    "body": "Is leading the Atlas migration.",
+                    "confidence": 0.9,
+                    "fact_ids": ["f-guild"],
+                }],
+            )), {}
+
+    class InvalidAdmission:
+        primary_calls = 0
+        fallback_calls = 0
+
+        def complete_with_source(self, **_kwargs):
+            self.primary_calls += 1
+            return '{"decisions":[', {}, "primary"
+
+        def complete_fallback(self, **_kwargs):
+            self.fallback_calls += 1
+            return '{"decisions":[', {}
+
+    admission = InvalidAdmission()
+    pipeline = _card_pipeline(store, Curator(), admission=admission)
+
+    with pytest.raises(RuntimeError, match="semantic admission failed"):
+        pipeline._rebuild_actor_card(OPTICS)
+    assert admission.primary_calls == 1
+    assert admission.fallback_calls == 1
+    status = store.get_actor_card_rebuild_status("t1", OPTICS)
+    assert status is not None
+    assert status["outcome"] == "admission_error"
+
+
+def test_malformed_primary_fallback_is_not_called_twice_on_disagreement(
+    store,
+):
+    _single_guild_card_source(store)
+
+    class Curator:
+        def complete(self, **kwargs):
+            return json.dumps(_curation_for_visible_fact(
+                kwargs,
+                "f-guild",
+                [{
+                    "kind": CARD_KIND_ACTIVE_GOAL,
+                    "body": "Is leading the Atlas migration.",
+                    "confidence": 0.9,
+                    "fact_ids": ["f-guild"],
+                }],
+            )), {}
+
+    class DisagreeingFallback:
+        primary_calls = 0
+        fallback_calls = 0
+
+        def complete_with_source(self, **_kwargs):
+            self.primary_calls += 1
+            return '{"decisions":[', {}, "primary"
+
+        def complete_fallback(self, **kwargs):
+            self.fallback_calls += 1
+            prompt = json.loads(kwargs["user"])
+            decisions = [{
+                "candidate_id": candidate["candidate_id"],
+                "admit": False,
+                "reason": "not_durable",
+            } for candidate in prompt["candidates"]]
+            return json.dumps(_admission(
+                decisions,
+                substantive=False,
+                coverage_reason="no_durable_context",
+            )), {}
+
+    admission = DisagreeingFallback()
+    pipeline = _card_pipeline(store, Curator(), admission=admission)
+
+    with pytest.raises(RuntimeError, match="semantic admission failed"):
+        pipeline._rebuild_actor_card(OPTICS)
+    assert admission.primary_calls == 1
+    assert admission.fallback_calls == 1
+    status = store.get_actor_card_rebuild_status("t1", OPTICS)
+    assert status is not None
+    assert status["outcome"] == "coverage_disagreement"
+
+
+def _single_guild_card_source(store):
+    _conversation(store, "guild")
+    _turn(
+        store,
+        "ct-guild",
+        "guild",
+        OPTICS,
+        "guild",
+        "chan-guild",
+        content="I am leading the Atlas migration.",
+    )
+    _segment(store, "seg-guild", "guild", ["ct-guild"])
+    _fact(store, "f-guild", "guild", "seg-guild", OPTICS)
+    store.upsert_actor_profile_from_turn(
+        "guild",
+        OPTICS,
+        "Optics",
+        seen_at=_now(),
+    )
+
+
+def test_curator_and_admission_share_the_configured_turn_window(store):
+    _single_guild_card_source(store)
+
+    class Curator:
+        def complete(self, **kwargs):
+            turn_id = json.loads(kwargs["user"])["turns"][0]["id"]
+            return json.dumps(_curation([{
+                "kind": CARD_KIND_ACTIVE_GOAL,
+                "body": "Is leading the Atlas migration.",
+                "confidence": 0.9,
+                "turn_ids": [turn_id],
+            }])), {}
+
+    pipeline = _card_pipeline(store, Curator(), admission=_AdmitAll())
+    pipeline._config.assembler.actor_card_prompt_max_chars = 123_456
+    original = pipeline._actor_card_prompt_turns
+    observed: list[int] = []
+
+    def render(turns, *, max_chars=96_000):
+        observed.append(max_chars)
+        return original(turns, max_chars=max_chars)
+
+    pipeline._actor_card_prompt_turns = render
+
+    assert pipeline._rebuild_actor_card(OPTICS) == 1
+    assert observed == [123_456, 123_456]
+
+
+def test_empty_primary_valid_fallback_passes_full_admission_gate(store):
+    _single_guild_card_source(store)
+
+    class Curator:
+        def complete(self, **_kwargs):
+            return json.dumps(_curation([{
+                "kind": CARD_KIND_ACTIVE_GOAL,
+                "body": "Is leading the Atlas migration.",
+                "confidence": 0.9,
+                "fact_ids": ["f-guild"],
+                "turn_ids": ["ct-guild"],
+            }])), {}
+
+    class Empty:
+        calls = 0
+
+        def complete(self, **_kwargs):
+            self.calls += 1
+            return "", {}
+
+    class ValidFallback:
+        calls = 0
+
+        def complete(self, **kwargs):
+            self.calls += 1
+            prompt = json.loads(kwargs["user"])
+            decisions = [{
+                "candidate_id": item["candidate_id"],
+                "admit": True,
+                "reason": "durable",
+            } for item in prompt["candidates"]]
+            return json.dumps(_admission(decisions)), {}
+
+    primary = Empty()
+    fallback = ValidFallback()
+    pipeline = _card_pipeline(
+        store,
+        Curator(),
+        admission=_EmptyResponseFallbackProvider(
+            primary,
+            fallback,
+            primary_model="primary",
+            fallback_model="fallback",
+        ),
+    )
+
+    assert pipeline._rebuild_actor_card(OPTICS) == 1
+    assert primary.calls == 1
+    assert fallback.calls == 1
+    assert _bodies(store.get_actor_card(
+        "t1",
+        OPTICS,
+        owner_conversation_id="guild",
+        audience_conversation_id="guild",
+        audience_channel_id="chan-guild",
+    )) == ["Is leading the Atlas migration."]
+
+
+def test_both_admission_models_empty_fails_closed(store):
+    _single_guild_card_source(store)
+
+    class Curator:
+        def complete(self, **_kwargs):
+            return json.dumps(_curation([{
+                "kind": CARD_KIND_ACTIVE_GOAL,
+                "body": "Is leading the Atlas migration.",
+                "confidence": 0.9,
+                "fact_ids": ["f-guild"],
+                "turn_ids": ["ct-guild"],
+            }])), {}
+
+    class Empty:
+        def complete(self, **_kwargs):
+            return "", {}
+
+    pipeline = _card_pipeline(
+        store,
+        Curator(),
+        admission=_EmptyResponseFallbackProvider(
+            Empty(),
+            Empty(),
+            primary_model="primary",
+            fallback_model="fallback",
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="semantic admission failed"):
+        pipeline._rebuild_actor_card(OPTICS)
+    status = store.get_actor_card_rebuild_status("t1", OPTICS)
+    assert status is not None
+    assert status["outcome"] == "admission_error"
+    assert store.get_actor_profile("t1", OPTICS).card_dirty is True
+    assert store.get_actor_card(
+        "t1",
+        OPTICS,
+        owner_conversation_id="guild",
+        audience_conversation_id="guild",
+        audience_channel_id="chan-guild",
+    ) is None
+
+
 # ---------------------------------------------------------------------------
 # Fact enumeration
 # ---------------------------------------------------------------------------
@@ -159,6 +824,101 @@ def test_list_actor_facts_derives_audience_from_canonical_rows(store):
         "f-dm": ("dm", "dm", "chan-dm"),
         "f-guild": ("guild", "guild", "chan-guild"),
     }
+
+
+def test_list_actor_turn_sources_is_exact_tenant_and_audience_scoped(store):
+    _dm_and_guild(store)
+    # The cap is per policy audience: neither DM nor guild can crowd the other
+    # out even when each is independently limited to one row.
+    sources = store.list_actor_turn_sources("t1", OPTICS, limit=1)
+    got = {
+        source.turn.canonical_turn_id: (
+            source.owner_conversation_id,
+            source.audience_conversation_id,
+            source.audience_channel_id,
+            source.turn.user_content,
+        )
+        for source in sources
+    }
+    assert got == {
+        "ct-dm": ("dm", "dm", "chan-dm", "hello"),
+        "ct-guild": ("guild", "guild", "chan-guild", "hello"),
+    }
+    assert store.list_actor_turn_sources(
+        "other-tenant", OPTICS, limit=10,
+    ) == []
+    assert store.list_actor_turn_sources("t1", BIGTEX, limit=10) == []
+
+
+def test_turn_sourced_card_is_atomic_readable_and_delete_invalidated(store):
+    _conversation(store, "guild")
+    _turn(
+        store,
+        "ct-guild",
+        "guild",
+        OPTICS,
+        "guild",
+        "chan-guild",
+        content="I regularly ask about endurance training.",
+    )
+    store.upsert_actor_profile_from_turn(
+        "guild", OPTICS, "Optics", seen_at=_now(),
+    )
+    entry = _entry(
+        "e-history",
+        "relevant_history",
+        "Has discussed endurance training with Vast.",
+    )
+
+    assert store.replace_actor_card(
+        "t1",
+        OPTICS,
+        [(
+            entry,
+            [_turn_source(
+                "e-history",
+                "guild",
+                "guild",
+                "ct-guild",
+                "chan-guild",
+            )],
+        )],
+        input_hash="turn-hash",
+        expected_source_epochs={"guild": 1},
+    ) == 1
+    assert _bodies(store.get_actor_card(
+        "t1",
+        OPTICS,
+        owner_conversation_id="guild",
+        audience_conversation_id="guild",
+        audience_channel_id="chan-guild",
+    )) == ["Has discussed endurance training with Vast."]
+    row = store._get_conn().execute(
+        """SELECT canonical_turn_id
+             FROM actor_card_turn_sources
+            WHERE entry_id = 'e-history'""",
+    ).fetchone()
+    assert row[0] == "ct-guild"
+
+    store._get_conn().execute(
+        """DELETE FROM canonical_turns
+            WHERE canonical_turn_id = 'ct-guild'""",
+    )
+    store._get_conn().commit()
+
+    profile = store.get_actor_profile("t1", OPTICS)
+    assert profile is not None and profile.card_dirty is True
+    assert store._get_conn().execute(
+        """SELECT 1 FROM actor_card_entries
+            WHERE id = 'e-history'""",
+    ).fetchone() is None
+    assert store.get_actor_card(
+        "t1",
+        OPTICS,
+        owner_conversation_id="guild",
+        audience_conversation_id="guild",
+        audience_channel_id="chan-guild",
+    ) is None
 
 
 def test_segment_source_mapping_survives_store_round_trip(store):
@@ -197,15 +957,17 @@ def test_compaction_card_builder_curates_and_skips_unchanged_input(store):
         def __init__(self):
             self.calls = 0
 
-        def complete(self, **_kwargs):
+        def complete(self, **kwargs):
             self.calls += 1
-            return json.dumps({"entries": [{
+            entries = [{
                 "kind": CARD_KIND_ACTIVE_GOAL,
                 "body": "finish the migration",
                 "confidence": 0.8,
-                "sensitivity": "normal",
                 "fact_ids": ["f-dm"],
-            }]}), {}
+            }]
+            return json.dumps(
+                _curation_for_visible_fact(kwargs, "f-dm", entries),
+            ), {}
 
     llm = LLM()
     pipeline = object.__new__(CompactionPipeline)
@@ -216,6 +978,7 @@ def test_compaction_card_builder_curates_and_skips_unchanged_input(store):
             actor_card_enabled=True,
             actor_card_fact_limit=60,
             actor_card_entries_per_kind=3,
+            actor_card_admission_model="semantic-model",
         ),
         compactor=SimpleNamespace(max_summary_tokens=500),
     )
@@ -223,6 +986,7 @@ def test_compaction_card_builder_curates_and_skips_unchanged_input(store):
         llm=llm,
         _parse_response=lambda text: json.loads(text),
     )
+    pipeline._actor_card_admission_provider_override = _AdmitAll()
 
     assert pipeline._rebuild_actor_card(OPTICS) == 1
     card = store.get_actor_card(
@@ -230,9 +994,226 @@ def test_compaction_card_builder_curates_and_skips_unchanged_input(store):
         audience_conversation_id="dm", audience_channel_id="chan-dm",
     )
     assert _bodies(card) == ["finish the migration"]
+    status = store.get_actor_card_rebuild_status("t1", OPTICS)
+    assert status is not None
+    assert status["outcome"] == "written"
+    assert status["source_count"] == 4
+    assert status["raw_entry_count"] == 1
+    assert status["accepted_entry_count"] == 1
+    assert status["written_count"] == 1
+    assert status["rejected_counts"] == {}
 
     assert pipeline._rebuild_actor_card(OPTICS) == 0
-    assert llm.calls == 1
+    assert llm.calls == 2
+
+
+def test_turn_only_card_lifecycle_adds_refines_revokes_and_ignores_probe(store):
+    """Substantive canonical speech must build and maintain a card without facts."""
+    _conversation(store, "guild")
+    _turn(
+        store,
+        "ct-goal",
+        "guild",
+        OPTICS,
+        "guild",
+        "chan-a",
+        content=(
+            "I am leading the Atlas migration to Kubernetes this quarter."
+        ),
+    )
+    store.upsert_actor_profile_from_turn(
+        "guild", OPTICS, "Optics", seen_at=_now(),
+    )
+
+    class Curator:
+        calls = 0
+
+        def complete(self, **kwargs):
+            self.calls += 1
+            turns = {
+                item["id"]: item["content"]
+                for item in json.loads(kwargs["user"])["turns"]
+            }
+            entries = []
+            if "ct-finish" not in turns:
+                entries.append({
+                    "kind": CARD_KIND_ACTIVE_GOAL,
+                    "body": "Is leading the Atlas migration to Kubernetes.",
+                    "confidence": 0.95,
+                    "turn_ids": ["ct-goal"],
+                })
+            if "ct-pref" in turns and "ct-finish" not in turns:
+                entries.append({
+                    "kind": CARD_KIND_COMMUNICATION_PREF,
+                    "body": "Prefers bullet summaries for the Atlas project.",
+                    "confidence": 0.9,
+                    "turn_ids": ["ct-pref"],
+                })
+            if "ct-finish" in turns:
+                entries.append({
+                    "kind": CARD_KIND_COMMUNICATION_PREF,
+                    "body": "Prefers brief prose instead of bullet summaries.",
+                    "confidence": 0.95,
+                    "turn_ids": ["ct-finish"],
+                })
+            return json.dumps(_curation(entries)), {}
+
+    curator = Curator()
+    pipeline = _card_pipeline(
+        store,
+        curator,
+        admission=_AdmitAll(),
+    )
+
+    assert pipeline._rebuild_actor_card(OPTICS) == 1
+    assert _bodies(store.get_actor_card(
+        "t1",
+        OPTICS,
+        owner_conversation_id="guild",
+        audience_conversation_id="guild",
+        audience_channel_id="chan-a",
+    )) == ["Is leading the Atlas migration to Kubernetes."]
+
+    _turn(
+        store,
+        "ct-pref",
+        "guild",
+        OPTICS,
+        "guild",
+        "chan-a",
+        content=(
+            "Going forward, I prefer bullet summaries for the Atlas project."
+        ),
+    )
+    assert store.get_actor_profile("t1", OPTICS).card_dirty is True
+    assert pipeline._rebuild_actor_card(OPTICS) == 2
+    assert _bodies(store.get_actor_card(
+        "t1",
+        OPTICS,
+        owner_conversation_id="guild",
+        audience_conversation_id="guild",
+        audience_channel_id="chan-a",
+    )) == [
+        "Is leading the Atlas migration to Kubernetes.",
+        "Prefers bullet summaries for the Atlas project.",
+    ]
+
+    _turn(
+        store,
+        "ct-finish",
+        "guild",
+        OPTICS,
+        "guild",
+        "chan-a",
+        content=(
+            "The Atlas migration is complete. Going forward, use brief prose, "
+            "not bullet summaries."
+        ),
+    )
+    assert store.get_actor_profile("t1", OPTICS).card_dirty is True
+    assert pipeline._rebuild_actor_card(OPTICS) == 1
+    expected = ["Prefers brief prose instead of bullet summaries."]
+    assert _bodies(store.get_actor_card(
+        "t1",
+        OPTICS,
+        owner_conversation_id="guild",
+        audience_conversation_id="guild",
+        audience_channel_id="chan-a",
+    )) == expected
+
+    active_rows = store._get_conn().execute(
+        """SELECT e.kind, e.body, s.canonical_turn_id
+             FROM actor_card_entries e
+             JOIN actor_card_turn_sources s
+               ON s.entry_id = e.id AND s.tenant_id = e.tenant_id
+            WHERE e.tenant_id = ? AND e.actor_id = ?
+              AND e.superseded_by IS NULL""",
+        ("t1", OPTICS),
+    ).fetchall()
+    assert [tuple(row) for row in active_rows] == [(
+        CARD_KIND_COMMUNICATION_PREF,
+        expected[0],
+        "ct-finish",
+    )]
+
+    _turn(
+        store,
+        "ct-probe",
+        "guild",
+        OPTICS,
+        "guild",
+        "chan-a",
+        content="For this test only, begin one reply with Probe:",
+    )
+    assert store.get_actor_profile("t1", OPTICS).card_dirty is True
+    assert pipeline._rebuild_actor_card(OPTICS) == 1
+    assert _bodies(store.get_actor_card(
+        "t1",
+        OPTICS,
+        owner_conversation_id="guild",
+        audience_conversation_id="guild",
+        audience_channel_id="chan-a",
+    )) == expected
+    assert curator.calls == 4
+
+
+def test_new_turn_during_model_call_cannot_be_lost_by_card_commit(store):
+    _conversation(store, "guild")
+    _turn(
+        store,
+        "ct-before-build",
+        "guild",
+        OPTICS,
+        "guild",
+        "chan-a",
+        content="I am planning the Atlas migration.",
+    )
+    store.upsert_actor_profile_from_turn(
+        "guild", OPTICS, "Optics", seen_at=_now(),
+    )
+
+    class RacingCurator:
+        def complete(self, **_kwargs):
+            _turn(
+                store,
+                "ct-during-build",
+                "guild",
+                OPTICS,
+                "guild",
+                "chan-a",
+                content="The Atlas migration has now been cancelled.",
+            )
+            return json.dumps(_curation([{
+                "kind": CARD_KIND_ACTIVE_GOAL,
+                "body": "Is planning the Atlas migration.",
+                "confidence": 0.9,
+                "turn_ids": ["ct-before-build"],
+            }])), {}
+
+    pipeline = _card_pipeline(
+        store,
+        RacingCurator(),
+        admission=_AdmitAll(),
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="replacement did not commit cleanly",
+    ):
+        pipeline._rebuild_actor_card(OPTICS)
+
+    profile = store.get_actor_profile("t1", OPTICS)
+    assert profile is not None and profile.card_dirty is True
+    assert profile.card_input_hash == ""
+    assert store.get_actor_card(
+        "t1",
+        OPTICS,
+        owner_conversation_id="guild",
+        audience_conversation_id="guild",
+        audience_channel_id="chan-a",
+    ) is None
+    status = store.get_actor_card_rebuild_status("t1", OPTICS)
+    assert status is not None
+    assert status["outcome"] == "stale_or_rejected_write"
 
 
 def test_compaction_card_builder_rejects_any_unknown_fact_citation(store):
@@ -241,14 +1222,16 @@ def test_compaction_card_builder_rejects_any_unknown_fact_citation(store):
     _dm_and_guild(store)
 
     class LLM:
-        def complete(self, **_kwargs):
-            return json.dumps({"entries": [{
+        def complete(self, **kwargs):
+            entries = [{
                 "kind": CARD_KIND_ACTIVE_GOAL,
                 "body": "unsupported synthesis",
                 "confidence": 0.8,
-                "sensitivity": "normal",
                 "fact_ids": ["f-dm", "invented-fact"],
-            }]}), {}
+            }]
+            return json.dumps(
+                _curation_for_visible_fact(kwargs, "f-dm", entries),
+            ), {}
 
     pipeline = object.__new__(CompactionPipeline)
     pipeline._store = store
@@ -266,11 +1249,453 @@ def test_compaction_card_builder_rejects_any_unknown_fact_citation(store):
         _parse_response=lambda text: json.loads(text),
     )
 
-    assert pipeline._rebuild_actor_card(OPTICS) == 0
+    with pytest.raises(
+        RuntimeError, match="rejected every model entry",
+    ):
+        pipeline._rebuild_actor_card(OPTICS)
+    assert store.get_actor_profile("t1", OPTICS).card_dirty is True
+    status = store.get_actor_card_rebuild_status("t1", OPTICS)
+    assert status is not None
+    assert status["outcome"] == "rejected_all"
+    assert status["rejected_counts"] == {
+        "unknown_or_cross_audience_fact_id": 1,
+    }
     assert store.get_actor_card(
         "t1", OPTICS, owner_conversation_id="dm",
         audience_conversation_id="dm", audience_channel_id="chan-dm",
     ) is None
+
+
+def test_compaction_card_builder_repairs_a_visible_turn_in_fact_ids(store):
+    _dm_and_guild(store)
+
+    class Curator:
+        def complete(self, **kwargs):
+            visible = {
+                item["id"]
+                for item in json.loads(kwargs["user"])["turns"]
+            }
+            if "ct-guild" not in visible:
+                return json.dumps(_curation([])), {}
+            return json.dumps(_curation([{
+                "kind": CARD_KIND_RELEVANT_HISTORY,
+                "body": "Has discussed a substantive guild topic.",
+                "confidence": 0.9,
+                # The same valid turn was copied into the wrong namespace by
+                # the curator shape observed in production.
+                "fact_ids": ["ct-guild"],
+                "turn_ids": ["ct-guild"],
+            }])), {}
+
+    class Admission(_AdmitAll):
+        prompts = []
+
+        def complete(self, **kwargs):
+            self.prompts.append(json.loads(kwargs["user"]))
+            return super().complete(**kwargs)
+
+    admission = Admission()
+    pipeline = _card_pipeline(
+        store,
+        Curator(),
+        admission=admission,
+    )
+    assert pipeline._rebuild_actor_card(OPTICS) == 1
+    candidate = next(
+        prompt["candidates"][0]
+        for prompt in admission.prompts
+        if prompt["candidates"]
+    )
+    assert candidate["fact_ids"] == []
+    assert candidate["turn_ids"] == ["ct-guild"]
+    assert _bodies(store.get_actor_card(
+        "t1",
+        OPTICS,
+        owner_conversation_id="guild",
+        audience_conversation_id="guild",
+        audience_channel_id="chan-guild",
+    )) == ["Has discussed a substantive guild topic."]
+
+
+def test_compaction_card_builder_repairs_a_visible_fact_in_turn_ids(store):
+    _dm_and_guild(store)
+
+    class Curator:
+        def complete(self, **kwargs):
+            visible = {
+                item["id"]
+                for item in json.loads(kwargs["user"])["facts"]
+            }
+            if "f-guild" not in visible:
+                return json.dumps(_curation([])), {}
+            return json.dumps(_curation([{
+                "kind": CARD_KIND_RELEVANT_HISTORY,
+                "body": "Has discussed a substantive guild topic.",
+                "confidence": 0.9,
+                "fact_ids": [],
+                "turn_ids": ["f-guild"],
+            }])), {}
+
+    class Admission(_AdmitAll):
+        prompts = []
+
+        def complete(self, **kwargs):
+            self.prompts.append(json.loads(kwargs["user"]))
+            return super().complete(**kwargs)
+
+    admission = Admission()
+    pipeline = _card_pipeline(
+        store,
+        Curator(),
+        admission=admission,
+    )
+    assert pipeline._rebuild_actor_card(OPTICS) == 1
+    candidate = next(
+        prompt["candidates"][0]
+        for prompt in admission.prompts
+        if prompt["candidates"]
+    )
+    assert candidate["fact_ids"] == ["f-guild"]
+    assert candidate["turn_ids"] == []
+
+
+def test_compaction_card_builder_bounds_excessive_citations(store):
+    _conversation(store, "guild")
+    turn_ids = []
+    for index in range(17):
+        turn_id = f"ct-{index}"
+        turn_ids.append(turn_id)
+        _turn(
+            store,
+            turn_id,
+            "guild",
+            OPTICS,
+            "guild",
+            "chan-guild",
+            content=f"Substantive topic message {index}.",
+        )
+    store.upsert_actor_profile_from_turn(
+        "guild",
+        OPTICS,
+        "Optics",
+        seen_at=_now(),
+    )
+
+    class Curator:
+        def complete(self, **_kwargs):
+            base = {
+                "kind": CARD_KIND_RELEVANT_HISTORY,
+                "body": "Has discussed a substantive guild topic.",
+                "confidence": 0.9,
+                "fact_ids": [],
+            }
+            return json.dumps(_curation([
+                {**base, "turn_ids": turn_ids},
+                {**base, "turn_ids": list(reversed(turn_ids))},
+            ])), {}
+
+    pipeline = _card_pipeline(
+        store,
+        Curator(),
+        admission=_AdmitAll(),
+    )
+    assert pipeline._rebuild_actor_card(OPTICS) == 1
+    status = store.get_actor_card_rebuild_status("t1", OPTICS)
+    assert status is not None
+    assert status["rejected_counts"] == {
+        "citations_trimmed": 2,
+        "duplicate_entry": 1,
+    }
+    card = store.get_actor_card(
+        "t1",
+        OPTICS,
+        owner_conversation_id="guild",
+        audience_conversation_id="guild",
+        audience_channel_id="chan-guild",
+    )
+    assert card is not None
+    assert len(card.entries) == 1
+    source_count = store._get_conn().execute(
+        """SELECT COUNT(*)
+             FROM actor_card_turn_sources
+            WHERE entry_id = ?""",
+        (card.entries[0].id,),
+    ).fetchone()[0]
+    assert source_count == 16
+
+
+def test_compaction_card_builder_rejects_cross_audience_wrong_namespace_id(
+    store,
+):
+    _dm_and_guild(store)
+
+    class Curator:
+        def complete(self, **kwargs):
+            visible = {
+                item["id"]
+                for item in json.loads(kwargs["user"])["turns"]
+            }
+            if "ct-guild" not in visible:
+                return json.dumps(_curation([])), {}
+            return json.dumps(_curation([{
+                "kind": CARD_KIND_RELEVANT_HISTORY,
+                "body": "Has discussed a substantive guild topic.",
+                "confidence": 0.9,
+                # This is a real turn, but it belongs to the private DM
+                # partition and was not exposed to this guild call.
+                "fact_ids": ["ct-dm"],
+                "turn_ids": [],
+            }])), {}
+
+    pipeline = _card_pipeline(
+        store,
+        Curator(),
+        admission=_AdmitAll(),
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="rejected every model entry",
+    ):
+        pipeline._rebuild_actor_card(OPTICS)
+    status = store.get_actor_card_rebuild_status("t1", OPTICS)
+    assert status is not None
+    assert status["rejected_counts"] == {
+        "unknown_or_cross_audience_fact_id": 1,
+    }
+
+
+def test_compaction_card_builder_rejects_same_audience_turn_omitted_from_prompt(
+    store,
+):
+    _conversation(store, "guild")
+    _turn(
+        store,
+        "ct-stored-but-omitted",
+        "guild",
+        OPTICS,
+        "guild",
+        "chan-guild",
+        content="A real stored message outside the rendered prompt window.",
+    )
+    store.upsert_actor_profile_from_turn(
+        "guild",
+        OPTICS,
+        "Optics",
+        seen_at=_now(),
+    )
+
+    class Curator:
+        def complete(self, **_kwargs):
+            return json.dumps(_curation([{
+                "kind": CARD_KIND_RELEVANT_HISTORY,
+                "body": "Has discussed a substantive guild topic.",
+                "confidence": 0.9,
+                "fact_ids": ["ct-stored-but-omitted"],
+                "turn_ids": [],
+            }])), {}
+
+    pipeline = _card_pipeline(
+        store,
+        Curator(),
+        admission=_AdmitAll(),
+    )
+    pipeline._actor_card_prompt_turns = lambda _turns: []
+    with pytest.raises(
+        RuntimeError,
+        match="rejected every model entry",
+    ):
+        pipeline._rebuild_actor_card(OPTICS)
+    status = store.get_actor_card_rebuild_status("t1", OPTICS)
+    assert status is not None
+    assert status["rejected_counts"] == {
+        "unknown_or_cross_audience_fact_id": 1,
+    }
+
+
+def test_compaction_card_builder_deduplicates_after_namespace_repair(store):
+    _dm_and_guild(store)
+    _turn(
+        store,
+        "ct-guild-2",
+        "guild",
+        OPTICS,
+        "guild",
+        "chan-guild",
+        content="A second substantive guild topic message.",
+    )
+
+    class Curator:
+        def complete(self, **kwargs):
+            visible = {
+                item["id"]
+                for item in json.loads(kwargs["user"])["turns"]
+            }
+            if "ct-guild" not in visible:
+                return json.dumps(_curation([])), {}
+            base = {
+                "kind": CARD_KIND_COMMUNICATION_PREF,
+                "body": "Prefers concise summaries for substantive topics.",
+                "confidence": 0.9,
+            }
+            return json.dumps(_curation([
+                {
+                    **base,
+                    "fact_ids": [],
+                    "turn_ids": ["ct-guild", "ct-guild-2"],
+                },
+                {
+                    **base,
+                    "confidence": 0.95,
+                    # Same source set, reordered and partly copied into the
+                    # wrong namespace.
+                    "fact_ids": ["ct-guild-2"],
+                    "turn_ids": ["ct-guild"],
+                },
+            ])), {}
+
+    pipeline = _card_pipeline(
+        store,
+        Curator(),
+        admission=_AdmitAll(),
+    )
+    assert pipeline._rebuild_actor_card(OPTICS) == 1
+    status = store.get_actor_card_rebuild_status("t1", OPTICS)
+    assert status is not None
+    assert status["accepted_entry_count"] == 1
+    assert status["written_count"] == 1
+    assert status["rejected_counts"] == {"duplicate_entry": 1}
+    stored = store._get_conn().execute(
+        """SELECT confidence, sensitivity, audience_scope
+             FROM actor_card_entries
+            WHERE tenant_id = ? AND actor_id = ?
+              AND superseded_by IS NULL""",
+        ("t1", OPTICS),
+    ).fetchall()
+    assert [tuple(row) for row in stored] == [(
+        0.95,
+        "normal",
+        CARD_SCOPE_CROSS_CONTEXT,
+    )]
+
+
+def test_actor_card_failures_back_off_and_terminally_suppress_same_input(store):
+    _dm_and_guild(store)
+
+    class Malformed:
+        calls = 0
+
+        def complete(self, **_kwargs):
+            self.calls += 1
+            return '{"entries":[]}', {}
+
+    curator = Malformed()
+    pipeline = _card_pipeline(
+        store,
+        curator,
+        admission=_AdmitAll(),
+    )
+
+    with pytest.raises(RuntimeError, match="no valid entries array"):
+        pipeline._rebuild_actor_card(OPTICS)
+    status = store.get_actor_card_rebuild_status("t1", OPTICS)
+    assert status["failure_count"] == 1
+    assert status["next_retry_at"]
+
+    # Automatic work is bounded during backoff.
+    assert pipeline._rebuild_actor_card(OPTICS) == 0
+    assert curator.calls == 1
+
+    # An operator-forced rebuild bypasses backoff but still increments the
+    # bounded failure counter for this exact immutable input.
+    for expected in (2, 3):
+        with pytest.raises(RuntimeError, match="no valid entries array"):
+            pipeline._rebuild_actor_card(OPTICS, force=True)
+        assert (
+            store.get_actor_card_rebuild_status(
+                "t1", OPTICS,
+            )["failure_count"]
+            == expected
+        )
+    assert pipeline._rebuild_actor_card(OPTICS) == 0
+    assert curator.calls == 3
+
+    # Changed evidence is a new input and therefore gets one fresh attempt.
+    _turn(
+        store,
+        "ct-new-input",
+        "guild",
+        OPTICS,
+        "guild",
+        "chan-guild",
+        content="A genuinely new message changes the input hash.",
+    )
+    with pytest.raises(RuntimeError, match="no valid entries array"):
+        pipeline._rebuild_actor_card(OPTICS)
+    assert curator.calls == 4
+    assert (
+        store.get_actor_card_rebuild_status(
+            "t1", OPTICS,
+        )["failure_count"]
+        == 1
+    )
+
+
+def test_transient_card_failure_enters_bounded_due_retry_queue(store):
+    _dm_and_guild(store)
+    store.mark_actor_card_dirty(
+        "t1",
+        OPTICS,
+        build_input_hash="building:input-hash",
+    )
+    store.record_actor_card_rebuild_status(
+        "t1",
+        OPTICS,
+        attempted_at=_now(),
+        input_hash="input-hash",
+        source_count=2,
+        raw_entry_count=0,
+        accepted_entry_count=0,
+        rejected_counts={},
+        outcome="model_error",
+        response_hash="response-hash",
+        written_count=0,
+    )
+
+    assert store.list_due_actor_card_rebuilds(
+        "t1",
+        due_at="2000-01-01T00:00:00+00:00",
+    ) == []
+    assert store.list_due_actor_card_rebuilds(
+        "t1",
+        due_at="9999-01-01T00:00:00+00:00",
+    ) == [OPTICS]
+    assert store.list_due_actor_card_rebuilds(
+        "other-tenant",
+        due_at="9999-01-01T00:00:00+00:00",
+    ) == []
+
+    store._get_conn().execute(
+        """UPDATE actor_card_rebuild_status
+              SET next_retry_at = '2000-01-01T00:00:00+00:00'
+            WHERE tenant_id = 't1' AND actor_id = ?""",
+        (OPTICS,),
+    )
+    store._get_conn().commit()
+    pipeline = _card_pipeline(
+        store,
+        curator=object(),
+        admission=_AdmitAll(),
+    )
+    assert pipeline._due_actor_card_rebuilds() == [OPTICS]
+
+    store._get_conn().execute(
+        """UPDATE actor_card_rebuild_status
+              SET failure_count = 3
+            WHERE tenant_id = 't1' AND actor_id = ?""",
+        (OPTICS,),
+    )
+    store._get_conn().commit()
+    assert pipeline._due_actor_card_rebuilds() == []
 
 
 def test_compaction_card_builder_rejects_boolean_confidence(store):
@@ -279,14 +1704,16 @@ def test_compaction_card_builder_rejects_boolean_confidence(store):
     _dm_and_guild(store)
 
     class LLM:
-        def complete(self, **_kwargs):
-            return json.dumps({"entries": [{
+        def complete(self, **kwargs):
+            entries = [{
                 "kind": CARD_KIND_ACTIVE_GOAL,
                 "body": "not numeric confidence",
                 "confidence": True,
-                "sensitivity": "normal",
                 "fact_ids": ["f-dm"],
-            }]}), {}
+            }]
+            return json.dumps(
+                _curation_for_visible_fact(kwargs, "f-dm", entries),
+            ), {}
 
     pipeline = object.__new__(CompactionPipeline)
     pipeline._store = store
@@ -303,11 +1730,791 @@ def test_compaction_card_builder_rejects_boolean_confidence(store):
         llm=LLM(), _parse_response=lambda text: json.loads(text),
     )
 
-    assert pipeline._rebuild_actor_card(OPTICS) == 0
+    with pytest.raises(
+        RuntimeError, match="rejected every model entry",
+    ):
+        pipeline._rebuild_actor_card(OPTICS)
+    assert store.get_actor_profile("t1", OPTICS).card_dirty is True
+    status = store.get_actor_card_rebuild_status("t1", OPTICS)
+    assert status is not None
+    assert status["outcome"] == "rejected_all"
+    assert status["rejected_counts"] == {"invalid_confidence": 1}
     assert store.get_actor_card(
         "t1", OPTICS, owner_conversation_id="dm",
         audience_conversation_id="dm", audience_channel_id="chan-dm",
     ) is None
+
+
+def test_compaction_card_builder_rejects_deprecated_sensitivity_field(store):
+    """Sensitivity is absent from the strict model contract, not advisory input."""
+    from types import SimpleNamespace
+
+    _dm_and_guild(store)
+
+    class LLM:
+        def complete(self, **kwargs):
+            entries = [{
+                "kind": CARD_KIND_COMMUNICATION_PREF,
+                "body": "prefers concise answers",
+                "confidence": 0.8,
+                "sensitivity": "high",
+                "fact_ids": ["f-guild"],
+            }]
+            return json.dumps(
+                _curation_for_visible_fact(kwargs, "f-guild", entries),
+            ), {}
+
+    pipeline = object.__new__(CompactionPipeline)
+    pipeline._store = store
+    pipeline._config = SimpleNamespace(
+        tenant_id="t1",
+        assembler=SimpleNamespace(
+            actor_card_enabled=True,
+            actor_card_fact_limit=60,
+            actor_card_entries_per_kind=3,
+        ),
+        compactor=SimpleNamespace(max_summary_tokens=500),
+    )
+    pipeline._compactor = SimpleNamespace(
+        llm=LLM(), _parse_response=lambda text: json.loads(text),
+    )
+
+    with pytest.raises(
+        RuntimeError, match="rejected every model entry",
+    ):
+        pipeline._rebuild_actor_card(OPTICS)
+
+    assert store.get_actor_profile("t1", OPTICS).card_dirty is True
+    status = store.get_actor_card_rebuild_status("t1", OPTICS)
+    assert status is not None
+    assert status["outcome"] == "rejected_all"
+    assert status["rejected_counts"] == {"invalid_entry_shape": 1}
+
+
+def test_compaction_card_builder_accepts_explicit_clean_empty_and_records_contract(
+    store,
+):
+    """No durable pattern is valid; malformed output is not."""
+    from types import SimpleNamespace
+
+    _dm_and_guild(store)
+
+    class LLM:
+        kwargs = None
+
+        def complete(self, **kwargs):
+            self.kwargs = kwargs
+            return json.dumps(_curation([])), {}
+
+    llm = LLM()
+    pipeline = object.__new__(CompactionPipeline)
+    pipeline._store = store
+    pipeline._config = SimpleNamespace(
+        tenant_id="t1",
+        assembler=SimpleNamespace(
+            actor_card_enabled=True,
+            actor_card_fact_limit=60,
+            actor_card_entries_per_kind=3,
+        ),
+        compactor=SimpleNamespace(max_summary_tokens=500),
+    )
+    pipeline._compactor = SimpleNamespace(
+        llm=llm, _parse_response=lambda text: json.loads(text),
+    )
+    pipeline._actor_card_admission_provider_override = _AdmitAll()
+
+    assert pipeline._rebuild_actor_card(OPTICS) == 0
+    assert "sensitivity" not in llm.kwargs["system"].lower()
+    assert "Subject matter must never determine admission" in (
+        llm.kwargs["system"]
+    )
+    assert "explicitly and unambiguously asks" in llm.kwargs["system"]
+    assert "temporary, test-only" in llm.kwargs["system"]
+    assert "Every body must be self-contained and unambiguous" in (
+        llm.kwargs["system"]
+    )
+    assert "not a serialization of subject/verb/object fields" in (
+        llm.kwargs["system"]
+    )
+    assert "Preserve every material qualifier from the source" in (
+        llm.kwargs["system"]
+    )
+    assert "Do not turn a qualified statement into a broader" in (
+        llm.kwargs["system"]
+    )
+    assert "at most 16 citation ids total per entry" in (
+        llm.kwargs["system"]
+    )
+    assert llm.kwargs["max_tokens"] == 2000
+    prompt = json.loads(llm.kwargs["user"])
+    assert prompt["facts"]
+    assert all(
+        isinstance(item["mentioned_at"], str)
+        for item in prompt["facts"]
+    )
+    assert store.get_actor_profile("t1", OPTICS).card_dirty is False
+    status = store.get_actor_card_rebuild_status("t1", OPTICS)
+    assert status is not None
+    assert status["outcome"] == "clean_empty"
+    assert status["source_count"] == 4
+    assert status["raw_entry_count"] == 0
+    assert status["accepted_entry_count"] == 0
+
+
+def test_semantic_admission_rejects_candidate_without_rewriting_card(store):
+    """The focused model gate can reject a schema-valid but non-durable entry."""
+    from types import SimpleNamespace
+
+    _dm_and_guild(store)
+
+    class Curator:
+        def complete(self, **kwargs):
+            entries = [{
+                "kind": CARD_KIND_COMMUNICATION_PREF,
+                "body": "begin every reply with a temporary probe prefix",
+                "confidence": 1.0,
+                "fact_ids": ["f-guild"],
+            }]
+            return json.dumps(
+                _curation_for_visible_fact(kwargs, "f-guild", entries),
+            ), {}
+
+    class Admission:
+        prompt = None
+        system = None
+
+        def complete(self, **kwargs):
+            self.prompt = json.loads(kwargs["user"])
+            self.system = kwargs["system"]
+            if not self.prompt["candidates"]:
+                return json.dumps(_admission([])), {}
+            candidate_id = self.prompt["candidates"][0]["candidate_id"]
+            return json.dumps(_admission([{
+                "candidate_id": candidate_id,
+                "admit": False,
+                "reason": "test_probe",
+            }])), {}
+
+    admission = Admission()
+    pipeline = object.__new__(CompactionPipeline)
+    pipeline._store = store
+    pipeline._config = SimpleNamespace(
+        tenant_id="t1",
+        assembler=SimpleNamespace(
+            actor_card_enabled=True,
+            actor_card_fact_limit=60,
+            actor_card_entries_per_kind=3,
+            actor_card_admission_model="semantic-model",
+        ),
+        compactor=SimpleNamespace(max_summary_tokens=500),
+    )
+    pipeline._compactor = SimpleNamespace(
+        llm=Curator(), _parse_response=lambda text: json.loads(text),
+    )
+    pipeline._actor_card_admission_provider_override = admission
+
+    with pytest.raises(
+        RuntimeError, match="semantic admission failed",
+    ):
+        pipeline._rebuild_actor_card(OPTICS)
+    assert admission.prompt["candidates"][0]["body"] == (
+        "begin every reply with a temporary probe prefix"
+    )
+    assert (
+        "candidate body itself must be self-contained and unambiguous"
+        in admission.system
+    )
+    assert "reject with insufficient_evidence" in admission.system
+    assert "Compact fact fields and tags" in admission.system
+    assert "preserving every material qualifier" in admission.system
+    assert "drops a qualifier, broadens the statement" in admission.system
+    assert "does not entail the unqualified body" in admission.system
+    assert "Reject with not_person_card" in admission.system
+    assert any(
+        message["content"] == "hello"
+        for segment in admission.prompt["evidence_segments"]
+        for message in segment["messages"]
+    )
+    assert {
+        segment["segment_ref"]
+        for segment in admission.prompt["evidence_segments"]
+    } == {"seg-guild"}
+    assert {
+        fact["id"] for fact in admission.prompt["facts"]
+    } == {"f-guild"}
+    assert store.get_actor_card(
+        "t1", OPTICS, owner_conversation_id="guild",
+        audience_conversation_id="guild", audience_channel_id="chan-guild",
+    ) is None
+    status = store.get_actor_card_rebuild_status("t1", OPTICS)
+    assert status is not None
+    assert status["outcome"] == "coverage_disagreement"
+    assert status["accepted_entry_count"] == 1
+    assert status["rejected_counts"] == {}
+    assert status["failure_count"] == 3
+
+
+def test_fallback_supplied_initial_judgment_is_not_counted_twice(store):
+    """One fallback model cannot manufacture a 2-of-3 majority."""
+    _single_guild_card_source(store)
+
+    class Curator:
+        def complete(self, **kwargs):
+            entries = [{
+                "kind": CARD_KIND_INTERACTION_STYLE,
+                "body": "I do not talk much.",
+                "confidence": 1.0,
+                "fact_ids": ["f-guild"],
+            }]
+            return json.dumps(
+                _curation_for_visible_fact(kwargs, "f-guild", entries),
+            ), {}
+
+    class EmptyPrimary:
+        calls = 0
+
+        def complete(self, **_kwargs):
+            self.calls += 1
+            return "", {}
+
+    class RejectingFallback:
+        calls = 0
+
+        def complete(self, **kwargs):
+            self.calls += 1
+            prompt = json.loads(kwargs["user"])
+            decisions = [{
+                "candidate_id": candidate["candidate_id"],
+                "admit": False,
+                "reason": "not_durable",
+            } for candidate in prompt["candidates"]]
+            return json.dumps(_admission(decisions)), {}
+
+    primary = EmptyPrimary()
+    fallback = RejectingFallback()
+    admission = _EmptyResponseFallbackProvider(
+        primary,
+        fallback,
+        primary_model="primary",
+        fallback_model="fallback",
+    )
+    pipeline = _card_pipeline(store, Curator(), admission=admission)
+
+    with pytest.raises(RuntimeError, match="semantic admission failed"):
+        pipeline._rebuild_actor_card(OPTICS)
+    assert primary.calls == 1
+    assert fallback.calls == 1
+    status = store.get_actor_card_rebuild_status("t1", OPTICS)
+    assert status is not None
+    assert status["outcome"] == "coverage_disagreement"
+    assert status["response_hash"]
+
+
+def test_coverage_disagreement_uses_fallback_majority_for_clean_empty(store):
+    """Two independent admission models can overrule one curator outlier."""
+    _single_guild_card_source(store)
+
+    class Curator:
+        def complete(self, **kwargs):
+            entries = [{
+                "kind": CARD_KIND_INTERACTION_STYLE,
+                "body": "I do not talk much.",
+                "confidence": 1.0,
+                "fact_ids": ["f-guild"],
+            }]
+            return json.dumps(
+                _curation_for_visible_fact(kwargs, "f-guild", entries),
+            ), {}
+
+    class Admission:
+        primary_calls = 0
+        fallback_calls = 0
+
+        @staticmethod
+        def _rejection(kwargs):
+            prompt = json.loads(kwargs["user"])
+            decisions = [{
+                "candidate_id": candidate["candidate_id"],
+                "admit": False,
+                "reason": "not_durable",
+            } for candidate in prompt["candidates"]]
+            return json.dumps(_admission(decisions)), {}
+
+        def complete(self, **kwargs):
+            self.primary_calls += 1
+            return self._rejection(kwargs)
+
+        def complete_fallback(self, **kwargs):
+            self.fallback_calls += 1
+            return self._rejection(kwargs)
+
+    admission = Admission()
+    pipeline = _card_pipeline(store, Curator(), admission=admission)
+
+    assert pipeline._rebuild_actor_card(OPTICS) == 0
+    assert admission.primary_calls == 1
+    assert admission.fallback_calls == 1
+    assert store.get_actor_profile("t1", OPTICS).card_dirty is False
+    status = store.get_actor_card_rebuild_status("t1", OPTICS)
+    assert status is not None
+    assert status["outcome"] == "clean_empty_filtered"
+    assert status["rejected_counts"] == {"semantic_not_durable": 1}
+
+
+def test_coverage_disagreement_uses_curator_fallback_majority_for_card(store):
+    """The fallback's candidate decisions win with the curator's coverage."""
+    _single_guild_card_source(store)
+    body = "Is leading the Atlas migration."
+
+    class Curator:
+        def complete(self, **kwargs):
+            entries = [{
+                "kind": CARD_KIND_ACTIVE_GOAL,
+                "body": body,
+                "confidence": 0.9,
+                "fact_ids": ["f-guild"],
+            }]
+            return json.dumps(
+                _curation_for_visible_fact(kwargs, "f-guild", entries),
+            ), {}
+
+    class Admission:
+        primary_calls = 0
+        fallback_calls = 0
+
+        def complete(self, **kwargs):
+            self.primary_calls += 1
+            prompt = json.loads(kwargs["user"])
+            decisions = [{
+                "candidate_id": candidate["candidate_id"],
+                "admit": False,
+                "reason": "not_durable",
+            } for candidate in prompt["candidates"]]
+            return json.dumps(_admission(decisions)), {}
+
+        def complete_fallback(self, **kwargs):
+            self.fallback_calls += 1
+            prompt = json.loads(kwargs["user"])
+            decisions = [{
+                "candidate_id": candidate["candidate_id"],
+                "admit": True,
+                "reason": "durable",
+            } for candidate in prompt["candidates"]]
+            return json.dumps(_admission(decisions)), {}
+
+    admission = Admission()
+    pipeline = _card_pipeline(store, Curator(), admission=admission)
+
+    assert pipeline._rebuild_actor_card(OPTICS) == 1
+    assert admission.primary_calls == 1
+    assert admission.fallback_calls == 1
+    assert _bodies(store.get_actor_card(
+        "t1",
+        OPTICS,
+        owner_conversation_id="guild",
+        audience_conversation_id="guild",
+        audience_channel_id="another-guild-channel",
+    )) == [body]
+    status = store.get_actor_card_rebuild_status("t1", OPTICS)
+    assert status is not None
+    assert status["outcome"] == "written"
+
+
+def test_medical_subject_is_admitted_without_a_sensitivity_category(store):
+    from types import SimpleNamespace
+
+    _dm_and_guild(store)
+    body = "Is considering a medication change discussed with Vast."
+
+    class Curator:
+        def complete(self, **kwargs):
+            entries = [{
+                "kind": "relevant_history",
+                "body": body,
+                "confidence": 0.9,
+                "fact_ids": ["f-dm"],
+            }]
+            return json.dumps(
+                _curation_for_visible_fact(kwargs, "f-dm", entries),
+            ), {}
+
+    class Admission:
+        prompts = []
+        system = ""
+
+        def complete(self, **kwargs):
+            prompt = json.loads(kwargs["user"])
+            self.prompts.append(prompt)
+            self.system = kwargs["system"]
+            if not prompt["candidates"]:
+                return json.dumps(_admission([])), {}
+            candidate_id = prompt["candidates"][0]["candidate_id"]
+            return json.dumps(_admission([{
+                "candidate_id": candidate_id,
+                "admit": True,
+                "reason": "durable",
+            }])), {}
+
+    pipeline = object.__new__(CompactionPipeline)
+    pipeline._store = store
+    pipeline._config = SimpleNamespace(
+        tenant_id="t1",
+        assembler=SimpleNamespace(
+            actor_card_enabled=True,
+            actor_card_fact_limit=60,
+            actor_card_entries_per_kind=3,
+            actor_card_admission_model="semantic-model",
+        ),
+        compactor=SimpleNamespace(max_summary_tokens=500),
+    )
+    pipeline._compactor = SimpleNamespace(
+        llm=Curator(), _parse_response=lambda text: json.loads(text),
+    )
+    admission = Admission()
+    pipeline._actor_card_admission_provider_override = admission
+
+    assert pipeline._rebuild_actor_card(OPTICS) == 1
+    row = store._get_conn().execute(
+        """SELECT body, sensitivity, audience_scope
+             FROM actor_card_entries
+            WHERE tenant_id = ? AND actor_id = ?
+              AND superseded_by IS NULL""",
+        ("t1", OPTICS),
+    ).fetchone()
+    assert tuple(row) == (body, "normal", CARD_SCOPE_SAME_CONVERSATION)
+    assert _bodies(store.get_actor_card(
+        "t1", OPTICS, owner_conversation_id="dm",
+        audience_conversation_id="dm", audience_channel_id="chan-dm",
+    )) == [body]
+    assert "sensitivity" not in admission.system.lower()
+    assert "Subject matter must never determine admission" in admission.system
+    candidate = next(
+        prompt["candidates"][0]
+        for prompt in admission.prompts
+        if prompt["candidates"]
+    )
+    assert "proposed_sensitivity" not in candidate
+
+
+def test_one_off_medical_question_is_clean_empty_for_durability_only(store):
+    _conversation(store, "guild")
+    _turn(
+        store,
+        "ct-flonase",
+        "guild",
+        OPTICS,
+        "guild",
+        "chan-health",
+        content="What side effects does Flonase have?",
+    )
+    store.upsert_actor_profile_from_turn(
+        "guild",
+        OPTICS,
+        "Optics",
+        seen_at=_now(),
+    )
+
+    class Curator:
+        system = ""
+
+        def complete(self, **kwargs):
+            self.system = kwargs["system"]
+            return json.dumps(_curation(
+                [],
+                substantive=False,
+                coverage_reason="no_durable_context",
+            )), {}
+
+    curator = Curator()
+    pipeline = _card_pipeline(
+        store,
+        curator,
+        admission=_AdmitAll(),
+    )
+
+    assert pipeline._rebuild_actor_card(OPTICS) == 0
+    assert store.get_actor_profile("t1", OPTICS).card_dirty is False
+    assert store.get_actor_card(
+        "t1",
+        OPTICS,
+        owner_conversation_id="guild",
+        audience_conversation_id="guild",
+        audience_channel_id="chan-other",
+    ) is None
+    assert "Subject matter must never determine admission" in curator.system
+    assert "isolated trivia questions are not substantive" in curator.system
+    assert "sensitivity" not in curator.system.lower()
+
+
+@pytest.mark.parametrize(
+    "variant",
+    [
+        "extra_top_level",
+        "non_boolean",
+        "legacy_sensitivity_field",
+        "duplicate_candidate",
+        "missing_candidate",
+        "hallucinated_candidate",
+        "reason_mismatch",
+    ],
+)
+def test_semantic_admission_malformed_output_fails_closed(store, variant):
+    _dm_and_guild(store)
+
+    class Curator:
+        def complete(self, **_kwargs):
+            return json.dumps(_curation([{
+                "kind": CARD_KIND_COMMUNICATION_PREF,
+                "body": "prefers concise answers",
+                "confidence": 0.9,
+                "fact_ids": ["f-guild"],
+            }])), {}
+
+    class Admission:
+        def complete(self, **kwargs):
+            prompt = json.loads(kwargs["user"])
+            candidate_id = prompt["candidates"][0]["candidate_id"]
+            decision = {
+                "candidate_id": candidate_id,
+                "admit": True,
+                "reason": "durable",
+            }
+            if variant == "extra_top_level":
+                payload = {**_admission([decision]), "extra": True}
+            elif variant == "non_boolean":
+                payload = _admission(
+                    [{**decision, "admit": "yes"}],
+                    substantive=True,
+                )
+            elif variant == "legacy_sensitivity_field":
+                payload = _admission(
+                    [{**decision, "sensitivity": "high"}],
+                    substantive=True,
+                )
+            elif variant == "duplicate_candidate":
+                payload = _admission([decision, decision])
+            elif variant == "missing_candidate":
+                payload = _admission([], substantive=True)
+            elif variant == "hallucinated_candidate":
+                payload = _admission(
+                    [
+                        decision,
+                        {**decision, "candidate_id": "invented"},
+                    ],
+                )
+            else:
+                payload = _admission(
+                    [{**decision, "reason": "test_probe"}],
+                )
+            return json.dumps(payload), {}
+
+    pipeline = _card_pipeline(
+        store,
+        Curator(),
+        admission=Admission(),
+    )
+    with pytest.raises(
+        RuntimeError, match="semantic admission failed",
+    ):
+        pipeline._rebuild_actor_card(OPTICS)
+
+    profile = store.get_actor_profile("t1", OPTICS)
+    assert profile is not None and profile.card_dirty is True
+    status = store.get_actor_card_rebuild_status("t1", OPTICS)
+    assert status is not None
+    assert status["outcome"] == "admission_error"
+    assert store.get_actor_card(
+        "t1", OPTICS, owner_conversation_id="guild",
+        audience_conversation_id="guild", audience_channel_id="chan-guild",
+    ) is None
+
+
+def test_explicit_privacy_request_is_rejected_without_a_privacy_category(store):
+    _dm_and_guild(store)
+    _turn(
+        store,
+        "ct-explicit-private",
+        "dm",
+        OPTICS,
+        "dm",
+        "chan-dm",
+        content=(
+            "Keep this specific preference private and do not retain or reuse "
+            "it in future replies."
+        ),
+    )
+
+    class Curator:
+        def complete(self, **kwargs):
+            visible = {
+                item["id"]
+                for item in json.loads(kwargs["user"])["turns"]
+            }
+            if "ct-explicit-private" not in visible:
+                return json.dumps(_curation([])), {}
+            return json.dumps(_curation([{
+                "kind": CARD_KIND_COMMUNICATION_PREF,
+                "body": "Has a private communication preference.",
+                "confidence": 0.9,
+                "turn_ids": ["ct-explicit-private"],
+            }])), {}
+
+    class Admission:
+        system = ""
+
+        def complete(self, **kwargs):
+            self.system = kwargs["system"]
+            candidates = json.loads(kwargs["user"])["candidates"]
+            if not candidates:
+                return json.dumps(_admission([])), {}
+            return json.dumps(_admission([{
+                "candidate_id": candidates[0]["candidate_id"],
+                "admit": False,
+                "reason": "explicit_privacy_request",
+            }], substantive=True)), {}
+
+    admission = Admission()
+    pipeline = _card_pipeline(
+        store,
+        Curator(),
+        admission=admission,
+    )
+    assert pipeline._rebuild_actor_card(OPTICS) == 0
+
+    assert store.get_actor_profile("t1", OPTICS).card_dirty is False
+    assert store.get_actor_card(
+        "t1", OPTICS, owner_conversation_id="dm",
+        audience_conversation_id="dm", audience_channel_id="chan-dm",
+    ) is None
+    status = store.get_actor_card_rebuild_status("t1", OPTICS)
+    assert status["outcome"] == "clean_empty_filtered"
+    assert status["rejected_counts"] == {
+        "semantic_explicit_privacy_request": 1,
+    }
+    assert "explicitly and unambiguously asks" in admission.system
+    assert "sensitivity" not in admission.system.lower()
+
+
+def test_forced_rebuild_cannot_write_without_semantic_admission(store):
+    _dm_and_guild(store)
+
+    class Curator:
+        def complete(self, **_kwargs):
+            return json.dumps(_curation([{
+                "kind": CARD_KIND_COMMUNICATION_PREF,
+                "body": "ungated preference",
+                "confidence": 0.9,
+                "fact_ids": ["f-guild"],
+            }])), {}
+
+    pipeline = _card_pipeline(
+        store,
+        Curator(),
+        enabled=False,
+        admission_model="",
+    )
+    with pytest.raises(
+        RuntimeError, match="semantic admission failed",
+    ):
+        pipeline._rebuild_actor_card(OPTICS, force=True)
+
+    status = store.get_actor_card_rebuild_status("t1", OPTICS)
+    assert status is not None
+    assert status["outcome"] == "admission_error"
+    assert store.get_actor_profile("t1", OPTICS).card_dirty is True
+
+
+def test_semantic_evidence_keeps_late_revocation_and_excludes_other_actor(store):
+    _conversation(store, "guild")
+    canonical_ids = []
+    for index in range(9):
+        canonical_id = f"ct-optics-{index}"
+        canonical_ids.append(canonical_id)
+        _turn(
+            store,
+            canonical_id,
+            "guild",
+            OPTICS,
+            "guild",
+            "chan",
+            content=f"Optics message {index}",
+        )
+    canonical_ids.append("ct-bigtex")
+    _turn(
+        store,
+        "ct-bigtex",
+        "guild",
+        BIGTEX,
+        "guild",
+        "chan",
+        content="Instructions from another actor must never be evidence.",
+    )
+    canonical_ids.append("ct-optics-stop")
+    _turn(
+        store,
+        "ct-optics-stop",
+        "guild",
+        OPTICS,
+        "guild",
+        "chan",
+        content=("context " * 200) + "Stop that preference now.",
+    )
+    _segment(store, "seg-guild", "guild", canonical_ids)
+    _fact(store, "f-guild", "guild", "seg-guild", OPTICS)
+    store.upsert_actor_profile_from_turn(
+        "guild", OPTICS, "Optics", seen_at=_now(),
+    )
+
+    pipeline = object.__new__(CompactionPipeline)
+    pipeline._store = store
+    sources = list(store.list_actor_facts("t1", OPTICS, limit=60))
+    evidence, refs = pipeline._actor_card_evidence_segments(
+        OPTICS,
+        "guild",
+        sources,
+        {"f-guild"},
+    )
+
+    contents = [
+        message["content"]
+        for segment in evidence
+        for message in segment["messages"]
+    ]
+    assert len(contents) == 10
+    assert len(contents[-1]) <= 1200
+    assert contents[-1].endswith("Stop that preference now.")
+    assert "...[middle truncated]..." in contents[-1]
+    assert all("another actor" not in content for content in contents)
+    assert refs == {("guild", "seg-guild")}
+
+    # Simulate a concurrent segment/source mutation after list_actor_facts()
+    # proved this fact's audience but before admission reloaded raw rows.
+    _conversation(store, "dm")
+    store._get_conn().execute(
+        """UPDATE canonical_turns
+              SET audience_conversation_id = 'dm',
+                  user_content = 'CROSS_AUDIENCE_SECRET'
+            WHERE canonical_turn_id = ?""",
+        (canonical_ids[0],),
+    )
+    store._get_conn().commit()
+    raced, _raced_refs = pipeline._actor_card_evidence_segments(
+        OPTICS,
+        "guild",
+        sources,
+        {"f-guild"},
+    )
+    assert "CROSS_AUDIENCE_SECRET" not in json.dumps(raced)
+
+    bounded, bounded_refs = pipeline._actor_card_evidence_segments(
+        OPTICS,
+        "guild",
+        sources,
+        {"f-guild"},
+        max_chars=1,
+    )
+    assert bounded == []
+    assert bounded_refs == set()
 
 
 def test_list_actor_facts_is_tenant_scoped(store):
@@ -380,6 +2587,172 @@ def test_dm_entry_is_not_served_in_the_guild(store):
     assert "private DM goal" not in (_bodies(in_guild) or [])
 
 
+def test_turn_sourced_relevant_history_never_leaks_from_dm_to_guild(store):
+    _dm_and_guild(store)
+    history = _entry(
+        "e-turn-dm-history",
+        "relevant_history",
+        "Has discussed a private DM topic with Vast.",
+    )
+    assert store.replace_actor_card(
+        "t1",
+        OPTICS,
+        [(
+            history,
+            [_turn_source(
+                history.id,
+                "dm",
+                "dm",
+                "ct-dm",
+                "chan-dm",
+            )],
+        )],
+        input_hash="turn-dm-history",
+        expected_source_epochs={"dm": 1},
+    ) == 1
+
+    assert _bodies(store.get_actor_card(
+        "t1",
+        OPTICS,
+        owner_conversation_id="dm",
+        audience_conversation_id="dm",
+        audience_channel_id="chan-dm",
+    )) == ["Has discussed a private DM topic with Vast."]
+    assert store.get_actor_card(
+        "t1",
+        OPTICS,
+        owner_conversation_id="guild",
+        audience_conversation_id="guild",
+        audience_channel_id="chan-guild",
+    ) is None
+
+
+def test_card_models_never_receive_dm_and_guild_evidence_together(store):
+    _conversation(store, "dm")
+    _conversation(store, "guild")
+    _turn(
+        store,
+        "ct-private",
+        "dm",
+        OPTICS,
+        "dm",
+        "chan-dm",
+        content="PRIVATE_ORCHID is the topic of this private discussion.",
+    )
+    _turn(
+        store,
+        "ct-public",
+        "guild",
+        OPTICS,
+        "guild",
+        "chan-guild",
+        content="PUBLIC_CUBE is the topic of this guild discussion.",
+    )
+    store.upsert_actor_profile_from_turn(
+        "guild", OPTICS, "Optics", seen_at=_now(),
+    )
+
+    class Curator:
+        prompts = []
+
+        def complete(self, **kwargs):
+            prompt = json.loads(kwargs["user"])
+            self.prompts.append(prompt)
+            turn = prompt["turns"][0]
+            private = "PRIVATE_ORCHID" in turn["content"]
+            return json.dumps(_curation([{
+                "kind": "relevant_history",
+                "body": (
+                    "Has discussed PRIVATE_ORCHID with Vast."
+                    if private
+                    else "Has discussed PUBLIC_CUBE with Vast."
+                ),
+                "confidence": 0.9,
+                "turn_ids": [turn["id"]],
+            }])), {}
+
+    class Admission:
+        prompts = []
+
+        def complete(self, **kwargs):
+            prompt = json.loads(kwargs["user"])
+            self.prompts.append(prompt)
+            candidate = prompt["candidates"][0]
+            return json.dumps(_admission([{
+                "candidate_id": candidate["candidate_id"],
+                "admit": True,
+                "reason": "durable",
+            }])), {}
+
+    curator = Curator()
+    admission = Admission()
+    pipeline = _card_pipeline(
+        store,
+        curator,
+        admission=admission,
+    )
+    assert pipeline._rebuild_actor_card(OPTICS) == 2
+
+    for prompt in [*curator.prompts, *admission.prompts]:
+        serialized = json.dumps(prompt)
+        assert not (
+            "PRIVATE_ORCHID" in serialized
+            and "PUBLIC_CUBE" in serialized
+        )
+    assert _bodies(store.get_actor_card(
+        "t1",
+        OPTICS,
+        owner_conversation_id="dm",
+        audience_conversation_id="dm",
+        audience_channel_id="chan-dm",
+    )) == ["Has discussed PRIVATE_ORCHID with Vast."]
+    assert _bodies(store.get_actor_card(
+        "t1",
+        OPTICS,
+        owner_conversation_id="guild",
+        audience_conversation_id="guild",
+        audience_channel_id="chan-guild",
+    )) == ["Has discussed PUBLIC_CUBE with Vast."]
+
+
+def test_per_kind_card_limit_is_independent_for_each_audience(store):
+    _dm_and_guild(store)
+
+    class Curator:
+        def complete(self, **kwargs):
+            prompt = json.loads(kwargs["user"])
+            audience = prompt["turns"][0]["audience_conversation_id"]
+            turn_id = prompt["turns"][0]["id"]
+            return json.dumps(_curation([{
+                "kind": "relevant_history",
+                "body": f"Has substantive history in {audience}.",
+                "confidence": 0.9,
+                "turn_ids": [turn_id],
+            }])), {}
+
+    pipeline = _card_pipeline(
+        store,
+        Curator(),
+        admission=_AdmitAll(),
+    )
+    pipeline._config.assembler.actor_card_entries_per_kind = 1
+    assert pipeline._rebuild_actor_card(OPTICS) == 2
+    assert _bodies(store.get_actor_card(
+        "t1",
+        OPTICS,
+        owner_conversation_id="dm",
+        audience_conversation_id="dm",
+        audience_channel_id="chan-dm",
+    )) == ["Has substantive history in dm."]
+    assert _bodies(store.get_actor_card(
+        "t1",
+        OPTICS,
+        owner_conversation_id="guild",
+        audience_conversation_id="guild",
+        audience_channel_id="chan-guild",
+    )) == ["Has substantive history in guild."]
+
+
 def test_interaction_style_crosses_dm_and_guild_for_the_same_actor(store):
     _dm_and_guild(store)
     style = _entry(
@@ -428,20 +2801,19 @@ def test_conversation_scope_admits_same_conversation_entries_from_all_channels(s
     assert _bodies(card) == ["goal from channel a", "goal from channel b"]
 
 
-def test_channel_mismatch_fails_closed(store):
-    """A source from channel A is not served to a same_conversation request in
-    channel B."""
+def test_channels_share_same_conversation_card(store):
+    """A channel is provenance, not a boundary inside one conversation."""
     _dm_and_guild(store)
     _build_dm_goal_and_cross_pref(store)
     card = store.get_actor_card(
         "t1", OPTICS, owner_conversation_id="dm",
         audience_conversation_id="dm", audience_channel_id="chan-other",
     )
-    assert "private DM goal" not in (_bodies(card) or [])
+    assert "private DM goal" in (_bodies(card) or [])
 
 
-def test_unknown_source_channel_fails_closed(store):
-    """An empty source channel is unknown, not wildcard."""
+def test_unknown_source_channel_does_not_hide_same_conversation_card(store):
+    """A proven audience id is sufficient; source channel is provenance."""
     _conversation(store, "c1")
     _turn(store, "ct1", "c1", OPTICS, "c1", channel="")  # no durable channel
     _segment(store, "seg1", "c1", ["ct1"])
@@ -453,12 +2825,11 @@ def test_unknown_source_channel_fails_closed(store):
           [_source("e1", "c1", "c1", "f1", channel="")])],
         input_hash="h", expected_source_epochs={"c1": 1},
     )
-    # Request HAS a durable channel; the source's is unknown -> excluded.
     card = store.get_actor_card(
         "t1", OPTICS, owner_conversation_id="c1",
         audience_conversation_id="c1", audience_channel_id="chan-real",
     )
-    assert card is None
+    assert _bodies(card) == ["goal"]
 
 
 def test_empty_audience_reads_no_card(store):
@@ -470,19 +2841,29 @@ def test_empty_audience_reads_no_card(store):
     ) is None
 
 
-def test_high_sensitivity_entries_are_never_served(store):
+def test_legacy_high_sensitivity_metadata_does_not_hide_card(store):
     _dm_and_guild(store)
     store.replace_actor_card(
         "t1", OPTICS,
-        [(_entry("e1", CARD_KIND_ACTIVE_GOAL, "secret", sensitivity=CARD_SENSITIVITY_HIGH),
-          [_source("e1", "dm", "dm", "f-dm", "chan-dm")])],
-        input_hash="h", expected_source_epochs={"dm": 1},
+        [(_entry(
+            "e1",
+            CARD_KIND_ACTIVE_GOAL,
+            "is considering a medication change",
+            sensitivity=CARD_SENSITIVITY_HIGH,
+        ), [_source(
+            "e1",
+            "guild",
+            "guild",
+            "f-guild",
+            "chan-guild",
+        )])],
+        input_hash="h", expected_source_epochs={"guild": 1},
     )
     card = store.get_actor_card(
-        "t1", OPTICS, owner_conversation_id="dm",
-        audience_conversation_id="dm", audience_channel_id="chan-dm",
+        "t1", OPTICS, owner_conversation_id="guild",
+        audience_conversation_id="guild", audience_channel_id="chan-other",
     )
-    assert card is None
+    assert _bodies(card) == ["is considering a medication change"]
 
 
 # ---------------------------------------------------------------------------
@@ -562,18 +2943,422 @@ def test_entries_supersede_rather_than_duplicate(store):
     assert old[0] == "e2"  # superseded by its same-kind replacement, not deleted
 
 
-def test_dirty_card_is_not_served(store):
+def test_additive_turn_keeps_last_good_card_served_while_refresh_is_pending(store):
+    _dm_and_guild(store)
+    _build_dm_goal_and_cross_pref(store)
+    _turn(
+        store,
+        "ct-new-preference",
+        "guild",
+        OPTICS,
+        "guild",
+        "chan-guild",
+        content="Please prefer the smallest live integration test.",
+    )
+    profile = store.get_actor_profile("t1", OPTICS)
+    assert profile is not None
+    assert profile.card_dirty is True
+    assert profile.card_invalid is False
+    assert profile.card_input_hash == "h1"
+    assert _bodies(store.get_actor_card(
+        "t1", OPTICS, owner_conversation_id="dm",
+        audience_conversation_id="dm", audience_channel_id="chan-dm",
+    )) == ["prefers terse answers", "private DM goal"]
+
+
+def test_mixed_version_dirty_rows_are_invalidated_once(tmp_path):
+    path = tmp_path / "mixed-version-cards.db"
+    with sqlite3.connect(path) as conn:
+        conn.execute("""
+            CREATE TABLE actor_profiles (
+                tenant_id TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                platform TEXT NOT NULL DEFAULT '',
+                display_name TEXT NOT NULL DEFAULT '',
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                card_built_at TEXT NULL,
+                card_dirty INTEGER NOT NULL DEFAULT 0,
+                card_invalid INTEGER NOT NULL DEFAULT 0,
+                card_input_hash TEXT NOT NULL DEFAULT '',
+                card_build_marker TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (tenant_id, actor_id)
+            )
+        """)
+        conn.execute(
+            """INSERT INTO actor_profiles
+                   (tenant_id, actor_id, first_seen_at, last_seen_at,
+                    card_built_at, card_dirty, card_invalid)
+               VALUES ('t1', ?, ?, ?, ?, 1, 0)""",
+            (OPTICS, _now(), _now(), _now()),
+        )
+
+    migrated = SQLiteStore(db_path=str(path))
+    conn = migrated._get_conn()
+    row = conn.execute(
+        """SELECT card_dirty, card_invalid, card_build_marker
+             FROM actor_profiles WHERE actor_id = ?""",
+        (OPTICS,),
+    ).fetchone()
+    assert tuple(row) == (1, 1, "")
+    version = conn.execute(
+        """SELECT version FROM actor_card_schema_migrations
+            WHERE name = 'dirty-invalid-split'"""
+    ).fetchone()
+    assert version[0] == 1
+
+    # Once the semantic cutover is persisted, split-aware additive dirt is
+    # not reclassified as destructive on a later schema check.
+    conn.execute(
+        """UPDATE actor_profiles
+              SET card_dirty = 1, card_invalid = 0
+            WHERE actor_id = ?""",
+        (OPTICS,),
+    )
+    conn.commit()
+    migrated._ensure_actor_card_schema(conn)
+    assert conn.execute(
+        "SELECT card_invalid FROM actor_profiles WHERE actor_id = ?",
+        (OPTICS,),
+    ).fetchone()[0] == 0
+
+
+def test_dirty_invalid_cutover_is_stamped_on_fresh_database(tmp_path):
+    fresh = SQLiteStore(db_path=str(tmp_path / "fresh-cards.db"))
+    version = fresh._get_conn().execute(
+        """SELECT version FROM actor_card_schema_migrations
+            WHERE name = 'dirty-invalid-split'"""
+    ).fetchone()
+    assert version[0] == 1
+
+
+def test_refresh_re_admits_existing_cross_context_entry_instead_of_silent_drop(
+    store,
+):
+    """Curator omission is not authority to erase durable identity/style."""
+    _dm_and_guild(store)
+    _build_dm_goal_and_cross_pref(store)
+    _turn(
+        store,
+        "ct-guild-new",
+        "guild",
+        OPTICS,
+        "guild",
+        "chan-guild",
+        content="A new substantive guild discussion.",
+    )
+
+    class Curator:
+        def complete(self, **kwargs):
+            turn = json.loads(kwargs["user"])["turns"][0]
+            return json.dumps(_curation([{
+                "kind": CARD_KIND_RELEVANT_HISTORY,
+                "body": (
+                    "Has a new substantive discussion in "
+                    f"{turn['audience_conversation_id']}."
+                ),
+                "confidence": 0.8,
+                "turn_ids": [turn["id"]],
+            }])), {}
+
+    class Admission:
+        prompts = []
+        system = ""
+
+        def complete(self, **kwargs):
+            self.system = kwargs["system"]
+            prompt = json.loads(kwargs["user"])
+            self.prompts.append(prompt)
+            return json.dumps(_admission([{
+                "candidate_id": candidate["candidate_id"],
+                "admit": True,
+                "reason": "durable",
+            } for candidate in prompt["candidates"]])), {}
+
+    admission = Admission()
+    pipeline = _card_pipeline(
+        store,
+        Curator(),
+        admission=admission,
+    )
+    assert pipeline._rebuild_actor_card(OPTICS) == 3
+
+    carryover = next(
+        candidate
+        for prompt in admission.prompts
+        for candidate in prompt["candidates"]
+        if candidate["candidate_id"] == "e-pref"
+    )
+    assert carryover["origin"] == "existing"
+    assert carryover["body"] == "prefers terse answers"
+    assert "distinct actor-authored messages or interactions" in admission.system
+    assert "distinct source segments" not in admission.system
+
+    # The durable cross-context entry survives verbatim. The old private goal
+    # is same-conversation working memory and legitimately rotates out.
+    assert _bodies(store.get_actor_card(
+        "t1",
+        OPTICS,
+        owner_conversation_id="guild",
+        audience_conversation_id="guild",
+        audience_channel_id="chan-guild",
+    )) == [
+        "Has a new substantive discussion in guild.",
+        "prefers terse answers",
+    ]
+    dm_bodies = _bodies(store.get_actor_card(
+        "t1",
+        OPTICS,
+        owner_conversation_id="dm",
+        audience_conversation_id="dm",
+        audience_channel_id="chan-dm",
+    ))
+    assert "prefers terse answers" in dm_bodies
+    assert "private DM goal" not in dm_bodies
+
+
+def test_refresh_removes_cross_context_entry_only_after_explicit_rejection(
+    store,
+):
+    _dm_and_guild(store)
+    _build_dm_goal_and_cross_pref(store)
+    _turn(
+        store,
+        "ct-guild-stop",
+        "guild",
+        OPTICS,
+        "guild",
+        "chan-guild",
+        content="Stop the old preference.",
+    )
+
+    class Curator:
+        def complete(self, **kwargs):
+            turn = json.loads(kwargs["user"])["turns"][0]
+            return json.dumps(_curation([{
+                "kind": CARD_KIND_RELEVANT_HISTORY,
+                "body": "Has a current substantive discussion.",
+                "confidence": 0.8,
+                "turn_ids": [turn["id"]],
+            }])), {}
+
+    class Admission:
+        def complete(self, **kwargs):
+            prompt = json.loads(kwargs["user"])
+            decisions = []
+            for candidate in prompt["candidates"]:
+                existing = candidate["origin"] == "existing"
+                decisions.append({
+                    "candidate_id": candidate["candidate_id"],
+                    "admit": not existing,
+                    "reason": (
+                        "stopped_or_replaced" if existing else "durable"
+                    ),
+                })
+            return json.dumps(_admission(decisions)), {}
+
+    pipeline = _card_pipeline(
+        store,
+        Curator(),
+        admission=Admission(),
+    )
+    assert pipeline._rebuild_actor_card(OPTICS) == 2
+    assert "prefers terse answers" not in (
+        _bodies(store.get_actor_card(
+            "t1",
+            OPTICS,
+            owner_conversation_id="guild",
+            audience_conversation_id="guild",
+            audience_channel_id="chan-guild",
+        )) or []
+    )
+    status = store.get_actor_card_rebuild_status("t1", OPTICS)
+    assert status["rejected_counts"] == {
+        "semantic_stopped_or_replaced": 1,
+    }
+
+
+def test_destructively_invalidated_card_is_not_served(store):
     _dm_and_guild(store)
     _build_dm_goal_and_cross_pref(store)
     conn = store._get_conn()
     conn.execute(
-        "UPDATE actor_profiles SET card_dirty = 1 WHERE actor_id = ?", (OPTICS,)
+        """UPDATE actor_profiles
+              SET card_dirty = 1, card_invalid = 1
+            WHERE actor_id = ?""",
+        (OPTICS,),
     )
     conn.commit()
     assert store.get_actor_card(
         "t1", OPTICS, owner_conversation_id="dm",
         audience_conversation_id="dm", audience_channel_id="chan-dm",
     ) is None
+
+
+def test_live_build_marker_does_not_overwrite_last_good_card_version(store):
+    _dm_and_guild(store)
+    _build_dm_goal_and_cross_pref(store)
+    assert store.mark_actor_card_dirty(
+        "t1",
+        OPTICS,
+        build_input_hash="building:new-version",
+    )
+    profile = store.get_actor_profile("t1", OPTICS)
+    assert profile is not None
+    assert profile.card_dirty is True
+    assert profile.card_invalid is False
+    assert profile.card_input_hash == "h1"
+    assert profile.card_build_marker == "building:new-version"
+    assert _bodies(store.get_actor_card(
+        "t1", OPTICS, owner_conversation_id="guild",
+        audience_conversation_id="guild",
+        audience_channel_id="chan-guild",
+    )) == ["prefers terse answers"]
+
+
+def test_noop_canonical_reconciliation_keeps_turn_sourced_card_valid(store):
+    """A tagger upsert that names unchanged evidence columns is not destructive."""
+    _conversation(store, "guild")
+    _turn(
+        store,
+        "ct-preference",
+        "guild",
+        OPTICS,
+        "guild",
+        "chan-guild",
+        content="Prefer the smallest live integration test.",
+    )
+    store.upsert_actor_profile_from_turn(
+        "guild",
+        OPTICS,
+        "Optics",
+        seen_at=_now(),
+    )
+    conn = store._get_conn()
+    conn.execute(
+        """UPDATE canonical_turns
+              SET first_seen_at = ?
+            WHERE canonical_turn_id = ?""",
+        (_now(), "ct-preference"),
+    )
+    conn.commit()
+    store.replace_actor_card(
+        "t1",
+        OPTICS,
+        [(
+            _entry(
+                "e-pref",
+                CARD_KIND_COMMUNICATION_PREF,
+                "prefers the smallest live integration test",
+                scope=CARD_SCOPE_CROSS_CONTEXT,
+            ),
+            [_turn_source(
+                "e-pref",
+                "guild",
+                "guild",
+                "ct-preference",
+                "chan-guild",
+            )],
+        )],
+        input_hash="h1",
+        expected_source_epochs={"guild": 1},
+    )
+
+    conn.execute(
+        """UPDATE canonical_turns
+              SET user_content = user_content,
+                  sender_actor_id = sender_actor_id,
+                  audience_conversation_id = audience_conversation_id,
+                  audience_attribution_version =
+                      audience_attribution_version,
+                  origin_channel_id = origin_channel_id,
+                  created_at = created_at,
+                  first_seen_at = first_seen_at
+            WHERE canonical_turn_id = ?""",
+        ("ct-preference",),
+    )
+    conn.commit()
+
+    profile = store.get_actor_profile("t1", OPTICS)
+    assert profile is not None
+    assert profile.card_dirty is False
+    assert profile.card_invalid is False
+    assert _bodies(store.get_actor_card(
+        "t1",
+        OPTICS,
+        owner_conversation_id="guild",
+        audience_conversation_id="guild",
+        audience_channel_id="chan-guild",
+    )) == ["prefers the smallest live integration test"]
+
+    # A real evidence edit remains destructive and must invalidate the cache.
+    conn.execute(
+        """UPDATE canonical_turns
+              SET user_content = 'Prefer a broad test suite.'
+            WHERE canonical_turn_id = ?""",
+        ("ct-preference",),
+    )
+    conn.commit()
+    profile = store.get_actor_profile("t1", OPTICS)
+    assert profile is not None
+    assert profile.card_dirty is True
+    assert profile.card_invalid is True
+    assert store.get_actor_card(
+        "t1",
+        OPTICS,
+        owner_conversation_id="guild",
+        audience_conversation_id="guild",
+        audience_channel_id="chan-guild",
+    ) is None
+
+
+def test_nullable_evidence_timestamp_change_still_invalidates_card(store):
+    """SQLite's trigger comparison remains null-safe for historical rows."""
+    _conversation(store, "guild")
+    _turn(store, "ct-pref", "guild", OPTICS, "guild", "chan-guild")
+    store.upsert_actor_profile_from_turn(
+        "guild",
+        OPTICS,
+        "Optics",
+        seen_at=_now(),
+    )
+    conn = store._get_conn()
+    conn.execute(
+        """UPDATE canonical_turns
+              SET first_seen_at = ?
+            WHERE canonical_turn_id = ?""",
+        (_now(), "ct-pref"),
+    )
+    conn.commit()
+    store.replace_actor_card(
+        "t1",
+        OPTICS,
+        [(
+            _entry("e-pref", CARD_KIND_COMMUNICATION_PREF, "prefers brevity"),
+            [_turn_source(
+                "e-pref",
+                "guild",
+                "guild",
+                "ct-pref",
+                "chan-guild",
+            )],
+        )],
+        input_hash="h1",
+        expected_source_epochs={"guild": 1},
+    )
+
+    conn.execute(
+        """UPDATE canonical_turns
+              SET first_seen_at = NULL
+            WHERE canonical_turn_id = ?""",
+        ("ct-pref",),
+    )
+    conn.commit()
+
+    profile = store.get_actor_profile("t1", OPTICS)
+    assert profile is not None
+    assert profile.card_dirty is True
+    assert profile.card_invalid is True
 
 
 def test_delete_conversation_removes_its_contribution_to_every_card(store):

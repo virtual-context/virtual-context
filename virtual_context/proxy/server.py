@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -110,6 +111,104 @@ _PREP_BREAKDOWN_LOG_THRESHOLD_MS = 1_000.0
 _PREP_BREAKDOWN_LOG_THRESHOLD_BYTES = 1_000_000
 _PREP_BREAKDOWN_MAX_STAGES = 8
 _PROTECTED_BREAKDOWN_LOG_THRESHOLD_TOKENS = 50_000
+
+
+# ---------------------------------------------------------------------------
+# Request-local conversation delivery metadata
+# ---------------------------------------------------------------------------
+
+
+def _build_recent_conversation_native_metadata(
+    messages: list[Message],
+) -> dict[str, object]:
+    """Describe exact native-role replay without duplicating its content.
+
+    OpenClaw's native Codex runtime owns a persistent provider thread and does
+    not adopt lifecycle-hook mutations to ``event.messages``.  The VC plugin
+    therefore needs to recognize the exact requester replay inside the
+    prepared body and project it through a Codex-supported context lane.
+
+    Only hashes and a count cross the REST boundary.  The plugin must verify
+    those hashes against the contiguous suffix immediately before the active
+    user turn before it projects anything.  A malformed role sequence fails
+    closed so peer, system, tool, or partially trimmed content can never be
+    promoted accidentally.
+    """
+    if not messages or len(messages) % 2:
+        return {}
+
+    hashes: list[str] = []
+    for index, message in enumerate(messages):
+        expected_role = "user" if index % 2 == 0 else "assistant"
+        if message.role != expected_role or not isinstance(message.content, str):
+            return {}
+        if not message.content:
+            return {}
+        digest = hashlib.sha256(
+            f"{message.role}\0{message.content}".encode("utf-8")
+        ).hexdigest()
+        hashes.append(digest)
+
+    return {
+        "message_count": len(messages),
+        "message_hashes": hashes,
+    }
+
+
+def _build_final_recent_conversation_native_metadata(
+    messages: list[Message],
+    enriched_body: dict,
+    fmt: PayloadFormat,
+) -> dict[str, object]:
+    """Attest the newest safe replay suffix present in the final payload.
+
+    ``messages`` must be the insertion outcome returned by the payload format,
+    not the assembler's requested replay. Dedup may intentionally insert
+    nothing, while budget enforcement, merging, and upstream trimming can
+    alter an earlier insertion.
+
+    A requester window can begin with an incomplete older canonical group
+    after compaction/protected-window recovery. Rejecting the whole delivery
+    in that case makes a newer complete requester pair disappear specifically
+    after compaction. Select the largest valid alternating suffix (bounded to
+    the plugin's 200-message contract) that remains immediately before the
+    active user. Every candidate still comes only from the assembler's
+    actor-proved requester replay; this function never promotes arbitrary
+    payload history.
+    """
+    if not messages:
+        return {}
+
+    items = fmt.get_messages(enriched_body)
+    if not isinstance(items, list) or len(items) <= 2:
+        return {}
+    active_index = len(items) - 1
+    active = items[active_index]
+    if not isinstance(active, dict) or active.get("role") != "user":
+        return {}
+
+    # Earliest start first means the first match is the largest safe suffix.
+    first_start = max(0, len(messages) - 200)
+    for start in range(first_start, len(messages)):
+        candidate = messages[start:]
+        metadata = _build_recent_conversation_native_metadata(candidate)
+        if not metadata:
+            continue
+        count = int(metadata["message_count"])
+        replay_start = active_index - count
+        if replay_start < 0:
+            continue
+        suffix = items[replay_start:active_index]
+        if len(suffix) != count:
+            continue
+        if all(
+            isinstance(item, dict)
+            and item.get("role") == expected.role
+            and fmt.extract_message_text(item) == expected.content
+            for item, expected in zip(suffix, candidate)
+        ):
+            return metadata
+    return {}
 
 
 # ---------------------------------------------------------------------------
@@ -438,6 +537,7 @@ def _roles_for_active_user(
         reply_target_body=probe.reply_target_body,
         owner_conversation_id=owner,
         audience_conversation_id=audience_conversation_id,
+        origin_channel_id=channel_id,
         audience_channel_id=speaker_channel_id,
         audience_channel_label=channel_label,
     )
@@ -1374,7 +1474,10 @@ async def prepare_payload(
                     and getattr(_phase_decision, "canonical_ingest_rows", ())
                 ):
                     try:
-                        from ..core.protected_window import _stamp_canonical_turn_ids
+                        from ..core.protected_window import (
+                            _drop_active_tail_ingest_rows,
+                            _stamp_canonical_turn_ids,
+                        )
                         _ingest_rows = list(_phase_decision.canonical_ingest_rows)
                         # Drop suffix rows that correspond to the active-tail
                         # user message ingested in this request but excluded
@@ -1383,8 +1486,10 @@ async def prepare_payload(
                         _extracted = _extract_ingestible_messages(body)
                         _completed = state._completed_history_messages(_extracted)
                         _drop = max(0, len(_extracted) - len(_completed))
-                        if _drop and len(_ingest_rows) > _drop:
-                            _ingest_rows = _ingest_rows[:-_drop]
+                        _ingest_rows = _drop_active_tail_ingest_rows(
+                            _ingest_rows,
+                            _drop,
+                        )
                         _stamp_canonical_turn_ids(
                             state.conversation_history, _ingest_rows,
                         )
@@ -1704,10 +1809,25 @@ async def prepare_payload(
     _note_prep("merge_consecutive_messages", _merge_stage)
 
     _inject_stage = time.monotonic()
+    _replay_messages = (
+        assembled.recent_conversation_messages
+        if assembled is not None
+        else []
+    )
+    # Native requester continuity is injected only into this outbound copy.
+    # ``body`` and ``_pre_filter_body`` remain the client-owned shapes used by
+    # canonical ingestion, so replayed rows cannot be re-admitted.
+    (
+        _replayed_body,
+        _delivered_replay_messages,
+    ) = fmt.inject_replayed_conversation_with_delivery(
+        body,
+        _replay_messages,
+    )
     if api_format == "anthropic" and prepend_text:
         from ..core.provider_adapters import AnthropicAdapter
 
-        enriched_body = copy.deepcopy(body)
+        enriched_body = copy.deepcopy(_replayed_body)
         AnthropicAdapter(api_key="").inject_context(enriched_body, prepend_text)
         if isinstance(enriched_body.get("system"), list):
             enriched_body["system"] = "\n\n".join(
@@ -1716,7 +1836,11 @@ async def prepare_payload(
                 if isinstance(block, dict) and block.get("type") == "text"
             )
     else:
-        enriched_body = _inject_context(body, prepend_text, api_format)
+        enriched_body = _inject_context(
+            _replayed_body,
+            prepend_text,
+            api_format,
+        )
     _note_prep("inject_context", _inject_stage)
 
     # Inject VC paging tools for autonomous mode (formats that support it)
@@ -2190,6 +2314,10 @@ async def prepare_payload(
             _non_virtualizable_floor = fmt._estimate_system_tokens(_pre_filter_body) + fmt.estimate_tools_tokens(_pre_filter_body)
         else:
             _vc_tokens = fmt._count(prepend_text) if prepend_text else 0
+            if assembled is not None:
+                _vc_tokens += int(
+                    assembled.recent_conversation_message_tokens or 0
+                )
             _sys_t, _tools_t = _current_outbound_floor_components(enriched_body)
             _non_virtualizable_floor = _sys_t + _tools_t
         state._last_non_virtualizable_floor = _non_virtualizable_floor
@@ -2313,6 +2441,19 @@ async def prepare_payload(
     total_turns = turn
     _prepare_meta = _prepare_metadata()
     _prepare_meta["payload_accounting"] = dict(_payload_accounting)
+    _native_delivery = _build_final_recent_conversation_native_metadata(
+        _delivered_replay_messages,
+        enriched_body,
+        fmt,
+    )
+    if _native_delivery:
+        _prepare_meta["recent_conversation_native"] = _native_delivery
+    elif _delivered_replay_messages:
+        logger.warning(
+            "RECENT_CONVERSATION_NATIVE_METADATA rejected after outbound "
+            "transforms: inserted_messages=%d",
+            len(_delivered_replay_messages),
+        )
     overhead_ms = _prepare_meta["prepare_total_ms"]
     _log_prepare_breakdown(
         total_ms=overhead_ms,

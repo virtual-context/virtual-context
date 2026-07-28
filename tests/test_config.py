@@ -30,14 +30,71 @@ def test_actor_card_assembly_config_parses_yaml_keys():
             "actor_card_enabled": True,
             "actor_card_max_tokens": 321,
             "actor_card_fact_limit": 17,
+            "actor_card_turn_limit": 81,
+            "actor_card_prompt_max_chars": 123456,
             "actor_card_entries_per_kind": 2,
+            "actor_card_curation_model": "openai/gpt-5.4",
+            "actor_card_curation_fallback_model": "anthropic/claude-fable-5",
+            "actor_card_admission_model": "anthropic/claude-fable-5",
+            "actor_card_admission_fallback_model": "openai/gpt-5.4",
         },
     })
 
     assert config.assembler.actor_card_enabled is True
     assert config.assembler.actor_card_max_tokens == 321
     assert config.assembler.actor_card_fact_limit == 17
+    assert config.assembler.actor_card_turn_limit == 81
+    assert config.assembler.actor_card_prompt_max_chars == 123456
     assert config.assembler.actor_card_entries_per_kind == 2
+    assert config.assembler.actor_card_curation_model == "openai/gpt-5.4"
+    assert (
+        config.assembler.actor_card_curation_fallback_model
+        == "anthropic/claude-fable-5"
+    )
+    assert (
+        config.assembler.actor_card_admission_model
+        == "anthropic/claude-fable-5"
+    )
+    assert (
+        config.assembler.actor_card_admission_fallback_model
+        == "openai/gpt-5.4"
+    )
+
+
+def test_actor_card_gate_requires_a_semantic_admission_model():
+    for value in ("", None, 17):
+        with pytest.raises(
+            ValueError, match="actor_card_admission_model is required",
+        ):
+            assembly = {"actor_card_enabled": True}
+            if value != "":
+                assembly["actor_card_admission_model"] = value
+            load_config(config_dict={"assembly": assembly})
+
+
+def test_actor_card_fallback_model_must_be_a_string_when_provided():
+    with pytest.raises(
+        ValueError,
+        match="actor_card_admission_fallback_model must be a string",
+    ):
+        load_config(config_dict={
+            "assembly": {
+                "actor_card_enabled": True,
+                "actor_card_admission_model": "primary",
+                "actor_card_admission_fallback_model": 17,
+            },
+        })
+
+
+def test_actor_card_null_fallback_model_normalizes_to_unset():
+    config = load_config(config_dict={
+        "assembly": {
+            "actor_card_enabled": True,
+            "actor_card_admission_model": "primary",
+            "actor_card_admission_fallback_model": None,
+        },
+    })
+    assert config.assembler.actor_card_admission_fallback_model == ""
 
 
 def test_actor_cards_refuse_a_non_sql_or_split_store():
