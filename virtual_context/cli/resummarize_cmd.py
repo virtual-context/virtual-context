@@ -18,6 +18,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
+import shlex
 import sys
 from datetime import datetime, timezone
 
@@ -120,6 +122,31 @@ def _fail(stage: str, error: str, conversation_id: str) -> None:
     sys.exit(1)
 
 
+def _sql_str(value: str) -> str:
+    """A safely quoted SQL string literal for the printed runbook.
+
+    The runbook is copy/paste material, so every interpolated value is
+    quoted as data: conversation ids are caller-supplied free text and
+    must not be able to terminate the literal.
+    """
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _redis_glob_escape(value: str) -> str:
+    """Escape Redis glob metacharacters so an id only matches itself."""
+    return re.sub(r"([\\*?\[\]])", r"\\\1", value)
+
+
+def _fsync_parent_dir(path: str) -> None:
+    """Make a newly created file's directory entry crash-durable."""
+    parent = os.path.dirname(os.path.abspath(path)) or "/"
+    dirfd = os.open(parent, os.O_RDONLY)
+    try:
+        os.fsync(dirfd)
+    finally:
+        os.close(dirfd)
+
+
 def _checksums(conn, conversation_id: str) -> dict:
     seg = conn.execute(
         "SELECT count(*) AS n, "
@@ -195,26 +222,33 @@ def _usage_totals(totals: dict, usage: dict) -> None:
 
 
 def _print_cascade_runbook(conversation_id: str, tags: list[str]) -> None:
-    tag_list = ", ".join(f"'{t}'" for t in sorted(tags))
+    cid = _sql_str(conversation_id)
+    tag_list = ", ".join(_sql_str(t) for t in sorted(tags))
+    cid_arg = shlex.quote(conversation_id)
+    emb_key = shlex.quote(f"vc:tag_summary_embeddings:{conversation_id}")
+    stats_key = shlex.quote(f"vc:tag_stats:{conversation_id}")
+    hint_glob = shlex.quote(
+        f"vc:context_hint:{_redis_glob_escape(conversation_id)}:*",
+    )
     print("\n=== CASCADE RUNBOOK (not executed; run each step, then its check) ===")
     print(f"# affected tags: {sorted(tags)}")
     print("\n# 1. Two-table targeted delete (tag summaries AND their embeddings):")
-    print(f"DELETE FROM tag_summary_embeddings WHERE conversation_id = '{conversation_id}' AND tag IN ({tag_list});")
-    print(f"DELETE FROM tag_summaries WHERE conversation_id = '{conversation_id}' AND tag IN ({tag_list});")
+    print(f"DELETE FROM tag_summary_embeddings WHERE conversation_id = {cid} AND tag IN ({tag_list});")
+    print(f"DELETE FROM tag_summaries WHERE conversation_id = {cid} AND tag IN ({tag_list});")
     print("#    VERIFY (expect 0 and 0):")
-    print(f"SELECT count(*) FROM tag_summaries WHERE conversation_id = '{conversation_id}' AND tag IN ({tag_list});")
-    print(f"SELECT count(*) FROM tag_summary_embeddings WHERE conversation_id = '{conversation_id}' AND tag IN ({tag_list});")
+    print(f"SELECT count(*) FROM tag_summaries WHERE conversation_id = {cid} AND tag IN ({tag_list});")
+    print(f"SELECT count(*) FROM tag_summary_embeddings WHERE conversation_id = {cid} AND tag IN ({tag_list});")
     print("\n# 2. Backfill (skip-existing regenerates exactly the deleted tags):")
-    print(f"virtual-context admin backfill-tag-summaries {conversation_id} --tenant-id <tenant>")
+    print(f"virtual-context admin backfill-tag-summaries {cid_arg} --tenant-id <tenant>")
     print("#    VERIFY (expect one fresh row per affected tag):")
-    print(f"SELECT tag, updated_at FROM tag_summaries WHERE conversation_id = '{conversation_id}' AND tag IN ({tag_list}) ORDER BY tag;")
+    print(f"SELECT tag, updated_at FROM tag_summaries WHERE conversation_id = {cid} AND tag IN ({tag_list}) ORDER BY tag;")
     print("\n# 3. Redis invalidation (embedding snapshot, context hints, tag stats):")
-    print(f"redis-cli DEL 'vc:tag_summary_embeddings:{conversation_id}' 'vc:tag_stats:{conversation_id}'")
-    print(f"redis-cli --scan --pattern 'vc:context_hint:{conversation_id}:*' | xargs -r redis-cli DEL")
+    print(f"redis-cli DEL {emb_key} {stats_key}")
+    print(f"redis-cli --scan --pattern {hint_glob} | xargs -r redis-cli DEL")
     print("#    VERIFY (expect 0, 0, and no keys):")
-    print(f"redis-cli EXISTS 'vc:tag_summary_embeddings:{conversation_id}'")
-    print(f"redis-cli EXISTS 'vc:tag_stats:{conversation_id}'")
-    print(f"redis-cli --scan --pattern 'vc:context_hint:{conversation_id}:*'")
+    print(f"redis-cli EXISTS {emb_key}")
+    print(f"redis-cli EXISTS {stats_key}")
+    print(f"redis-cli --scan --pattern {hint_glob}")
     print("\n# 4. Worker recycle (process-local caches have no expiry):")
     print("#    recycle the serving workers, then VERIFY start times are post-recycle:")
     print("ps -o pid,lstart,command -C python | grep -i uvicorn")
@@ -248,6 +282,14 @@ def cmd_admin_resummarize_segments(args) -> None:
     if getattr(args, "tenant_id", ""):
         config.tenant_id = args.tenant_id
     _apply_storage_overrides(config, args)
+    # The engine and the repair connection MUST target the same store.
+    # The override helper deliberately ignores DATABASE_URL when a -c
+    # config was supplied, so a config carrying its own storage section
+    # could otherwise build the engine against one database while the
+    # CAS writes land in another. This command is Postgres-only by
+    # construction (xmin), and its store is the resolved DSN, full stop.
+    config.storage.backend = "postgres"
+    config.storage.postgres_dsn = dsn
 
     from ..engine import VirtualContextEngine
 
@@ -276,10 +318,16 @@ def cmd_admin_resummarize_segments(args) -> None:
     consecutive_provider_failures = 0
     status = "completed"
     last_ref = None
+    # The resume cursor advances only past rows that received a provider
+    # RESPONSE. A row whose call failed (including the one that trips
+    # the breaker) stays ahead of the cursor, so a resume retries it
+    # instead of silently skipping unrepaired damage.
+    resume_after_ref = args.after_ref
 
     try:
         with _connect(dsn, read_only=False) as conn, \
                 open(journal_path, "a", encoding="utf-8") as journal:
+            _fsync_parent_dir(journal_path)
             sql = _selection_sql(
                 args.include_short, args.since, args.until, args.after_ref,
             )
@@ -319,6 +367,7 @@ def cmd_admin_resummarize_segments(args) -> None:
                     continue
                 consecutive_provider_failures = 0
                 totals["calls"] += 1
+                resume_after_ref = row["ref"]
                 if isinstance(outcome, Malformed):
                     counts["malformed"] += 1
                     _usage_totals(totals, outcome.usage)
@@ -386,7 +435,8 @@ def cmd_admin_resummarize_segments(args) -> None:
         "rejected": rejected,
         "usage": totals,
         "journal": journal_path,
-        "last_ref": last_ref,
+        "last_attempted_ref": last_ref,
+        "resume_after_ref": resume_after_ref,
         "note": ("skipped_concurrent is NORMAL on an active conversation: "
                  "live compaction rewrites rows mid-run; re-running is the "
                  "intended completion path and is safe by idempotency"),

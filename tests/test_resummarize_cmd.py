@@ -100,3 +100,32 @@ def test_stripped_length_uses_bound_parameter_not_literal():
     sql = _selection_sql(False, None, None, None)
     assert "%(strip_ws)s" in sql
     assert "E'" not in sql
+
+
+def test_cascade_runbook_neutralizes_hostile_conversation_id(capsys):
+    """Every interpolation site in the printed runbook treats the
+    conversation id as data: SQL literals cannot be terminated, shell
+    arguments are quoted, and Redis globs match only themselves."""
+    from virtual_context.cli.resummarize_cmd import _print_cascade_runbook
+
+    hostile = "conv'; SELECT pg_sleep(9); --"
+    _print_cascade_runbook(hostile, ["legal", "court"])
+    out = capsys.readouterr().out
+
+    # The SQL literal doubles the quote, so the payload stays inside it.
+    assert "conv''; SELECT pg_sleep(9); --" in out
+    # No line contains the raw quote-terminated payload.
+    assert "= 'conv';" not in out
+    # Shell arguments are quoted (shlex wraps the whole id).
+    assert "'conv'\"'\"'; SELECT pg_sleep(9); --'" in out
+
+
+def test_cascade_runbook_escapes_redis_glob_metacharacters(capsys):
+    from virtual_context.cli.resummarize_cmd import _print_cascade_runbook
+
+    _print_cascade_runbook("conv*with?glob[chars]", ["legal"])
+    out = capsys.readouterr().out
+    scan_lines = [l for l in out.splitlines() if "--pattern" in l]
+    assert scan_lines
+    for line in scan_lines:
+        assert "conv\\*with\\?glob\\[chars\\]" in line
