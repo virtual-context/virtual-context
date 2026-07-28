@@ -32,6 +32,7 @@ from pathlib import Path
 
 import pytest
 
+from virtual_context.core.canonical_turns import STRIP_WHITESPACE
 from virtual_context.core.ingest_reconciler import IngestReconciler
 from virtual_context.core.semantic_search import SemanticSearchManager
 from virtual_context.storage.sqlite import SQLiteStore
@@ -156,6 +157,48 @@ def test_projection_preserves_every_field_the_enrichment_merge_reads(tmp_path: P
 # ---------------------------------------------------------------------------
 
 @pytest.mark.regression("BUG-045")
+def test_strip_whitespace_constant_matches_python():
+    """The trim set must be exactly what ``str.strip()`` removes.
+
+    Regenerated from Python rather than compared against a copy, so the
+    constant cannot drift from the behavior it stands in for. If a future
+    Python widens its whitespace definition, this fails instead of
+    quietly reintroducing the mismatch.
+    """
+    regenerated = {
+        cp for cp in range(0x110000) if chr(cp).strip() == ""
+    }
+    assert {ord(ch) for ch in STRIP_WHITESPACE} == regenerated
+    # And it must not be written as a dialect escape sequence, which is how
+    # the vertical tab was lost on one backend and the letter "v" gained.
+    assert "\\" not in STRIP_WHITESPACE
+
+
+@pytest.mark.regression("BUG-045")
+@pytest.mark.parametrize("codepoint", sorted(ord(c) for c in STRIP_WHITESPACE))
+def test_presence_flag_false_for_every_whitespace_character(
+    tmp_path: Path, codepoint: int,
+):
+    """Every character Python strips must read as "no content" in SQL.
+
+    A disagreement here is a false POSITIVE: a row holding only whitespace
+    reports as carrying user text, which lets a row that is not the user
+    half of a turn take durable speaker attribution. Hand-written per
+    dialect this was wrong for 23 Unicode characters on both backends,
+    plus the vertical tab on one of them.
+    """
+    store = _store(tmp_path)
+    store.save_canonical_turn(
+        "c", 0, chr(codepoint) * 3, "assistant text",
+        canonical_turn_id="id-1", sort_key=1000.0, turn_hash="h1",
+    )
+    projected = store.get_canonical_turn_reconcile_rows("c")[0]
+    assert projected.has_user_content is False, (
+        f"U+{codepoint:04X} reads as content in SQL but Python strips it"
+    )
+
+
+@pytest.mark.regression("BUG-045")
 @pytest.mark.parametrize(
     "user_text",
     [
@@ -168,6 +211,15 @@ def test_projection_preserves_every_field_the_enrichment_merge_reads(tmp_path: P
         "\t\n\r\x0b\x0c ",
         " leading and trailing ",
         "0",
+        # A bare "v": one backend's escaped literal trimmed the letter
+        # itself rather than the vertical tab it was meant to name.
+        "v",
+        "vvv",
+        "\x0b",
+        " ",
+        "　",
+        " ",
+        " real ",
     ],
 )
 def test_presence_flag_agrees_with_python_strip(tmp_path: Path, user_text: str):

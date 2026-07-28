@@ -11,6 +11,33 @@ from datetime import datetime, timezone
 from ..types import CanonicalTurnRow, IngestBatchRecord
 
 HASH_VERSION = 1
+
+# Every character ``str.strip()`` removes, as one string.
+#
+# Storage backends decide whether a stored row carries text by trimming it
+# in SQL, while the rest of the engine asks ``(value or "").strip()``. Those
+# two must answer identically or a row that holds only whitespace can be
+# read as carrying content, which is what lets a row that is not the user
+# half of a turn take speaker attribution.
+#
+# The set is passed to SQL as a bound parameter rather than written as an
+# escaped literal per dialect. Hand-writing it invites exactly the mismatch
+# it is meant to prevent: PostgreSQL's escape strings define ``\b \f \n \r
+# \t`` and drop the backslash on anything else, so ``E'\v'`` is the letter
+# ``v`` and not a vertical tab, while SQLite's ``char(11)`` is. Deriving it
+# once, here, keeps both dialects on the same ruler as Python.
+#
+# ``test_canonical_turns.py`` regenerates this from ``str.strip()`` and
+# fails if the two ever drift.
+STRIP_WHITESPACE = (
+    "\x09\x0a\x0b\x0c\x0d"
+    "\x1c\x1d\x1e\x1f\x20"
+    "\x85\xa0\u1680\u2000\u2001"
+    "\u2002\u2003\u2004\u2005\u2006"
+    "\u2007\u2008\u2009\u200a\u2028"
+    "\u2029\u202f\u205f\u3000"
+)
+
 _WS_RE = re.compile(r"\s+")
 _MEDIA_RE = re.compile(r"\[media attached:[^\]]+\]", re.IGNORECASE)
 _SESSION_RE = re.compile(r"\[Session from [^\]]+\]", re.IGNORECASE)
