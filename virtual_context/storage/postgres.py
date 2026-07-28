@@ -9271,9 +9271,15 @@ class PostgresStore(ContextStore):
         self,
         conversation_id: str,
     ) -> int:
-        # Use the raw loader to avoid recursion: the non-raw loader triggers
-        # this method on legacy (all -1) conversations.
-        rows = self._load_canonical_turn_rows_raw(conversation_id)
+        # Grouping needs each row's identity and whether each half carries
+        # text, and nothing else, so it reads the projection rather than
+        # every column. That is the same load already narrowed on the
+        # reconcile path, and it was being paid here again in full.
+        #
+        # The RAW projected loader specifically, for the reason this
+        # comment has always given: the repairing loader calls this
+        # method, so reading through it here would recurse.
+        rows = self._get_canonical_turn_reconcile_rows_raw(conversation_id)
         if not rows:
             return 0
 
@@ -9281,8 +9287,8 @@ class PostgresStore(ContextStore):
         current_group = -1
         pending_user_group = -1
         for row in rows:
-            has_user = bool(row.user_content)
-            has_assistant = bool(row.assistant_content)
+            has_user = row.has_user_content
+            has_assistant = row.has_assistant_content
             if has_user and has_assistant:
                 current_group += 1
                 pending_user_group = -1
@@ -9399,7 +9405,7 @@ class PostgresStore(ContextStore):
     ) -> list[CanonicalTurnRow]:
         return self._load_canonical_turn_rows(conversation_id)
 
-    def get_canonical_turn_reconcile_rows(
+    def _get_canonical_turn_reconcile_rows_raw(
         self,
         conversation_id: str,
     ) -> list[CanonicalTurnReconcileRow]:
@@ -9431,8 +9437,24 @@ class PostgresStore(ContextStore):
                    ORDER BY sort_key, canonical_turn_id""",
                 (STRIP_WHITESPACE, STRIP_WHITESPACE, conversation_id),
             ).fetchall()
-        projected = [_row_to_reconcile_row(row) for row in rows]
-        return self._backfill_groups_if_legacy(conversation_id, projected)
+        return [_row_to_reconcile_row(row) for row in rows]
+
+    def get_canonical_turn_reconcile_rows(
+        self,
+        conversation_id: str,
+    ) -> list[CanonicalTurnReconcileRow]:
+        """Projected canonical turns, repairing legacy turn groups first.
+
+        Mirrors the split the full-row loader already uses, and for the
+        same reason its comment gives: the repair calls
+        ``recompute_canonical_turn_groups``, which reads rows itself. A
+        loader that repairs cannot be the loader the repair reads
+        through, or a legacy conversation recurses between them.
+        """
+        return self._backfill_groups_if_legacy(
+            conversation_id,
+            self._get_canonical_turn_reconcile_rows_raw(conversation_id),
+        )
 
     def _backfill_groups_if_legacy(self, conversation_id, projected):
         """Trigger the one-shot turn-group recompute a legacy row set needs.

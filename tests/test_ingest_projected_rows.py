@@ -460,3 +460,73 @@ def test_projection_still_triggers_the_legacy_group_backfill(tmp_path: Path):
     assert [r.turn_group_number for r in projected] == [
         r.turn_group_number for r in full
     ]
+
+
+@pytest.mark.regression("BUG-048")
+def test_raw_projected_loader_does_not_trigger_the_backfill(tmp_path: Path):
+    """The raw variant reads; the public one reads and may repair.
+
+    ``recompute_canonical_turn_groups`` reads rows to assign groups, and
+    the repair calls that method. So the loader the repair reads through
+    cannot itself be the repairing one, or a legacy conversation
+    recurses. The full-row loader has carried this split for the same
+    reason and its comment says so; the projected loader needs it now
+    that grouping reads through it.
+    """
+    store = _store(tmp_path)
+    for index in range(4):
+        store.save_canonical_turn(
+            "c", index,
+            "u" if index % 2 == 0 else "",
+            "" if index % 2 == 0 else "a",
+            canonical_turn_id=f"id-{index}",
+            sort_key=float((index + 1) * 1000.0),
+            turn_hash=f"h{index}",
+            turn_group_number=-1,
+        )
+
+    raw = store._get_canonical_turn_reconcile_rows_raw("c")
+    assert raw, "fixture must produce rows"
+    assert all(r.turn_group_number < 0 for r in raw), (
+        "the raw loader must report stored state, not repair it"
+    )
+    still_legacy = store._get_conn().execute(
+        "SELECT turn_group_number FROM canonical_turns WHERE conversation_id = ?",
+        ("c",),
+    ).fetchall()
+    assert all(row[0] < 0 for row in still_legacy), "reading rawly must change nothing"
+
+    repaired = store.get_canonical_turn_reconcile_rows("c")
+    assert any(r.turn_group_number >= 0 for r in repaired)
+    assert [r.turn_group_number for r in repaired] == [
+        r.turn_group_number for r in store.get_all_canonical_turns("c")
+    ], "the two loaders must agree once repaired"
+
+
+@pytest.mark.regression("BUG-048")
+def test_grouping_matches_what_full_rows_produced(tmp_path: Path):
+    """Reading the projection must group turns identically.
+
+    Grouping switched from ``bool(content)`` to the projection's
+    strip-equivalent flags. Those differ only on content that is
+    non-empty but entirely whitespace, of which production has none, so
+    this pins that ordinary data is unaffected by the switch.
+    """
+    store = _store(tmp_path)
+    shapes = [("u0", ""), ("", "a0"), ("u1", "a1"), ("u2", ""), ("", "a2")]
+    for index, (user, asst) in enumerate(shapes):
+        store.save_canonical_turn(
+            "c", index, user, asst,
+            canonical_turn_id=f"id-{index}",
+            sort_key=float((index + 1) * 1000.0),
+            turn_hash=f"h{index}",
+            turn_group_number=-1,
+        )
+
+    store.recompute_canonical_turn_groups("c")
+    groups = [r.turn_group_number for r in store.get_all_canonical_turns("c")]
+
+    # user-only opens a group, a bare assistant joins the pending user,
+    # a combined row is its own group.
+    assert groups == [0, 0, 1, 2, 2], groups
+    assert all(g >= 0 for g in groups), "every row must be assigned"
