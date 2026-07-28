@@ -55,7 +55,7 @@ def conv(request):
         )
 
 
-@pytest.mark.regression("BUG-045")
+@pytest.mark.regression("BUG-048")
 def test_postgres_trims_exactly_what_python_strips(conv):
     """Every character Python strips must read as "no content" here.
 
@@ -82,7 +82,7 @@ def test_postgres_trims_exactly_what_python_strips(conv):
     )
 
 
-@pytest.mark.regression("BUG-045")
+@pytest.mark.regression("BUG-048")
 @pytest.mark.parametrize(
     "user_text",
     [
@@ -109,7 +109,7 @@ def test_postgres_presence_flag_agrees_with_python_strip(conv, user_text):
     )
 
 
-@pytest.mark.regression("BUG-045")
+@pytest.mark.regression("BUG-048")
 def test_postgres_and_sqlite_agree_on_every_stripped_character(tmp_path, conv):
     """Pin the two backends against each other, not just against Python.
 

@@ -392,7 +392,7 @@ Use `pytest -m regression` to run all regression tests.
 - **Fix**: The precondition counts coverage over the conversation's row tail INCLUDING tagged rows. The pair walker gains a hydrate fast-path: pairs whose backing rows are all tagged (matched by per-message `turn_hash`) get their TurnTagIndex entries from the stored row tags, consuming the strict cursor without invoking the tag generator or rewriting rows. Half-tagged pairs fall through to the normal tagger (idempotent). Supporting fix: the canonical-turn full-row loaders now SELECT `covered_ingestible_entries` so legacy combined rows (coverage 2) count correctly.
 - **Tests**: `test_strict_tagging_tagged_rows.py` — prod-signature repro, hydration tag fidelity, zero-tagger-call full hydration, untagged-tail still tagged, half-tagged fall-through, missing-rows and stale-epoch invariants preserved.
 
-### BUG-045 — Reconciliation loads every column of every stored turn, including the text it never reads
+### BUG-048 — Reconciliation loads every column of every stored turn, including the text it never reads
 
 - **Symptom**: Ingest cost scales with stored conversation size and is independent of request size, and the per-row cost grows with row width rather than staying flat. A no-content projection of the same rows measures flat at 4.2-5.6 us/row across a 7x range in conversation size while the full row goes 22.9 to 95.2 us/row over the same range.
 - **Root cause**: `IngestReconciler` loaded stored history through `get_all_canonical_turns`, which selects every column. Reconciliation keys on `turn_hash`, `sort_key` and identity/provenance columns, and never reads a stored row's text; the only thing it asks of the content is whether a row carries user text at all, as a role gate before taking speaker attribution. The content columns are the widest part of a row and are stored out of line, so on Postgres they dominate a load that never uses them.
@@ -406,7 +406,7 @@ Use `pytest -m regression` to run all regression tests.
   - `test_ingest_projected_rows.py::test_projected_row_cannot_be_written_back`
   - `test_ingest_projected_rows.py::test_unsupported_backend_falls_back_to_the_full_load`
 
-### BUG-044 — Anchor refresh rewrites the whole conversation's anchor table on every ingest
+### BUG-047 — Anchor refresh rewrites the whole conversation's anchor table on every ingest
 
 - **Symptom**: Ingest cost grows linearly with stored conversation size and is independent of what the caller sent. A 15-message request against a 9,173-row conversation costs the same as a 490 KB one. On the largest production conversation the prepare path exceeded the client's timeout often enough that a quarter of prepares were abandoned before a response was sent.
 - **Root cause**: `_refresh_persisted_anchors` rebuilt the complete anchor set on every call and persisted it through `replace_canonical_turn_anchors`, which is a `DELETE` of every anchor row for the conversation followed by a re-INSERT of the entire rebuilt set. The set holds one row per window start per window size (3, 4, 5), so roughly 3N rows are deleted and 3N re-inserted per ingest. Appending a turn creates exactly one new window start per window size and invalidates none, so nearly the whole rewrite was writing back byte-identical rows. Measured on a 9,200-row conversation: 27,597 anchor rows rewritten, of which 6 were new and 0 removed. Both ingest fast paths (`exact_resend`, `tail_append`) paid it too, and on `exact_resend` the anchor set is provably unchanged, making the entire rewrite dead work.
@@ -507,5 +507,5 @@ Use `pytest -m regression` to run all regression tests.
 | `test_tag_summary_materialization.py` | BUG-041 |
 | `test_embedding_context_guard.py` | BUG-042 |
 | `test_embedding_reserved_seats.py` | BUG-043 |
-| `test_ingest_anchor_incremental.py` | BUG-044 |
-| `test_ingest_projected_rows.py` | BUG-045 |
+| `test_ingest_anchor_incremental.py` | BUG-047 |
+| `test_ingest_projected_rows.py` | BUG-048 |

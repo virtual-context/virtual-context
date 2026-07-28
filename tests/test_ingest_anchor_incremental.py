@@ -155,7 +155,7 @@ TRANSITIONS = {
 }
 
 
-@pytest.mark.regression("BUG-044")
+@pytest.mark.regression("BUG-047")
 @pytest.mark.parametrize("name", sorted(TRANSITIONS))
 def test_incremental_delta_matches_full_rebuild(name):
     """The delta write must land on exactly the full-rebuild anchor set."""
@@ -179,7 +179,7 @@ def test_incremental_delta_matches_full_rebuild(name):
     assert set(store.anchors) == _canonical_anchor_set(after_rows)
 
 
-@pytest.mark.regression("BUG-044")
+@pytest.mark.regression("BUG-047")
 @pytest.mark.parametrize("name", sorted(TRANSITIONS))
 def test_incremental_result_is_order_independent(name):
     """Both temporal orderings converge on the same persisted set.
@@ -218,7 +218,7 @@ def test_incremental_result_is_order_independent(name):
 # The cost property the change exists to buy.
 # ---------------------------------------------------------------------------
 
-@pytest.mark.regression("BUG-044")
+@pytest.mark.regression("BUG-047")
 def test_append_writes_bounded_anchor_rows_not_whole_conversation():
     """An append must touch a constant number of anchors, not O(N).
 
@@ -247,7 +247,7 @@ def test_append_writes_bounded_anchor_rows_not_whole_conversation():
     assert store.full_rebuilds == 0, "the append must not trigger a rebuild"
 
 
-@pytest.mark.regression("BUG-044")
+@pytest.mark.regression("BUG-047")
 def test_unchanged_sequence_writes_nothing():
     """A resend that changes no row must issue no anchor write at all.
 
@@ -273,7 +273,7 @@ def test_unchanged_sequence_writes_nothing():
 # Divergence guard: the delta is only valid against a known prior state.
 # ---------------------------------------------------------------------------
 
-@pytest.mark.regression("BUG-044")
+@pytest.mark.regression("BUG-047")
 @pytest.mark.parametrize("corruption", ["missing", "stale", "duplicate", "swapped"])
 def test_diverged_store_is_repaired_exactly(corruption):
     """Whatever state the table is in, one refresh restores the truth.
@@ -311,7 +311,7 @@ def test_diverged_store_is_repaired_exactly(corruption):
     assert len(store.anchors) == len(truth), "duplicates must not survive repair"
 
 
-@pytest.mark.regression("BUG-044")
+@pytest.mark.regression("BUG-047")
 def test_unreadable_anchor_store_rebuilds_rather_than_assuming_empty():
     """A backend that cannot report its anchors must not be read as empty.
 
@@ -339,7 +339,7 @@ def test_unreadable_anchor_store_rebuilds_rather_than_assuming_empty():
     assert len(store.anchors) == len(_canonical_anchor_set(rows))
 
 
-@pytest.mark.regression("BUG-044")
+@pytest.mark.regression("BUG-047")
 def test_store_without_delta_support_still_rebuilds():
     """A store lacking the delta surfaces keeps the old behavior."""
 
@@ -363,7 +363,7 @@ def test_store_without_delta_support_still_rebuilds():
 # Store-level: the SQL delta must equal the SQL rebuild.
 # ---------------------------------------------------------------------------
 
-@pytest.mark.regression("BUG-044")
+@pytest.mark.regression("BUG-047")
 @pytest.mark.parametrize("name", sorted(TRANSITIONS))
 def test_sqlite_delta_write_matches_rebuild_write(tmp_path: Path, name):
     """Applying the delta leaves the same table state as replacing wholesale.
@@ -398,7 +398,7 @@ def test_sqlite_delta_write_matches_rebuild_write(tmp_path: Path, name):
     assert len(delta_store.get_canonical_turn_anchors("c")) == len(desired_set)
 
 
-@pytest.mark.regression("BUG-044")
+@pytest.mark.regression("BUG-047")
 def test_sqlite_reader_reports_duplicates(tmp_path: Path):
     """Duplicates must be visible, not collapsed.
 
@@ -416,7 +416,7 @@ def test_sqlite_reader_reports_duplicates(tmp_path: Path):
     assert reported.count(anchors[0]) == 2
 
 
-@pytest.mark.regression("BUG-044")
+@pytest.mark.regression("BUG-047")
 def test_sqlite_delta_is_scoped_to_its_conversation(tmp_path: Path):
     """A delta must never touch a sibling conversation's anchors."""
     store = SQLiteStore(tmp_path / "s.db")
@@ -445,7 +445,7 @@ def _stored_anchor_set(store: SQLiteStore) -> set[tuple[int, str, str]]:
 # The anchor set must remain usable for alignment after an incremental write.
 # ---------------------------------------------------------------------------
 
-@pytest.mark.regression("BUG-044")
+@pytest.mark.regression("BUG-047")
 def test_anchor_hashes_still_resolve_windows_after_delta():
     """Post-delta anchors must still map a window digest to its start row.
 
@@ -477,7 +477,7 @@ def test_anchor_hashes_still_resolve_windows_after_delta():
 # Production default: the rebuild, not the delta.
 # ---------------------------------------------------------------------------
 
-@pytest.mark.regression("BUG-044")
+@pytest.mark.regression("BUG-047")
 def test_incremental_writes_are_off_by_default(monkeypatch):
     """With the default settings the refresh must rebuild, not diff.
 
@@ -501,7 +501,7 @@ def test_incremental_writes_are_off_by_default(monkeypatch):
     assert len(store.anchors) == len(_canonical_anchor_set(rows))
 
 
-@pytest.mark.regression("BUG-044")
+@pytest.mark.regression("BUG-047")
 def test_failed_delta_insert_does_not_leave_anchors_deleted(tmp_path: Path):
     """A delta that fails partway must not commit its deletions.
 
