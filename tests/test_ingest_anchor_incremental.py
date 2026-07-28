@@ -499,3 +499,32 @@ def test_incremental_writes_are_off_by_default(monkeypatch):
     assert set(store.anchors) == _canonical_anchor_set(rows)
     # And the rebuild stays idempotent: no duplicate accumulation.
     assert len(store.anchors) == len(_canonical_anchor_set(rows))
+
+
+@pytest.mark.regression("BUG-044")
+def test_failed_delta_insert_does_not_leave_anchors_deleted(tmp_path: Path):
+    """A delta that fails partway must not commit its deletions.
+
+    Repairing a duplicate deletes every copy of a triple before adding one
+    back. If the insert fails and the delete has already been committed,
+    a required anchor is simply gone, and the aligner then gets a
+    positional index missing an entry it expects.
+    """
+    store = SQLiteStore(tmp_path / "s.db")
+    anchors = _build_anchor_rows(_rows(_BASE))
+    store.replace_canonical_turn_anchors("c", anchors)
+    before = set(store.get_canonical_turn_anchors("c"))
+
+    doomed = anchors[:3]
+    with pytest.raises(Exception):
+        store.apply_canonical_turn_anchor_delta(
+            "c",
+            # A window_size that cannot be coerced fails at execute time,
+            # after the deletions have run.
+            insert=[(object(), "h", "id-x")],
+            delete=doomed,
+        )
+
+    assert set(store.get_canonical_turn_anchors("c")) == before, (
+        "a failed insert must not leave its deletions behind"
+    )

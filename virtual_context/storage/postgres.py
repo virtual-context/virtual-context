@@ -9854,24 +9854,30 @@ class PostgresStore(ContextStore):
         ]
         if not deletions and not insertions:
             return 0
+        # The pool runs in autocommit mode, so without an explicit
+        # transaction the delete and the insert commit independently and a
+        # failure between them leaves every copy of a required anchor
+        # deleted. Repairing a duplicate removes all copies before adding
+        # one back, which is exactly the window where that matters.
         with self.pool.connection() as conn:
-            with conn.cursor() as cur:
-                if deletions:
-                    cur.executemany(
-                        """DELETE FROM canonical_turn_anchors
-                           WHERE conversation_id = %s
-                             AND anchor_hash = %s
-                             AND start_turn_id = %s
-                             AND window_size = %s""",
-                        deletions,
-                    )
-                if insertions:
-                    cur.executemany(
-                        """INSERT INTO canonical_turn_anchors
-                           (conversation_id, anchor_hash, start_turn_id, window_size)
-                           VALUES (%s, %s, %s, %s)""",
-                        insertions,
-                    )
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    if deletions:
+                        cur.executemany(
+                            """DELETE FROM canonical_turn_anchors
+                               WHERE conversation_id = %s
+                                 AND anchor_hash = %s
+                                 AND start_turn_id = %s
+                                 AND window_size = %s""",
+                            deletions,
+                        )
+                    if insertions:
+                        cur.executemany(
+                            """INSERT INTO canonical_turn_anchors
+                               (conversation_id, anchor_hash, start_turn_id, window_size)
+                               VALUES (%s, %s, %s, %s)""",
+                            insertions,
+                        )
         return len(insertions)
 
     def get_canonical_turn_anchors(

@@ -9650,33 +9650,43 @@ CREATE TABLE IF NOT EXISTS request_captures (
         apply can never leave a duplicate behind. Both statements are
         scoped to ``conversation_id``.
         """
-        conn = self._get_conn()
+        # Delete and insert must land together: repairing a duplicate
+        # removes every copy before adding one back, so a failure between
+        # them would leave a required anchor missing.
+        # Both parameter lists are built BEFORE anything executes. Building
+        # them lazily would let a malformed insert row raise after the
+        # deletes had already run, outside the rollback.
         deletions = [
             (conversation_id, anchor_hash, start_turn_id, int(window_size))
             for window_size, anchor_hash, start_turn_id in delete
             if anchor_hash and start_turn_id
         ]
-        if deletions:
-            conn.executemany(
-                """DELETE FROM canonical_turn_anchors
-                   WHERE conversation_id = ?
-                     AND anchor_hash = ?
-                     AND start_turn_id = ?
-                     AND window_size = ?""",
-                deletions,
-            )
         insertions = [
             (conversation_id, anchor_hash, start_turn_id, int(window_size))
             for window_size, anchor_hash, start_turn_id in insert
             if anchor_hash and start_turn_id
         ]
-        if insertions:
-            conn.executemany(
-                """INSERT INTO canonical_turn_anchors
-                   (conversation_id, anchor_hash, start_turn_id, window_size)
-                   VALUES (?, ?, ?, ?)""",
-                insertions,
-            )
+        conn = self._get_conn()
+        try:
+            if deletions:
+                conn.executemany(
+                    """DELETE FROM canonical_turn_anchors
+                       WHERE conversation_id = ?
+                         AND anchor_hash = ?
+                         AND start_turn_id = ?
+                         AND window_size = ?""",
+                    deletions,
+                )
+            if insertions:
+                conn.executemany(
+                    """INSERT INTO canonical_turn_anchors
+                       (conversation_id, anchor_hash, start_turn_id, window_size)
+                       VALUES (?, ?, ?, ?)""",
+                    insertions,
+                )
+        except Exception:
+            conn.rollback()
+            raise
         self._commit_if_unlocked(conn)
         return len(insertions)
 
