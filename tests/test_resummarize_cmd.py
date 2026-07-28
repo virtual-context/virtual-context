@@ -125,52 +125,75 @@ def test_cascade_runbook_escapes_redis_glob_metacharacters(capsys):
 
     _print_cascade_runbook("conv*with?glob[chars]", ["legal"])
     out = capsys.readouterr().out
-    eval_lines = [l for l in out.splitlines() if "redis-cli EVAL" in l]
+    eval_lines = [l for l in out.splitlines() if "EVAL" in l]
     assert eval_lines
     for line in eval_lines:
         assert "conv\\*with\\?glob\\[chars\\]" in line
 
 
 def test_resume_cursor_freezes_at_first_lost_row():
-    """failure(A), success(B), failure(C), breaker-trip(D): the cursor
-    must still point BEFORE A. A later success must not advance it past
-    a row that received no response and was never repaired."""
+    """failure(A), decided(B), failure(C), breaker-trip(D): the cursor
+    must still point BEFORE A. Calls mirror the apply loop exactly:
+    every provider failure calls on_provider_failure, INCLUDING the row
+    that then trips the breaker."""
     from virtual_context.cli.resummarize_cmd import _ResumeCursor
 
     cursor = _ResumeCursor(None)
     cursor.on_provider_failure()          # A: lost
-    cursor.on_response("B")               # B: success must NOT advance
+    cursor.on_decided("B")                # B: decided, must NOT advance
     cursor.on_provider_failure()          # C: lost
-    # D trips the breaker; no cursor call happens for it.
+    cursor.on_provider_failure()          # D: lost, trips the breaker
     assert cursor.ref is None
     assert cursor.frozen
 
 
-def test_resume_cursor_advances_past_responses_until_first_failure():
+def test_resume_cursor_advances_past_decided_rows_until_first_freeze():
+    """Accepted, malformed, and rejected rows are DECIDED and advance
+    the cursor (a block of persistent rejectors must not starve later
+    damage on resumed runs); provider failures and CAS skips are
+    UNDECIDED and freeze it permanently."""
     from virtual_context.cli.resummarize_cmd import _ResumeCursor
 
     cursor = _ResumeCursor("start")
-    cursor.on_response("A")
-    cursor.on_response("B")
+    cursor.on_decided("A")                # accepted
+    cursor.on_decided("B")                # rejected: decided, advances
     assert cursor.ref == "B"
     cursor.on_provider_failure()
-    cursor.on_response("D")
+    cursor.on_decided("D")
     assert cursor.ref == "B"
     assert cursor.frozen
 
 
+def test_resume_cursor_freezes_on_concurrent_cas_skip():
+    """A CAS skip means no decision landed: the concurrent writer may
+    have left the row damaged, so the cursor must not pass it."""
+    from virtual_context.cli.resummarize_cmd import _ResumeCursor
+
+    cursor = _ResumeCursor(None)
+    cursor.on_decided("A")
+    cursor.freeze()                       # B: skipped_concurrent
+    cursor.on_decided("C")
+    assert cursor.ref == "A"
+    assert cursor.frozen
+
+
 def test_cascade_runbook_never_reparses_redis_keys_in_the_shell(capsys):
-    """Hint-key deletion must be a server-side script with the pattern
-    as ARGV: piping scan output through xargs re-parses raw key text,
-    where a quote aborts the pipeline and a space splits one key into
-    several DEL arguments."""
+    """Hint-key deletion must be server-side, paged, with the pattern
+    as ARGV: piping scan output through xargs re-parses raw key text
+    (a quote aborts the pipeline, a space splits one key into several
+    DEL arguments), and looping SCAN to completion inside one EVAL
+    blocks the server for the whole keyspace."""
     from virtual_context.cli.resummarize_cmd import _print_cascade_runbook
 
     _print_cascade_runbook("conv with spaces' and quote", ["legal"])
     out = capsys.readouterr().out
     assert "xargs" not in out
     assert "--scan" not in out
-    eval_lines = [l for l in out.splitlines() if "redis-cli EVAL" in l]
-    assert len(eval_lines) == 2  # delete script + count verify script
+    eval_lines = [l for l in out.splitlines() if "EVAL" in l]
+    assert len(eval_lines) == 2  # delete page + count page
     for line in eval_lines:
         assert "ARGV[1]" in line
+        assert "ARGV[2]" in line          # cursor is a parameter...
+        assert "repeat" not in line       # ...not an in-script loop
+    # The cursor loop lives client-side in the printed shell.
+    assert out.count('[ "$c" = "0" ] && break') == 2
