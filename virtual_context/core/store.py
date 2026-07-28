@@ -964,16 +964,16 @@ class ContextStore(ABC):
     ) -> int:
         return 0
 
-    def count_canonical_turn_anchors(self, conversation_id: str) -> int:
-        """Persisted anchor row count, or a negative sentinel if unknown.
+    def get_canonical_turn_anchors(
+        self, conversation_id: str,
+    ) -> list[tuple[int, str, str]] | None:
+        """Persisted anchors, or None when the backend cannot report them.
 
-        Callers use this to decide whether an incremental anchor delta is
-        safe to apply. A backend that cannot really count must report a
-        value no row count can equal, so the caller falls back to a full
-        rebuild rather than writing a delta against an unverified prior
-        state.
+        None rather than an empty list: holding no anchors and being
+        unable to say are different answers, and reading the second as
+        the first would write a delta as though the table were empty.
         """
-        return -1
+        return None
 
     def get_canonical_turn_anchor_positions(
         self,
