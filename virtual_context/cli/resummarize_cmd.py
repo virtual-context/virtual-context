@@ -522,11 +522,11 @@ def cmd_admin_resummarize_segments(args) -> None:
         "resume_cursor_frozen": cursor.frozen,
         "note": ("skipped_concurrent is NORMAL on an active conversation: "
                  "live compaction rewrites rows mid-run. COMPLETION PATH: "
-                 "malformed and rejected rows remain damaged and remain "
-                 "selected but are BEHIND resume_after_ref, so finish with a "
-                 "fresh run WITHOUT --after-ref, which re-selects them and "
-                 "every skipped_concurrent row; re-running is safe by "
-                 "idempotency"),
+                 "malformed/rejected rows processed before any cursor freeze "
+                 "may be behind resume_after_ref; finish with a fresh "
+                 "invocation WITHOUT --after-ref to retry all still-damaged "
+                 "malformed, rejected, and skipped-concurrent rows; "
+                 "re-running is safe by idempotency"),
     }, indent=2))
     if counts["accepted"]:
         _print_cascade_runbook(conversation_id, sorted(affected_tags))
