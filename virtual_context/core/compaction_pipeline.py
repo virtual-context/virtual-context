@@ -761,30 +761,49 @@ class CompactionPipeline:
                     ) in turn_source_by_audience_id
                 )
 
-            unknown_fact_id = False
+            unknown_fact_id: str | None = None
             for source_id in dict.fromkeys(fact_ids):
                 if _valid_fact_id(source_id):
                     normalized_fact_ids.append(source_id)
                 elif _valid_turn_id(source_id):
                     normalized_turn_ids.append(source_id)
                 else:
-                    unknown_fact_id = True
+                    unknown_fact_id = source_id
                     break
-            if unknown_fact_id:
+            if unknown_fact_id is not None:
                 rejected["unknown_or_cross_audience_fact_id"] += 1
+                # IDs only, never entry bodies: the guard exists to keep
+                # audiences isolated, so its own diagnostics must not leak
+                # content across them. The offending id is what separates a
+                # hallucinated citation from a mangled real one from a
+                # correctly refused cross-audience reference.
+                logger.debug(
+                    "ACTOR_CARD_CITATION_REJECTED "
+                    "reason=unknown_or_cross_audience_fact_id "
+                    "audience_id=%s source_id=%s",
+                    audience_id,
+                    unknown_fact_id,
+                )
                 continue
 
-            unknown_turn_id = False
+            unknown_turn_id: str | None = None
             for source_id in dict.fromkeys(turn_ids):
                 if _valid_turn_id(source_id):
                     normalized_turn_ids.append(source_id)
                 elif _valid_fact_id(source_id):
                     normalized_fact_ids.append(source_id)
                 else:
-                    unknown_turn_id = True
+                    unknown_turn_id = source_id
                     break
-            if unknown_turn_id:
+            if unknown_turn_id is not None:
                 rejected["unknown_or_cross_audience_turn_id"] += 1
+                logger.debug(
+                    "ACTOR_CARD_CITATION_REJECTED "
+                    "reason=unknown_or_cross_audience_turn_id "
+                    "audience_id=%s source_id=%s",
+                    audience_id,
+                    unknown_turn_id,
+                )
                 continue
 
             fact_ids = list(dict.fromkeys(normalized_fact_ids))
