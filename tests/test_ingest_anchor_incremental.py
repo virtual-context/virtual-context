@@ -36,9 +36,22 @@ from virtual_context.core.ingest_reconciler import (
     IngestReconciler,
     _build_anchor_rows,
 )
+import virtual_context.core.ingest_reconciler as _ir
 from virtual_context.core.semantic_search import SemanticSearchManager
 from virtual_context.storage.sqlite import SQLiteStore
 from virtual_context.types import CanonicalTurnRow
+
+
+@pytest.fixture(autouse=True)
+def _enable_incremental_anchor_writes(monkeypatch):
+    """Exercise the delta path even though production runs the rebuild.
+
+    Incremental writes are off in production because the read-modify-write
+    races across workers. The machinery is kept and kept correct so it can
+    be turned on once the write is idempotent, and that is only true if
+    these tests keep running against it.
+    """
+    monkeypatch.setattr(_ir, "_INCREMENTAL_ANCHOR_WRITES", True)
 
 
 def _rows(tokens: list[str]) -> list[CanonicalTurnRow]:
@@ -458,3 +471,31 @@ def test_anchor_hashes_still_resolve_windows_after_delta():
     # And no digest from the superseded sequence may survive.
     stale = compute_anchor_hash(before_rows, 3, 3)
     assert not any(anchor[1] == stale for anchor in store.anchors)
+
+
+# ---------------------------------------------------------------------------
+# Production default: the rebuild, not the delta.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.regression("BUG-044")
+def test_incremental_writes_are_off_by_default(monkeypatch):
+    """With the default settings the refresh must rebuild, not diff.
+
+    The delta races across workers and can leave an anchor set belonging
+    to neither writer, so it stays off until the write is idempotent.
+    This asserts the shipped default rather than the tested one: every
+    other test in this file turns the delta on deliberately.
+    """
+    monkeypatch.setattr(_ir, "_INCREMENTAL_ANCHOR_WRITES", False)
+    rows = _rows(_BASE)
+    store = _AnchorStore(rows)
+    reconciler = _reconciler(store)
+
+    reconciler._refresh_persisted_anchors("c")
+    reconciler._refresh_persisted_anchors("c")
+
+    assert store.delta_calls == 0, "the delta must not run by default"
+    assert store.full_rebuilds == 2
+    assert set(store.anchors) == _canonical_anchor_set(rows)
+    # And the rebuild stays idempotent: no duplicate accumulation.
+    assert len(store.anchors) == len(_canonical_anchor_set(rows))

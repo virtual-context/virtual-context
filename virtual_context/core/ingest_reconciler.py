@@ -130,6 +130,25 @@ _ALIGNMENT_WINDOW_SIZES = tuple(reversed(_ANCHOR_WINDOW_SIZES))
 # volume.
 _INGEST_BREAKDOWN_LOG_THRESHOLD_MS = 500.0
 
+# Incremental anchor writes are OFF.
+#
+# Writing only the anchor difference is far cheaper than rewriting the
+# whole set, but it is a read-modify-write with no cross-process lock, so
+# two workers can interleave and leave a set that belongs to neither of
+# them. The unconditional rebuild races too, but it lands one worker's
+# complete snapshot rather than a hybrid, and a hybrid is the worse
+# outcome: a stale anchor makes the aligner return a WRONG match instead
+# of a missed one, and a wrong match on a non-empty conversation appends
+# the payload as new rows, duplicating history.
+#
+# The measured saving is real and the machinery stays, exercised by its
+# tests so it cannot rot. Turning it on needs the write made idempotent,
+# via a uniqueness constraint on (conversation_id, window_size,
+# start_turn_id), or the refresh serialized across workers. Until then
+# the cost of the rebuild is the price of a set that is always somebody's
+# complete answer.
+_INCREMENTAL_ANCHOR_WRITES = False
+
 
 def _build_anchor_rows(rows: list[CanonicalTurnRow]) -> list[tuple[int, str, str]]:
     """Build the complete anchor set for an ordered canonical row sequence.
@@ -2086,7 +2105,7 @@ class IngestReconciler:
         desired = _build_anchor_rows(rows)
         applier = getattr(self._store, "apply_canonical_turn_anchor_delta", None)
         reader = getattr(self._store, "get_canonical_turn_anchors", None)
-        if callable(applier) and callable(reader):
+        if _INCREMENTAL_ANCHOR_WRITES and callable(applier) and callable(reader):
             stored = None
             try:
                 stored = reader(conversation_id)
