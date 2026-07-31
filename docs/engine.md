@@ -19,10 +19,10 @@ The compactor runs in the background thread after `on_turn_complete`, never bloc
 ```yaml
 compaction:
   soft_threshold: 0.70        # begin compaction at 70% fill
-  hard_threshold: 0.85        # force deep compaction at 85% fill
+  hard_threshold: 0.85        # force compaction at 85% fill
   protected_recent_turns: 6   # recent turns exempt from compaction
-  min_summary_tokens: 100     # floor for summary length
-  max_summary_tokens: 500     # ceiling for summary length
+  min_summary_tokens: 200     # floor for summary length
+  max_summary_tokens: 2000    # ceiling for summary length
 ```
 
 ## Tagging Pipeline

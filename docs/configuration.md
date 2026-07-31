@@ -60,10 +60,10 @@ Controls when and how conversation history is compressed.
 ```yaml
 compaction:
   soft_threshold: 0.70              # start compaction at this fill level
-  hard_threshold: 0.85              # force deep compaction at this level
+  hard_threshold: 0.85              # force compaction at this level
   protected_recent_turns: 6         # recent turns exempt from compaction
-  min_summary_tokens: 100           # minimum tokens for a summary
-  max_summary_tokens: 500           # maximum tokens for a summary
+  min_summary_tokens: 200           # minimum tokens for a summary
+  max_summary_tokens: 2000          # maximum tokens for a summary
 ```
 
 **Thresholds** are fractions of the context window. At 70% fill with a 120K window, compaction starts when ~84K tokens are in use.
@@ -87,7 +87,7 @@ The summarization LLM is separate from the upstream provider. You can use a chea
 
 ```yaml
 storage:
-  backend: "sqlite"                 # "sqlite", "postgres", or "neo4j"
+  backend: "sqlite"                 # "sqlite", "filesystem", "postgres", "neo4j", or "falkordb"
   sqlite:
     path: ".virtualcontext/store.db"
   postgres:
@@ -98,26 +98,24 @@ storage:
     password: "password"
 ```
 
-SQLite is the default and requires no setup. PostgreSQL is recommended for multi-worker proxy deployments. Neo4j/FalkorDB adds graph-based fact traversal.
+SQLite is the default and requires no setup. PostgreSQL (requires the `postgres` extra) is recommended for multi-worker proxy deployments. Neo4j/FalkorDB adds graph-based fact traversal. The `filesystem` backend stores segments as Markdown files with YAML frontmatter and does not host the full feature set of the database backends.
 
 ### Retrieval
 
 ```yaml
 retrieval:
+  inbound_tagger_type: "embedding"  # "embedding" or "llm" (inbound path)
+  embedding_model: "all-MiniLM-L6-v2"  # local model for the embedding tagger
   active_tag_lookback: 4            # recent turns whose tags are skipped
-  anchorless_lookback: 2            # turns used when no tags match
+  anchorless_lookback: 6            # turns used when no tags match
   strategy_config:
     default:
       max_results: 10               # max segments to retrieve
       max_budget_fraction: 0.25     # max fraction of window for context
       include_related: true         # include segments related to matches
-    broad:
-      max_results: 15
-      max_budget_fraction: 0.35
-    temporal:
-      max_results: 8
-      max_budget_fraction: 0.20
 ```
+
+Only the `default` strategy entry is read; per-strategy overrides beyond it have no effect.
 
 **`active_tag_lookback`**: Tags from the last N turns are excluded from retrieval because their content is already in the raw conversation history. Higher values mean less redundancy but risk missing relevant older content under the same tags.
 
@@ -143,21 +141,27 @@ retrieval:
 
 ```yaml
 assembly:
-  tag_context_max_tokens: 2000      # max tokens per tag rule inclusion
-  recent_turns_kept: 4              # recent turns always included in full
+  tag_context_max_tokens: 30000     # global budget for injected tag context
+  recent_turns_always_included: 3   # recent turns always included in full
   context_hint_enabled: true        # inject topic list after compaction
-  context_hint_max_tokens: 500      # max tokens for the topic hint
+  context_hint_max_tokens: 2000     # max tokens for the topic hint
 ```
 
 **`context_hint_enabled`**: When true, after compaction the assembler injects a brief list of all available tags with segment counts. This gives the model topic awareness without spending full summary budget.
 
 ### Proxy
 
+The single-instance listen address comes from the CLI (`--host`, default `127.0.0.1`; `--port`, default `5757`; `--upstream`), not from YAML. The `proxy:` block configures logging, limits, the session cache, and multi-instance mode:
+
 ```yaml
 proxy:
-  host: "0.0.0.0"
-  port: 8100
-  upstream: "https://api.anthropic.com"
+  request_log_dir: null             # directory for per-request payload logs
+  request_log_max_files: 200        # rotation cap for request logs
+  llm_calls_log: null               # JSONL log of internal LLM calls
+  upstream_context_limit: null      # cap on tokens forwarded upstream
+  passthrough_trim_ratio: 0.40      # trim ratio applied on the passthrough path
+  redis_url: null                   # Redis session cache (or REDIS_URL env)
+  redis_history_cap: 200            # max history entries kept in Redis
 
   # Multi-instance mode
   instances:
@@ -175,16 +179,16 @@ In multi-instance mode, each instance can have its own config file with isolated
 
 ### Tag Rules
 
-Tag rules force specific segments to always be included when certain tags are active:
+Tag rules select a custom summarization prompt for segments whose tags match a pattern:
 
 ```yaml
 tag_rules:
-  - tags: ["project-setup", "architecture"]
+  - match: "legal-*"
     priority: 1
-    max_tokens: 2000
+    summary_prompt: "Summarize precisely, preserving dates, names, and docket numbers."
 ```
 
-When retrieval detects these tags in the query, the corresponding segments are included before the greedy fill pass, ensuring critical context is never dropped.
+`match` is a glob-style (fnmatch) pattern over tag names, `priority` breaks ties when several rules match (default 5, lower wins), and `summary_prompt` overrides the default summarization prompt for matching segments. Tag rules do not force segments into the assembled context.
 
 ## Presets
 
@@ -210,8 +214,10 @@ Reports missing required fields, invalid types, and cross-field constraint viola
 
 | Variable | Purpose |
 |----------|---------|
-| `ANTHROPIC_API_KEY` | API key for Anthropic provider (tagger, summarizer, or upstream) |
-| `OPENAI_API_KEY` | API key for OpenAI provider |
-| `GEMINI_API_KEY` | API key for Google Gemini provider |
-| `OPENROUTER_API_KEY` | API key for OpenRouter |
-| `VIRTUAL_CONTEXT_CONFIG` | Override config file path (equivalent to `-c`) |
+| `ANTHROPIC_API_KEY` | API key for the Anthropic provider (read directly by the provider) |
+| `OPENAI_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY` | Provider API keys, honored through a `providers.<label>.api_key_env` entry in the config (the `onboard` and `init` commands generate these entries) |
+| `REDIS_URL` | Redis session cache URL; overrides `proxy.redis_url` |
+| `VC_DASHBOARD_TOKEN` | Require a token on dashboard endpoints (unauthenticated when unset) |
+| `VIRTUAL_CONTEXT_CONFIG` | Config file path override, read by the MCP server only; the CLI uses `-c` and auto-discovery |
+
+When a `providers:` block is present, `summarization.provider` must name one of its entries; config validation fails otherwise.
