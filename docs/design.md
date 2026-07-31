@@ -8,7 +8,7 @@ The central thesis: compressed, structured context produces better model reasoni
 
 This is counterintuitive. Compression is lossy. But conversation text has extremely low information density. Most turns contain phatic exchanges, restated context, debugging dead ends, and scaffolding that served a purpose in the moment but adds noise later. Compaction strips this while preserving the semantic core.
 
-The benchmarks confirm it: virtual-context achieves 95% accuracy on LocOMo memory questions vs. 33% for full-history baselines, because retrieval + compression surfaces the right information while full history buries it.
+The benchmarks confirm it: on LongMemEval (100 questions), virtual-context answers 95/100 correctly vs. 33/100 for the same reader model given the full raw history, while sending 55% fewer tokens per question. Retrieval plus compression surfaces the right information; full history buries it. See [benchmarks](benchmarks.md) for details.
 
 ## Two-Tagger Architecture
 

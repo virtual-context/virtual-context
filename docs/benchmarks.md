@@ -1,10 +1,16 @@
 # Benchmarks
 
-Virtual-context is evaluated against four established memory benchmarks and an internal stress test suite. All benchmarks run against the full pipeline: tagging, compaction, retrieval, assembly, and LLM response.
+Virtual-context is evaluated against established long-conversation memory benchmarks (LongMemEval, LoCoMo, MRCR, AMB) and an internal stress test suite. All benchmarks run against the full pipeline: tagging, compaction, retrieval, assembly, and LLM response.
 
 ## Benchmark Suites
 
-### LocOMo (Long Conversation Memory)
+### LongMemEval
+
+[LongMemEval](https://github.com/xiaowu0162/LongMemEval) (ICLR 2025) tests long-term memory across many chat sessions: a large haystack of prior sessions is ingested, then questions probe facts stated anywhere in that history. Questions span six categories: knowledge-update, multi-session, temporal-reasoning, single-session-user, single-session-assistant, and single-session-preference.
+
+**Results** (100 questions from LongMemEval-500, 5 batches of 20): virtual-context answered 95/100 correctly vs. 33/100 for the same reader model given the full raw history. Average tokens per question dropped 55% (52,347 vs. 117,582), and average cost per question dropped from $0.36 to $0.16. The full per-question table is in the [README](../README.md#benchmark-results).
+
+### LoCoMo
 
 Tests memory accuracy over extended multi-turn conversations. Questions are categorized by type:
 
@@ -15,14 +21,6 @@ Tests memory accuracy over extended multi-turn conversations. Questions are cate
 | Open-ended | Questions requiring synthesis across topics |
 | Temporal | Questions about when events occurred |
 | Adversarial | Questions designed to confuse retrieval (similar topics, contradictions) |
-
-**Results**: 95% overall accuracy vs. 33% for full-history baselines. The largest gains are on temporal and multi-hop questions, where raw history dumps bury the relevant facts in noise.
-
-### LongMemEval
-
-Evaluates long-term memory fidelity after compaction. Tests whether facts survive multiple compaction cycles without degradation.
-
-The benchmark runs a conversation through hundreds of turns, triggering multiple compaction events, then queries for facts stated early in the conversation. This tests the full compaction -> storage -> retrieval -> assembly pipeline.
 
 ### MRCR (Multi-Round Conversational Retrieval)
 
@@ -43,10 +41,11 @@ Benchmarks live in `benchmarks/` and are structured as:
 ```
 benchmarks/
   locomo/
-    baseline.py       # LLM provider calls with retry logic
-    runner.py          # Orchestrates test execution
-    evaluator.py       # Scores responses against ground truth
-    datasets/          # Question sets
+    run.py             # Entry point (python -m benchmarks.locomo.run)
+    baseline.py        # Full-history baseline runner
+    vc_runner.py       # Runs questions through the virtual-context pipeline
+    scoring.py         # Scores responses against ground truth
+    dataset.py         # Dataset loading
   longmemeval/
     ...
   mrcr/
@@ -54,6 +53,8 @@ benchmarks/
   amb/
     ...
 ```
+
+The directory also contains `beam/` and `writ/` harnesses.
 
 Each benchmark runner:
 1. Loads a dataset of conversations and questions
@@ -84,10 +85,10 @@ Stress tests are runnable via the dashboard's Replay feature: point it at a prom
 
 ```bash
 # Run a specific benchmark
-python -m benchmarks.locomo.runner --config virtual-context.yaml
+python -m benchmarks.locomo.run --config virtual-context.yaml
 
 # Run with a specific provider
-python -m benchmarks.locomo.runner --provider anthropic --model claude-sonnet-4-20250514
+python -m benchmarks.locomo.run --provider anthropic --model claude-sonnet-4-20250514
 
 # Run stress tests via the proxy dashboard
 # 1. Start the proxy
@@ -109,14 +110,14 @@ virtual-context proxy --upstream https://api.anthropic.com
 
 ## Regression Tests
 
-The test suite includes regression markers tied to specific bugs (BUG-001 through BUG-031+). Each regression test reproduces the exact scenario that triggered a bug and verifies the fix. These run as part of the standard `pytest` suite:
+The test suite includes regression markers tied to specific bugs (`BUG-NNN` and `PROXY-NNN` series; see `tests/REGRESSION_MAP.md` for the full index). Each regression test reproduces the exact scenario that triggered a bug and verifies the fix. Run them via the `regression` marker:
 
 ```bash
-pytest tests/ -k "BUG"
+pytest tests/ -m regression
 ```
 
-Key regression areas:
-- **BUG-012**: Turn number indexing breaks when preamble messages shift indices
-- **BUG-018**: Tag summary rebuild drops segments during concurrent compaction
-- **BUG-024**: Chain restore produces orphaned tool_use without matching tool_result
-- **BUG-027**: Fact supersession fails when old and new facts use different verb forms
+Example regression areas (full descriptions in `tests/REGRESSION_MAP.md`):
+- **BUG-012**: Tag splitter collects empty or wrong text for turns in proxy history
+- **BUG-018**: Recent context turns pollute the inbound tagger after compaction
+- **BUG-036**: Sort-key insertion gaps exhaust under repeated mid-history inserts
+- **BUG-041**: Compaction materialized tag summaries for only a subset of segment tags
