@@ -355,7 +355,6 @@ The proxy includes a [live dashboard](#live-dashboard) at `http://localhost:5757
 virtual-context proxy -u https://api.anthropic.com  # start proxy
 virtual-context status                               # tag stats and token usage
 virtual-context tags                                 # list all tags
-virtual-context domains                              # tags with turn counts and summaries
 virtual-context recall auth                          # retrieve stored summaries for a tag
 virtual-context retrieve -m "What about auth?"       # tag + retrieve (JSON)
 virtual-context transform -m "What about auth?"      # tag + retrieve + assemble
@@ -366,7 +365,9 @@ virtual-context onboard [--upstream URL]              # guided setup (interactiv
 virtual-context daemon install|status|start|stop     # background service
 virtual-context config validate                      # check config syntax
 virtual-context telemetry [--verbose] [--json]       # cost, tokens, timing
+virtual-context import ...                           # import conversation history
 virtual-context chat [--headless] [--replay ...]     # interactive TUI or headless
+virtual-context admin <subcommand>                   # backfills and repairs (docs/commands.md)
 ```
 
 ## Interactive Chat (TUI)

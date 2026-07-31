@@ -130,3 +130,52 @@ Commands are detected by pattern matching in the user message text. Detection is
 - **Works on both paths**: Proxy (streaming and non-streaming) and direct REST API calls
 
 When a command is detected, the engine intercepts the request before forwarding to the upstream provider and handles it internally.
+
+## CLI Reference
+
+The `virtual-context` command line is a separate surface from the in-conversation commands above.
+
+| Subcommand | Purpose |
+|------------|---------|
+| `proxy` | Start the HTTP proxy for LLM enrichment |
+| `daemon install\|status\|start\|stop\|restart\|uninstall` | Manage the proxy as a background service |
+| `onboard` | Guided setup: create/validate config, optionally install the daemon |
+| `init <preset>` | Generate a config from a preset |
+| `presets list\|show <name>` | List or inspect config presets |
+| `config validate` | Validate the config file |
+| `status` | Show tag stats and token usage |
+| `tags` | List all tags in the store |
+| `recall <tag>` | Recall stored context by tag |
+| `retrieve -m <msg>` | Retrieve context for a message (JSON output) |
+| `transform -m <msg>` | Retrieve and assemble a context block |
+| `compact` | Trigger manual compaction |
+| `aliases list\|suggest\|add` | Manage tag aliases |
+| `chat` | Interactive TUI chat (`--headless --replay` for scripted runs) |
+| `import` | Import conversation history from exports |
+| `telemetry` / `cost-report` | Show conversation telemetry and cost |
+| `admin <subcommand>` | Operational primitives (backfills, repairs) |
+
+### Admin Subcommands
+
+`virtual-context admin` hosts guarded operational commands for backfilling and repairing stored data. They operate directly on the store, support explicit database targeting, and are designed to be idempotent:
+
+| Subcommand | Purpose |
+|------------|---------|
+| `backfill-tag-summaries` | Materialize missing tag summaries |
+| `backfill-fact-embeddings` | Write embeddings for facts that predate embedding storage |
+| `backfill-senders` | Recover sender labels on canonical turns |
+| `backfill-channels` | Recover channel provenance on canonical turns |
+| `backfill-actors` | Recover durable actor IDs from retained raw user text |
+| `backfill-reply-roles` | Recover reply roles and audience provenance |
+| `backfill-fact-authors` | Re-distill facts with canonical actor provenance |
+| `backfill-session-state-markers` | Rebuild session-restore markers from canonical rows |
+| `rebuild-actor-cards` | Rebuild per-actor card caches |
+| `rebuild-derived-data` | Rebuild derived data for a conversation |
+| `reattribute-audience` | Correct audience attribution on stored rows |
+| `resummarize-segments` | Re-run summarization for stored segments |
+| `resequence-canonical-turns` | Repair canonical turn ordering |
+| `normalize-canonical-actor-ids` | Normalize actor ID formats on canonical rows |
+| `reindex-canonical-turn-embeddings` | Rebuild canonical turn embedding indexes |
+| `retag-canonical-turns` | Re-tag stored turns with pair context via the configured tagger |
+
+Run `virtual-context admin <subcommand> --help` for the flags each command takes.
