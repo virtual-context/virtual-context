@@ -2,7 +2,34 @@
 
 This page provides copy-paste install commands for macOS/Linux and Windows, plus daemon setup instructions.
 
-## macOS / Linux
+## Requirements
+
+- Python **3.11 or newer**. On older Pythons, pip will refuse to resolve the package.
+- All core dependencies (including the proxy server) ship in the base install.
+
+## pip
+
+```bash
+pip install virtual-context
+```
+
+Optional extras for specific storage backends and features:
+
+```bash
+pip install "virtual-context[postgres]"   # PostgreSQL backend (psycopg + pool)
+pip install "virtual-context[redis]"      # Redis session cache for the proxy
+pip install "virtual-context[neo4j]"      # Neo4j backend
+pip install "virtual-context[falkordb]"   # FalkorDB backend
+pip install "virtual-context[all]"        # postgres + redis
+```
+
+The `storage.backend: postgres` configuration requires the `postgres` extra.
+
+### Config discovery
+
+Commands look for a config file named `virtual-context.yaml` (also accepted: `.yml`, `.json`, and the `virtualcontext.` prefix) starting in the current directory and walking up to your home directory, then fall back to `~/.virtualcontext/config.yaml`. Pass `-c <path>` to use an explicit file.
+
+## macOS / Linux (install script)
 
 Install the CLI:
 
@@ -74,6 +101,8 @@ Options:
 - Add `--no-start` to install service files without starting immediately.
 - Omit `--upstream` when using multi-instance proxy mode in `virtual-context.yaml`.
 
+The daemon runs the proxy on the default port **5757** (there is no `--port` flag on `daemon install`; multi-instance configs set ports per instance).
+
 After install, use daemon lifecycle commands:
 
 ```bash
@@ -88,8 +117,8 @@ virtual-context daemon uninstall
 
 Create a LaunchAgent so the proxy runs in the background.
 
-1. Run `virtual-context daemon install --upstream ...` (recommended), or manually create the plist below.
-2. Save this as `~/Library/LaunchAgents/io.virtualcontext.proxy.plist`:
+1. Run `virtual-context daemon install --upstream ...` (recommended; it writes a plist with fully resolved paths), or manually create the plist below.
+2. Save this as `~/Library/LaunchAgents/io.virtualcontext.proxy.plist`, **replacing `/Users/YOURNAME` with your actual home directory in the two log paths**. launchd does not expand `$HOME` in `StandardOutPath`/`StandardErrorPath` (those keys are used verbatim), so shell variables there break logging and can keep the job from spawning. `$HOME` inside `ProgramArguments` is fine because that line runs through `bash -lc`.
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -112,9 +141,9 @@ Create a LaunchAgent so the proxy runs in the background.
   <true/>
 
   <key>StandardOutPath</key>
-  <string>$HOME/Library/Logs/virtual-context.log</string>
+  <string>/Users/YOURNAME/Library/Logs/virtual-context.log</string>
   <key>StandardErrorPath</key>
-  <string>$HOME/Library/Logs/virtual-context.err.log</string>
+  <string>/Users/YOURNAME/Library/Logs/virtual-context.err.log</string>
 </dict>
 </plist>
 ```
@@ -130,7 +159,7 @@ launchctl start io.virtualcontext.proxy
 Check status/logs:
 
 ```bash
-launchctl list | rg virtualcontext
+launchctl list | grep virtualcontext
 tail -n 100 ~/Library/Logs/virtual-context.log
 ```
 
@@ -145,7 +174,7 @@ After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/virtual-context -c %h/virtual-context.yaml proxy --upstream https://api.anthropic.com
+ExecStart=%h/.local/bin/virtual-context -c %h/.virtualcontext/config.yaml proxy --upstream https://api.anthropic.com
 Restart=always
 RestartSec=2
 Environment=PYTHONUNBUFFERED=1
