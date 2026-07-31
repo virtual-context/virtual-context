@@ -70,7 +70,7 @@ Detection uses structural signals (field names, URL paths, model name prefixes) 
 
 The assembly pass uses greedy set cover to fill the context budget. Segments are sorted by retrieval score, then added in order until the budget is full. If a segment doesn't fit, smaller segments are tried.
 
-This is optimal in practice (within a constant factor of the theoretical best) and fast (single pass, O(n) in the number of candidate segments). More sophisticated approaches (dynamic programming, ILP) were tested but didn't improve results enough to justify the complexity.
+This is within a constant factor of the theoretical best and fast (single pass, O(n) in the number of candidate segments). More sophisticated packing approaches (dynamic programming, ILP) would add complexity without changing what the model sees in practice: the budget boundary falls in the tail of the score distribution, where candidates are near-interchangeable.
 
 ## Background Compaction, Never Blocking
 
@@ -84,8 +84,9 @@ The virtual-context block injected into the system prompt is a working set, not 
 
 1. **Recent turns** at full fidelity (protected window)
 2. **Retrieved summaries** for relevant topics (demand-paged based on the current query)
-3. **Topic hints** listing what else is available (table of contents, not full text)
-4. **Tool definitions** for `vc_expand_topic`, `vc_find_quote`, etc. (the model can page in more)
+3. **Extracted facts** and, for the requester, a person card (in group conversations, a speaker roster)
+4. **Topic hints** listing what else is available (table of contents, not full text)
+5. **Tool definitions** for `vc_expand_topic`, `vc_find_quote`, etc. (the model can page in more)
 
 This mirrors a demand-paged virtual memory system. The model operates on the working set. If it needs more, it calls a tool to fault the page in. The engine manages the page table (tag index), the page frames (segment budget), and eviction (compaction).
 

@@ -115,11 +115,7 @@ Only the `default` strategy entry is read. Broad recall ("summarize everything w
 
 ## Assembly
 
-The assembler constructs the `<virtual-context>` block that gets injected into the system prompt. It operates in two passes:
-
-### Priority Pass (Tag Rules)
-
-Tag rules define must-include content. If a tag rule matches the current query, segments under that tag are included first, consuming budget from the top.
+The assembler constructs the `<virtual-context>` block that gets injected into the system prompt. Alongside retrieved summaries it renders extracted facts, the requester's person card, and (in group conversations with speaker features enabled) the speaker roster.
 
 ### Fill Pass (Greedy Set Cover)
 
@@ -206,7 +202,7 @@ The monitor tracks context window fill level in real time:
 
 - After each turn, it recalculates: `(raw_history_tokens + injected_context_tokens) / context_window`
 - When the fill level crosses the soft threshold, it signals the compactor
-- When it crosses the hard threshold, it forces immediate deep compaction
+- When it crosses the hard threshold, it forces immediate compaction
 - The fill level is exposed via the dashboard and telemetry
 
 ## Tool Loop

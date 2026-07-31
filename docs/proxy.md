@@ -89,11 +89,11 @@ The proxy forwards raw SSE bytes from the upstream to preserve exact framing. A 
 
 Messages from OpenClaw (Telegram, WhatsApp, etc.) contain channel metadata that would pollute tagging if left in the model-visible text. The envelope parser first **claims** the useful parts (sender identity, channel, reply target) as provenance stored on the canonical turn, then strips the wrappers. Patterns handled include:
 
-- `[vc:prompt]\n` — marker from the OpenClaw plugin
-- `[vc:user]...[/vc:user]` — backward-compatible wrapper (inner content returned directly)
-- `System: [TIMESTAMP] event` lines — OpenClaw system events
-- `[ChannelName ... id:NNN ...] ` — channel header (Telegram, WhatsApp, etc.)
-- `[message_id: NNN]` — message footer
+- `[vc:prompt]\n`: marker from the OpenClaw plugin
+- `[vc:user]...[/vc:user]`: backward-compatible wrapper (inner content returned directly)
+- `System: [TIMESTAMP] event` lines: OpenClaw system events
+- `[ChannelName ... id:NNN ...] `: channel header (Telegram, WhatsApp, etc.)
+- `[message_id: NNN]`: message footer
 - Embedded conversation markers and metadata blocks
 
 ### Thread Safety
