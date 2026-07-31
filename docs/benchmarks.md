@@ -12,6 +12,8 @@ Virtual-context is evaluated against established long-conversation memory benchm
 
 ### LoCoMo
 
+A full LoCoMo run is not yet published; the headline accuracy figures in this documentation are LongMemEval results, reported above.
+
 Tests memory accuracy over extended multi-turn conversations. Questions are categorized by type:
 
 | Question Type | Description |
