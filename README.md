@@ -1,7 +1,7 @@
-<!-- [![PyPI](https://img.shields.io/pypi/v/virtual-context.svg)](https://pypi.org/project/virtual-context/) -->
-<!-- [![Python](https://img.shields.io/pypi/pyversions/virtual-context.svg)](https://pypi.org/project/virtual-context/) -->
-<!-- [![Downloads](https://img.shields.io/pypi/dm/virtual-context.svg)](https://pypistats.org/packages/virtual-context) -->
-<!-- [![License](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](https://github.com/yursilkidwai/virtual-context/blob/main/LICENSE) -->
+[![PyPI](https://img.shields.io/pypi/v/virtual-context.svg)](https://pypi.org/project/virtual-context/)
+[![Python](https://img.shields.io/pypi/pyversions/virtual-context.svg)](https://pypi.org/project/virtual-context/)
+[![Downloads](https://img.shields.io/pypi/dm/virtual-context.svg)](https://pypistats.org/packages/virtual-context)
+[![License](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](https://github.com/virtual-context/virtual-context/blob/main/LICENSE)
 [![Discord](https://img.shields.io/badge/Discord-Chat%20with%20us-5865F2?logo=discord&logoColor=white)](https://discord.gg/kGJva2D8Ej)
 [![Twitter](https://img.shields.io/badge/Twitter-Follow-1DA1F2?logo=x&logoColor=white)](https://x.com/virtualctx)
 
@@ -141,7 +141,7 @@ Set these to allow OpenClaw to maintain large context windows from a client pers
   }
 ```
 
-A dedicated [OpenClaw plugin](https://github.com/openclaw/openclaw/pull/12082) is also in progress, using lifecycle hooks for sync retrieval (`message.pre`) and fire-and-forget compaction (`agent.post`).
+A dedicated [OpenClaw plugin](https://github.com/virtual-context/openclaw-plugin) is also available, using lifecycle hooks for sync retrieval (`message.pre`) and fire-and-forget compaction (`agent.post`).
 
 ### Other Clients (Cursor, Continue, any OpenAI-compatible client)
 
@@ -528,7 +528,7 @@ git clone https://github.com/virtual-context/virtual-context.git
 cd virtual-context
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-python -m pytest tests/ -v --ignore=tests/ollama    # ~1500 unit tests
+python -m pytest tests/ -v --ignore=tests/ollama    # ~4,600 unit tests
 python -m pytest tests/ollama/ -v -m ollama          # integration (requires local LLM)
 ```
 
