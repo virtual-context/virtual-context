@@ -4,15 +4,13 @@ The engine is the core intelligence layer. It handles compression, tagging, fact
 
 ## Compactor
 
-Two-tier compaction converts raw conversation turns into compressed segments:
+Compaction converts raw conversation turns into compressed segments. It starts when the context window fill level crosses the soft threshold (default 70%) and is forced at the hard threshold (default 85%). It selects uncompacted turns outside the protected window, groups them by tag overlap, and calls the summarization LLM to produce condensed segment summaries. Each summary preserves the tag set, turn range, and token count of the original, and every non-`_general` tag on a just-compacted segment gets its tag summary materialized at commit.
 
-**Summary compaction** fires when the context window fill level crosses the soft threshold (default 70%). It selects uncompacted turns outside the protected window, groups them by tag overlap, and calls the summarization LLM to produce condensed segment summaries. Each summary preserves the tag set, turn range, and token count of the original.
+Compaction is incremental. A watermark tracks which turns have been processed; only turns above the watermark are candidates. Protected recent turns (default 6) are never compacted, keeping the most recent context at full fidelity. In multi-worker deployments each compaction runs as a leased, fenced operation, so a stalled worker cannot overwrite a takeover (see [architecture](architecture.md)).
 
-**Deep compaction** fires at the hard threshold (default 85%). It re-compresses existing summaries into even shorter forms, trading detail for budget.
+There is no second summarize-the-summaries tier. The separately named `deep_compaction_ratio` is a payload-side filter in the proxy's message rewriting: turns far enough below the compacted boundary are dropped from the outgoing payload entirely instead of being stubbed, because the segment summaries already cover them. Stored data is never affected.
 
-Compaction is incremental. A watermark tracks which turns have been processed. Only turns above the watermark are candidates. Protected recent turns (default 6) are never compacted, keeping the most recent context at full fidelity.
-
-The compactor runs in the background thread after `on_turn_complete`, never blocking the response path.
+The compactor runs on a background pool after `on_turn_complete`, never blocking the response path.
 
 ### Compaction Configuration
 
@@ -27,21 +25,19 @@ compaction:
 
 ## Tagging Pipeline
 
-Tags are the primary indexing mechanism. Every turn gets tagged twice, by two independent systems running in parallel:
+Tags are the primary indexing mechanism. Every turn is tagged on two paths, at two different moments:
 
 ### Inbound Embedding Tagger
 
-Runs on the user message before the LLM responds. Uses a local embedding model to compute vector similarity against existing tags, then assigns the closest matches above a threshold. This is fast, deterministic, and ensures retrieval safety: if a topic was discussed before, its tag will be found even if the user phrases it differently.
+Runs on the user message before the LLM responds (selected by `retrieval.inbound_tagger_type`, default `"embedding"`). Uses a local embedding model to compute vector similarity against existing tags, then assigns the closest matches above a threshold. This is fast, deterministic, and ensures retrieval safety: if a topic was discussed before, its tag will be found even if the user phrases it differently.
 
-### LLM Response Tagger
+### LLM Turn Tagger
 
-Runs after `on_turn_complete` with the full turn (user + assistant). Calls the configured tagger LLM (typically Haiku-class) to assign semantic tags. This produces richer vocabulary and catches nuances the embedding tagger misses, but takes a few hundred milliseconds.
-
-The two tag sets are merged. The union provides both retrieval reliability (embeddings) and vocabulary richness (LLM).
+Runs on the background path with the full completed turn (user + assistant). Calls the configured tagger LLM (typically a small, fast model) to assign semantic tags. This produces richer vocabulary and catches nuances the embedding tagger misses, with no latency pressure because the response has already streamed. Every turn ends up LLM-tagged; the inbound embedding tags exist so retrieval has tags before the turn completes.
 
 ### Context Bleed Gate
 
-When the conversation shifts topics abruptly, the inbound tagger may carry forward tags from the previous topic due to embedding similarity. The context bleed gate detects sharp topic shifts by measuring the overlap between the current inbound tags and the recent tag history. When overlap drops below a threshold, it suppresses carryover tags that would pollute retrieval.
+The turn tagger can include preceding turns in its prompt for context. The context bleed gate is an embedding-similarity check (`tag_generator.context_bleed_threshold`, default 0.1) that decides whether that preceding context is related enough to include: when the current turn's similarity to the preceding context falls below the threshold, the context is left out of the tagger prompt so an abrupt topic shift is not tagged with the previous topic's vocabulary.
 
 ### Tag Splitting and Aliases
 
@@ -52,12 +48,11 @@ When a tag grows too large (too many segments assigned), the engine splits it in
 The `TurnTagIndex` is the in-memory index of per-turn tag assignments. Each entry records:
 
 - Turn number
-- Inbound tags (from the embedding tagger)
-- Response tags (from the LLM tagger)
-- Primary tag (the strongest single tag for this turn)
-- Token count of the turn pair
+- The turn's tag list and primary tag (the strongest single tag)
+- The backing canonical turn ID
+- Session date, sender, and fact signals
 
-The index supports lookback queries (e.g., "what tags were active in the last 4 turns?") used by retrieval to determine the working set.
+The index supports lookback queries (e.g., "what tags were active in the last 4 turns?") used by retrieval to determine the working set. It is rebuilt from canonical turn rows on session restore.
 
 ## Segmenter
 
@@ -67,41 +62,44 @@ The segmenter splits compacted output into discrete segments, each with:
 - A token count
 - A text body (the summary)
 - A turn range (which original turns this covers)
-- A segment type (summary or deep-summary)
 
-Segments are the unit of storage and retrieval. When retrieval selects content to inject, it selects segments.
+Segments are the unit of summary storage. Retrieval ranks *tags* (see below) and then fetches the segments stored under the selected tags.
 
 ## Retrieval
 
-Retrieval finds stored segments relevant to the current query. It uses a 3-signal Reciprocal Rank Fusion (RRF) approach:
+Retrieval decides which stored *topics* are relevant to the current query. The ranked unit is the tag: three signals each produce a ranked list of candidate tags, the lists are fused, and segments are then fetched for the winning tags.
 
 ### Signal 1: IDF Tag Overlap
 
-Compares the inbound query tags against segment tag sets, weighted by inverse document frequency. Tags that appear on few segments score higher than ubiquitous tags. This is the primary recall signal.
+Compares the inbound query tags against stored tags, weighted by inverse document frequency. Tags that appear on few segments score higher than ubiquitous tags. This is the primary recall signal.
 
 ### Signal 2: BM25 Keyword
 
-Standard BM25 scoring of the query text against segment text. Catches keyword matches that the tag system might miss.
+BM25 scoring of the query text against stored summary text, aggregated per tag. Catches keyword matches that the tag system might miss.
 
 ### Signal 3: Embedding Cosine Similarity
 
-Vector similarity between the query embedding and segment embeddings. Catches semantic matches where neither tags nor keywords overlap.
+Vector similarity between the query embedding and tag-summary embeddings. Catches semantic matches where neither tags nor keywords overlap. The query vector can optionally be blended with recent conversational context (`retrieval.scoring.embedding_context_turns`), with a guard that prevents the blend from demoting a tag below its bare-query score.
 
-The three scores are combined via RRF with configurable weights.
+The three per-tag rankings are combined via Reciprocal Rank Fusion with configurable weights.
 
-### Gravity and Hub Dampening
+### Dampening and Boosts
 
-**Gravity dampening** penalizes segments from far in the past, preferring recent context when scores are close.
+After fusion, three adjustments run (all on by default, configurable under `retrieval.scoring.dampening`):
 
-**Hub dampening** penalizes segments that match too many queries (hub nodes in the retrieval graph), preventing commonly-tagged segments from dominating every retrieval.
+**Gravity dampening** halves the embedding score of tags that have no BM25 support at all, so a purely-semantic match cannot outrank tags with corroborating keyword evidence.
+
+**Hub dampening** penalizes tags whose segment count exceeds the 90th percentile of the tag-count distribution (query tags exempt), preventing catch-all topics from dominating every retrieval.
+
+**Resolution boost** promotes fact-bearing tags, so topics with extracted structured facts rank ahead of equally-scored topics without them.
+
+**Reserved seats** (`retrieval.scoring.embedding_reserved_seats`, off by default) can force the top N embedding-only candidates into the fused top-K, for queries where the embedding signal is the only one that finds the right topic.
 
 ### Active Tag Skipping
 
 Tags from the most recent N turns (configurable via `active_tag_lookback`) are skipped during retrieval. Their content is already present in the raw conversation history within the context window, so retrieving them would waste budget on duplicates.
 
 ### Strategy Configuration
-
-Different query types use different retrieval strategies:
 
 ```yaml
 retrieval:
@@ -111,15 +109,9 @@ retrieval:
       max_results: 10
       max_budget_fraction: 0.25
       include_related: true
-    broad:
-      max_results: 15
-      max_budget_fraction: 0.35
-    temporal:
-      max_results: 8
-      max_budget_fraction: 0.20
 ```
 
-Broad queries (detected by heuristic: questions about "everything", "all", summary requests) get more budget. Temporal queries (detected by time references: "last week", "in March") use the temporal resolver to constrain the date range.
+Only the `default` strategy entry is read. Broad recall ("summarize everything we discussed") is served by the `vc_recall_all` tool, and time-scoped queries by `vc_remember_when`, which uses the temporal resolver to turn relative dates into absolute ranges.
 
 ## Assembly
 
@@ -139,7 +131,7 @@ The assembly budget is a fraction of the total context window (default 25%). The
 
 ### Context Hints
 
-After compaction, the assembler can inject a topic list hint: a brief enumeration of all available tags with segment counts. This gives the model awareness of what it could ask about without spending tokens on full summaries. Controlled by `assembly.context_hint_enabled`.
+After compaction, the assembler injects a structured `<context-topics>` block: a budgeted topic list with per-topic descriptors, a line naming how many topics exist in total, and guidance telling the model how to page more detail in via the vc_* tools. Controlled by `assembly.context_hint_enabled`, budgeted by `assembly.context_hint_max_tokens` (default 2000). The hint is cached and pre-warmed at compaction commit, so the first request after a compaction does not pay the rebuild cost.
 
 ## Token Counter
 
@@ -147,9 +139,9 @@ Three counting modes, selected at startup:
 
 | Mode | Method | Speed | Accuracy |
 |------|--------|-------|----------|
-| `anthropic` | Anthropic's tokenizer library | Slow | Exact for Claude models |
+| `anthropic` | Bundled Claude-oriented tokenizer file | Slow | Approximate (~6% error vs. API-reported counts) |
 | `tiktoken` | OpenAI's tiktoken library | Fast | Exact for GPT models, close for others |
-| `estimate` | `len(text) / 4` | Instant | ~10-20% variance |
+| `estimate` | `len(text) / 4` | Instant | Rough |
 
 The counter is image-aware: for base64-encoded images, it uses dimension-based token costing (matching provider pricing) rather than counting the base64 string characters. This prevents massive overestimates for image-heavy conversations.
 
@@ -171,7 +163,7 @@ Each fact has metadata:
 
 ### Supersession
 
-When a new fact contradicts an existing one, the old fact is superseded. "User moved from NYC to LA" invalidates "User lives in NYC." Supersession runs during the compaction LLM pass, which has full context to judge contradictions.
+When a new fact contradicts an existing one, the old fact is superseded. "User moved from NYC to LA" invalidates "User lives in NYC." Supersession is a dedicated LLM-backed checker with its own provider and model configuration (`supersession:` block), invoked from the compaction pipeline after fact extraction.
 
 ### Fact Querying
 
@@ -181,7 +173,7 @@ The `vc_query_facts` tool allows structured queries against the fact store:
 vc_query_facts(subject="user", verb="visited", status="completed")
 ```
 
-Verb matching includes morphological expansion: querying "led" also matches "leads", "leading". Object matching auto-relaxes if too narrow.
+Verb matching expands through hand-curated synonym clusters plus embedding similarity against the verbs present in the store, so querying "led" can also match "managed" or "ran" where those verbs were extracted. Facts can additionally be ranked by dense similarity between the query and stored fact embeddings (`retrieval.fact_dense_retrieval`, model-versioned embeddings written at extraction time).
 
 ## Chain Collapse
 
