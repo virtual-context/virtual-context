@@ -36,6 +36,7 @@ from ..core.progress_snapshot import (
 )
 from ..core.canonical_turns import STRIP_WHITESPACE
 from ..core.store import ContextStore
+from ..core.exceptions import ConversationLifecycleConflict
 from ..types import AUDIENCE_ATTRIBUTION_VERSION, ChunkEmbedding, ConversationStats, DepthLevel, EngineStateSnapshot, Fact, FactLink, FactSignal, CanonicalTurnChunkEmbedding, CanonicalTurnReconcileRow, CanonicalTurnRow, LinkedFact, QuoteResult, SegmentMetadata, SourceProvenance, SpeakerRetrievalContext, StoredSegment, StoredSummary, TagStats, TagSummary, TemporalStatus, TurnTagEntry, WorkingSetEntry, channel_excerpt_prefix, strip_channel_hash
 from ..types import (
     CARD_CROSS_CONTEXT_KINDS,
@@ -3879,31 +3880,47 @@ CREATE TABLE IF NOT EXISTS request_captures (
         )
         return int(cursor.rowcount or 0)
 
-    def activate_conversation(self, conversation_id: str) -> int:
+    def activate_conversation(
+        self,
+        conversation_id: str,
+        *,
+        recreate_deleted: bool = False,
+    ) -> int:
         conn = self._get_conn()
-        row = conn.execute(
-            "SELECT generation FROM conversation_lifecycle WHERE conversation_id = ?",
-            (conversation_id,),
-        ).fetchone()
-        now = _dt_to_str(datetime.now(timezone.utc))
-        if row is None:
-            conn.execute(
-                """INSERT INTO conversation_lifecycle
-                (conversation_id, generation, deleted, updated_at)
-                VALUES (?, 0, 0, ?)""",
-                (conversation_id, now),
-            )
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                "SELECT generation, deleted FROM conversation_lifecycle "
+                "WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()
+            now = _dt_to_str(datetime.now(timezone.utc))
+            if row is None:
+                generation = 0
+                conn.execute(
+                    """INSERT INTO conversation_lifecycle
+                    (conversation_id, generation, deleted, updated_at)
+                    VALUES (?, 0, 0, ?)""",
+                    (conversation_id, now),
+                )
+            else:
+                if bool(row[1]) and not recreate_deleted:
+                    raise ConversationLifecycleConflict(
+                        "deleted conversation requires explicit recreation: "
+                        f"{conversation_id[:12]}"
+                    )
+                generation = int(row[0]) + (1 if bool(row[1]) else 0)
+                conn.execute(
+                    """UPDATE conversation_lifecycle
+                    SET generation = ?, deleted = 0, updated_at = ?
+                    WHERE conversation_id = ?""",
+                    (generation, now, conversation_id),
+                )
             conn.commit()
-            return 0
-        generation = int(row[0])
-        conn.execute(
-            """UPDATE conversation_lifecycle
-            SET deleted = 0, updated_at = ?
-            WHERE conversation_id = ?""",
-            (now, conversation_id),
-        )
-        conn.commit()
-        return generation
+            return generation
+        except Exception:
+            conn.rollback()
+            raise
 
     def begin_conversation_deletion(self, conversation_id: str) -> int:
         conn = self._get_conn()
@@ -3932,6 +3949,14 @@ CREATE TABLE IF NOT EXISTS request_captures (
             (conversation_id,),
         ).fetchone()
         return int(row[0]) if row is not None else 0
+
+    def is_conversation_deleted(self, conversation_id: str) -> bool:
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT deleted FROM conversation_lifecycle WHERE conversation_id = ?",
+            (conversation_id,),
+        ).fetchone()
+        return bool(row[0]) if row is not None else False
 
     def is_conversation_generation_current(
         self,
@@ -6595,13 +6620,36 @@ CREATE TABLE IF NOT EXISTS request_captures (
             conn.rollback()
             raise
 
-    def delete_conversation(self, conversation_id: str) -> int:
+    def delete_conversation(
+        self,
+        conversation_id: str,
+        *,
+        expected_generation: int | None = None,
+    ) -> int:
         conn = self._get_conn()
         # One explicit write transaction. The shipped implementation relied on
         # an implicit one, which is not sufficient once the card capture below
         # has to observe state that the very same delete is about to destroy.
         conn.execute("BEGIN IMMEDIATE")
         try:
+            if expected_generation is not None:
+                lifecycle_row = conn.execute(
+                    "SELECT generation, deleted FROM conversation_lifecycle "
+                    "WHERE conversation_id = ?",
+                    (conversation_id,),
+                ).fetchone()
+                current_generation = int(lifecycle_row[0]) if lifecycle_row else None
+                current_deleted = bool(lifecycle_row[1]) if lifecycle_row else False
+                if (
+                    current_generation != int(expected_generation)
+                    or not current_deleted
+                ):
+                    raise ConversationLifecycleConflict(
+                        "stale conversation delete refused for "
+                        f"{conversation_id[:12]}: expected generation "
+                        f"{expected_generation}, current={current_generation}, "
+                        f"deleted={current_deleted}"
+                    )
             tenant_row = conn.execute(
                 "SELECT tenant_id FROM conversations WHERE conversation_id = ?",
                 (conversation_id,),
@@ -6670,18 +6718,23 @@ CREATE TABLE IF NOT EXISTS request_captures (
             self._prune_orphan_actor_profiles(
                 conn, deleted_tenant, profile_actor_ids,
             )
+
+            # Remove generation-shared media before COMMIT releases the
+            # lifecycle write lock. A successor cannot create new files until
+            # the old directory has been removed.
+            import os
+            import shutil
+            _data_dir = str(self.db_path.parent) if hasattr(self, "db_path") else ""
+            media_dir = (
+                os.path.join(_data_dir, "media", conversation_id)
+                if _data_dir else ""
+            )
+            if media_dir and os.path.isdir(media_dir):
+                shutil.rmtree(media_dir, ignore_errors=True)
             conn.execute("COMMIT")
         except Exception:
             conn.execute("ROLLBACK")
             raise
-
-        # Disk cleanup: remove media files for this conversation
-        import os
-        import shutil
-        _data_dir = str(self.db_path.parent) if hasattr(self, "db_path") else ""
-        media_dir = os.path.join(_data_dir, "media", conversation_id) if _data_dir else ""
-        if media_dir and os.path.isdir(media_dir):
-            shutil.rmtree(media_dir, ignore_errors=True)
 
         return deleted
 
@@ -7264,64 +7317,97 @@ CREATE TABLE IF NOT EXISTS request_captures (
 
     def save_engine_state(self, state: EngineStateSnapshot) -> None:
         conn = self._get_conn()
-        entries_json = json.dumps([
-            {
-                "turn_number": e.turn_number,
-                "canonical_turn_id": getattr(e, "canonical_turn_id", "") or "",
-                "message_hash": e.message_hash,
-                "tags": e.tags,
-                "primary_tag": e.primary_tag,
-                "timestamp": _dt_to_str(e.timestamp),
-                "session_date": e.session_date,
-                "fact_signals": [
-                    {"subject": fs.subject, "verb": fs.verb,
-                     "object": fs.object, "status": fs.status}
-                    for fs in e.fact_signals
-                ] if e.fact_signals else [],
-                "code_refs": list(getattr(e, "code_refs", []) or []),
-                "sender": e.sender,
-            }
-            for e in state.turn_tag_entries
-        ])
-        # Include split_processed_tags, working_set, and trailing_fingerprint
-        # in the entries JSON blob (avoids schema migrations)
-        state_blob = json.dumps({
-            "turn_tag_entries": json.loads(entries_json),
-            "split_processed_tags": state.split_processed_tags,
-            "working_set": [
+        own_txn = not conn.in_transaction
+        if own_txn:
+            conn.execute("BEGIN IMMEDIATE")
+        try:
+            expected_generation = int(state.conversation_generation or 0)
+            conn.execute(
+                """INSERT OR IGNORE INTO conversation_lifecycle
+                (conversation_id, generation, deleted, updated_at)
+                VALUES (?, 0, 0, ?)""",
+                (
+                    state.conversation_id,
+                    _dt_to_str(datetime.now(timezone.utc)),
+                ),
+            )
+            lifecycle = conn.execute(
+                """SELECT generation, deleted FROM conversation_lifecycle
+                WHERE conversation_id = ?""",
+                (state.conversation_id,),
+            ).fetchone()
+            current_generation = int(lifecycle[0])
+            deleted = bool(lifecycle[1])
+            if deleted or current_generation != expected_generation:
+                raise ConversationLifecycleConflict(
+                    "stale engine checkpoint refused for "
+                    f"{state.conversation_id[:12]}: expected generation "
+                    f"{expected_generation}, current {current_generation}, "
+                    f"deleted={deleted}"
+                )
+            entries_json = json.dumps([
                 {
-                    "tag": ws.tag,
-                    "depth": ws.depth.value if hasattr(ws.depth, 'value') else ws.depth,
-                    "tokens": ws.tokens,
-                    "last_accessed_turn": ws.last_accessed_turn,
+                    "turn_number": e.turn_number,
+                    "canonical_turn_id": getattr(e, "canonical_turn_id", "") or "",
+                    "message_hash": e.message_hash,
+                    "tags": e.tags,
+                    "primary_tag": e.primary_tag,
+                    "timestamp": _dt_to_str(e.timestamp),
+                    "session_date": e.session_date,
+                    "fact_signals": [
+                        {"subject": fs.subject, "verb": fs.verb,
+                         "object": fs.object, "status": fs.status}
+                        for fs in e.fact_signals
+                    ] if e.fact_signals else [],
+                    "code_refs": list(getattr(e, "code_refs", []) or []),
+                    "sender": e.sender,
                 }
-                for ws in state.working_set
-            ],
-            "trailing_fingerprint": state.trailing_fingerprint,
-            "telemetry_rollup": state.telemetry_rollup,
-            "request_captures": state.request_captures,
-            "provider": state.provider,
-            "flushed_prefix_messages": state.flushed_prefix_messages,
-            "last_request_time": state.last_request_time,
-            "tool_tag_counter": state.tool_tag_counter,
-            "last_compacted_turn": state.last_compacted_turn,
-            "last_completed_turn": state.last_completed_turn,
-            "last_indexed_turn": state.last_indexed_turn,
-            "checkpoint_version": state.checkpoint_version,
-        })
-        conn.execute(
-            """INSERT OR REPLACE INTO engine_state
-            (conversation_id, compacted_prefix_messages, turn_count, turn_tag_entries, saved_at)
-            VALUES (?, ?, ?, ?, ?)""",
-            (
-                state.conversation_id,
-                state.compacted_prefix_messages,
-                state.turn_count,
-                state_blob,
-                _dt_to_str(state.saved_at),
-            ),
-        )
-        conn.commit()
+                for e in state.turn_tag_entries
+            ])
+            # Include split_processed_tags, working_set, and trailing_fingerprint
+            # in the entries JSON blob (avoids schema migrations)
+            state_blob = json.dumps({
+                "turn_tag_entries": json.loads(entries_json),
+                "split_processed_tags": state.split_processed_tags,
+                "working_set": [
+                    {
+                        "tag": ws.tag,
+                        "depth": ws.depth.value if hasattr(ws.depth, 'value') else ws.depth,
+                        "tokens": ws.tokens,
+                        "last_accessed_turn": ws.last_accessed_turn,
+                    }
+                    for ws in state.working_set
+                ],
+                "trailing_fingerprint": state.trailing_fingerprint,
+                "telemetry_rollup": state.telemetry_rollup,
+                "request_captures": state.request_captures,
+                "provider": state.provider,
+                "flushed_prefix_messages": state.flushed_prefix_messages,
+                "last_request_time": state.last_request_time,
+                "tool_tag_counter": state.tool_tag_counter,
+                "last_compacted_turn": state.last_compacted_turn,
+                "last_completed_turn": state.last_completed_turn,
+                "last_indexed_turn": state.last_indexed_turn,
+                "checkpoint_version": state.checkpoint_version,
+            })
+            conn.execute(
+                """INSERT OR REPLACE INTO engine_state
+                (conversation_id, compacted_prefix_messages, turn_count, turn_tag_entries, saved_at)
+                VALUES (?, ?, ?, ?, ?)""",
+                (
+                    state.conversation_id,
+                    state.compacted_prefix_messages,
+                    state.turn_count,
+                    state_blob,
+                    _dt_to_str(state.saved_at),
+                ),
+            )
+            if own_txn:
+                conn.commit()
+        except Exception:
+            if own_txn:
+                conn.rollback()
+            raise
 
     def _parse_engine_state_row(self, row) -> EngineStateSnapshot:
         raw = json.loads(row["turn_tag_entries"])

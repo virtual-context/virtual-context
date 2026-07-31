@@ -23,6 +23,24 @@ returns merge success unconditionally.
 from __future__ import annotations
 
 
+class ConversationReconcileBusy(RuntimeError):
+    """The canonical reconcile row lock was not acquired in time.
+
+    This is an availability signal, not a request-data error.  Callers must
+    surface it as retryable instead of silently continuing without the
+    cross-worker ingestion fence.
+    """
+
+
+class ConversationLifecycleConflict(RuntimeError):
+    """A destructive lifecycle operation no longer owns its generation.
+
+    Delete callers must treat this as retryable. It means a conversation was
+    recreated (or otherwise advanced) after deletion began, so committing the
+    stale purge would destroy successor data.
+    """
+
+
 class MergeAuditMissing(Exception):
     """Raised by the body method (`Store.merge_conversation_data`) when the
     pre-flight `SELECT 1 FROM merge_audit ... FOR UPDATE` (D1) finds no

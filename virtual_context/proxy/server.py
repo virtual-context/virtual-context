@@ -30,8 +30,10 @@ from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
 from ..engine import VirtualContextEngine
+from ..core.exceptions import ConversationReconcileBusy
 from ..core.tool_loop import (
     VC_TOOL_NAMES,  # noqa: F401 — re-exported
     vc_tool_definitions,
@@ -625,7 +627,7 @@ async def prepare_payload(
             " ".join(stage_bits) if stage_bits else "no-stages",
         )
 
-    def _serialize_payload_and_estimate(
+    def _serialize_payload_and_estimate_sync(
         payload: dict,
         *,
         serialize_stage: str,
@@ -643,6 +645,22 @@ async def prepare_payload(
             serialized_json=payload_json,
         )
         return payload_json, payload_bytes, payload_tokens
+
+    async def _serialize_payload_and_estimate(
+        payload: dict,
+        *,
+        serialize_stage: str,
+        count_stage: str,
+        cache_scope: str | None = None,
+    ) -> tuple[str, int, int]:
+        """Serialize/count/cache without blocking the ASGI event loop."""
+        return await asyncio.to_thread(
+            _serialize_payload_and_estimate_sync,
+            payload,
+            serialize_stage=serialize_stage,
+            count_stage=count_stage,
+            cache_scope=cache_scope,
+        )
 
     # Measure inbound BEFORE normalization using the media-aware segmented
     # estimator. It composes shell + per-message counts, which closely tracks
@@ -673,13 +691,16 @@ async def prepare_payload(
         _inbound_cache_source = "memory"
     elif _cache_provider and _cache_conv_id:
         _cache_load_stage = time.monotonic()
-        _inbound_cache = _cache_provider.load_payload_token_cache(_cache_conv_id)
+        _inbound_cache = await asyncio.to_thread(
+            _cache_provider.load_payload_token_cache, _cache_conv_id,
+        )
         _note_prep("inbound_token_cache_load", _cache_load_stage)
         if _inbound_cache is not None and state:
             state._inbound_payload_token_cache = _inbound_cache
             _inbound_cache_source = "redis"
     if body_bytes:
-        _inbound_cache_estimate = fmt.estimate_payload_tokens_segmented(
+        _inbound_cache_estimate = await asyncio.to_thread(
+            fmt.estimate_payload_tokens_segmented,
             body,
             cache=_inbound_cache,
         )
@@ -688,7 +709,8 @@ async def prepare_payload(
             state._inbound_payload_token_cache = _inbound_cache_estimate.cache
         if _cache_provider and _cache_conv_id:
             _cache_save_stage = time.monotonic()
-            _cache_provider.save_payload_token_cache(
+            await asyncio.to_thread(
+                _cache_provider.save_payload_token_cache,
                 _cache_conv_id,
                 _inbound_cache_estimate.cache,
             )
@@ -917,10 +939,13 @@ async def prepare_payload(
         (message for message in reversed(_request_messages) if message.role == "user"),
         None,
     )
-    _audience_conversation_id = _resolve_request_audience(
-        state, inbound_conversation_id,
+    _audience_conversation_id = await asyncio.to_thread(
+        _resolve_request_audience,
+        state,
+        inbound_conversation_id,
     )
-    _request_roles = _roles_for_active_user(
+    _request_roles = await asyncio.to_thread(
+        _roles_for_active_user,
         state,
         _active_user,
         user_message,
@@ -1047,8 +1072,10 @@ async def prepare_payload(
                 _data_dir = os.environ.get('VC_DATA_DIR', '/data/tenants')
         _media_dir = os.path.join(_data_dir, 'media')
         _media_stage = time.monotonic()
-        body, _media_compressed = compress_media_in_payload(
-            body, fmt,
+        body, _media_compressed = await asyncio.to_thread(
+            compress_media_in_payload,
+            body,
+            fmt,
             store=state.engine._store,
             conversation_id=state.engine.config.conversation_id,
             media_dir=_media_dir,
@@ -1076,7 +1103,13 @@ async def prepare_payload(
         from .state import PhaseDecision as _PhaseDecision
         _hpp_stage = time.monotonic()
         try:
-            _phase_decision = state.handle_prepare_payload(
+            # This path performs synchronous Redis/Postgres work, including a
+            # per-conversation reconcile lock.  Running it on the ASGI event
+            # loop means one blocked lifecycle row can make that worker stop
+            # answering even a liveness probe.  Keep the state operation
+            # synchronous, but isolate it in Starlette's worker-thread pool.
+            _phase_decision = await asyncio.to_thread(
+                state.handle_prepare_payload,
                 body=body,
                 payload_accounting=_payload_accounting,
                 # The pre-alias-resolution caller key. The engine's own
@@ -1087,7 +1120,7 @@ async def prepare_payload(
                 source_audience_conversation_id=_audience_conversation_id,
                 current_user_metadata=current_user_metadata,
             )
-        except _LE_MISMATCH:
+        except (_LE_MISMATCH, ConversationReconcileBusy):
             raise
         except Exception:
             logger.exception(
@@ -1150,7 +1183,9 @@ async def prepare_payload(
         if current_state in (SessionState.ACTIVE, SessionState.INGESTING):
             _dispatch_history_messages = state._completed_history_messages(_extract_ingestible_messages(body))
             _dispatch_needed_turns = state._history_turn_count(_dispatch_history_messages)
-            current_state, _passthrough_reason = state.resolve_prepare_state(_dispatch_history_messages)
+            current_state, _passthrough_reason = await asyncio.to_thread(
+                state.resolve_prepare_state, _dispatch_history_messages,
+            )
             _dispatch_completed_turns = state._completed_turn_count()
             _dispatch_indexed_turns = state._indexed_turn_count()
             _dispatch_existing_turns = _dispatch_indexed_turns
@@ -1175,7 +1210,7 @@ async def prepare_payload(
             # background tagger state for observability, not this
             # request's routing.
             if _owns_ingestion_lease and state.has_pending_indexing():
-                state.resume_pending_ingestion_if_needed()
+                await asyncio.to_thread(state.resume_pending_ingestion_if_needed)
             # ACTIVE-path dispatch log so operators can observe
             # "this prepare routed ACTIVE while pending tag work exists
             # in the background." The PASSTHROUGH_DECISION log fires
@@ -1259,7 +1294,7 @@ async def prepare_payload(
                 from .message_filter import trim_to_upstream_limit
                 _pre_trim_msgs = len(body.get(fmt.get_message_key(body) if hasattr(fmt, 'get_message_key') else 'messages', []))
                 body, _pt_trimmed = trim_to_upstream_limit(body, _pt_limit, fmt)
-                _pt_outbound_json, _outbound_bytes, _post_trim_tokens = _serialize_payload_and_estimate(
+                _pt_outbound_json, _outbound_bytes, _post_trim_tokens = await _serialize_payload_and_estimate(
                     body,
                     serialize_stage="passthrough_serialize_outbound",
                     count_stage="passthrough_count_outbound",
@@ -1292,7 +1327,7 @@ async def prepare_payload(
 
             # Compute outbound tokens (after trim + tool interception)
             if not _pt_outbound_json:
-                _pt_outbound_json, _outbound_bytes, _outbound_tokens = _serialize_payload_and_estimate(
+                _pt_outbound_json, _outbound_bytes, _outbound_tokens = await _serialize_payload_and_estimate(
                     body,
                     serialize_stage="passthrough_serialize_outbound",
                     count_stage="passthrough_count_outbound",
@@ -1448,15 +1483,20 @@ async def prepare_payload(
     inbound_ms = 0.0
     if state:
         try:
+            _prior_work_timeout = float(os.environ.get(
+                "VC_PRIOR_WORK_WAIT_TIMEOUT_SECONDS", "90",
+            ))
             t0 = time.monotonic()
-            await asyncio.to_thread(state.wait_for_tag)
+            await state.wait_for_tag_async(timeout=_prior_work_timeout)
             wait_ms += _note_prep("wait_for_prior_tag", t0)
             # Backpressure: if last tag_turn hit the hard threshold,
             # wait for pending compaction to finish before proceeding.
             # Soft threshold → async (no wait), hard → block until caught up.
             if state._last_compact_priority == "hard":
                 t_compact = time.monotonic()
-                await asyncio.to_thread(state.wait_for_compact)
+                await state.wait_for_compact_async(
+                    timeout=_prior_work_timeout,
+                )
                 wait_ms += _note_prep("wait_for_prior_compact", t_compact)
 
             if not state.is_conversation_deleted():
@@ -1946,7 +1986,7 @@ async def prepare_payload(
     _note_prep("strip_vc_markers", _strip_stage)
 
     # Ground truth: actual byte-measured outbound token count
-    _outbound_json, _outbound_bytes, outbound_tokens = _serialize_payload_and_estimate(
+    _outbound_json, _outbound_bytes, outbound_tokens = await _serialize_payload_and_estimate(
         enriched_body,
         serialize_stage="serialize_outbound",
         count_stage="count_outbound_tokens",
@@ -2038,7 +2078,7 @@ async def prepare_payload(
 
             # Re-serialize to get new outbound size
             fmt.strip_vc_markers(enriched_body)
-            _outbound_json, _outbound_bytes, outbound_tokens = _serialize_payload_and_estimate(
+            _outbound_json, _outbound_bytes, outbound_tokens = await _serialize_payload_and_estimate(
                 enriched_body,
                 serialize_stage="serialize_outbound_pass2",
                 count_stage="count_outbound_tokens_pass2",
@@ -2164,15 +2204,18 @@ async def prepare_payload(
         _budget_window = _context_window_limit
         def _budget_token_estimator(payload: dict) -> int:
             return _estimate_payload_tokens_cached(payload, cache_scope="outbound")
-        enriched_body, _budget_reductions, _budget_freed = enforce_payload_budget(
-            enriched_body, fmt, _budget_window,
+        enriched_body, _budget_reductions, _budget_freed = await asyncio.to_thread(
+            enforce_payload_budget,
+            enriched_body,
+            fmt,
+            _budget_window,
             store=state.engine._store,
             conversation_id=state.engine.config.conversation_id,
             initial_tokens=outbound_tokens,
             token_estimator=_budget_token_estimator,
         )
         if _budget_reductions > 0:
-            _outbound_json, _outbound_bytes, outbound_tokens = _serialize_payload_and_estimate(
+            _outbound_json, _outbound_bytes, outbound_tokens = await _serialize_payload_and_estimate(
                 enriched_body,
                 serialize_stage="serialize_outbound",
                 count_stage="count_outbound_tokens",
@@ -2243,7 +2286,7 @@ async def prepare_payload(
                 if _client_truncated:
                     _recovery_turns = _fill_turns
                 if _fill_summaries or _fill_turns:
-                    _outbound_json, _outbound_bytes, outbound_tokens = _serialize_payload_and_estimate(
+                    _outbound_json, _outbound_bytes, outbound_tokens = await _serialize_payload_and_estimate(
                         enriched_body,
                         serialize_stage="serialize_outbound",
                         count_stage="count_outbound_tokens",
@@ -2278,7 +2321,7 @@ async def prepare_payload(
         _bloat_fallback = True
         enriched_body = _pre_filter_body
         body = _pre_filter_body
-        _outbound_json, _outbound_bytes, outbound_tokens = _serialize_payload_and_estimate(
+        _outbound_json, _outbound_bytes, outbound_tokens = await _serialize_payload_and_estimate(
             enriched_body,
             serialize_stage="serialize_outbound",
             count_stage="count_outbound_tokens",
@@ -2352,7 +2395,7 @@ async def prepare_payload(
         from .message_filter import trim_to_upstream_limit
         enriched_body, _upstream_trimmed = trim_to_upstream_limit(enriched_body, _upstream_limit, fmt)
         if _upstream_trimmed:
-            _outbound_json, _outbound_bytes, outbound_tokens = _serialize_payload_and_estimate(
+            _outbound_json, _outbound_bytes, outbound_tokens = await _serialize_payload_and_estimate(
                 enriched_body,
                 serialize_stage="serialize_outbound",
                 count_stage="count_outbound_tokens",
@@ -2958,6 +3001,24 @@ def create_app(
     # requests to per-tenant engines. Default None = use local registry.
     app.state.state_resolver = None
 
+    @app.exception_handler(ConversationReconcileBusy)
+    async def _conversation_reconcile_busy_handler(
+        _request: Request,
+        exc: ConversationReconcileBusy,
+    ) -> JSONResponse:
+        logger.warning("CONVERSATION_RECONCILE_BUSY: %s", exc)
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "type": "conversation_reconcile_busy",
+                    "message": "Conversation state is busy; retry the request.",
+                    "retryable": True,
+                }
+            },
+            headers={"Retry-After": "1"},
+        )
+
     # Register dashboard routes BEFORE the catch-all so /dashboard is not swallowed
     # Dashboard uses the default state for settings and config access
     register_dashboard_routes(
@@ -3048,7 +3109,13 @@ def create_app(
         state: ProxyState | None = None
         _resolver = getattr(app.state, "state_resolver", None)
         if _resolver is not None:
-            state, is_new = _resolver(request, body, inbound_conversation_id)
+            # Cloud resolution constructs engines and reads Redis/Postgres.
+            # It is deliberately a synchronous hook, so never execute it on
+            # the ASGI event loop: a blocked backend or registry bug must not
+            # take liveness and unrelated tenants down with the request.
+            state, is_new = await asyncio.to_thread(
+                _resolver, request, body, inbound_conversation_id,
+            )
         elif registry:
             state, is_new = registry.get_or_create(
                 inbound_conversation_id, body=body,

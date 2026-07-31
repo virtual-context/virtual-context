@@ -21,6 +21,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingRes
 
 from ..tui.state import load_replay_prompts
 from ..types import Message, StrategyConfig
+from ..core.exceptions import ConversationLifecycleConflict
 
 if TYPE_CHECKING:
     from fastapi import FastAPI
@@ -373,8 +374,11 @@ def register_dashboard_routes(
             )
         try:
             begin_delete = getattr(store, "begin_conversation_deletion", None)
+            expected_generation = None
             if callable(begin_delete):
-                await asyncio.to_thread(begin_delete, conversation_id)
+                expected_generation = int(
+                    await asyncio.to_thread(begin_delete, conversation_id)
+                )
             await _stop_replay_for_conversation(conversation_id)
             target_state = None
             if registry and hasattr(registry, "remove_conversation"):
@@ -402,7 +406,16 @@ def register_dashboard_routes(
             # closes the engine's store, and this handler resolved its store
             # from that same engine, so the reverse order would purge through
             # a closed pool.
-            deleted = await asyncio.to_thread(store.delete_conversation, conversation_id)
+            delete_kwargs = (
+                {"expected_generation": expected_generation}
+                if expected_generation is not None
+                else {}
+            )
+            deleted = await asyncio.to_thread(
+                store.delete_conversation,
+                conversation_id,
+                **delete_kwargs,
+            )
             if target_state is not None:
                 try:
                     await asyncio.to_thread(
@@ -440,6 +453,16 @@ def register_dashboard_routes(
                 state = _dashboard_state()
             logger.info("Deleted conversation %s: %d segments removed", conversation_id, deleted)
             return JSONResponse({"deleted": deleted})
+        except ConversationLifecycleConflict as exc:
+            logger.warning(
+                "Stale conversation delete refused for %s: %s",
+                conversation_id,
+                exc,
+            )
+            return JSONResponse(
+                {"error": "Conversation lifecycle changed; retry deletion"},
+                status_code=503,
+            )
         except Exception as exc:
             logger.error("Failed to delete conversation %s: %s", conversation_id, exc, exc_info=True)
             return JSONResponse(

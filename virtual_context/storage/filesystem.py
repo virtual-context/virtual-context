@@ -11,6 +11,7 @@ from pathlib import Path
 import yaml
 
 from ..core.store import ContextStore
+from ..core.exceptions import ConversationLifecycleConflict
 from ..types import ChunkEmbedding, ConversationStats, DepthLevel, EngineStateSnapshot, QuoteResult, SegmentMetadata, StoredSegment, StoredSummary, TagStats, TagSummary, TurnTagEntry, WorkingSetEntry
 from .helpers import dt_to_str as _dt_to_str, str_to_dt as _str_to_dt, extract_excerpt as _extract_excerpt
 
@@ -892,10 +893,22 @@ class FilesystemStore(ContextStore):
         except (json.JSONDecodeError, OSError):
             return None
 
-    def activate_conversation(self, conversation_id: str) -> int:
+    def activate_conversation(
+        self,
+        conversation_id: str,
+        *,
+        recreate_deleted: bool = False,
+    ) -> int:
         path = self._conversation_lifecycle_path(conversation_id)
         path.parent.mkdir(parents=True, exist_ok=True)
         data = self._load_conversation_lifecycle(conversation_id) or {"generation": 0}
+        if data.get("deleted") and not recreate_deleted:
+            raise ConversationLifecycleConflict(
+                "deleted conversation requires explicit recreation: "
+                f"{conversation_id[:12]}"
+            )
+        if data.get("deleted"):
+            data["generation"] = int(data.get("generation", 0) or 0) + 1
         data["deleted"] = False
         data["updated_at"] = _dt_to_str(datetime.now(timezone.utc))
         path.write_text(json.dumps(data, indent=2))
@@ -917,6 +930,10 @@ class FilesystemStore(ContextStore):
     def get_conversation_generation(self, conversation_id: str) -> int:
         data = self._load_conversation_lifecycle(conversation_id) or {}
         return int(data.get("generation", 0) or 0)
+
+    def is_conversation_deleted(self, conversation_id: str) -> bool:
+        data = self._load_conversation_lifecycle(conversation_id) or {}
+        return bool(data.get("deleted", False))
 
     def is_conversation_generation_current(
         self,
@@ -1012,8 +1029,22 @@ class FilesystemStore(ContextStore):
     # Cross-cutting queries (stubs — FilesystemStore lacks SQL)
     # ------------------------------------------------------------------
 
-    def delete_conversation(self, conversation_id: str) -> int:
+    def delete_conversation(
+        self,
+        conversation_id: str,
+        *,
+        expected_generation: int | None = None,
+    ) -> int:
         """Delete all segments for a conversation. Returns segment count deleted."""
+        if expected_generation is not None:
+            data = self._load_conversation_lifecycle(conversation_id) or {}
+            if (
+                int(data.get("generation", 0) or 0) != int(expected_generation)
+                or not bool(data.get("deleted", False))
+            ):
+                raise ConversationLifecycleConflict(
+                    f"stale conversation delete refused for {conversation_id[:12]}"
+                )
         deleted = 0
         safe_id = conversation_id.replace("/", "_").replace("\\", "_").replace("..", "_")
 

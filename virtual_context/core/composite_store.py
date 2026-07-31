@@ -6,6 +6,7 @@ from datetime import timedelta
 from typing import TYPE_CHECKING
 
 from .protocols import FactLinkStore, FactStore, SearchStore, SegmentStore, StateStore
+from .exceptions import ConversationLifecycleConflict
 from ..types import (
     BacklogCandidate,
     ChunkEmbedding,
@@ -227,9 +228,15 @@ class CompositeStore:
     def get_orphan_tag_snippets(self, limit: int = 1000) -> list[dict]:
         return self._segments.get_orphan_tag_snippets(limit=limit)
 
-    def delete_conversation(self, conversation_id: str) -> int:
+    def delete_conversation(
+        self,
+        conversation_id: str,
+        *,
+        expected_generation: int | None = None,
+    ) -> int:
         deleted = 0
         seen: set[int] = set()
+        stores = []
         for store in (
             self._segments,
             self._facts,
@@ -241,9 +248,20 @@ class CompositeStore:
             if marker in seen or not hasattr(store, "delete_conversation"):
                 continue
             seen.add(marker)
+            stores.append(store)
+        if expected_generation is not None and len(stores) != 1:
+            raise ConversationLifecycleConflict(
+                "generation-fenced delete requires one transactional backend"
+            )
+        for store in stores:
+            kwargs = (
+                {"expected_generation": expected_generation}
+                if expected_generation is not None
+                else {}
+            )
             deleted = max(
                 deleted,
-                int(store.delete_conversation(conversation_id) or 0),
+                int(store.delete_conversation(conversation_id, **kwargs) or 0),
             )
         return deleted
 
@@ -800,10 +818,20 @@ class CompositeStore:
             conversation_id=conversation_id,
         )
 
-    def activate_conversation(self, conversation_id: str) -> int:
+    def activate_conversation(
+        self,
+        conversation_id: str,
+        *,
+        recreate_deleted: bool = False,
+    ) -> int:
         lifecycle = getattr(self._state, "activate_conversation", None)
         if callable(lifecycle):
-            return int(lifecycle(conversation_id) or 0)
+            return int(
+                lifecycle(
+                    conversation_id,
+                    recreate_deleted=recreate_deleted,
+                ) or 0
+            )
         return 0
 
     def begin_conversation_deletion(self, conversation_id: str) -> int:
@@ -817,6 +845,12 @@ class CompositeStore:
         if callable(lifecycle):
             return int(lifecycle(conversation_id) or 0)
         return 0
+
+    def is_conversation_deleted(self, conversation_id: str) -> bool:
+        lifecycle = getattr(self._state, "is_conversation_deleted", None)
+        if callable(lifecycle):
+            return bool(lifecycle(conversation_id))
+        return False
 
     def is_conversation_generation_current(
         self,
