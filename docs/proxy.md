@@ -65,31 +65,36 @@ The proxy auto-detects whether incoming requests use the Anthropic or OpenAI for
 
 Detection happens in `_detect_api_format()` — no configuration needed.
 
-### Request Lifecycle
+### Passthrough vs. Active Routing
+
+Not every request takes the full pipeline. The proxy routes each request by whether the conversation has **retrievable content**: any compacted segments or indexed turns. A brand-new conversation has neither, so its requests are passed through with minimal modification (media compression still applies) and near-zero added latency. Once the conversation has retrievable content, requests take the active path below. This gate is per-conversation and content-based, so cold starts are cheap and enrichment begins exactly when there is something to enrich. Operators can also force a conversation into passthrough via the dashboard (`POST /dashboard/conversations/{id}/passthrough`). Separately, if an enriched payload ever comes out larger than the original, a bloat fallback reverts to the unmodified payload for that request.
+
+### Request Lifecycle (active path)
 
 1. **Parse**: Read the POST body, detect API format, extract the last user message text.
-2. **Strip envelope**: Remove OpenClaw channel metadata (Telegram headers, message IDs, `[vc:prompt]` markers, `[vc:user]` wrappers, `System:` event lines).
+2. **Extract envelope**: Parse OpenClaw channel metadata (sender, channel, reply target) and preserve it as provenance, removing the wrappers from the model-visible text.
 3. **Wait**: Block until the previous turn's `on_turn_complete` finishes (runs in a background thread).
-4. **Ingest history** (first request only): Extract all prior user/assistant message pairs from the request body, tag them via `engine.ingest_history()`, and bootstrap the TurnTagIndex. This gives the engine full topic awareness from the client's conversation history without requiring a separate initialization step.
+4. **Reconcile**: Align the request's message history against the stored canonical turns, appending anything new (see [architecture](architecture.md)). On the first request this bootstraps the TurnTagIndex from the client's existing history via `engine.ingest_history()`.
 5. **Enrich**: Call `engine.on_message_inbound(message, history)` which tags the query, retrieves matching stored summaries, and assembles a context block.
 6. **Inject**: Deep-copy the request body and prepend the `<virtual-context>` block to the system prompt (Anthropic) or system message (OpenAI).
 7. **Forward**: Send the enriched request to the upstream provider. Streaming requests use raw byte forwarding to preserve exact SSE framing (critical for the Node.js Anthropic SDK).
 8. **Capture**: Accumulate the assistant's text from streaming deltas or the non-streaming response body.
-9. **Complete**: Append the assistant message to the conversation history and fire `on_turn_complete()` in a background thread. This tags the full turn, updates the TurnTagIndex, checks compaction thresholds, and builds tag summaries.
+9. **Complete**: Append the assistant message to the conversation history and fire `on_turn_complete()` in a background thread. This persists the completed turn, tags it, updates the TurnTagIndex, checks compaction thresholds, and builds tag summaries.
 
 ### Streaming Support
 
 The proxy forwards raw SSE bytes from the upstream to preserve exact framing. A side-channel parser accumulates text deltas for `on_turn_complete`. Non-2xx responses (rate limits, overloads) are returned as JSON errors instead of broken SSE streams.
 
-### OpenClaw Envelope Stripping
+### OpenClaw Envelope Handling
 
-Messages from OpenClaw (Telegram, WhatsApp, etc.) contain channel metadata that pollutes tagging. The proxy strips five patterns in order:
+Messages from OpenClaw (Telegram, WhatsApp, etc.) contain channel metadata that would pollute tagging if left in the model-visible text. The envelope parser first **claims** the useful parts (sender identity, channel, reply target) as provenance stored on the canonical turn, then strips the wrappers. Patterns handled include:
 
-1. `[vc:prompt]\n` — marker from the virtual-context-tagger OpenClaw plugin
-2. `[vc:user]...[/vc:user]` — backward-compatible wrapper (inner content returned directly)
-3. `System: [TIMESTAMP] event` lines — OpenClaw system events
-4. `[ChannelName ... id:NNN ...] ` — channel header (Telegram, WhatsApp, etc.)
-5. `[message_id: NNN]` — message footer
+- `[vc:prompt]\n` — marker from the OpenClaw plugin
+- `[vc:user]...[/vc:user]` — backward-compatible wrapper (inner content returned directly)
+- `System: [TIMESTAMP] event` lines — OpenClaw system events
+- `[ChannelName ... id:NNN ...] ` — channel header (Telegram, WhatsApp, etc.)
+- `[message_id: NNN]` — message footer
+- Embedded conversation markers and metadata blocks
 
 ### Thread Safety
 

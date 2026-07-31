@@ -26,19 +26,21 @@ This split is the default: `retrieval.inbound_tagger_type` is `"embedding"` out 
 
 The engine processes requests synchronously on the inbound path and asynchronously on the completion path. This is deliberate:
 
-**Inbound must be synchronous.** The model needs context before it can respond. Tagging, retrieval, and assembly must complete before the request is forwarded to the upstream. This adds ~50-200ms to request latency, but the alternative (sending an un-enriched request) defeats the purpose.
+**Inbound must be synchronous.** The model needs context before it can respond. Tagging, retrieval, and assembly must complete before the request is forwarded to the upstream. This adds latency to the request path, but the alternative (sending an un-enriched request) defeats the purpose. The inbound tagger is an embedding model by default precisely to keep this path off the LLM.
 
-**Completion can be asynchronous.** After the response is streamed back to the client, the background thread handles response tagging, index updates, compaction checks, and fact extraction. The user is already reading the response; this work doesn't block them.
+**Completion can be asynchronous.** After the response is streamed back to the client, the background path handles turn persistence, tagging, index updates, compaction checks, and fact extraction. The user is already reading the response; this work doesn't block them.
 
-The tradeoff: each new request must wait for the previous turn's completion to finish. The `wait_for_complete()` call at the start of each request ensures consistency. In practice, completion takes 200-500ms, and users take seconds between turns, so the wait is rarely noticeable.
+The tradeoff: each new request must wait for the previous turn's completion work on the same conversation. Users take seconds between turns, so the wait is rarely noticeable.
+
+**The REST path has no completion signal of its own.** A hosting service calls *prepare* before its LLM call and *ingest* after it, as two separate requests; the ingest may arrive late or never. That asymmetry is why prepare persists the user half of the turn immediately, why ingest reconciles rather than appends, and why every write is idempotent against redelivery. The proxy gets completion for free from sitting on the response stream; the REST surface has to earn the same guarantees with reconciliation.
 
 ## Tag Preservation Through Compaction
 
 When segments are compacted (summarized), their tag assignments are preserved. The summary inherits the tags of the original turns. This ensures that retrieval by tag still works after compaction; the tag space is stable even as the underlying text is compressed.
 
-When segments are deep-compacted (re-summarized), tags are preserved again. The tag set is monotonically stable across compaction tiers.
+The tag *vocabulary* is not frozen, though. Overloaded tags are split into narrower subtags, near-duplicate tags are canonicalized through the alias table, and queries against an old name still resolve to its successors. Stability comes from the alias chain, not from immutability.
 
-This is why tag quality matters so much at assignment time: tags are the permanent index. A bad tag persists through all compaction levels.
+This is why tag quality matters so much at assignment time: tags are the primary index. A bad tag persists until the vocabulary lifecycle corrects it, and everything stored under it in the meantime inherits the damage.
 
 ## Chain Collapse Over Truncation
 
