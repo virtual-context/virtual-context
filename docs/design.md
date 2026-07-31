@@ -54,7 +54,7 @@ Virtual-context operates as a proxy, not a library. It doesn't require changes t
 
 This is a deliberate constraint. SDK integrations are tighter and can do more (e.g., client-side token counting, structured prompting), but they require adoption, maintenance per framework, and lock-in. A proxy is invisible and universal.
 
-The SDK path exists (`virtual-context[sdk]`) for users who want direct engine access, but the primary distribution mechanism is the proxy.
+The SDK path exists (import `virtual_context` and drive `VirtualContextEngine` directly) for users who want direct engine access, but the primary distribution mechanism is the proxy.
 
 ## Format Detection Over Configuration
 

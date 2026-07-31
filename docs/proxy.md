@@ -5,8 +5,8 @@ The virtual-context proxy sits between any LLM client (OpenClaw, Cursor, custom 
 ## Quick Start
 
 ```bash
-# Install with bridge extras (adds uvicorn + fastapi)
-pip install virtual-context[bridge]
+# The base install includes the proxy server (uvicorn + fastapi)
+pip install virtual-context
 
 # Start the proxy
 ANTHROPIC_API_KEY=sk-... virtual-context proxy \
@@ -182,7 +182,11 @@ Lists all sessions that have stored segments (from compaction). Each session car
 - Compaction model used
 - **Delete** button for past sessions (removes all stored segments)
 
-**Endpoints**: `GET /dashboard/sessions`, `DELETE /dashboard/sessions/{session_id}`
+**Endpoints**: `GET /dashboard/conversations`, `DELETE /dashboard/conversations/{conversation_id}`
+
+### Dashboard Authentication
+
+Dashboard endpoints, including mutating ones (`POST /dashboard/shutdown`, `POST /dashboard/compact`, `PUT /dashboard/settings`, `DELETE /dashboard/conversations/{id}`, the replay controls, and the per-conversation passthrough toggle at `POST /dashboard/conversations/{id}/passthrough`), are **unauthenticated by default**. Set the `VC_DASHBOARD_TOKEN` environment variable to require a token on dashboard requests; the server logs a warning at startup when it is unset. The default bind address is `127.0.0.1`, so the dashboard is not reachable from other hosts unless you change `--host`. If you do bind a non-loopback address, set the token.
 
 #### Active Tags
 
@@ -309,7 +313,7 @@ The dashboard connects to `GET /dashboard/events` for real-time updates. The str
 
 ## Configuration Reference
 
-See `virtual-context-proxy.yaml` for a complete annotated proxy config. Key sections:
+See `virtual-context.yaml.example` in the repository root for a complete annotated config. Key sections:
 
 ```yaml
 version: "0.2"
