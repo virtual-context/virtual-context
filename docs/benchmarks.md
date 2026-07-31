@@ -94,7 +94,7 @@ python -m benchmarks.locomo.run --provider anthropic --model claude-sonnet-4-202
 # 1. Start the proxy
 virtual-context proxy --upstream https://api.anthropic.com
 
-# 2. Open http://localhost:8100/dashboard
+# 2. Open http://localhost:5757/dashboard
 # 3. Use the Replay panel with a stress test file
 ```
 

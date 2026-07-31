@@ -50,7 +50,7 @@ This mirrors virtual memory: pages are swapped to disk and faulted back in on ac
 
 ## No SDK Dependencies
 
-Virtual-context operates as a proxy, not a library. It doesn't require changes to the LLM client, the model, or the application code. You point your API calls at `localhost:8100` instead of `api.anthropic.com`, and everything works.
+Virtual-context operates as a proxy, not a library. It doesn't require changes to the LLM client, the model, or the application code. You point your API calls at `localhost:5757` instead of `api.anthropic.com`, and everything works.
 
 This is a deliberate constraint. SDK integrations are tighter and can do more (e.g., client-side token counting, structured prompting), but they require adoption, maintenance per framework, and lock-in. A proxy is invisible and universal.
 

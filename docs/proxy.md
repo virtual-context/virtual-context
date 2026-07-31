@@ -9,21 +9,21 @@ The virtual-context proxy sits between any LLM client (OpenClaw, Cursor, custom 
 pip install virtual-context[bridge]
 
 # Start the proxy
-ANTHROPIC_API_KEY=sk-... virtual-context -c virtual-context-proxy.yaml proxy \
+ANTHROPIC_API_KEY=sk-... virtual-context proxy \
   --upstream https://api.anthropic.com \
-  --port 8100
+  --port 5757
 
-# Point your LLM client at http://localhost:8100 instead of the real API
-# Open the dashboard at http://localhost:8100/dashboard
+# Point your LLM client at http://localhost:5757 instead of the real API
+# Open the dashboard at http://localhost:5757/dashboard
 ```
 
 ### CLI Options
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--upstream` | *(required)* | Upstream provider URL (e.g. `https://api.anthropic.com`, `http://localhost:11434/v1`) |
-| `--port` | `8100` | Local port to listen on |
-| `--host` | `0.0.0.0` | Bind address |
+| `--upstream` / `-u` | *(none)* | Upstream provider URL (e.g. `https://api.anthropic.com`, `http://localhost:11434/v1`). Required in single-instance mode; ignored when `proxy.instances` is configured |
+| `--port` / `-p` | `5757` | Local port to listen on |
+| `--host` | `127.0.0.1` | Bind address (localhost only by default) |
 | `-c` / `--config` | auto-discover | Path to `virtual-context.yaml` config file |
 
 ---
@@ -36,7 +36,7 @@ LLM Client (OpenClaw, Cursor, etc.)
     │  POST /v1/messages  (or /v1/chat/completions)
     ▼
 ┌─────────────────────────────────────────────┐
-│  virtual-context proxy  (localhost:8100)     │
+│  virtual-context proxy  (localhost:5757)     │
 │                                             │
 │  1. Detect API format (Anthropic / OpenAI)  │
 │  2. Extract user message                    │
