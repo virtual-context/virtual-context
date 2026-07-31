@@ -6,6 +6,7 @@ import asyncio
 import json
 import threading
 import time
+from concurrent.futures import Future
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
@@ -30,7 +31,8 @@ from virtual_context.proxy.metrics import ProxyMetrics
 from virtual_context.proxy.handlers import _handle_non_streaming
 from virtual_context.proxy.state import PhaseDecision
 from virtual_context.core.turn_tag_index import TurnTagIndex
-from virtual_context.types import AssembledContext, EngineState, Message, SplitResult, TagResult, TurnTagEntry
+from virtual_context.core.exceptions import ConversationReconcileBusy
+from virtual_context.types import AssembledContext, EngineState, Message, RequestRoles, SplitResult, TagResult, TurnTagEntry
 
 # ---------------------------------------------------------------------------
 # ProxyState
@@ -57,6 +59,20 @@ class TestProxyState:
         engine = self._make_engine()
         state = ProxyState(engine)
         state.wait_for_complete()  # should not raise
+
+    @pytest.mark.asyncio
+    async def test_async_tag_wait_times_out_without_clearing_worker_future(self):
+        state = ProxyState(self._make_engine())
+        future = Future()
+        state._pending_tag = future
+
+        with pytest.raises(asyncio.TimeoutError):
+            await state.wait_for_tag_async(timeout=0.01)
+        assert state._pending_tag is future
+
+        future.set_result(None)
+        await state.wait_for_tag_async(timeout=0.1)
+        assert state._pending_tag is None
 
     def test_fire_and_wait_for_tag(self):
         engine = self._make_engine()
@@ -368,6 +384,34 @@ def test_client(app_with_mock_engine):
 
 
 class TestIntegration:
+    def test_cloud_state_resolver_runs_off_the_asgi_event_loop(
+        self, app_with_mock_engine,
+    ):
+        app, _engine = app_with_mock_engine
+        observed = {"worker_thread": False}
+
+        def _resolver(_request, _body, _conversation_id):
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                observed["worker_thread"] = True
+            raise RuntimeError("resolver probe complete")
+
+        app.state.state_resolver = _resolver
+        from starlette.testclient import TestClient
+
+        with TestClient(app) as client:
+            with pytest.raises(Exception, match="resolver probe complete"):
+                client.post(
+                    "/v1/messages",
+                    json={
+                        "model": "test-model",
+                        "messages": [{"role": "user", "content": "hello"}],
+                    },
+                )
+
+        assert observed["worker_thread"] is True
+
     def test_non_chat_passthrough(self, test_client):
         """Non-chat POST requests are forwarded without engine involvement."""
         client, engine = test_client
@@ -502,6 +546,16 @@ class TestIntegration:
 
 class TestPreparePayloadInboundTokenCache:
     def test_prepare_payload_loads_and_saves_redis_payload_cache(self, tmp_path):
+        off_loop_calls: list[str] = []
+
+        def _record_off_loop(label: str) -> None:
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                off_loop_calls.append(label)
+                return
+            raise AssertionError(f"{label} ran on the ASGI event loop")
+
         config = load_config(config_dict={
             "conversation_id": "conv-123",
             "context_window": 10000,
@@ -550,12 +604,22 @@ class TestPreparePayloadInboundTokenCache:
             separator_tokens=1,
             total_tokens=24,
         )
-        provider.load_payload_token_cache.side_effect = [cached, None]
+        load_results = iter([cached, None])
+
+        def _load_cache(*_args, **_kwargs):
+            _record_off_loop("cache_load")
+            return next(load_results)
+
+        def _save_cache(*_args, **_kwargs):
+            _record_off_loop("cache_save")
+
+        provider.load_payload_token_cache.side_effect = _load_cache
+        provider.save_payload_token_cache.side_effect = _save_cache
         engine._session_state_provider = provider
 
         state = ProxyState(engine)
         fmt = AnthropicFormat()
-        fmt.estimate_payload_tokens_segmented = MagicMock(side_effect=[
+        estimates = iter([
             PayloadTokenEstimate(
                 total_tokens=24,
                 cache=next_cache,
@@ -571,6 +635,12 @@ class TestPreparePayloadInboundTokenCache:
                 shell_cache_hit=False,
             ),
         ])
+
+        def _estimate(*_args, **_kwargs):
+            _record_off_loop("token_estimate")
+            return next(estimates)
+
+        fmt.estimate_payload_tokens_segmented = MagicMock(side_effect=_estimate)
         body = {
             "model": "claude-opus-4-6",
             "stream": False,
@@ -598,6 +668,14 @@ class TestPreparePayloadInboundTokenCache:
         assert fmt.estimate_payload_tokens_segmented.call_args_list[1].kwargs["cache"] is None
         assert state._inbound_payload_token_cache == next_cache
         assert state._outbound_payload_token_cache == outbound_cache
+        assert off_loop_calls == [
+            "cache_load",
+            "token_estimate",
+            "cache_save",
+            "cache_load",
+            "token_estimate",
+            "cache_save",
+        ]
 
     def test_compute_protected_turn_stats_uses_precomputed_message_tokens(self):
         fmt = AnthropicFormat()
@@ -760,6 +838,208 @@ class TestPrepareRouting:
         engine.on_message_inbound.return_value = AssembledContext()
         metrics = ProxyMetrics()
         return ProxyState(engine, metrics=metrics), metrics
+
+    def test_canonical_reconcile_runs_off_the_asgi_event_loop(self):
+        state, metrics = self._make_state()
+        observed = {"worker_thread": False}
+
+        def _handle_prepare(**_kwargs):
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                observed["worker_thread"] = True
+            return PhaseDecision(phase="active", started_tagger=True)
+
+        state.handle_prepare_payload = _handle_prepare
+        state.resolve_prepare_state = MagicMock(
+            return_value=(SessionState.ACTIVE, None)
+        )
+        state.has_pending_indexing = MagicMock(return_value=False)
+        state.engine.on_message_inbound.return_value = AssembledContext()
+        body = {
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+
+        asyncio.run(
+            prepare_payload(
+                body,
+                state,
+                AnthropicFormat(),
+                metrics,
+                body_bytes=json.dumps(body).encode("utf-8"),
+            )
+        )
+
+        assert observed["worker_thread"] is True
+
+    def test_prepare_state_reset_and_ingestion_resume_run_off_event_loop(self):
+        state, metrics = self._make_state()
+        observed: list[str] = []
+
+        def _off_loop(label):
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                observed.append(label)
+                return
+            raise AssertionError(f"{label} ran on the ASGI event loop")
+
+        def _resolve(_history):
+            _off_loop("resolve_prepare_state")
+            return SessionState.ACTIVE, None
+
+        def _resume():
+            _off_loop("resume_pending_ingestion")
+            return False
+
+        state.handle_prepare_payload = MagicMock(
+            return_value=PhaseDecision(phase="active", started_tagger=True)
+        )
+        state.resolve_prepare_state = _resolve
+        state.has_pending_indexing = MagicMock(return_value=True)
+        state.resume_pending_ingestion_if_needed = _resume
+        body = {
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+
+        asyncio.run(
+            prepare_payload(
+                body,
+                state,
+                AnthropicFormat(),
+                metrics,
+                body_bytes=json.dumps(body).encode("utf-8"),
+            )
+        )
+
+        assert observed == [
+            "resolve_prepare_state",
+            "resume_pending_ingestion",
+        ]
+
+    def test_media_compression_runs_off_the_asgi_event_loop(self):
+        state, metrics = self._make_state()
+        observed: list[str] = []
+
+        def _compress(body, _fmt, **_kwargs):
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                observed.append("media_compression")
+                return body, 0
+            raise AssertionError("media compression ran on the ASGI event loop")
+
+        state.engine.config.tool_output.enabled = True
+        state.handle_prepare_payload = MagicMock(
+            return_value=PhaseDecision(phase="active", started_tagger=True)
+        )
+        state.resolve_prepare_state = MagicMock(
+            return_value=(SessionState.ACTIVE, None)
+        )
+        state.has_pending_indexing = MagicMock(return_value=False)
+        body = {
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+
+        with patch(
+            "virtual_context.proxy.media.compress_media_in_payload", _compress,
+        ):
+            asyncio.run(
+                prepare_payload(
+                    body,
+                    state,
+                    AnthropicFormat(),
+                    metrics,
+                    body_bytes=json.dumps(body).encode("utf-8"),
+                )
+            )
+
+        assert observed == ["media_compression"]
+
+    def test_speaker_audience_resolution_runs_off_the_asgi_event_loop(self):
+        state, metrics = self._make_state()
+        observed = {"audience": False, "roles": False}
+
+        def _audience(*_args, **_kwargs):
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                observed["audience"] = True
+            return "discord:guild:1"
+
+        def _roles(*_args, **_kwargs):
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                observed["roles"] = True
+            return RequestRoles()
+
+        state.handle_prepare_payload = MagicMock(
+            return_value=PhaseDecision(phase="active", started_tagger=True)
+        )
+        state.resolve_prepare_state = MagicMock(
+            return_value=(SessionState.ACTIVE, None)
+        )
+        state.has_pending_indexing = MagicMock(return_value=False)
+        body = {
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+
+        with (
+            patch("virtual_context.proxy.server._resolve_request_audience", _audience),
+            patch("virtual_context.proxy.server._roles_for_active_user", _roles),
+        ):
+            asyncio.run(
+                prepare_payload(
+                    body,
+                    state,
+                    AnthropicFormat(),
+                    metrics,
+                    body_bytes=json.dumps(body).encode("utf-8"),
+                    inbound_conversation_id="discord:guild:1",
+                )
+            )
+
+        assert observed == {"audience": True, "roles": True}
+
+    def test_canonical_reconcile_busy_is_not_swallowed(self):
+        state, metrics = self._make_state()
+
+        def _handle_prepare(**_kwargs):
+            raise ConversationReconcileBusy("busy")
+
+        state.handle_prepare_payload = _handle_prepare
+        body = {
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+
+        with pytest.raises(ConversationReconcileBusy):
+            asyncio.run(
+                prepare_payload(
+                    body,
+                    state,
+                    AnthropicFormat(),
+                    metrics,
+                    body_bytes=json.dumps(body).encode("utf-8"),
+                )
+            )
+
+    def test_reconcile_busy_has_retryable_503_handler(self, app_with_mock_engine):
+        app, _engine = app_with_mock_engine
+
+        handler = app.exception_handlers[ConversationReconcileBusy]
+        response = asyncio.run(
+            handler(MagicMock(), ConversationReconcileBusy("busy"))
+        )
+
+        assert response.status_code == 503
+        assert response.headers["retry-after"] == "1"
+        assert json.loads(response.body)["error"]["retryable"] is True
 
     def test_native_requester_replay_is_outbound_only(self):
         state, metrics = self._make_state()

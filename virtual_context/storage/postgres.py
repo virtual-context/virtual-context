@@ -5,7 +5,10 @@ from __future__ import annotations
 import contextvars
 import json
 import logging
+import os
 import re
+import signal
+import threading
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
@@ -26,6 +29,10 @@ from ..core.progress_snapshot import (
     ActiveCompactionSnapshot,
     ActiveEpisodeSnapshot,
     ProgressSnapshot,
+)
+from ..core.exceptions import (
+    ConversationLifecycleConflict,
+    ConversationReconcileBusy,
 )
 from ..types import (
     AUDIENCE_ATTRIBUTION_VERSION,
@@ -1188,17 +1195,75 @@ class PostgresStore(ContextStore):
         with self.pool.connection() as conn:
             now = _dt_to_str(datetime.now(timezone.utc))
             with conn.transaction():
-                conn.execute(
-                    """INSERT INTO conversation_lifecycle (conversation_id, generation, deleted, updated_at)
-                    VALUES (%s, 0, FALSE, %s)
-                    ON CONFLICT (conversation_id) DO UPDATE SET updated_at = EXCLUDED.updated_at""",
-                    (conversation_id, now),
-                )
-                conn.execute(
-                    "SELECT conversation_id FROM conversation_lifecycle WHERE conversation_id = %s FOR UPDATE",
-                    (conversation_id,),
-                ).fetchone()
-                yield
+                # Bound acquisition of the lifecycle row lock.  Do not use
+                # idle_in_transaction_session_timeout here: the reconciler
+                # intentionally yields while its body writes through other
+                # pooled connections, and killing this transaction mid-body
+                # would silently remove the serialization guarantee.  A lock
+                # timeout fails before the protected body starts instead.
+                try:
+                    conn.execute("SET LOCAL lock_timeout = '5s'")
+                    conn.execute(
+                        """INSERT INTO conversation_lifecycle (conversation_id, generation, deleted, updated_at)
+                        VALUES (%s, 0, FALSE, %s)
+                        ON CONFLICT (conversation_id) DO UPDATE SET updated_at = EXCLUDED.updated_at""",
+                        (conversation_id, now),
+                    )
+                    conn.execute(
+                        "SELECT conversation_id FROM conversation_lifecycle WHERE conversation_id = %s FOR UPDATE",
+                        (conversation_id,),
+                    ).fetchone()
+                except psycopg.errors.LockNotAvailable as exc:
+                    raise ConversationReconcileBusy(
+                        f"conversation reconcile busy: {conversation_id}",
+                    ) from exc
+
+                # A timeout on lock acquisition protects waiters, but it does
+                # not protect against a holder thread wedging after it owns
+                # the row. Releasing this transaction while that thread keeps
+                # writing would destroy the serialization guarantee, so the
+                # safe recovery is to terminate the owning worker. Uvicorn's
+                # parent (and Docker for single-worker deployments) respawns
+                # it, PostgreSQL rolls back the lock transaction, and the
+                # idempotent reconcile can retry cleanly.
+                try:
+                    holder_timeout_s = float(os.environ.get(
+                        "VC_RECONCILE_HOLDER_TIMEOUT_SECONDS", "300",
+                    ))
+                except (TypeError, ValueError):
+                    holder_timeout_s = 300.0
+                holder_guard = threading.Lock()
+                holder_active = True
+
+                def _abort_stuck_holder() -> None:
+                    nonlocal holder_active
+                    with holder_guard:
+                        if not holder_active:
+                            return
+                        logger.critical(
+                            "CONVERSATION_RECONCILE_HOLDER_TIMEOUT "
+                            "conversation=%s timeout_s=%.1f pid=%d; "
+                            "terminating worker for safe lock recovery",
+                            conversation_id,
+                            holder_timeout_s,
+                            os.getpid(),
+                        )
+                        os.kill(os.getpid(), signal.SIGKILL)
+
+                holder_timer = None
+                if holder_timeout_s > 0:
+                    holder_timer = threading.Timer(
+                        holder_timeout_s, _abort_stuck_holder,
+                    )
+                    holder_timer.daemon = True
+                    holder_timer.start()
+                try:
+                    yield
+                finally:
+                    with holder_guard:
+                        holder_active = False
+                    if holder_timer is not None:
+                        holder_timer.cancel()
 
     # Advisory-lock key serializing the whole schema bootstrap across
     # concurrent workers. Stable bigint (not a hash) so it's reproducible
@@ -3192,17 +3257,37 @@ class PostgresStore(ContextStore):
         )
         return int(cur.rowcount or 0)
 
-    def activate_conversation(self, conversation_id: str) -> int:
+    def activate_conversation(
+        self,
+        conversation_id: str,
+        *,
+        recreate_deleted: bool = False,
+    ) -> int:
         with self.pool.connection() as conn:
             row = conn.execute(
                 """INSERT INTO conversation_lifecycle (conversation_id, generation, deleted, updated_at)
                 VALUES (%s, 0, FALSE, %s)
                 ON CONFLICT (conversation_id) DO UPDATE SET
+                    generation = CASE
+                        WHEN conversation_lifecycle.deleted
+                        THEN conversation_lifecycle.generation + 1
+                        ELSE conversation_lifecycle.generation
+                    END,
                     deleted = FALSE,
                     updated_at = EXCLUDED.updated_at
+                WHERE NOT conversation_lifecycle.deleted OR %s
                 RETURNING generation""",
-                (conversation_id, _dt_to_str(datetime.now(timezone.utc))),
+                (
+                    conversation_id,
+                    _dt_to_str(datetime.now(timezone.utc)),
+                    bool(recreate_deleted),
+                ),
             ).fetchone()
+            if row is None:
+                raise ConversationLifecycleConflict(
+                    "deleted conversation requires explicit recreation: "
+                    f"{conversation_id[:12]}"
+                )
             return int(row["generation"] if isinstance(row, dict) else row[0])
 
     def begin_conversation_deletion(self, conversation_id: str) -> int:
@@ -3228,6 +3313,17 @@ class PostgresStore(ContextStore):
             if not row:
                 return 0
             return int(row["generation"] if isinstance(row, dict) else row[0])
+
+    def is_conversation_deleted(self, conversation_id: str) -> bool:
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                "SELECT deleted FROM conversation_lifecycle "
+                "WHERE conversation_id = %s",
+                (conversation_id,),
+            ).fetchone()
+            if not row:
+                return False
+            return bool(row["deleted"] if isinstance(row, dict) else row[0])
 
     def is_conversation_generation_current(
         self,
@@ -3469,6 +3565,12 @@ class PostgresStore(ContextStore):
         """
         with self.pool.connection() as conn:
             with conn.transaction():
+                # SSE callers impose a coroutine timeout, but cancelling an
+                # asyncio Future cannot stop the underlying psycopg thread.
+                # Native deadlines ensure the dedicated snapshot workers are
+                # actually released instead of becoming permanently stranded.
+                conn.execute("SET LOCAL lock_timeout = '2s'")
+                conn.execute("SET LOCAL statement_timeout = '5s'")
                 # Coordinate with delete/merge before observing the epoch.
                 conn.execute(
                     """SELECT 1 FROM conversation_lifecycle
@@ -4429,6 +4531,13 @@ class PostgresStore(ContextStore):
             # built-in try/finally.
             with self._alias_post_commit_scope_cm(conn) as post_commit_scope, \
                     conn.transaction():
+                # Bound both row-lock acquisition and total SQL time.  The
+                # cloud handler also isolates merge work in a dedicated,
+                # admission-limited executor; these native limits ensure a
+                # timed-out request releases its PostgreSQL connection and
+                # worker thread rather than continuing forever.
+                conn.execute("SET LOCAL lock_timeout = '5s'")
+                conn.execute("SET LOCAL statement_timeout = '120s'")
                 # D1 pre-flight: SELECT 1 FROM merge_audit FOR UPDATE.
                 # Holds the row lock through the body's commit so the
                 # stale-reservation sweeper cannot roll it back
@@ -6168,18 +6277,44 @@ class PostgresStore(ContextStore):
                     )
                 return "active"
 
-    def delete_conversation(self, conversation_id: str) -> int:
+    def delete_conversation(
+        self,
+        conversation_id: str,
+        *,
+        expected_generation: int | None = None,
+    ) -> int:
         with self.pool.connection() as conn:
             with conn.transaction():
                 # Take the lifecycle row lock BEFORE capture and deletion. The
                 # shipped implementation opened a transaction but took no
                 # lifecycle lock, so it did not coordinate with the merge fence
                 # that already locks this row FOR UPDATE.
-                conn.execute(
-                    """SELECT 1 FROM conversation_lifecycle
+                lifecycle_row = conn.execute(
+                    """SELECT generation, deleted FROM conversation_lifecycle
                         WHERE conversation_id = %s FOR UPDATE""",
                     (conversation_id,),
                 ).fetchone()
+                if expected_generation is not None:
+                    current_generation = (
+                        int(lifecycle_row["generation"])
+                        if isinstance(lifecycle_row, dict)
+                        else int(lifecycle_row[0])
+                    ) if lifecycle_row else None
+                    current_deleted = (
+                        bool(lifecycle_row["deleted"])
+                        if isinstance(lifecycle_row, dict)
+                        else bool(lifecycle_row[1])
+                    ) if lifecycle_row else False
+                    if (
+                        current_generation != int(expected_generation)
+                        or not current_deleted
+                    ):
+                        raise ConversationLifecycleConflict(
+                            "stale conversation delete refused for "
+                            f"{conversation_id[:12]}: expected generation "
+                            f"{expected_generation}, current={current_generation}, "
+                            f"deleted={current_deleted}"
+                        )
                 tenant_row = conn.execute(
                     """SELECT tenant_id FROM conversations
                         WHERE conversation_id = %s""",
@@ -6256,13 +6391,17 @@ class PostgresStore(ContextStore):
                     conn, deleted_tenant, profile_actor_ids,
                 )
 
-            # Disk cleanup: remove media files for this conversation
-            import os
-            import shutil
-            _data_dir = os.environ.get("VC_DATA_DIR", "/data/tenants")
-            media_dir = os.path.join(_data_dir, "media", conversation_id) if _data_dir else ""
-            if media_dir and os.path.isdir(media_dir):
-                shutil.rmtree(media_dir, ignore_errors=True)
+                # Remove generation-shared media before releasing the
+                # lifecycle row lock. A successor cannot activate and write
+                # new files until this transaction commits.
+                import shutil
+                _data_dir = os.environ.get("VC_DATA_DIR", "/data/tenants")
+                media_dir = (
+                    os.path.join(_data_dir, "media", conversation_id)
+                    if _data_dir else ""
+                )
+                if media_dir and os.path.isdir(media_dir):
+                    shutil.rmtree(media_dir, ignore_errors=True)
 
             return deleted
 
@@ -7500,7 +7639,45 @@ class PostgresStore(ContextStore):
     # ------------------------------------------------------------------
 
     def save_engine_state(self, state: EngineStateSnapshot) -> None:
-        with self.pool.connection() as conn:
+        with self.pool.connection() as conn, conn.transaction():
+            expected_generation = int(state.conversation_generation or 0)
+            # Materialize and lock the lifecycle row in the same transaction
+            # as the checkpoint upsert.  Locking an existing row is not
+            # enough: a missing-row check has no PostgreSQL gap lock and a
+            # concurrent delete could otherwise insert G1, purge, and then be
+            # followed by this stale G0 upsert.
+            conn.execute(
+                """INSERT INTO conversation_lifecycle
+                (conversation_id, generation, deleted, updated_at)
+                VALUES (%s, 0, FALSE, %s)
+                ON CONFLICT (conversation_id) DO NOTHING""",
+                (
+                    state.conversation_id,
+                    _dt_to_str(datetime.now(timezone.utc)),
+                ),
+            )
+            lifecycle = conn.execute(
+                """SELECT generation, deleted FROM conversation_lifecycle
+                WHERE conversation_id = %s FOR SHARE""",
+                (state.conversation_id,),
+            ).fetchone()
+            current_generation = int(
+                lifecycle["generation"]
+                if isinstance(lifecycle, dict)
+                else lifecycle[0]
+            )
+            deleted = bool(
+                lifecycle["deleted"]
+                if isinstance(lifecycle, dict)
+                else lifecycle[1]
+            )
+            if deleted or current_generation != expected_generation:
+                raise ConversationLifecycleConflict(
+                    "stale engine checkpoint refused for "
+                    f"{state.conversation_id[:12]}: expected generation "
+                    f"{expected_generation}, current {current_generation}, "
+                    f"deleted={deleted}"
+                )
             entries_data = {
                 "entries": [
                     {
