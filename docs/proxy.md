@@ -56,14 +56,18 @@ LLM Client (OpenClaw, Cursor, etc.)
 Upstream Provider (Anthropic, OpenAI, Ollama)
 ```
 
-### Two API Formats
+### Four API Formats
 
-The proxy auto-detects whether incoming requests use the Anthropic or OpenAI format:
+The proxy auto-detects which of four request formats each incoming request uses, and injects context at the right point for each:
 
-- **Anthropic**: detected by `"system"` field or model name starting with `"claude"`. Context injected into the `system` field.
-- **OpenAI**: default. Context injected as a system message at `messages[0]`.
+| Format | Detection Signal | Context Injection Point |
+|--------|-----------------|------------------------|
+| **Anthropic** | `"system"` field or model name starts with `"claude"` | `system` field (string or content blocks) |
+| **OpenAI Chat** | `/v1/chat/completions` path | `messages[0]` with `role: "system"` |
+| **OpenAI Responses** | `/v1/responses` path | `instructions` field |
+| **Gemini** | `/v1beta/models` path pattern | `system_instruction` field |
 
-Detection happens in `_detect_api_format()` — no configuration needed.
+Detection is automatic per request; no configuration needed.
 
 ### Passthrough vs. Active Routing
 
