@@ -318,12 +318,11 @@ context_window: 120000
 token_counter: "estimate"        # "estimate" (len/4) or "tiktoken"
 
 tag_generator:
-  type: "llm"                    # "llm", "keyword", or "embedding"
+  type: "llm"                    # "llm" or "keyword"
   provider: "anthropic"
   model: "claude-haiku-4-5-20251001"
   max_tags: 10
   min_tags: 5
-  broad_patterns: []             # disable regex (Haiku handles natively)
   temporal_patterns: []
 
 compaction:

@@ -39,23 +39,19 @@ Controls how conversation turns are tagged for indexing.
 
 ```yaml
 tag_generator:
-  type: "llm"                       # "llm", "embedding", or "keyword"
+  type: "llm"                       # "llm" or "keyword"
   provider: "anthropic"             # "anthropic", "openai", "gemini", "local", or "openrouter"
   model: "claude-haiku-4-5-20251001"
   max_tags: 10                      # maximum tags per turn
   min_tags: 5                       # minimum tags to assign
-  broad_patterns: []                # regex patterns for broad query detection
-  temporal_patterns: []             # regex patterns for temporal query detection
-  embedding_model: "text-embedding-3-small"  # model for embedding tagger
 ```
 
 **Type options**:
 
-- `llm`: Full LLM-based tagging. Best quality, ~200ms latency per turn. Uses the configured provider and model.
-- `embedding`: Embedding-only tagging. Faster, deterministic, but limited vocabulary. Assigns tags by vector similarity to existing tag set.
-- `keyword`: Regex-based keyword extraction. Fastest, lowest quality. Useful for testing or very cost-sensitive setups.
+- `llm`: LLM-based tagging of completed turns. Best quality. Uses the configured provider and model.
+- `keyword`: Keyword extraction with a configured vocabulary (`keyword_fallback`). Fastest, lowest quality. Useful for testing or very cost-sensitive setups.
 
-When `type` is `llm`, both the embedding tagger and LLM tagger run in parallel (two-tagger architecture). The embedding tagger provides the inbound tags for retrieval, while the LLM tagger provides richer response tags.
+Inbound tagging (the tags used for retrieval when a message arrives) is configured separately via `retrieval.inbound_tagger_type`: `"embedding"` (the default) assigns tags by vector similarity against the existing tag vocabulary using the local model at `retrieval.embedding_model` (default `all-MiniLM-L6-v2`), with no LLM call on the request path; `"llm"` routes inbound tagging through the LLM tagger instead. The LLM tagger always tags the completed turn on the background path, so every turn ends up LLM-tagged regardless of the inbound choice.
 
 ### Compaction
 

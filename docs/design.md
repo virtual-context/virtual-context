@@ -18,9 +18,9 @@ Why two taggers instead of one?
 
 **The LLM tagger is rich.** It understands context, catches implicit topics ("I'm worried about the deadline" -> `project-timeline`), and generates natural vocabulary that matches how users think about topics.
 
-Running both in parallel costs one Haiku call per turn (~0.01 cents) but provides the benefits of both approaches. The embedding tagger handles the inbound path (user message arrives, need tags now for retrieval), while the LLM tagger runs after the response (full turn context, no latency pressure).
+Running both costs one small-model LLM call per turn but provides the benefits of both approaches. The embedding tagger handles the inbound path (user message arrives, need tags now for retrieval), while the LLM tagger runs after the response (full turn context, no latency pressure).
 
-If you're optimizing for cost, set `tag_generator.type: "embedding"` to disable the LLM tagger entirely. The system degrades gracefully: retrieval still works, just with less vocabulary richness.
+This split is the default: `retrieval.inbound_tagger_type` is `"embedding"` out of the box, and can be set to `"llm"` to route inbound tagging through the LLM tagger instead. If you're optimizing for cost, set `tag_generator.type: "keyword"` to replace LLM tagging of completed turns with keyword extraction. The system degrades gracefully: retrieval still works, just with less vocabulary richness.
 
 ## Sync-First Processing
 
