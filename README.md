@@ -303,6 +303,8 @@ Type these as normal messages in any client connected through the proxy. Case-in
 | `VCCOMPACT` | Force compaction of uncompacted turns |
 | `VCLIST` | List all conversations with labels and turn counts |
 | `VCFORGET <tag>` | Delete segments and summaries for a specific tag |
+| `VCMERGE INTO <label\|id>` | Merge this conversation's stored data into another ([details](docs/commands.md)) |
+| `VCMERGESTATUS` | Report merge progress |
 
 ### VCATTACH: Shared Memory Across Platforms
 
@@ -314,7 +316,7 @@ When identity detaches (system prompt changes, client truncation loses the marke
 
 **Multi-agent collaboration.** Two agents (or two humans using different clients) can work on the same problem space simultaneously. Agent A researches in Claude Code, compacting findings. Agent B drafts a proposal in Telegram, pulling from the same segments. Each agent's contributions are compacted into the shared store. The virtual context IS the shared workspace.
 
-**Conversation merging.** Two conversations about the same topic? Pick the one with richer context and `VCATTACH` the other to it. The old conversation is deleted; the target keeps all its compacted data. The alias table is persistent, so stale markers follow the alias instead of creating orphans.
+**Redirect, not merge.** `VCATTACH` writes a durable alias: the old conversation identity routes to the target from then on, and nothing is deleted. The alias table is persistent, so stale markers embedded in older responses follow the alias instead of creating orphans. To combine two conversations' stored data into one, use `VCMERGE INTO <target>` ([details](docs/commands.md)).
 
 ## Virtual-Context vs RAG vs Compaction
 
