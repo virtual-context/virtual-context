@@ -51,6 +51,7 @@ def mock_store():
     s.delete_conversation.return_value = 0
     s.load_engine_state.return_value = None
     s.save_engine_state.return_value = None
+    s.activate_conversation.return_value = 0
     return s
 
 
@@ -62,6 +63,28 @@ def provider(mock_redis, mock_store):
 def test_load_returns_none_for_missing_key(provider, mock_redis):
     result = provider.load("conv-123")
     assert result is None
+
+
+def test_successful_redis_read_clears_prior_degraded_state(provider, mock_redis):
+    # First load: primary GET fails, fallback's freshness marker GET succeeds.
+    # Second load: primary GET succeeds with a clean miss.
+    mock_redis.get.side_effect = [RuntimeError("redis unavailable"), None, None]
+
+    assert provider.load("conv-recovery") is None
+    assert provider.is_degraded is True
+
+    assert provider.load("conv-recovery") is None
+    assert provider.is_degraded is False
+
+
+def test_authoritative_load_never_uses_durable_fallback(provider, mock_redis, mock_store):
+    mock_redis.get.side_effect = RuntimeError("selective redis failure")
+
+    with pytest.raises(RuntimeError, match="selective redis failure"):
+        provider.load_authoritative("conv-authority")
+
+    mock_store.load_engine_state.assert_not_called()
+    assert provider.is_degraded is True
 
 
 def test_save_and_load_roundtrip(provider, mock_redis):
@@ -115,6 +138,27 @@ def test_save_rejects_newer_redis_version_without_mutating_local_version(provide
     raw = mock_redis._test_store.get("vc:session:conv-123")
     blob = json.loads(raw)
     assert blob["version"] == 3
+
+
+def test_save_rejects_checkpoint_from_previous_conversation_generation(
+    provider, mock_redis,
+):
+    mock_redis._test_store["vc:session:conv-123"] = SessionState(
+        conversation_generation=2,
+        version=0,
+    ).to_json()
+
+    stale = SessionState(
+        conversation_generation=0,
+        version=7,
+        last_completed_turn=99,
+    )
+    assert provider.save("conv-123", stale) is None
+
+    loaded = provider.load("conv-123")
+    assert loaded is not None
+    assert loaded.conversation_generation == 2
+    assert loaded.last_completed_turn == -1
 
 
 def test_delete_sets_tombstone(provider, mock_redis):

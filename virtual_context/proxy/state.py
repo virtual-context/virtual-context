@@ -6,6 +6,7 @@ state machine for non-blocking ingestion and turn-complete processing.
 
 from __future__ import annotations
 
+import asyncio
 import enum
 import hashlib
 import inspect
@@ -1902,6 +1903,21 @@ class ProxyState:
             self._pending_tag.result()
             self._pending_tag = None
 
+    async def wait_for_tag_async(self, *, timeout: float | None = None) -> None:
+        """Await tagging without occupying a second executor thread."""
+        future = self._pending_tag
+        if future is None:
+            return
+        wrapped = asyncio.wrap_future(future)
+        if timeout is None:
+            await wrapped
+        else:
+            # A request deadline must not cancel the actual tag job. Keep it
+            # pending so the next request can observe the same completion.
+            await asyncio.wait_for(asyncio.shield(wrapped), timeout=timeout)
+        if self._pending_tag is future:
+            self._pending_tag = None
+
     def wait_for_compact(self) -> None:
         """Block until compaction finishes. Tagging should already be complete."""
         while True:
@@ -1909,6 +1925,33 @@ class ProxyState:
             if future is None:
                 return
             future.result()
+            if self._pending_compact is future:
+                self._pending_compact = None
+                return
+
+    async def wait_for_compact_async(
+        self,
+        *,
+        timeout: float | None = None,
+    ) -> None:
+        """Await compaction futures directly on the event loop."""
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            future = self._pending_compact
+            if future is None:
+                return
+            remaining = (
+                None if deadline is None
+                else max(0.0, deadline - time.monotonic())
+            )
+            wrapped = asyncio.wrap_future(future)
+            if remaining is None:
+                await wrapped
+            else:
+                await asyncio.wait_for(
+                    asyncio.shield(wrapped),
+                    timeout=remaining,
+                )
             if self._pending_compact is future:
                 self._pending_compact = None
                 return

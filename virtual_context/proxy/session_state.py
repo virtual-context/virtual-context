@@ -305,6 +305,11 @@ class SessionStateProvider:
         """
         try:
             raw = self._redis.get(self._key(conversation_id))
+            # A successful GET -- including a clean miss -- proves Redis
+            # recovered after a prior transport failure. ``_degraded`` tracks
+            # Redis authority, not whether the optional durable fallback has
+            # a row.
+            self._degraded = False
             if raw is None:
                 # Redis miss — try Postgres fallback
                 return self._load_from_store(conversation_id)
@@ -314,6 +319,32 @@ class SessionStateProvider:
             self._degraded = True
             # Degraded — try Postgres fallback
             return self._load_from_store(conversation_id)
+
+    def load_authoritative(self, conversation_id: str) -> SessionState | None:
+        """Load only from Redis, never from the durable fallback.
+
+        This per-call result is safe for multiworker lifecycle decisions.
+        Callers must not infer whether *their* read used Redis by sampling the
+        provider-wide ``is_degraded`` flag after ``load()``: another request
+        can clear that shared flag while the failed call is still completing
+        its fallback.
+        """
+        try:
+            raw = self._redis.get(self._key(conversation_id))
+            if raw is None:
+                self._degraded = False
+                return None
+            state = SessionState.from_json(raw)
+            self._degraded = False
+            return state
+        except Exception:
+            self._degraded = True
+            logger.warning(
+                "Authoritative Redis load failed for %s",
+                conversation_id[:12],
+                exc_info=True,
+            )
+            raise
 
     def save(self, conversation_id: str, state: SessionState) -> int | None:
         """Save session state to Redis with optimistic version check.
@@ -339,6 +370,21 @@ class SessionStateProvider:
                     if current.get("deleted"):
                         state.version = original_version
                         logger.info("Save rejected for %s — tombstoned", conversation_id[:12])
+                        return None
+                    current_generation = int(
+                        current.get("conversation_generation", 0) or 0
+                    )
+                    state_generation = int(
+                        getattr(state, "conversation_generation", 0) or 0
+                    )
+                    if current_generation != state_generation:
+                        state.version = original_version
+                        logger.info(
+                            "Save rejected for %s — stale generation %d != %d",
+                            conversation_id[:12],
+                            state_generation,
+                            current_generation,
+                        )
                         return None
                     current_version = int(current.get("version", 0) or 0)
                     if current_version > original_version:
@@ -686,17 +732,14 @@ class SessionStateProvider:
                 exc_info=True,
             )
 
-    def delete(self, conversation_id: str) -> None:
-        """Tombstone the conversation. BOTH backends must succeed.
+    def publish_tombstone(self, conversation_id: str) -> None:
+        """Publish the Redis deletion fence without touching PostgreSQL.
 
-        Redis tombstone prevents workers from loading the live state.
-        Postgres delete prevents resurrection via _load_from_store fallback.
-        If either fails, retry it — a partial delete leaks state.
+        Cloud lifecycle code uses this before durable purge so other workers
+        stop serving the generation before destructive work begins. ``delete``
+        calls it too, preserving the original public all-backends contract.
         """
         tombstone = SessionState(deleted=True, version=_MAX_VERSION)
-        errors: list[str] = []
-
-        # 1. Redis tombstone
         try:
             self._redis.set(
                 self._key(conversation_id),
@@ -709,13 +752,47 @@ class SessionStateProvider:
             self.delete_tag_summary_embedding_snapshot(conversation_id)
             self._degraded = False
         except Exception as e:
-            errors.append(f"Redis: {e}")
             self._degraded = True
+            raise RuntimeError(
+                f"Redis tombstone failed for {conversation_id[:12]}: {e}",
+            ) from e
 
-        # 2. Postgres delete
+    def delete(self, conversation_id: str) -> None:
+        """Tombstone the conversation. BOTH backends must succeed.
+
+        Redis tombstone prevents workers from loading the live state.
+        Postgres delete prevents resurrection via _load_from_store fallback.
+        If either fails, retry it — a partial delete leaks state.
+        """
+        errors: list[str] = []
+
+        # 1. Redis tombstone
+        try:
+            self.publish_tombstone(conversation_id)
+        except Exception as e:
+            errors.append(f"Redis: {e}")
+
+        # 2. Durable delete. Carry the generation returned by the deletion
+        # fence into the purge transaction so a stale worker cannot erase a
+        # conversation recreated after this delete began.
         if self._store and hasattr(self._store, "delete_conversation"):
             try:
-                self._store.delete_conversation(conversation_id)
+                begin_delete = getattr(
+                    self._store,
+                    "begin_conversation_deletion",
+                    None,
+                )
+                expected_generation = (
+                    int(begin_delete(conversation_id))
+                    if callable(begin_delete)
+                    else None
+                )
+                kwargs = (
+                    {"expected_generation": expected_generation}
+                    if expected_generation is not None
+                    else {}
+                )
+                self._store.delete_conversation(conversation_id, **kwargs)
             except Exception as e:
                 errors.append(f"Postgres: {e}")
         elif self._store is None:
@@ -745,12 +822,25 @@ class SessionStateProvider:
         self._tag_stats_runtime_cache.pop(conversation_id, None)
         self._tag_summary_embedding_snapshot_runtime_cache.pop(conversation_id, None)
         try:
+            activate = getattr(self._store, "activate_conversation", None)
+            generation = 0
+            if callable(activate):
+                generation = int(
+                    activate(conversation_id, recreate_deleted=True) or 0
+                )
             raw = self._redis.get(self._key(conversation_id))
-            if raw is None:
-                return
-            current = SessionState.from_json(raw)
-            if current.deleted:
-                self._redis.delete(self._key(conversation_id))
+            current = SessionState.from_json(raw) if raw is not None else None
+            if current is None or current.deleted:
+                # Keep an active-generation marker instead of deleting the
+                # tombstone key.  A detached pre-delete worker then sees a
+                # generation mismatch and cannot republish its old checkpoint.
+                self._redis.set(
+                    self._key(conversation_id),
+                    SessionState(
+                        conversation_generation=generation,
+                        version=0,
+                    ).to_json(),
+                )
             self._degraded = False
         except Exception:
             logger.warning("Redis undelete failed for %s", conversation_id[:12], exc_info=True)
@@ -790,6 +880,22 @@ class SessionStateProvider:
         """
         if not self._store or not hasattr(self._store, "load_engine_state"):
             return None
+        is_deleted = getattr(self._store, "is_conversation_deleted", None)
+        if callable(is_deleted):
+            try:
+                if is_deleted(conversation_id) is True:
+                    logger.info(
+                        "Skipping durable fallback for deleted conversation %s",
+                        conversation_id[:12],
+                    )
+                    return SessionState(deleted=True, version=_MAX_VERSION)
+            except Exception:
+                logger.warning(
+                    "Skipping durable fallback for %s — lifecycle state unavailable",
+                    conversation_id[:12],
+                    exc_info=True,
+                )
+                return None
         # Check if store is known-stale for this conversation (Redis key shared
         # across all workers). Fail CLOSED: if we can't read the marker
         # (Redis down), refuse the fallback. The only time we reach this path

@@ -1061,7 +1061,12 @@ class ContextStore(ABC):
     # Conversation lifecycle fencing
     # ------------------------------------------------------------------
 
-    def activate_conversation(self, conversation_id: str) -> int:
+    def activate_conversation(
+        self,
+        conversation_id: str,
+        *,
+        recreate_deleted: bool = False,
+    ) -> int:
         """Mark a conversation as live and return its current generation."""
         return 0
 
@@ -1072,6 +1077,10 @@ class ContextStore(ABC):
     def get_conversation_generation(self, conversation_id: str) -> int:
         """Return the current durable generation for a conversation."""
         return 0
+
+    def is_conversation_deleted(self, conversation_id: str) -> bool:
+        """Return whether durable lifecycle state forbids restoration."""
+        return False
 
     def is_conversation_generation_current(
         self,
@@ -1742,7 +1751,12 @@ class ContextStore(ABC):
     # Tool Output Storage
     # ------------------------------------------------------------------
 
-    def delete_conversation(self, conversation_id: str) -> int:
+    def delete_conversation(
+        self,
+        conversation_id: str,
+        *,
+        expected_generation: int | None = None,
+    ) -> int:
         return 0
 
     def delete_tag_aliases_for_conversation(self, conversation_id: str) -> int:
