@@ -223,16 +223,20 @@ The tool loop manages multi-round tool interactions where the model calls vc_* t
 
 ### Tool Catalogue
 
-The engine exposes these tools to the model:
+The engine exposes eight tools to the model on the proxy tool loop:
 
 | Tool | Purpose |
 |------|---------|
 | `vc_expand_topic` | Load full text for a topic tag (with optional collapse of other tags to free budget) |
-| `vc_find_quote` | Full-text search across all stored conversation text |
+| `vc_find_quote` | Full-text and semantic search across all stored conversation text |
+| `vc_search_summaries` | Search segment summaries instead of raw text |
+| `vc_find_session` | Locate a session after a session-suppressed quote result |
 | `vc_query_facts` | Structured fact lookup with filters |
 | `vc_remember_when` | Time-scoped recall (date ranges + query) |
 | `vc_recall_all` | Load all topic summaries at once |
 | `vc_restore_tool` | Recover a collapsed tool chain at full fidelity |
+
+This tool-loop surface is distinct from the MCP server's tool set (see the README's MCP section); the two lists overlap but are not the same.
 
 ### Anti-Repetition
 

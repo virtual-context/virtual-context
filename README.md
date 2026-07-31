@@ -209,7 +209,7 @@ if report:
 
 ### MCP Server
 
-virtual-context also exposes an MCP server for Claude Desktop, Cursor, or any MCP-compatible client. The model calls tools like `recall_all`, `remember_when`, `find_quote`, `query_facts`, `expand_topic`, and `collapse_topic` internally to build robust memory. These are not user-facing commands; the model decides when to use them based on what the conversation needs.
+virtual-context also exposes an MCP server for Claude Desktop, Cursor, or any MCP-compatible client. It registers eight tools: `recall_context`, `compact_context`, `expand_topic`, `recall_all`, `remember_when`, `find_quote`, `search_summaries`, and `domain_status`. These are not user-facing commands; the model decides when to use them based on what the conversation needs. (The proxy's in-conversation tool loop exposes a separate, overlapping set of eight `vc_*` tools; see [docs/engine.md](docs/engine.md).)
 
 ## What It Does
 
