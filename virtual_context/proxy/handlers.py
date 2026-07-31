@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from contextlib import ExitStack
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -1927,14 +1928,85 @@ async def _handle_vcattach(
                     "VCATTACH: shutdown of evicted state failed for %s", cid[:12],
                 )
 
-    execute_attach(
-        old_id=result.conversation_id,
-        target_id=target_id,
-        store=_inner,
-        # Core proxy: local eviction only. Cloud path: per-request Redis hydration
-        # ensures all workers see the reset state on next request.
-        registry_invalidate=_evict_and_close if registry else None,
+    lease_factory = getattr(
+        tenant_registry,
+        "_conversation_lifecycle_lease",
+        None,
     )
+    callback_factory = getattr(
+        tenant_registry,
+        "alias_invalidation_callback",
+        None,
+    )
+    cross_worker_invalidate = (
+        callback_factory(tenant_id)
+        if callable(callback_factory) and tenant_id
+        else None
+    )
+    session_state_provider = getattr(
+        tenant_registry,
+        "_session_state_provider",
+        None,
+    )
+    try:
+        with ExitStack() as lifecycle_leases:
+            if callable(lease_factory):
+                for alias_source in sorted(
+                    {result.conversation_id, target_id},
+                ):
+                    lifecycle_leases.enter_context(lease_factory(alias_source))
+            execute_attach(
+                old_id=result.conversation_id,
+                target_id=target_id,
+                store=_inner,
+                registry_invalidate=_evict_and_close if registry else None,
+                cross_worker_invalidate=cross_worker_invalidate,
+                session_state_provider=session_state_provider,
+            )
+    except Exception as exc:
+        from ..core.exceptions import InvalidationFailedError
+        if not isinstance(exc, InvalidationFailedError):
+            raise
+
+        # The alias DML may already be committed when Redis publication
+        # fails.  Preserve the REST-mode at-least-once contract in proxy
+        # mode: make the failure explicitly retryable instead of letting the
+        # outer proxy turn it into an opaque 500.  Streaming callers receive
+        # an SSE-formatted error with the same HTTP 503 + Retry-After
+        # semantics as JSON callers.
+        logger.warning(
+            "vcattach invalidation failed",
+            extra={
+                "metric": "vcattach_invalidation_failed",
+                "tenant_id": tenant_id or "",
+                "source": result.conversation_id[:12],
+                "target": target_id[:12],
+                "callback_error": repr(exc.__cause__),
+            },
+        )
+        retry_message = (
+            "alias eviction transport unavailable; retry the VCATTACH"
+        )
+        retry_headers = {"Retry-After": "1"}
+        if result.is_streaming:
+            streamed = f"[vcattach_invalidation_failed] {retry_message}"
+            return StreamingResponse(
+                iter([fmt.emit_fake_response_sse(streamed, target_id)]),
+                media_type="text/event-stream",
+                status_code=503,
+                headers=retry_headers,
+            )
+        return JSONResponse(
+            {
+                "conversation_id": target_id,
+                "vc_command": "attach",
+                "error": "alias eviction transport unavailable; retry",
+                "message": retry_message,
+                "retryable": True,
+            },
+            status_code=503,
+            headers=retry_headers,
+        )
 
     text = f"Conversation attached to {target_label} ({target_id}). History restored."
     if result.is_streaming:
@@ -2415,6 +2487,7 @@ def _handle_vc_command_rest(
     result, state, registry, tenant_id, vcconv,
     *,
     cross_worker_invalidate=None,
+    lifecycle_lease_factory=None,
 ):
     """REST endpoint handler for all VC commands. Returns JSONResponse.
 
@@ -2607,14 +2680,25 @@ def _handle_vc_command_rest(
             registry, "_session_state_provider", None,
         )
         try:
-            execute_attach(
-                old_id=conv_id,
-                target_id=target_id,
-                store=_inner,
-                registry_invalidate=_invalidate,
-                cross_worker_invalidate=cross_worker_invalidate,
-                session_state_provider=_session_state_provider,
-            )
+            # Cloud supplies a re-entrant, cross-worker lease factory.  Hold
+            # both alias sources mutated by execute_attach (target alias
+            # deletion and old-id alias save) in deterministic order so an
+            # in-flight multi-hop engine builder cannot publish a stale
+            # terminal between the DML commit and invalidation.
+            with ExitStack() as lifecycle_leases:
+                if callable(lifecycle_lease_factory):
+                    for alias_source in sorted({conv_id, target_id}):
+                        lifecycle_leases.enter_context(
+                            lifecycle_lease_factory(alias_source),
+                        )
+                execute_attach(
+                    old_id=conv_id,
+                    target_id=target_id,
+                    store=_inner,
+                    registry_invalidate=_invalidate,
+                    cross_worker_invalidate=cross_worker_invalidate,
+                    session_state_provider=_session_state_provider,
+                )
         except Exception as exc:
             from ..core.exceptions import InvalidationFailedError
             if isinstance(exc, InvalidationFailedError):

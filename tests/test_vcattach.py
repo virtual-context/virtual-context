@@ -4,6 +4,7 @@ import os
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 import asyncio
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -684,6 +685,61 @@ def test_rest_vcattach_does_not_call_session_state_provider_delete():
     inner.save_conversation_alias.assert_called_once_with("old-conv", "target-conv")
 
 
+def test_rest_vcattach_holds_both_alias_source_lifecycle_leases():
+    from virtual_context.proxy.handlers import _handle_vc_command_rest
+
+    inner = MagicMock()
+    inner.load_engine_state.return_value = {"conversation_id": "target-conv"}
+    state = SimpleNamespace(
+        engine=SimpleNamespace(_store=SimpleNamespace(_store=inner)),
+    )
+    registry, _provider = _build_rest_registry(
+        labels={"target-conv": "Telegram DM"},
+        conv_ids=["old-conv", "target-conv"],
+    )
+    active = set()
+    events = []
+
+    @contextmanager
+    def _lease(conversation_id):
+        events.append(("enter", conversation_id))
+        active.add(conversation_id)
+        try:
+            yield conversation_id
+        finally:
+            active.remove(conversation_id)
+            events.append(("exit", conversation_id))
+
+    def _save_alias(old_id, target_id):
+        assert active == {"old-conv", "target-conv"}
+        assert (old_id, target_id) == ("old-conv", "target-conv")
+
+    inner.save_conversation_alias.side_effect = _save_alias
+    result = SimpleNamespace(
+        vc_command="attach",
+        vc_command_arg="Telegram DM",
+        conversation_id="old-conv",
+    )
+
+    _handle_vc_command_rest(
+        result,
+        state,
+        registry,
+        tenant_id="tenant-1",
+        vcconv="old-conv",
+        lifecycle_lease_factory=_lease,
+    )
+
+    assert events[:2] == [
+        ("enter", "old-conv"),
+        ("enter", "target-conv"),
+    ]
+    assert events[-2:] == [
+        ("exit", "target-conv"),
+        ("exit", "old-conv"),
+    ]
+
+
 def test_rest_vcattach_evicts_issuing_chat_state():
     """The issuing chat's in-memory ProxyState must be popped from
     registry._states[tenant_id] so the next request from that chat falls
@@ -915,6 +971,133 @@ def test_proxy_vcattach_evicts_issuing_chat_state():
         "the next request from this chat keeps routing to the stale state."
     )
     assert "target-conv" in invalidated
+
+
+def test_proxy_vcattach_holds_cloud_lifecycle_leases_and_invalidates():
+    from virtual_context.proxy.handlers import _handle_vcattach
+    from virtual_context.proxy.formats import detect_format
+
+    inner = MagicMock()
+    inner.load_engine_state.return_value = {"conversation_id": "target-conv"}
+    state = SimpleNamespace(
+        engine=SimpleNamespace(_store=SimpleNamespace(_store=inner)),
+    )
+    registry = SimpleNamespace(remove_conversation=lambda _cid: None)
+    active = set()
+    events = []
+
+    class TenantRegistry:
+        _session_state_provider = None
+
+        @contextmanager
+        def _conversation_lifecycle_lease(self, conversation_id):
+            active.add(conversation_id)
+            try:
+                yield conversation_id
+            finally:
+                active.remove(conversation_id)
+
+        def alias_invalidation_callback(self, tenant_id):
+            assert tenant_id == "tenant-1"
+            return events.append
+
+    def _save_alias(old_id, target_id):
+        assert active == {"old-conv", "target-conv"}
+        assert (old_id, target_id) == ("old-conv", "target-conv")
+
+    inner.save_conversation_alias.side_effect = _save_alias
+    result = SimpleNamespace(
+        vcattach_label="target-conv",
+        conversation_id="old-conv",
+        is_streaming=False,
+    )
+    fmt = detect_format({
+        "model": "claude-sonnet-4-20250514",
+        "messages": [{"role": "user", "content": "VCATTACH target-conv"}],
+    })
+
+    asyncio.run(_handle_vcattach(
+        result,
+        fmt,
+        state,
+        registry,
+        labels={},
+        conv_ids=["old-conv", "target-conv"],
+        tenant_registry=TenantRegistry(),
+        tenant_id="tenant-1",
+    ))
+
+    assert active == set()
+    assert len(events) == 2
+
+
+@pytest.mark.parametrize("is_streaming", [False, True])
+def test_proxy_vcattach_invalidation_failure_is_retryable_503(is_streaming):
+    from virtual_context.core.exceptions import InvalidationFailedError
+    from virtual_context.proxy.handlers import _handle_vcattach
+    from virtual_context.proxy.formats import detect_format
+
+    inner = MagicMock()
+    inner.load_engine_state.return_value = {"conversation_id": "target-conv"}
+    state = SimpleNamespace(
+        engine=SimpleNamespace(_store=SimpleNamespace(_store=inner)),
+    )
+    registry = SimpleNamespace(remove_conversation=lambda _cid: None)
+
+    class TenantRegistry:
+        _session_state_provider = None
+
+        def alias_invalidation_callback(self, tenant_id):
+            assert tenant_id == "tenant-1"
+
+            def _fail(event):
+                raise InvalidationFailedError(
+                    event=event,
+                    cause=ConnectionError("redis offline"),
+                )
+
+            return _fail
+
+    result = SimpleNamespace(
+        vcattach_label="target-conv",
+        conversation_id="old-conv",
+        is_streaming=is_streaming,
+    )
+    fmt = detect_format({
+        "model": "claude-sonnet-4-20250514",
+        "stream": is_streaming,
+        "messages": [{"role": "user", "content": "VCATTACH target-conv"}],
+    })
+
+    async def _invoke():
+        response = await _handle_vcattach(
+            result,
+            fmt,
+            state,
+            registry,
+            labels={},
+            conv_ids=["old-conv", "target-conv"],
+            tenant_registry=TenantRegistry(),
+            tenant_id="tenant-1",
+        )
+        if hasattr(response, "body_iterator"):
+            chunks = []
+            async for chunk in response.body_iterator:
+                chunks.append(chunk.encode() if isinstance(chunk, str) else chunk)
+            return response, b"".join(chunks)
+        return response, response.body
+
+    response, body = asyncio.run(_invoke())
+
+    assert response.status_code == 503
+    assert response.headers["retry-after"] == "1"
+    assert b"alias eviction transport unavailable" in body
+    if is_streaming:
+        assert response.media_type == "text/event-stream"
+        assert b"vcattach_invalidation_failed" in body
+    else:
+        assert response.media_type == "application/json"
+        assert b'"retryable":true' in body
 
 
 # ---------------------------------------------------------------------
