@@ -36,7 +36,7 @@ virtual-context *manages* the window itself: compressing by topic, extracting st
 ```
 Layer 0: Raw conversation turns              (active memory, in the context window)
 Layer 1: Segment summaries + Facts per tag   (compressed pages, per-topic summaries)
-Layer 2: Tag summaries via greedy set cover   (working set descriptors, bird's-eye view)
+Layer 2: Tag summaries, one per topic        (working set descriptors, bird's-eye view)
 ```
 
 **[Full documentation →](https://virtual-context.com/docs/)** including [architecture and pipeline](https://virtual-context.com/docs/architecture/), [features deep dive](https://virtual-context.com/docs/capabilities/), [proxy internals](https://virtual-context.com/docs/proxy/), [design decisions](https://virtual-context.com/docs/design/), and [user commands](https://virtual-context.com/docs/vcattach/).
