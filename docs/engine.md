@@ -237,6 +237,15 @@ When the engine encounters base64-encoded images in conversation messages:
 
 A 391KB screenshot becomes ~40KB, cutting payload size by ~90%. Since providers use vision encoders with dimension-based token costs (not base64 string length), the token savings are modest, but the bandwidth and latency improvements are significant.
 
+## Session Restore and Recovery
+
+A conversation's live state (the TurnTagIndex, working set, watermarks) must survive process restarts and identity rebinds:
+
+- **Session-state snapshots**: the engine's per-conversation state is persisted through a session-state provider (Redis-backed in the proxy) and rehydrated on the next request, so a restart or redeploy does not reset the working set or watermarks.
+- **Self-hydrate on rebind**: when an engine is constructed for an explicit conversation ID (for example after `VCATTACH` redirects identity), it hydrates itself from the provider's snapshot for that conversation instead of starting cold.
+- **Markers from canonical rows**: the restore markers that make rehydration possible are derived from canonical turn rows, and `admin backfill-session-state-markers` rebuilds them for conversations that predate the mechanism (see [commands](commands.md)).
+- **Store-backed recovery**: when a client truncates its own history (Claude Code and OpenClaw both do this to manage their windows), the engine detects the truncation and restores the missing context from the durable store, so the upstream payload reads as if nothing was lost.
+
 ## Monitor
 
 The monitor tracks context window fill level in real time:
@@ -266,6 +275,21 @@ The engine exposes eight tools to the model on the proxy tool loop:
 | `vc_restore_tool` | Recover a collapsed tool chain at full fidelity |
 
 This tool-loop surface is distinct from the MCP server's tool set (see the README's MCP section); the two lists overlap but are not the same.
+
+### Time-Scoped Recall Modes
+
+`vc_remember_when` takes a `mode` that shapes what a temporal query returns:
+
+| Mode | Use |
+|------|-----|
+| `auto` (default) | The engine picks a mode from the query shape |
+| `lookup` | Narrow fact retrieval within the date range |
+| `state_at_time` | What was true on a specific date or short window |
+| `change_over_time` | Chronology and evidence: multiple dated items across the range |
+| `summarize_over_time` | Broad temporal synthesis: progression and shifts across the range |
+| `window_overview` | Browse what happened in a window, even without a strong topic query |
+
+Date ranges are resolved by the temporal resolver (relative phrases to absolute dates) and executed against stored session dates, so answers about "when" come from backend date math, not model recall.
 
 ### Anti-Repetition
 

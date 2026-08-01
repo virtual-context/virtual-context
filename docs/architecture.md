@@ -79,6 +79,7 @@ Ingestion reconciles each incoming payload against the rows already stored, on e
 - **Alignment**: incoming messages are matched to stored rows by content hash. A tail-hash fast path recognizes the common case (payload extends the stored conversation by one turn) without rewriting anything.
 - **Sort keys**: rows carry spaced numeric sort keys so mid-history inserts do not require renumbering. When repeated inserts exhaust a gap, the reconciler shifts subsequent keys to restore spacing.
 - **Fragment guard**: payloads that look like a fragment of a different conversation (no overlap with the stored tail) are rejected rather than appended, which prevents cross-conversation contamination.
+- **Turn groups**: canonical rows are per-message, so one logical turn (a user message and its assistant reply, or several user messages before one reply) spans multiple rows. A derived turn-group number ties those rows together, recomputed after ingestion, so compaction and windowing operate on whole logical turns and never split a reply from its prompt.
 - **Provenance**: sender, channel, actor identity, and reply-target metadata extracted from transport envelopes are stored on each row.
 
 ## Multi-Worker Coordination

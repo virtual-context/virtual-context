@@ -89,6 +89,8 @@ Not every request takes the full pipeline. The proxy routes each request by whet
 
 The proxy forwards raw SSE bytes from the upstream to preserve exact framing. A side-channel parser accumulates text deltas for `on_turn_complete`. Non-2xx responses (rate limits, overloads) are returned as JSON errors instead of broken SSE streams.
 
+Every streamed response emits three diagnostic log lines for operators: `STREAM_FIRST_BYTE` (time to the first upstream byte), `STREAM_STALL` (a mid-stream gap, with the gap length and chunk/byte counters at the point of the stall), and `STREAM_END` (total elapsed time, chunk and byte counts, and the largest gap observed). When a stream feels slow, these three lines localize whether the delay was before the first byte, inside the stream, or downstream of the proxy.
+
 ### OpenClaw Envelope Handling
 
 Messages from OpenClaw (Telegram, WhatsApp, etc.) contain channel metadata that would pollute tagging if left in the model-visible text. The envelope parser first **claims** the useful parts (sender identity, channel, reply target) as provenance stored on the canonical turn, then strips the wrappers. Patterns handled include:
