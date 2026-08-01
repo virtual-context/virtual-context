@@ -91,6 +91,22 @@ search:
   speaker_audience_scope: "channel"   # or "conversation"
 ```
 
+## Unified Guilds (Server-Wide Conversations)
+
+A server-style community can be unified into one conversation deliberately, via the caller-asserted stable-key namespace: conversation keys of the form `sk:agent:<name>:<platform>:<kind>:<id>` carry a `kind` segment, and `guild` is a first-class kind alongside `channel`, `group`, `direct`, and `dm`. A guild-kind key makes every channel of the server share one conversation owner: one memory, one fact base, one actor space for the whole community.
+
+That sharing is bounded by two privacy rules, both fail-closed:
+
+- **DM content can never render into guild context.** A stored row is eligible to render into guild-visible context only when it carries *both* an origin channel and a proved audience. A DM row has no origin channel, so the eligibility check structurally excludes it. This boundary is shared by every guild read path (native requester replay and peer reference context alike), so there is no path that renders a DM into a server channel.
+- **Audience proof is per-row, not per-conversation.** Owner-scoped lookup alone is not enough to render a row; each physical row must carry its own audience proof. Audience *equality* is deliberately not required, because peer guild channels and routes retained from before an alias change legitimately carry distinct audience IDs inside the same owner-scoped conversation.
+
+Within those bounds, a unified guild gets:
+
+- **Native requester replay**: the requester's own guild history is replayed into the model-visible window as native turns (correctly paired and ordered against the payload), so the assistant remembers its exchanges with that member regardless of which channel they happened in.
+- **Peer-channel visibility**: recent activity from sibling channels is merged in as reference context via `assembly.protected_window_db_source: "merge"` (mechanics in [engine internals](engine.md#cross-channel-context-unified-group-conversations)), with instruction authority reserved to the current requester.
+- **Actor continuity**: the same actor keeps one identity, one card, and one fact history across every channel of the server.
+- **Guild-appropriate search scope**: `search.speaker_audience_scope: "conversation"` (above) treats the origin channel as provenance rather than a filter, matching the unified model.
+
 ## Operator Surface
 
 Existing conversations predate these columns, so the admin CLI ships guarded, idempotent backfills (see [commands](commands.md) for the full table):
