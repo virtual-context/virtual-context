@@ -44,7 +44,11 @@ tag_generator:
   model: "claude-haiku-4-5-20251001"
   max_tags: 10                      # maximum tags per turn
   min_tags: 5                       # minimum tags to assign
+  prompt_mode: "detailed"           # "detailed" (full rules + examples) or "compact" (minimal)
+  temporal_heuristic_enabled: true  # ON BY DEFAULT: pattern-based temporal detection backstops the LLM
 ```
+
+`temporal_heuristic_enabled` marks a query temporal from date/time patterns in the text even when the LLM tagger did not, which routes it toward time-scoped retrieval. `prompt_mode: "compact"` shrinks the tagger prompt for cheaper models at some quality cost.
 
 **Type options**:
 
@@ -70,7 +74,11 @@ compaction:
   fill_pass_target: "soft"          # "soft", "hard", or a float fraction
   fill_pass_summary_ratio: 0.60
   store_recovery_threshold: 0.70    # recover from store when payload < this fraction of stored turns
+  code_mode: true                   # ON BY DEFAULT: coding-oriented prompts, no investigatory-action facts, code_refs
+  session_gap_minutes: 30           # split segments when messages are >N minutes apart (0 = disabled)
 ```
+
+`code_mode` is on by default and changes what facts are extracted; see [engine internals](engine.md#code-mode). `session_gap_minutes` silently splits segments at conversational time gaps, so widely spaced messages summarize separately even when their topics match.
 
 `defer_payload_mutation` and the flush gate are documented in [engine internals](engine.md). `fill_pass_enabled` conflicts with deferral (it rewrites the payload every request); the proxy warns if both are on.
 
@@ -114,6 +122,7 @@ SQLite is the default and requires no setup. PostgreSQL (requires the `postgres`
 retrieval:
   inbound_tagger_type: "embedding"  # "embedding" or "llm" (inbound path)
   embedding_model: "all-MiniLM-L6-v2"  # local model for the embedding tagger
+  skip_active_tags: true            # ON BY DEFAULT: don't re-retrieve tags already in the raw window
   active_tag_lookback: 4            # recent turns whose tags are skipped
   anchorless_lookback: 6            # turns used when no tags match
   strategy_config:
@@ -172,7 +181,10 @@ assembly:
   context_hint_enabled: true        # inject topic list after compaction
   context_hint_max_tokens: 2000     # max tokens for the topic hint
   protected_window_db_source: "off" # "merge" = store-fed recent window for unified multi-channel conversations
+  pre_compaction_filtering: "aggressive"  # "off" | "conservative" | "aggressive"
 ```
+
+`pre_compaction_filtering` governs tag-based relevance drops from the payload *before* the first compaction: `"off"` passes every turn through, `"conservative"` drops with a doubled protected window (`protected_recent_turns * 2`), and the default `"aggressive"` drops with the standard protected window. After the first compaction the standard window always applies regardless of this setting.
 
 **`context_hint_enabled`**: When true, after compaction the assembler injects a brief list of all available tags with segment counts. This gives the model topic awareness without spending full summary budget.
 
@@ -285,6 +297,7 @@ proxy:
   llm_calls_log: null               # JSONL log of internal LLM calls
   upstream_context_limit: null      # cap on tokens forwarded upstream
   passthrough_trim_ratio: 0.40      # trim ratio applied on the passthrough path
+  history_widening_threshold: 0.10  # growth fraction that triggers a full re-ingest
   redis_url: null                   # Redis session cache (or REDIS_URL env)
   redis_history_cap: 200            # max history entries kept in Redis
 
@@ -301,6 +314,8 @@ proxy:
 ```
 
 In multi-instance mode, each instance can have its own config file with isolated storage, tagger, and summarizer settings. Instances without a `config` field share the master engine.
+
+`history_widening_threshold`: when a request's first-turn hash changes *and* its turn count has grown by more than this fraction, the proxy concludes the client widened its history window backward (rather than merely aging forward), clears the conversation's ingest state, and re-ingests the full history (logged as `HISTORY_WIDENED`).
 
 ### Tag Rules
 

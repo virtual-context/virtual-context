@@ -203,6 +203,17 @@ vc_query_facts(subject="user", verb="visited", status="completed")
 
 Verb matching expands through hand-curated synonym clusters plus embedding similarity against the verbs present in the store, so querying "led" can also match "managed" or "ran" where those verbs were extracted. Facts can additionally be ranked by dense similarity between the query and stored fact embeddings (`retrieval.fact_dense_retrieval`, model-versioned embeddings written at extraction time).
 
+## Code Mode
+
+`compaction.code_mode` is **on by default** and reshapes summarization and fact extraction for coding conversations:
+
+- **Different prompts**: segment summaries and tag-summary rollups use coding-oriented prompt templates instead of the generic ones.
+- **Investigatory actions are excluded from facts**: "the assistant ran the tests" or "the assistant checked the file" is process noise, not knowledge; it is not extracted. What *is* extracted: conclusions, findings, decisions, configuration values, bugs found and their fixes, tool and library choices, and what was built or changed.
+- **Facts are framed about the thing, not the assistant**: "the endpoint now supports sorting", not "the assistant added sorting".
+- **Code references**: extraction also emits `code_refs`, a deduplicated list of concrete file/function/class references materially discussed in the turn (each up to `{file, line, symbol}`, at most 12 per extraction). These are carried through compaction and rendered alongside summaries, so "which files did we touch for X" survives compression.
+
+Because the default is on, this affects every deployment, including non-coding ones. Setting `code_mode: false` restores the generic summarization and fact-extraction prompts and stops emitting code references; nothing else changes.
+
 ## Cross-Channel Context (Unified Group Conversations)
 
 A server-style community (for example, a Discord server) can deliberately unify all of its channels into **one** stored conversation: every channel's turns land in the same canonical history, giving the assistant one continuous memory of the whole community. The transport, however, stays channel-local: the payload the client sends only contains the current channel's messages, so the model's raw window is blind to what just happened in a sibling channel.
