@@ -287,6 +287,7 @@ tool_output:
   default_truncate_threshold: 8192  # bytes before truncation applies
   default_head_ratio: 0.6           # kept from the start
   default_tail_ratio: 0.4           # kept from the end
+  max_index_bytes: 524288           # cap on indexed tool-output bytes
 ```
 
 ### Facts
@@ -312,6 +313,7 @@ curation:
   enabled: false                    # periodic fact-store cleanup pass
   provider: ""
   model: ""
+  max_response_tokens: 2048         # cap on the curation model's response
 ```
 
 ### Telemetry
