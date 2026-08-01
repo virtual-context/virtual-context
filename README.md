@@ -10,399 +10,342 @@
     <img src="assets/dashboard.png" alt="virtual-context dashboard" width="800">
   </a>
 </p>
-<p align="center"><sub>virtual-context cloud: running 3 million virtual token window at 80k actual tokens</sub></p>
+<p align="center"><sub>virtual-context cloud: running a 3 million token virtual window at 80k actual tokens</sub></p>
 
 # virtual-context
 
-**100x your agent's context by virtualizing it. Better reasoning. Persistent memory. Shared across platforms. Lower costs.**
+**Virtual memory for LLM context. Your agent addresses a 20M-token window; the model sees 60K of curated signal.**
 
-*95% accuracy vs 33% baseline on the same model, at half the cost. [See benchmark →](#benchmark-results)*
+*95/100 on LongMemEval vs 33/100 for the same model with raw history, at 55% fewer tokens per question. [Benchmark details below.](#benchmark-results)*
 
-Your client sets `contextWindow: 20000000` (20 million). Your model's real window is 200K. virtual-context sits between them and makes it work, the same way your OS lets a process address more memory than physically exists. The client sends its full conversation history. VC compresses, indexes, and pages. The model sees a dense 60K window where every token is signal.
+Your client sets `contextWindow: 20000000`. Your model's real window is 200K. virtual-context sits between them and makes it work, the same way an operating system lets a process address more memory than physically exists. The client sends its full conversation history; virtual-context compresses, indexes, and pages it, and forwards a dense window where every token is signal. Nothing is discarded. Everything remains addressable at full fidelity.
 
-Virtualizing the context window has many advantages:
+It runs as a local HTTP proxy, so no SDK integration is required: point any client at `localhost:5757` instead of the provider URL and it works. A Python SDK and an MCP server exist for direct integration.
 
-- **Compression**: Topic-level summarization with structured fact extraction, tool chain stubbing (52 tool call/response pairs collapse to a single retrievable stub), and image scaling (a 391KB base64 screenshot becomes ~40KB, cutting payload size by ~90%). A 937K-token payload collapses to ~65K. Everything is stored, indexed, and recoverable at full fidelity.
-- **Memory**: Your agent recalls what the user said at turn 12 when it reaches turn 1000. Facts, preferences, and decisions persist across the full conversation, not just what fits in the raw window.
-- **Reasoning quality**: A curated 60K window of dense signal produces measurably better answers than a raw 200K window full of noise. The model reasons over what matters, not over everything.
-- **Cost**: Smaller payloads, fewer tokens billed. A conversation running at a 1M-token virtual window regularly produces 60-90K actual payloads, a fraction of the raw cost. The payload is organized to maximize prompt cache hits, so even compressed conversations achieve significant caching in most cases.
-- **Cache-Aware Payload Compaction**: VC compacts conversations in the background but defers rewriting the request payload until the provider's prompt cache has expired or the context window is nearly full. This preserves the byte-identical prefix that providers use for cache hits, giving you compaction savings without sacrificing cached-token discounts. You get full compaction savings when they're free and full cache savings when they matter.
-- **Collaboration**: VCATTACH lets agents share memory across platforms and sessions. Custom agents, local tools, and API clients can all work from the same context. Multiple agents collaborate through shared memory. Conversations survive client restarts, platform switches, and session boundaries.
+## Why virtualize the window
 
-This is what makes virtual-context fundamentally different from memory systems that bolt a vector database onto your LLM. Those systems are *additive*: they retrieve chunks and compete for the context window your agent is working in right now. They do nothing to evict or curate what's already there.
+- **Memory that does not expire.** Your agent recalls what the user said at turn 12 when it reaches turn 1000. Facts, preferences, and decisions persist across the whole conversation and across sessions, platforms, and models.
+- **Better answers from less context.** A curated 60K window of relevant summaries outperforms a raw 200K window of everything. On LongMemEval, the same reader model scored 95/100 through virtual-context against 33/100 with the full raw history. Long raw contexts bury the fact you need; retrieval surfaces it.
+- **Lower cost.** In the benchmark run above, average tokens per question fell from 117,582 to 52,347 and cost per question from $0.36 to $0.16. Compression compounds with prompt caching: payloads are organized to preserve providers' cached prefixes.
+- **Group conversations with per-person memory.** In a Telegram group or Discord server, virtual-context knows who said what. Facts carry their author, each member gets a durable person card, and search can be scoped to one speaker. "What has Alice said about the trip?" is answerable from storage, not from the model's guess.
+- **One memory across platforms.** Build context in Claude Code, continue it from Telegram, query it from Cursor. `VCATTACH` connects any client to any stored conversation, and a whole community server can share a single memory.
+- **A migration path.** `virtual-context import` ingests your existing ChatGPT, Claude, or Grok conversation exports, so the memory starts full instead of empty.
 
-virtual-context *manages* the window itself: compressing by topic, extracting structured facts, paging in what's needed, and paging out what's not. The client thinks it has 20M tokens. The model sees 60K of curated signal. Nothing is lost. Everything is addressable, at varying levels of compression.
+## The memory model
 
 ```
-Layer 0: Raw conversation turns              (active memory, in the context window)
-Layer 1: Segment summaries + Facts per tag   (compressed pages, per-topic summaries)
-Layer 2: Tag summaries, one per topic        (working set descriptors, bird's-eye view)
+Canonical turns   (ground truth: every message stored verbatim, with sender,
+                   channel, and reply provenance)
+     |
+Layer 0: Raw recent turns           (active memory, in the context window)
+Layer 1: Segment summaries + facts  (compressed pages, per-topic)
+Layer 2: Tag summaries              (one per topic, the bird's-eye view)
 ```
 
-**[Full documentation →](https://virtual-context.com/docs/)** including [architecture and pipeline](https://virtual-context.com/docs/architecture/), [features deep dive](https://virtual-context.com/docs/capabilities/), [proxy internals](https://virtual-context.com/docs/proxy/), [design decisions](https://virtual-context.com/docs/design/), and [user commands](https://virtual-context.com/docs/vcattach/).
+Every message is durably recorded as a canonical turn. Compaction groups older turns by topic, summarizes each topic independently, and extracts structured facts. The model works from recent raw turns plus retrieved summaries, with a topic index telling it what else it can page in. When it needs more detail on a topic, it expands that topic back toward full text through built-in tools.
 
-## Cloud Offering
-
-[https://virtual-context.com](https://virtual-context.com) is the fastest way to get going. Sign up and change your base-url. Statistics, visibility into the context window, and cost savings reports included.
-
-## Install
+## Quick start
 
 ```bash
-pip install virtual-context
-```
-
-Python 3.11+, all core dependencies in the base install.
-
-Optional storage backends: `pip install virtual-context[postgres]`, `[neo4j]`, or `[falkordb]`.
-
-## Integration
-
-virtual-context runs as a local HTTP proxy between your client and the upstream LLM API. Point your client at `localhost:5757` instead of the upstream. The proxy handles everything transparently: tagging, retrieval, history filtering, compaction, tool interception. Auto-detects Anthropic, OpenAI (Chat + Codex/Responses), and Gemini request formats.
-
-```bash
+pip install virtual-context        # Python 3.11+
 virtual-context proxy --upstream https://api.anthropic.com
-# OR
-virtual-context proxy --upstream https://api.openai.com
-# OR
-virtual-context proxy --upstream https://generativelanguage.googleapis.com
 ```
 
-No config file needed for basic usage. For customization:
+Point your client at `http://127.0.0.1:5757` instead of the provider. That is the whole integration. The proxy auto-detects Anthropic, OpenAI Chat, OpenAI Responses, and Gemini request formats, and new conversations pass through untouched until there is stored context worth injecting.
+
+A live dashboard runs at `http://127.0.0.1:5757/dashboard` with a request inspector, per-topic state, and cost telemetry.
+
+No config file is needed for basic use. To customize, generate one from a preset and edit it:
 
 ```bash
-cp virtual-context.yaml.example virtual-context.yaml
-virtual-context -c virtual-context.yaml proxy
+virtual-context init coding        # or: agentic
+virtual-context config validate
 ```
+
+Guided setup, including installation as a background service:
+
+```bash
+virtual-context onboard --upstream https://api.anthropic.com
+```
+
+Full install options, daemon setup for macOS/Linux/Windows, and storage backends: [docs/install.md](docs/install.md).
+
+### Hosted option
+
+[virtual-context.com](https://virtual-context.com) runs the same engine as a service: sign up, change your base URL, and get the dashboard, statistics, and cost reports without running anything.
+
+## Integrations
 
 ### Claude Code
 
-Point Claude Code at the proxy. Either set the environment variable:
-
 ```bash
 export ANTHROPIC_BASE_URL=http://127.0.0.1:5757
-```
-
-Or add it to your shell profile (`~/.bashrc`, `~/.zshrc`) to make it permanent:
-
-```bash
+# or make it a habit:
 alias claudevc='ANTHROPIC_BASE_URL=http://127.0.0.1:5757 claude'
 ```
 
-Claude Code's tool chains (file reads, searches, command output) are automatically compressed. A 937K-token payload with 52 tool chains collapses to ~65K. When Claude Code truncates history to manage its own context window, virtual-context detects the truncation and recovers stored context transparently.
+Claude Code's tool chains (file reads, searches, command output) are compressed automatically: a 937K-token payload with 52 tool chains collapses to about 65K. When Claude Code truncates its own history to manage its window, virtual-context detects the truncation and restores the missing context from storage.
 
 ### OpenClaw
 
-Set these to allow OpenClaw to maintain large context windows from a client perspective:
+A dedicated [OpenClaw plugin](https://github.com/virtual-context/openclaw-plugin) integrates through lifecycle hooks: synchronous retrieval on `message.pre`, fire-and-forget compaction on `agent.post`.
 
-```
-  // 1. History limits (the real bottleneck most users will hit)
-  // channels.<provider> (e.g. channels.telegram)
-  "historyLimit": 99999,
-  "dmHistoryLimit": 99999
+Direct proxy use also works. The settings that matter, since OpenClaw manages its own history aggressively:
 
-  // global fallback
-  "messages": { "groupChat": { "historyLimit": 99999 } }
+```jsonc
+// 1. Raise history limits (per channel, e.g. channels.telegram)
+"historyLimit": 99999,
+"dmHistoryLimit": 99999,
+"messages": { "groupChat": { "historyLimit": 99999 } },
 
-  // 2. Model context window: must be on the provider in the per-agent models.json, with
-  // explicit model entries:
-  "anthropic": {
-    "baseUrl": "https://anthropic.virtual-context.com?vckey=...",
-    "api": "anthropic-messages",
-    "models": [
-      {
-        "id": "claude-opus-4-6",
-        "contextWindow": 2000000,  // Note this is 2M
-        ...
-      }
-    ]
-  }
-```
+// 2. Declare the virtual window on explicit model entries
+//    (baseUrl alone is not enough; without model entries the client
+//    falls back to its hardcoded 200K)
+"anthropic": {
+  "baseUrl": "https://anthropic.virtual-context.com?vckey=...",
+  "api": "anthropic-messages",
+  "models": [{ "id": "claude-opus-4-6", "contextWindow": 2000000 }]
+},
 
-  Just setting baseUrl alone isn't enough. Without model entries, it falls back to pi-ai's
-  hardcoded 200K. And models.overrides in the global config is display only; it doesn't affect
-  actual windowing.
+// 3. Let the proxy control windowing
+"agents": { "defaults": {
+  "contextPruning": { "mode": "off" },
+  "contextTokens": 2000000
+}},
 
-```
-  3. Context pruning: disable it so the proxy controls windowing:
-  "agents": {
-    "defaults": {
-      "contextPruning": { "mode": "off" },
-      "contextTokens": 2000000 // Note this is 2M
-    }
-  }
-
-  4. Session idle timeout: prevent OpenClaw from resetting sessions too early.
-  Without this, sessions reset after 12 hours by default, wiping the client-side
-  history before VC can manage it:
-  "session": {
-    "resetByType": {
-      "group": { "idleMinutes": 2880 }   // 48 hours (default is 720 / 12h)
-    }
-  }
+// 4. Keep sessions alive long enough for memory to matter
+//    (default group idle reset is 12h)
+"session": { "resetByType": { "group": { "idleMinutes": 2880 } } }
 ```
 
-A dedicated [OpenClaw plugin](https://github.com/virtual-context/openclaw-plugin) is also available, using lifecycle hooks for sync retrieval (`message.pre`) and fire-and-forget compaction (`agent.post`).
+### Any other client (Cursor, Continue, custom apps)
 
-### Other Clients (Cursor, Continue, any OpenAI-compatible client)
-
-Any client that lets you set a base URL works. Point it at `http://127.0.0.1:5757` (Anthropic format) or `http://127.0.0.1:5757/v1` (OpenAI format):
+Anything that lets you set a base URL works:
 
 ```python
-# Python (anthropic SDK)
-import anthropic
+# anthropic SDK
 client = anthropic.Anthropic(base_url="http://127.0.0.1:5757")
 
-# Python (openai SDK)
-from openai import OpenAI
+# openai SDK
 client = OpenAI(base_url="http://127.0.0.1:5757/v1")
 ```
 
-**Multi-instance mode** runs multiple providers on different ports in one process:
-
-```yaml
-proxy:
-  instances:
-    - port: 5757
-      upstream: https://api.anthropic.com
-      label: anthropic
-    - port: 5758
-      upstream: https://api.openai.com
-      label: openai
-    - port: 5760
-      upstream: https://generativelanguage.googleapis.com
-      label: gemini
-```
-
-**Daemon mode** runs the proxy as a background service:
-
-```bash
-virtual-context daemon install --upstream https://api.anthropic.com
-virtual-context onboard --install-daemon
-```
-
-Daemon lifecycle: `daemon status | start | stop | restart | uninstall`
-
-Full setup docs (macOS `launchd`, Linux `systemd --user`, Windows Task Scheduler): [`docs/install.md`](docs/install.md)
+Multi-instance mode serves several providers from one process, each on its own port with isolated storage; see [docs/install.md](docs/install.md).
 
 ### Python SDK
 
-Two function calls wrap your existing LLM pipeline:
+Two calls wrap an existing pipeline:
 
 ```python
-from virtual_context import VirtualContextEngine, Message
+from virtual_context import VirtualContextEngine
 
 engine = VirtualContextEngine(config_path="./virtual-context.yaml")
 
-# BEFORE sending to LLM: retrieve relevant stored context
-assembled = engine.on_message_inbound(
-    message="What was the Henninger filing deadline?",
-    conversation_history=messages,
-)
-# assembled.prepend_text → enriched system prompt with retrieved summaries
-# assembled.matched_tags → ["legal", "filing"]
+# before the LLM call: retrieve relevant stored context
+assembled = engine.on_message_inbound(message=user_message, conversation_history=messages)
+# assembled.prepend_text  -> enriched system prompt
+# assembled.matched_tags  -> the topics retrieval matched
 
-# AFTER LLM responds: tag, index, compact if needed
+# after the response: persist, tag, compact if needed
 report = engine.on_turn_complete(messages)
-if report:
-    print(f"Compacted {report.segments_compacted} segments, freed {report.tokens_freed:,} tokens")
 ```
 
-### MCP Server
+### MCP server
 
-virtual-context also exposes an MCP server for Claude Desktop, Cursor, or any MCP-compatible client. It registers eight tools: `recall_context`, `compact_context`, `expand_topic`, `recall_all`, `remember_when`, `find_quote`, `search_summaries`, and `domain_status`. These are not user-facing commands; the model decides when to use them based on what the conversation needs. It also serves two resources (`virtualcontext://domains`, a tag list with usage statistics, and `virtualcontext://domains/{tag}`, the stored summaries for one tag) and two prompts (`recall(topic)` and `summarize_conversation`). (The proxy's in-conversation tool loop exposes a separate, overlapping set of eight `vc_*` tools; see [docs/engine.md](docs/engine.md).)
+For Claude Desktop, Cursor, or any MCP client. Registers eight tools (`recall_context`, `compact_context`, `expand_topic`, `recall_all`, `remember_when`, `find_quote`, `search_summaries`, `domain_status`), two resources (the topic list with usage statistics, and per-topic summaries), and two prompts. The model decides when to call them.
 
-## What It Does
+## What it does
 
-### Automatic Topic Tagging
+### Automatic topic tagging
 
-There are no predefined domains to configure. An LLM tagger reads each turn and generates semantic tags (`database`, `auth`, `fitness`, `legal`) that naturally converge over the session. A vocabulary feedback loop passes known tags back into the tagger prompt, so it reuses `storage` instead of inventing `data-persistence` or `file-management`. When synonyms slip through (`db` vs `database`), a canonicalizer detects aliases via edit distance and normalizes them automatically.
+No predefined categories. An LLM tagger reads each completed turn and generates semantic tags (`database`, `auth`, `fitness`, `legal`) that converge over the session; a vocabulary feedback loop makes it reuse `storage` instead of inventing `data-persistence`. Synonyms are caught by a canonicalizer, and a tag that grows too broad is automatically split into narrower subtags with aliases preserving retrieval continuity. On the request path, a local embedding tagger assigns tags in milliseconds with no LLM call, so retrieval never waits on a model.
 
-When a tag appears on too many turns and loses discriminative power, virtual-context detects this and automatically splits it into narrower sub-tags. In a 143-turn OpenClaw session, `reservation-request` (43 turns, 30%) was split into `reservation-platform-troubleshooting`, `reservation-availability-search`, `reservation-browser-access`, and `reservation-general`. The vocabulary evolves toward maximum precision without manual curation.
+### Structured facts with authorship
 
-### Structured Fact Extraction
+Summaries compress; facts preserve the specifics. During compaction, virtual-context extracts structured facts (subject, verb, object, type, temporal status, source turns) and stores them queryable by any field. When new information contradicts an old fact ("I moved from NYC to LA"), a supersession pass marks the old one superseded. Facts carry typed relationships (`SUPERSEDES`, `CAUSED_BY`, `PART_OF`, and others) that queries can traverse.
 
-Summaries compress information but inevitably lose specific details. When the user says "I run 5K every morning" at turn 14, a summary might retain "runs regularly" but drop the exact distance and timing.
+Every fact also carries its author, taken from the stored message row rather than from model output. In a group chat, "Bob prefers window seats" is recorded as Bob's statement, and a reply is attributed to the person replying, with the quoted material attributed to the person quoted.
 
-virtual-context extracts structured facts during compaction: subject, verb, object, fact type (`preference`, `biographical`, `decision`, `plan`, `routine`, `medical`, `financial`), temporal status (`active`, `completed`, `planned`, `abandoned`, `recurring`), session provenance, and source turn numbers. Facts are queryable by any combination of these fields.
+### Group conversations that know who is who
 
-When new information contradicts a stored fact ("I moved from NYC to LA"), the supersession checker detects the conflict and marks the old fact as superseded. Facts have typed relationships (`SUPERSEDES`, `CAUSED_BY`, `PART_OF`, `CONTRADICTS`, `SAME_AS`, `RELATED_TO`) that are automatically detected and traversed during queries.
+Transport metadata (sender, channel, reply target) is claimed at ingestion and stored on every message row. On top of that:
 
-### Tool Chain Compression
+- **Person cards**: a curated, per-member digest of durable identity facts, rebuilt from that member's own recorded speech and injected when they speak. A gate-controlled admission model decides what counts as durable identity rather than a passing remark.
+- **Speaker-scoped search**: search tools accept a speaker selection, so "what did I say about this?" resolves to the requester and "what has Alice said?" returns only rows attributed to Alice.
+- **Whole-server memory**: a Discord-style community can unify every channel into one conversation. Members keep one identity across channels, sibling-channel activity stays visible, and two fail-closed privacy rules bound it: DM content can never render into server context, and every stored row must carry its own audience proof.
 
-Agent conversations are dominated by tool calls. A coding session with 50 tool rounds might have 900K tokens of tool output but only 60K of actual conversation.
+These features ship dark (off by default) and are enabled per deployment. Details: [docs/attribution.md](docs/attribution.md).
 
-virtual-context collapses entire tool chains into compact stubs:
+### Tool chain compression
+
+Agent conversations are dominated by tool output. A coding session can carry 900K tokens of tool results and 60K of actual conversation. virtual-context collapses completed tool exchanges into compact stubs with a restore reference:
 
 ```
-Before (3 messages, ~18K tokens):
-  assistant: [tool_use: Read file.py]
-  user:      [tool_result: <full 500-line file contents>]
-  assistant: "The file has a bug on line 42..."
-
-After (2 messages, ~200 tokens):
-  user:      [compacted turn: Read(file.py)]
-  assistant: "The file has a bug on line 42..."
+Before (3 messages, ~18K tokens):          After (2 messages, ~200 tokens):
+  assistant: [tool_use: Read file.py]        user:      [compacted turn: Read(file.py)]
+  user:      [tool_result: 500 lines]        assistant: "The bug is on line 42..."
+  assistant: "The bug is on line 42..."
 ```
 
-Handles all four provider formats (Anthropic, OpenAI Chat, OpenAI Responses, Gemini). Full raw tool output is stored durably and recoverable on demand. Past a configurable age threshold, stubs are dropped entirely (the segment summaries already cover that content).
+Full output is stored durably and the model can recover any chain on demand via `vc_restore_tool`. Old stubs past a configurable age are dropped entirely once segment summaries cover them.
 
-### Media Compression
+### Media compression
 
-Base64 images in API payloads are enormous: a single screenshot is 300-500KB of base64. Providers process images through vision encoders with fixed token costs based on dimensions, not base64 string length, but payload size still matters for bandwidth, latency, and TTFB. virtual-context compresses images on first sight: a 391KB screenshot becomes ~40KB, cutting payload size by ~90%. Originals are stored to disk for recovery. This runs on both passthrough and active paths, so even conversations that haven't triggered compaction benefit.
+A single screenshot is 300-500KB of base64. virtual-context recompresses images on first sight (a 391KB screenshot becomes about 40KB), stores the originals for recovery, and counts image tokens by the provider's dimension formula instead of the base64 length. This runs on the passthrough path too, so brand-new conversations benefit.
 
-### Virtual Memory Paging
+### Demand paging
 
-RAG retrieves content and appends it to the context window. It never frees space from what's already there. virtual-context treats the context window as managed memory with bidirectional paging:
+Retrieval is bidirectional. The model sees tag summaries for cold topics, segment summaries for relevant ones, and full text where it asks for it:
 
 ```
 Tag summaries  <------->  Segment summaries  <------->  Full stored text
-     ^                          ^                            ^
-  collapse                   default                      expand
-  (~200t)                  (~2,000t)                   (~8,000t+)
+   ~200t                      ~2,000t                       ~8,000t+
+  collapse                    default                        expand
 ```
 
-When the model needs more detail on a topic, it expands that topic from summary to full stored text. When budget pressure hits, cold topics are automatically collapsed. The working set persists across turns, so expansion decisions are stateful.
+The working set persists across turns, cold topics collapse under budget pressure, and the model drives expansion through tools when it needs detail.
 
-### Cross-Vocabulary Retrieval
+### Retrieval that survives vocabulary drift
 
-Users don't use the same words every time. "Materialized views for feed performance" at turn 46 might be recalled as "that caching trick for the feed" at turn 71. Pure tag overlap finds nothing.
+"Materialized views for feed performance" at turn 46 gets recalled as "that caching trick for the feed" at turn 71. Three signals are fused per topic with Reciprocal Rank Fusion: IDF-weighted tag overlap, BM25 over summary text, and embedding similarity, with dampening that stops catch-all topics from dominating and a boost for fact-bearing topics. When tags miss entirely, full-text and semantic search over the stored conversation are the fallback.
 
-virtual-context uses 3-signal retrieval scoring via Reciprocal Rank Fusion: IDF-weighted tag overlap, BM25 keyword search on summaries, and embedding cosine similarity. Related tags generated at both write time and query time bridge vocabulary gaps. When tag-based retrieval misses entirely, full-text and semantic search across stored conversation text provide a fallback.
+### Time-scoped recall
 
-### Time-Scoped Recall
+"Between June and July, what changed?" resolves through backend date math, not model guessing. The `vc_remember_when` tool takes a structured date range and a mode: point-in-time state, chronology of changes, a synthesis across the range, or a browse of the window. Session dates propagate through the pipeline, so temporal ordering is reliable.
 
-Queries like "going back to the very beginning, what were the key decisions?" or "between June and July, what changed?" reference a position in time, not just a topic. virtual-context combines semantic query matching with structured time ranges. Date math is backend-resolved, not LLM-resolved, so results are deterministic. Session dates propagate through the entire pipeline: every segment knows when it happened, and temporal ordering is always accurate.
+### Code mode
 
-### Configurable Context Ceiling
+On by default. Summarization and fact extraction switch to coding-aware prompts: investigatory noise ("assistant ran the tests") is not extracted, findings are framed about the artifact ("the endpoint now supports sorting") rather than the assistant, and extraction emits `code_refs`, concrete file/function references that survive compression. Turn it off for purely conversational deployments with `compaction.code_mode: false`.
 
-Most teams set `context_window` to whatever the model supports and let it fill up. This is expensive and degrades quality. Research on "lost in the middle" shows that LLM attention degrades in long contexts: facts buried in 200K tokens of raw history are missed more often than the same facts concentrated in a managed window.
+### Prompt-cache aware
+
+virtual-context places an explicit cache breakpoint (Anthropic format) so the client's stable prompt ends inside the cached region and the injected context sits after it, keeping cache hits flowing even though retrieved context changes every turn. Compaction goes further: with deferral enabled, the payload rewrite that would break the cached prefix waits until the provider's cache has expired anyway or the window approaches its budget, so you get compaction savings when they are free and cache savings when they matter.
+
+### A configurable ceiling
+
+Run a 200K model at 60K:
 
 ```yaml
-context_window: 60000  # run a 200K model at 60K
+context_window: 60000
 compaction:
   soft_threshold: 0.70
-  hard_threshold: 0.90
+  hard_threshold: 0.85
 ```
 
-A 200K-capable model running at 60K uses ~70% fewer input tokens per request. The model's attention is concentrated on curated, high-signal context rather than spread across mostly-stale history.
+Smaller payloads cost less and, per the benchmark above, answer better. The ceiling is yours to choose; the virtual window the client sees is independent of it.
 
-### Store-Backed Recovery
+### Truncation recovery
 
-Clients (Claude Code, OpenClaw) sometimes truncate conversation history to manage their own context windows. virtual-context detects the truncation and recovers from its durable store: chain snapshots, recent raw turns, sanitized and restored transparently. The payload that reaches the LLM contains the recovered context as if it had never been truncated.
+Clients truncate their own history to manage their windows. virtual-context detects it and restores the missing turns from storage, so the payload that reaches the model reads as if nothing was lost. Conversation state (the topic index, working set, watermarks) survives restarts through session snapshots, and a Redis-backed session cache makes proxy redeploys lossless.
 
-## User Commands
+### Import your history
 
-Type these as normal messages in any client connected through the proxy. Case-insensitive. The proxy intercepts them before they reach the LLM, so no tokens are consumed.
+```bash
+virtual-context import --provider chatgpt --input conversations.json
+virtual-context import --provider claude  --input ~/exports/ --compact
+```
+
+Adapters for ChatGPT, Claude, and Grok exports; single files or directories. Imported conversations arrive indexed, tagged, and retrievable. Details: [docs/commands.md](docs/commands.md).
+
+## Shared memory across platforms
+
+Type these as ordinary messages in any connected client. The proxy intercepts them; no tokens are spent.
 
 | Command | What it does |
 |---|---|
-| `VCATTACH <label\|id>` | Reattach to another conversation by label or UUID |
-| `VCLABEL <name>` | Set label on current conversation (no arg = show current) |
-| `VCSTATUS` | Show conversation ID, label, turns, segments, working set, active tags |
-| `VCRECALL <query>` | Search stored context, promote matching tags to working set for next turn |
-| `VCCOMPACT` | Force compaction of uncompacted turns |
-| `VCLIST` | List all conversations with labels and turn counts |
-| `VCFORGET <tag>` | Delete segments and summaries for a specific tag |
-| `VCMERGE INTO <label\|id>` | Merge this conversation's stored data into another ([details](docs/commands.md)) |
+| `VCATTACH <label\|id>` | Reattach to another conversation by label or ID |
+| `VCLABEL <name>` | Set the conversation label (no argument shows it) |
+| `VCSTATUS` | Conversation ID, label, turns, segments, working set, active tags |
+| `VCRECALL <query>` | Search stored context, promote matching topics for the next turn |
+| `VCCOMPACT` | Force compaction now |
+| `VCLIST` | List conversations with labels and turn counts |
+| `VCFORGET <tag>` | Delete a topic's segments and summaries |
+| `VCMERGE INTO <label\|id>` | Merge this conversation's stored data into another |
 | `VCMERGESTATUS` | Report merge progress |
 
-### VCATTACH: Shared Memory Across Platforms
+Every conversation gets a stable identity that survives restarts, deploys, and client changes. When identity detaches (a system prompt change, client truncation, a redeploy), `VCATTACH <label>` reconnects to the original conversation with all segments, facts, and tags intact.
 
-Every conversation gets a stable identity derived from the system prompt hash and conversation markers embedded in assistant responses. This identity persists across restarts, deploys, and client changes.
+`VCATTACH` is a redirect: the old identity durably routes to the target and nothing is deleted, so stale references keep resolving. Build deep context in Claude Code, then type `VCATTACH code-project` in a Telegram session with a different model; both clients now enrich the same memory. Two agents can work the same problem space simultaneously through it. To combine two conversations' stored data into one, `VCMERGE` does the actual merge. Details: [docs/commands.md](docs/commands.md).
 
-When identity detaches (system prompt changes, client truncation loses the marker, a deploy produces a different hash), type `VCATTACH <label>` to reconnect to the original conversation with all segments, facts, and tags intact.
+## Running it in production
 
-**Cross-platform shared memory.** Build up deep context in Claude Code (architecture decisions, code patterns, debugging history), then type `VCATTACH code-project` in a Telegram conversation with a different model. Both clients now share the same conversation identity: messages from either platform enrich the same compacted knowledge base. This isn't document sharing or chat mirroring. It's shared memory across platforms and models.
+The engine is built to be operated, not only demoed:
 
-**Multi-agent collaboration.** Two agents (or two humans using different clients) can work on the same problem space simultaneously. Agent A researches in Claude Code, compacting findings. Agent B drafts a proposal in Telegram, pulling from the same segments. Each agent's contributions are compacted into the shared store. The virtual context IS the shared workspace.
+- **Storage**: SQLite by default; PostgreSQL (`pip install "virtual-context[postgres]"`) for multi-worker deployments; filesystem, Neo4j, and FalkorDB backends exist for special cases.
+- **Multi-worker safety**: many workers can serve one conversation against shared Postgres. Compactions run under leased, fenced operations so a stalled worker cannot clobber a takeover; conversation lifecycle changes are epoch-guarded; schema bootstrap is serialized under an advisory lock; a backlog sweeper catches conversations whose traffic pattern never triggers inline compaction.
+- **Dashboard security**: dashboard endpoints are unauthenticated until you set `VC_DASHBOARD_TOKEN`; the default bind is loopback-only. Set the token before binding a non-loopback address.
+- **Operator tooling**: `virtual-context admin` ships sixteen guarded, idempotent backfill and repair commands (re-tagging, re-summarizing, attribution backfills, embedding reindexes), with explicit storage targeting and per-command dry-run semantics. `DATABASE_URL` lets them run bare inside a container with no config file mounted.
+- **Observability**: per-request stage logs (`FLUSH_GATE`, `HISTORY_WIDENED`, `STREAM_FIRST_BYTE`/`STREAM_STALL`/`STREAM_END`, `DROP-COMPACTED`), full request captures in the dashboard that survive restarts, and per-call cost telemetry.
 
-**Redirect, not merge.** `VCATTACH` writes a durable alias: the old conversation identity routes to the target from then on, and nothing is deleted. The alias table is persistent, so stale markers embedded in older responses follow the alias instead of creating orphans. To combine two conversations' stored data into one, use `VCMERGE INTO <target>` ([details](docs/commands.md)).
+Architecture details, including the canonical-turn model and the REST prepare/ingest surface: [docs/architecture.md](docs/architecture.md).
 
-## Virtual-Context vs RAG vs Compaction
+## virtual-context vs RAG vs compaction
 
-These approaches are complementary. RAG, other memory systems, and compaction can all run alongside virtual-context.
+These compose; RAG and compaction can run alongside virtual-context. The difference is what each manages.
 
 | | RAG | Compaction-only | virtual-context |
 |---|---|---|---|
-| **Primary mechanism** | Query-time retrieval by embedding similarity | Summarize old history to fit window | Tagged memory + retrieval + compaction + paging tools |
-| **What gets kept** | External documents + recent raw chat | Summaries of old turns + recent raw chat | Multi-layer memory (raw turns, segment summaries, tag summaries) |
-| **Specific fact lookup** | Depends on embedding/query phrasing alignment | Lossy after summarization | Structured fact queries + full-text search + summary drill-down |
-| **Broad overview** | Weak unless special orchestration | Can summarize, but often generic | All topic summaries loaded within budget |
-| **Time-scoped recall** | Custom logic outside core RAG | Requires date fidelity in summaries | Backend-resolved time ranges with session date propagation |
-| **Vocabulary mismatch tolerance** | Embedding-dependent | Low | 3-signal RRF fusion + related-tag expansion + semantic search fallback |
-| **Context budget control** | Append retrieved chunks | Compression with limited rehydration | Explicit paging: expand/collapse topics with bounded assembly |
-| **Cost at scale** | Grows with corpus size | Grows with conversation length | Configurable ceiling: run a 200K model at 30K |
-| **Best fit** | Knowledge/doc retrieval | Simple long-chat cost reduction | Long-running agent memory with mixed query types |
+| **Mechanism** | Query-time retrieval by similarity | Summarize old history to fit | Tagged memory + retrieval + compaction + paging |
+| **What is kept** | External documents + recent chat | Summaries + recent chat | Three layers, from raw turns to topic digests |
+| **Specific fact lookup** | Depends on phrasing alignment | Lossy after summarizing | Structured fact queries + full-text + drill-down |
+| **Who said it** | Not modeled | Not modeled | Per-message provenance, per-person cards, speaker-scoped search |
+| **Time-scoped recall** | Custom logic outside RAG | Needs date fidelity in summaries | Backend-resolved date ranges |
+| **Vocabulary drift** | Embedding-dependent | Weak | 3-signal fusion + related tags + semantic fallback |
+| **Budget control** | Appends retrieved chunks | Compression only | Explicit paging with a bounded assembly |
+| **Cost at scale** | Grows with corpus | Grows with length | A ceiling you set |
 
-## Proxy Features
-
-The proxy includes a [live dashboard](#live-dashboard) at `http://localhost:5757/dashboard` with request grid, turn inspector, session stats, telemetry, and SSE live updates.
-
-- **Conversation continuity** via invisible markers in assistant responses, with stable identity derived from system prompt hash
-- **Redis session cache** for lossless restarts across container deploys (falls back gracefully if Redis is unavailable)
-- **Four-format support** auto-detected per request (Anthropic, OpenAI Chat, OpenAI Responses, Gemini)
-- **History ingestion** bootstraps the tag index from existing conversation on the first request
-- **Streaming with zero added latency** (SSE forwarded byte-for-byte, text accumulated in background)
-- **Error-resilient** (engine failures fall back to unmodified passthrough; bloat fallback reverts to original payload)
-- **Envelope stripping** extracts sender identity and timestamps from metadata blocks (group chat participants appear as real names)
-- **Image-aware token counting** using Anthropic formula, not raw base64 tokenization
-- **Per-port config** for multi-instance setups with isolated engines and storage
-- **Telemetry** on every LLM call: token counts, cost, timing across five components (`compactor`, `tagger`, `tool_loop`, `fact_curator`, `proxy_upstream`)
+RAG retrieves and appends; it never frees space in the window it competes for. Compaction compresses but cannot bring detail back. virtual-context manages the window in both directions.
 
 ## CLI
 
 ```bash
-virtual-context proxy -u https://api.anthropic.com  # start proxy
+virtual-context proxy -u https://api.anthropic.com   # start the proxy
 virtual-context status                               # tag stats and token usage
 virtual-context tags                                 # list all tags
-virtual-context recall auth                          # retrieve stored summaries for a tag
+virtual-context recall auth                          # stored summaries for a tag
 virtual-context retrieve -m "What about auth?"       # tag + retrieve (JSON)
 virtual-context transform -m "What about auth?"      # tag + retrieve + assemble
 virtual-context compact -i msgs.json                 # manual compaction
+virtual-context import --provider chatgpt -i ...     # import exported history
 virtual-context aliases list|suggest|add             # tag alias management
-virtual-context init coding                          # create config from preset
-virtual-context onboard [--upstream URL]              # guided setup (interactive wizard)
+virtual-context init coding                          # config from a preset
+virtual-context onboard [--upstream URL]             # guided setup
 virtual-context daemon install|status|start|stop     # background service
-virtual-context config validate                      # check config syntax
+virtual-context config validate                      # check the config
 virtual-context telemetry [--verbose] [--json]       # cost, tokens, timing
-virtual-context import ...                           # import conversation history
-virtual-context chat [--headless] [--replay ...]     # interactive TUI or headless
-virtual-context admin <subcommand>                   # backfills and repairs (docs/commands.md)
+virtual-context chat [--headless] [--replay ...]     # interactive TUI
+virtual-context admin <subcommand>                   # backfills and repairs
 ```
 
-## Interactive Chat (TUI)
+The full command and flag reference, including the sixteen admin subcommands: [docs/commands.md](docs/commands.md).
+
+## Interactive chat (TUI)
 
 ```bash
 virtual-context chat --config virtual-context.yaml
 ```
 
-Terminal chat interface with live context visualization: tag panel with activity levels, real-time budget bar, turn inspector (Ctrl+I), manual compaction (`/compact` or Ctrl+K), session export (Ctrl+S). Headless mode (`--headless --replay prompts.txt`) for automated testing and regression validation.
+A terminal chat with live context visualization: tag panel, budget bar, turn inspector, manual compaction, session export. Headless mode (`--headless --replay prompts.txt`) drives automated testing.
 
-## Stress-Tested
+## Benchmark results
 
-Validated against adversarial 100-turn conversations with deliberately overlapping domains, vocabulary mismatches, ambiguous callbacks, and cross-domain synthesis queries, using a 3,000-token context window with Claude Haiku. 89% pass rate on 28 deliberately adversarial prompts. Tag vocabulary stabilizes within 10-15 turns via the feedback loop.
+### LongMemEval (100 questions)
 
-Also validated in production with OpenClaw (Telegram) handling real multi-topic conversations: tool chain preservation across 90-message conversations (52 messages filtered to 27 without breaking a single tool dependency), live embedding matching against 40+ tag vocabularies, and single-pass history ingestion of 43 pre-existing turns.
-
-## Benchmark Results
-
-### LongMemEval (100 Questions)
-
-100 random questions from [LongMemEval-500](https://github.com/xiaowu0162/LongMemEval) (5 batches x 20, seeds 42/99/777/1234/2025).
+100 random questions from [LongMemEval-500](https://github.com/xiaowu0162/LongMemEval) (5 batches of 20, seeds 42/99/777/1234/2025).
 
 **Configuration:**
 - **VC:** MiMo-V2-Flash (ingestion) + Claude Sonnet 4.5 (reader) + Gemini 3 Pro Preview (judge)
-- **Baseline:** Claude Sonnet 4.5 with full conversation history (~118K tokens) + Gemini 3 Pro Preview (judge)
+- **Baseline:** Claude Sonnet 4.5 with the full conversation history (~118K tokens) + the same judge
 
 | Metric | VC | Baseline |
 |--------|-----|----------|
 | Accuracy | 95/100 (95%) | 33/100 (33%) |
-| Avg Tokens/Question | 52,347 | 117,582 |
-| Avg Cost/Question | $0.16 | $0.36 |
-| Total Cost | $15.99 | $35.56 |
-| Token Reduction | 2.2x fewer | -- |
+| Avg tokens/question | 52,347 | 117,582 |
+| Avg cost/question | $0.16 | $0.36 |
+| Total cost | $15.99 | $35.56 |
+| Token reduction | 2.2x fewer | -- |
 
-#### Accuracy by Question Type
+#### Accuracy by question type
 
 | Category | Count | VC | Baseline |
 |----------|-------|----|----------|
@@ -414,7 +357,7 @@ Also validated in production with OpenClaw (Telegram) handling real multi-topic 
 | single-session-preference | 5 | 100.0% (5/5) | 20.0% (1/5) |
 
 <details>
-<summary>Click to expand full results table (100 questions)</summary>
+<summary>Click to expand the full results table (100 questions)</summary>
 
 | ID | Type | BL | BL Tokens | BL Cost | VC | VC Tokens | VC Cost |
 |----|------|-----|-----------|---------|-----|-----------|---------|
@@ -522,6 +465,24 @@ Also validated in production with OpenClaw (Telegram) handling real multi-topic 
 
 </details>
 
+A full LoCoMo run is not yet published; the figures above are LongMemEval results. Suite descriptions and how to run them: [docs/benchmarks.md](docs/benchmarks.md).
+
+Also validated against adversarial internal stress tests (100-turn conversations with deliberately overlapping domains and vocabulary mismatches at a 3,000-token window) and in production with OpenClaw handling real multi-topic group conversations.
+
+## Documentation
+
+| Page | Covers |
+|---|---|
+| [architecture.md](docs/architecture.md) | The memory model, request pipeline, multi-worker coordination, identity |
+| [engine.md](docs/engine.md) | Compaction, tagging, retrieval scoring, code mode, cache awareness |
+| [attribution.md](docs/attribution.md) | Group conversations: who-said-what, person cards, speaker search, guilds |
+| [proxy.md](docs/proxy.md) | Proxy internals, routing, dashboard, streaming, endpoints |
+| [configuration.md](docs/configuration.md) | Every user-facing config key with defaults |
+| [commands.md](docs/commands.md) | In-conversation commands, the CLI, import, admin tooling |
+| [install.md](docs/install.md) | Install paths, daemons, per-instance setups |
+| [design.md](docs/design.md) | Why it is built this way |
+| [benchmarks.md](docs/benchmarks.md) | Suites, results, how to run them |
+
 ## Development
 
 ```bash
@@ -530,11 +491,11 @@ cd virtual-context
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 python -m pytest tests/ -v --ignore=tests/ollama    # ~4,600 unit tests
-python -m pytest tests/ollama/ -v -m ollama          # integration (requires local LLM)
+python -m pytest tests/ollama/ -v -m ollama          # integration (requires a local LLM)
 ```
 
 ## License
 
 AGPL-3.0, Copyright Y. Ahmed Kidwai
 
-For commercial licensing inquiries, contact: ahmed@kidw.ai
+For commercial licensing inquiries: ahmed@kidw.ai
