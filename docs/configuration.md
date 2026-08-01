@@ -50,6 +50,27 @@ tag_generator:
 
 `temporal_heuristic_enabled` marks a query temporal from date/time patterns in the text even when the LLM tagger did not, which routes it toward time-scoped retrieval. `prompt_mode: "compact"` shrinks the tagger prompt for cheaper models at some quality cost.
 
+Further tagging keys, all optional:
+
+```yaml
+tag_generator:
+  max_tokens: 8192                  # LLM max_tokens for tagger calls
+  context_lookback_pairs: 5         # recent turn pairs fed as tagger context
+  context_bleed_threshold: 0.1      # embedding gate on that context (0 = disabled)
+  disable_thinking: false           # prepend /no_think to prompts (qwen3 workaround)
+  temporal_patterns: []             # override the built-in temporal regex list
+  keyword_fallback:                 # vocabulary for type: "keyword" tagging
+    tag_keywords: {}                #   tag -> list of keywords
+    tag_patterns: {}                #   tag -> list of regex patterns
+  tag_splitting:
+    enabled: false                  # auto-split overly-broad tags
+    frequency_threshold: 15         # min absolute turn count to trigger
+    frequency_pct_threshold: 0.15   # min relative frequency (count/total)
+    max_splits_per_turn: 1          # split attempts per completed turn
+```
+
+`disable_thinking` exists as a model workaround (some local models emit thinking blocks that break JSON tagging); leave it off unless you hit that. `keyword_fallback` is how users shape deterministic tagging: with `type: "keyword"`, tags come only from this vocabulary.
+
 **Type options**:
 
 - `llm`: LLM-based tagging of completed turns. Best quality. Uses the configured provider and model.
@@ -79,6 +100,22 @@ compaction:
 ```
 
 `code_mode` is on by default and changes what facts are extracted; see [engine internals](engine.md#code-mode). `session_gap_minutes` silently splits segments at conversational time gaps, so widely spaced messages summarize separately even when their topics match.
+
+#### Segmentation and merge tuning
+
+```yaml
+compaction:
+  summary_ratio: 0.15               # target summary size as a fraction of source
+  max_segment_tokens: 2000          # split segments larger than this
+  max_segment_turns: 20             # hard cap on turns per segment (0 = unlimited)
+  tag_overlap_threshold: 0.5        # min overlap coefficient to keep turns in one segment
+  tool_result_segment_threshold: 50000  # bytes; larger tool results get their own segment (0 = disabled)
+  merge_lookback: 5                 # check the last N segments for a merge candidate
+  merge_overlap_threshold: 0.35     # min relatedness score to merge
+  max_concurrent_summaries: 4       # parallel summarization LLM calls
+  llm_token_overhead: 2000          # extra tokens reserved for model thinking overhead
+  overflow_buffer: 1.2              # safety multiplier on summary size estimates
+```
 
 `defer_payload_mutation` and the flush gate are documented in [engine internals](engine.md). `fill_pass_enabled` conflicts with deferral (it rewrites the payload every request); the proxy warns if both are on.
 
@@ -125,11 +162,13 @@ retrieval:
   skip_active_tags: true            # ON BY DEFAULT: don't re-retrieve tags already in the raw window
   active_tag_lookback: 4            # recent turns whose tags are skipped
   anchorless_lookback: 6            # turns used when no tags match
+  embedding_threshold: 0.3          # min similarity for embedding-tagger matches
   strategy_config:
     default:
       max_results: 10               # max segments to retrieve
       max_budget_fraction: 0.25     # max fraction of window for context
       include_related: true         # include segments related to matches
+      min_overlap: 1                # min tag-overlap count to qualify
 ```
 
 Only the `default` strategy entry is read; per-strategy overrides beyond it have no effect.
@@ -186,6 +225,18 @@ assembly:
 
 `pre_compaction_filtering` governs tag-based relevance drops from the payload *before* the first compaction: `"off"` passes every turn through, `"conservative"` drops with a doubled protected window (`protected_recent_turns * 2`), and the default `"aggressive"` drops with the standard protected window. After the first compaction the standard window always applies regardless of this setting.
 
+#### Core context and budgets
+
+```yaml
+assembly:
+  core_files: []                    # pinned files, e.g. [{path: "PROJECT.md", priority: 8}]
+  core_context_max_tokens: 18000    # budget for pinned core context
+  facts_max_tokens: 20000           # budget for injected facts
+  context_injection_max_tokens: -1  # -1 = auto (tag budget + facts budget)
+```
+
+`core_files` pins file content into every assembled context: each entry is `{path, priority}` (priority defaults to 5, higher renders first); files are read from disk, concatenated with per-file headers, and budgeted by `core_context_max_tokens`. Missing files are skipped silently.
+
 **`context_hint_enabled`**: When true, after compaction the assembler injects a brief list of all available tags with segment counts. This gives the model topic awareness without spending full summary budget.
 
 ### Search
@@ -202,7 +253,11 @@ search:
   remember_when_max_results: 12
   semantic_search_max_results: 5
   query_facts_default_limit: 50
+  search_facts_max_results: 10
   excerpt_context_chars: 200
+  fts_snippet_chars: 500            # snippet length from full-text matches
+  tool_output_snippet_chars: 100    # snippet length inside stored tool output
+  postgres_max_words: 100           # word cap on Postgres full-text queries
   speaker_annotations_enabled: false  # annotate search results with speaker labels
   speaker_selection_enabled: false    # allow tools to filter by speaker
   speaker_audience_scope: "channel"   # or "conversation"
