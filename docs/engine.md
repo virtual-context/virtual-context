@@ -296,6 +296,10 @@ The engine exposes eight tools to the model on the proxy tool loop:
 
 This tool-loop surface is distinct from the MCP server's tool set (see the README's MCP section); the two lists overlap but are not the same.
 
+### Channel-Scoped Quote Search
+
+`vc_find_quote` accepts an optional `channel` argument: a channel name (with or without a leading `#`) or a stored channel ID. When passed, both the lexical and the semantic search branches restrict matches to rows whose stored channel provenance matches, with empty provenance failing closed out of the scope. When omitted, the whole conversation is searched; the tool schema tells the model to scope only when the question is explicitly about one channel.
+
 ### Time-Scoped Recall Modes
 
 `vc_remember_when` takes a `mode` that shapes what a temporal query returns:
