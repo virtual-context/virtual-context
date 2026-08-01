@@ -64,7 +64,15 @@ compaction:
   protected_recent_turns: 6         # recent turns exempt from compaction
   min_summary_tokens: 200           # minimum tokens for a summary
   max_summary_tokens: 2000          # maximum tokens for a summary
+  defer_payload_mutation: false     # preserve the prompt-cache prefix while warm
+  flush_ttl_seconds: 300            # cache considered cold after this idle time
+  fill_pass_enabled: false          # rewrite payload toward a target fill each request
+  fill_pass_target: "soft"          # "soft", "hard", or a float fraction
+  fill_pass_summary_ratio: 0.60
+  store_recovery_threshold: 0.70    # recover from store when payload < this fraction of stored turns
 ```
+
+`defer_payload_mutation` and the flush gate are documented in [engine internals](engine.md). `fill_pass_enabled` conflicts with deferral (it rewrites the payload every request); the proxy warns if both are on.
 
 **Thresholds** are fractions of the context window. At 70% fill with a 120K window, compaction starts when ~84K tokens are in use.
 

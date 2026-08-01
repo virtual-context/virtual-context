@@ -12,6 +12,29 @@ There is no second summarize-the-summaries tier. The separately named `deep_comp
 
 The compactor runs on a background pool after `on_turn_complete`, never blocking the response path.
 
+### Cache-Aware Payload Flushing
+
+Compacting storage and rewriting the outgoing payload are two separate steps, tracked by two watermarks: `compacted_prefix_messages` (how far compaction has covered the conversation in storage) and `flushed_prefix_messages` (how far the outgoing payload reflects it). Rewriting the payload breaks the byte-identical prefix that providers use for prompt-cache hits, so applying compaction to the payload immediately trades cache discounts for compaction savings.
+
+With `compaction.defer_payload_mutation: true`, a flush gate decides per request:
+
+- **Warm cache** (time since the previous request is under `flush_ttl_seconds`) with pending compaction work: payload mutations are **deferred**. The prefix stays byte-identical and cache hits keep flowing, while storage-side compaction proceeds normally.
+- **Cold cache** (the TTL has passed, so the provider's cache has expired anyway): the flush watermark catches up and the payload is rewritten. The compaction savings arrive exactly when the cache discount was already gone.
+- **Safety valve**: if a warm-deferred payload exceeds `hard_threshold * context_window`, the gate force-flushes and re-runs the skipped mutations in a second pass, so deferral can never push the payload past the budget.
+- After a restart the cache age is unknown and is treated as warm, so the first request never mutates blindly.
+
+With the default `defer_payload_mutation: false`, the flush watermark tracks the compaction watermark immediately (legacy behavior).
+
+Deferral conflicts with the fill pass: `fill_pass_enabled: true` rewrites the payload every request, destroying the prefix that deferral preserves, and the proxy logs a configuration-conflict warning if both are enabled.
+
+Observability: the gate logs a `FLUSH_GATE:` line on every decision (legacy, COLD, WARM deferred, WARM no-pending, SAFETY VALVE) and `DROP-COMPACTED:` when compacted turns are removed from a payload.
+
+```yaml
+compaction:
+  defer_payload_mutation: false   # true = preserve the prompt-cache prefix while warm
+  flush_ttl_seconds: 300          # cache considered cold after this idle time
+```
+
 ### Compaction Configuration
 
 ```yaml
