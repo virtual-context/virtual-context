@@ -98,7 +98,7 @@ Every resolution step reads through the **alias table**. `VCATTACH` writes a dur
 
 ## Attribution
 
-Group conversations carry per-message sender identity. The envelope parser claims the sender, channel, and reply-target from transport metadata before it is stripped from the model-visible text; these land as columns on the canonical turn. On top of that sit **actor profiles** and **person cards** (durable, per-actor fact digests injected into assembly for the requester) and **speaker-conditioned retrieval**: search tools accept a speaker selection, so "what has this person said" resolves against rows attributed to that actor rather than the whole conversation.
+Group conversations carry per-message sender identity. The envelope parser claims the sender, channel, and reply-target from transport metadata before it is stripped from the model-visible text; these land as columns on the canonical turn. On top of that sit **actor profiles** and **person cards** (durable, per-actor fact digests injected into assembly for the requester) and **speaker-conditioned retrieval**: search tools accept a speaker selection, so "what has this person said" resolves against rows attributed to that actor rather than the whole conversation. The full subsystem, its gates, and its operator surface are documented in [attribution](attribution.md).
 
 ## Component Map
 

@@ -184,8 +184,10 @@ search:
   excerpt_context_chars: 200
   speaker_annotations_enabled: false  # annotate search results with speaker labels
   speaker_selection_enabled: false    # allow tools to filter by speaker
-  speaker_audience_scope: "channel"
+  speaker_audience_scope: "channel"   # or "conversation"
 ```
+
+The speaker gates, the actor-card keys under `assembly:`, and how the whole attribution subsystem fits together are documented in [attribution](attribution.md).
 
 **The tool guard is on by default.** If the model issues more than `tool_guard_threshold` search-tool calls inside `tool_guard_window_seconds`, further search calls are stopped for the remainder of the window. If search tools appear to "stop working" mid-conversation, this guard is the first thing to check; raise the threshold or disable it if your workload legitimately searches in bursts.
 
