@@ -151,9 +151,25 @@ The `virtual-context` command line is a separate surface from the in-conversatio
 | `compact` | Trigger manual compaction |
 | `aliases list\|suggest\|add` | Manage tag aliases |
 | `chat` | Interactive TUI chat (`--headless --replay` for scripted runs) |
-| `import` | Import conversation history from exports |
+| `import` | Import conversation history from exports (see below) |
 | `telemetry` / `cost-report` | Show conversation telemetry and cost |
 | `admin <subcommand>` | Operational primitives (backfills, repairs) |
+
+### Importing Conversation History
+
+`virtual-context import` ingests conversation exports from other assistants into the store, so a user migrating to virtual-context arrives with their history already indexed, tagged, and retrievable:
+
+```bash
+virtual-context import --provider chatgpt --input conversation.json
+virtual-context import --provider claude  --input ~/exports/        # directory: every *.json inside
+virtual-context import --provider grok    --input export.json --compact
+```
+
+- `--provider` / `-p` (required): one of `chatgpt`, `claude`, `grok`. Each adapter parses that service's native conversation-export JSON.
+- `--input` / `-i` (required): a single export file, or a directory whose `*.json` files are imported in sorted order. Files with no messages are skipped and counted.
+- `--compact`: run compaction after the import (off by default). Without it, imported turns are ingested and tagged but summarization happens later through the normal thresholds.
+
+Each imported conversation keeps its own conversation ID from the export, so separate source conversations stay separate in the store, and progress is printed per conversation as turns are ingested.
 
 ### Admin Subcommands
 
