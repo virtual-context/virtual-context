@@ -171,6 +171,7 @@ assembly:
   recent_turns_always_included: 3   # recent turns always included in full
   context_hint_enabled: true        # inject topic list after compaction
   context_hint_max_tokens: 2000     # max tokens for the topic hint
+  protected_window_db_source: "off" # "merge" = store-fed recent window for unified multi-channel conversations
 ```
 
 **`context_hint_enabled`**: When true, after compaction the assembler injects a brief list of all available tags with segment counts. This gives the model topic awareness without spending full summary budget.

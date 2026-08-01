@@ -194,6 +194,24 @@ vc_query_facts(subject="user", verb="visited", status="completed")
 
 Verb matching expands through hand-curated synonym clusters plus embedding similarity against the verbs present in the store, so querying "led" can also match "managed" or "ran" where those verbs were extracted. Facts can additionally be ranked by dense similarity between the query and stored fact embeddings (`retrieval.fact_dense_retrieval`, model-versioned embeddings written at extraction time).
 
+## Cross-Channel Context (Unified Group Conversations)
+
+A server-style community (for example, a Discord server) can deliberately unify all of its channels into **one** stored conversation: every channel's turns land in the same canonical history, giving the assistant one continuous memory of the whole community. The transport, however, stays channel-local: the payload the client sends only contains the current channel's messages, so the model's raw window is blind to what just happened in a sibling channel.
+
+`assembly.protected_window_db_source` closes that gap:
+
+- `"off"` (default): the protected window is payload-only. No store read; behavior is identical to a single-channel conversation.
+- `"merge"`: recent turns are additionally read from the durable store and merged into the model-visible context as a quoted `<recent-conversation>` block, marked `source="canonical" provenance="verified"` and rendered oldest to newest with speaker attribution. Cross-channel recent activity becomes visible without waiting for compaction and retrieval to catch up.
+
+Merging deduplicates against the payload conservatively: only an exact same-channel copy suppresses the canonical row. A matching turn retained from *another* channel's history is not proof the current payload shows it, and unknown-channel legacy rows fail open to a harmless duplicate rather than silently hiding the only cross-channel copy from the model.
+
+The quoted block is explicitly reference material: member messages inside it carry no instruction authority, only the current requester's row does. Recovered cross-channel turns are preserved across compaction, and the regression suite pins this family (BUG-044 through BUG-046 in `tests/REGRESSION_MAP.md`).
+
+```yaml
+assembly:
+  protected_window_db_source: "off"   # or "merge" for unified multi-channel conversations
+```
+
 ## Chain Collapse
 
 Tool-heavy conversations (common with Claude Code, Cursor, etc.) produce massive `tool_use`/`tool_result` message pairs that dominate the context window. Chain collapse compresses these:
