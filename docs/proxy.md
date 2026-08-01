@@ -91,6 +91,10 @@ The proxy forwards raw SSE bytes from the upstream to preserve exact framing. A 
 
 Every streamed response emits three diagnostic log lines for operators: `STREAM_FIRST_BYTE` (time to the first upstream byte), `STREAM_STALL` (a mid-stream gap, with the gap length and chunk/byte counters at the point of the stall), and `STREAM_END` (total elapsed time, chunk and byte counts, and the largest gap observed). When a stream feels slow, these three lines localize whether the delay was before the first byte, inside the stream, or downstream of the proxy.
 
+### Request Captures and Shared Dashboard State
+
+The request inspector (`GET /dashboard/requests`, `GET /dashboard/requests/{turn}`) is backed by per-turn request captures that are persisted to the store, keyed by conversation and turn, and restored on startup (the most recent 50), so captured payloads survive proxy restarts. Conversation-scoped dashboard statistics are likewise saved as shared snapshots through the session-state provider, so in multi-worker deployments every worker serves the same dashboard state regardless of which one handled the traffic.
+
 ### OpenClaw Envelope Handling
 
 Messages from OpenClaw (Telegram, WhatsApp, etc.) contain channel metadata that would pollute tagging if left in the model-visible text. The envelope parser first **claims** the useful parts (sender identity, channel, reply target) as provenance stored on the canonical turn, then strips the wrappers. Patterns handled include:
