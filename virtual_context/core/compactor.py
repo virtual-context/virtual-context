@@ -357,7 +357,7 @@ CODING CONVERSATION MODE:
 - DO extract: conclusions, findings, discoveries, decisions made, user preferences, configuration values, deployment details, architectural choices, bugs found and their fixes, tool/library choices.
 - DO extract: what was built, fixed, changed, or implemented as a result of the conversation. Frame these as facts about the THING, not about the assistant. E.g. "Facts endpoint now supports date_created sorting" not "Assistant added sorting to the endpoint".
 - DO extract: facts about the user's projects, infrastructure, workflows, and environment.
-- The subject for findings should be the THING, not "Assistant" — e.g. "Deploy target is Linode at 45.33.74.201" not "Assistant deployed to Linode".
+- The subject for findings should be the THING, not "Assistant": e.g. "Deploy target is the VPS at 203.0.113.10" not "Assistant deployed to the VPS".
 - Prefer these verbs when they fit the actual event: changed/modified, has bug/broken, fixed, added/created, removed/deleted, deployed, reverted.
 - Also emit "code_refs": a deduplicated list of concrete file/function/class refs that were materially discussed or changed.
   Each item should look like {"file": "path/to/file.py", "line": 123, "symbol": "function_name"}.
