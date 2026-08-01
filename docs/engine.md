@@ -29,6 +29,15 @@ Deferral conflicts with the fill pass: `fill_pass_enabled: true` rewrites the pa
 
 Observability: the gate logs a `FLUSH_GATE:` line on every decision (legacy, COLD, WARM deferred, WARM no-pending, SAFETY VALVE) and `DROP-COMPACTED:` when compacted turns are removed from a payload.
 
+### Cache Breakpoints
+
+The boundary the flush gate protects is set explicitly. On the Anthropic format (only; `cache_control` is an Anthropic Messages API construct), virtual-context inserts a `cache_control: {"type": "ephemeral"}` breakpoint so that the **stable content ends inside the cached region and the injected VC block sits after it**:
+
+- When injecting into the system prompt, the breakpoint is placed on the last stable block of the client's own system content, and the fresh `<system-reminder>`-wrapped context block is appended after it. Any `cache_control` markers the client had set on its system blocks are removed and re-placed there: virtual-context takes ownership of breakpoint placement on the system prompt, because the injected block changes turn-to-turn and must not be inside the cached prefix.
+- When injecting into the last user message, the breakpoint lands on that message's last existing content block and the context block is appended after it, with the same effect.
+
+This is automatic and not configurable. The result is that the client's stable prompt and history remain cacheable across turns even though virtual-context appends volatile retrieved context to every request; the flush gate (above) then decides when it is worth breaking that stable prefix to apply compaction.
+
 ```yaml
 compaction:
   defer_payload_mutation: false   # true = preserve the prompt-cache prefix while warm
