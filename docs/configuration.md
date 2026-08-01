@@ -389,15 +389,18 @@ tag_rules:
 
 ## Presets
 
-Virtual-context ships with presets for common use cases:
+Virtual-context ships with two presets:
+
+- **`coding`**: aggressive compaction, code-specific keyword fallbacks, tool output interception, and the fact graph enabled. Tuned for tool-heavy development sessions.
+- **`agentic`**: balanced defaults for autonomous agent conversations across any domain, with the fact graph enabled.
 
 ```bash
 virtual-context presets list
-virtual-context presets show coding
-virtual-context presets show agentic
+virtual-context presets show coding      # print the preset's full config as YAML
+virtual-context init coding              # bootstrap a config file from it
 ```
 
-Use `virtual-context init <preset>` to bootstrap a config from a preset.
+`presets show` prints exactly what a preset sets, so the two summaries above never need to be trusted blind.
 
 ## Config Validation
 
