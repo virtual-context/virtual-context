@@ -415,4 +415,6 @@ Reports missing required fields, invalid types, and cross-field constraint viola
 | `OPENAI_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY` | Provider API keys, honored through a `providers.<label>.api_key_env` entry in the config (the `onboard` and `init` commands generate these entries) |
 | `REDIS_URL` | Redis session cache URL; overrides `proxy.redis_url` |
 | `VC_DASHBOARD_TOKEN` | Require a token on dashboard endpoints (unauthenticated when unset) |
+| `DATABASE_URL` | Postgres DSN fallback for the CLI. Storage precedence: explicit storage flag (`--postgres-dsn` / `--sqlite-path`) > `-c` config > `DATABASE_URL`, consulted only when neither flag nor config was given. Lets `admin` subcommands run bare inside a container that has the environment but no mounted config file |
+| `VC_DATA_DIR` | Data directory for deployments whose store has no local database path (default `/data/tenants`). Media originals saved by image compression land under `$VC_DATA_DIR/media/`, per conversation, and are cleaned up when a conversation is deleted |
 | `VIRTUAL_CONTEXT_CONFIG` | Config file path override, read by the MCP server only; the CLI uses `-c` and auto-discovery |

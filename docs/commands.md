@@ -195,3 +195,30 @@ Each imported conversation keeps its own conversation ID from the export, so sep
 | `retag-canonical-turns` | Re-tag stored turns with pair context via the configured tagger |
 
 Run `virtual-context admin <subcommand> --help` for the flags each command takes.
+
+#### Common admin flags
+
+**Two safety models exist; know which one your command uses.**
+
+- Commands that **write by default** and take `--dry-run` to report instead: `backfill-senders`, `backfill-channels`, `backfill-actors`, `backfill-reply-roles`, `backfill-fact-authors`, `rebuild-actor-cards`, `retag-canonical-turns`, `backfill-session-state-markers`.
+- Commands that **dry-run by default** and take `--apply` to write: `reattribute-audience`, `rebuild-derived-data`, `resummarize-segments`, `resequence-canonical-turns`, `normalize-canonical-actor-ids`, `reindex-canonical-turn-embeddings`.
+- `backfill-tag-summaries` and `backfill-fact-embeddings` take `--force-rebuild` to regenerate rows that already exist.
+
+Storage and scope targeting, shared across the admin surface:
+
+| Flag | Meaning |
+|------|---------|
+| `--postgres-dsn <dsn>` | Target Postgres; overrides the config's `storage.postgres.dsn` |
+| `--sqlite-path <path>` | Target SQLite; overrides the config's `storage.sqlite.path` |
+| `--tenant-id <id>` | Tenant to operate on (default: empty, single-tenant) |
+| `--all-convs-for-tenant` | Enumerate every conversation owning canonical rows for the tenant instead of naming one conversation ID |
+| `--limit N` | Cap rows upgraded per conversation, or conversations enumerated (default: no cap) |
+| `--platform <name>` | Actor commands only: operator-asserted platform (e.g. `telegram`) for conversations whose caller keys never named one; never inferred, applied only to identity blocks carrying a sender ID without platform proof |
+
+Storage resolution follows the precedence chain: explicit flag > `-c` config > the `DATABASE_URL` environment variable (see [configuration](configuration.md#environment-variables)); the env fallback is consulted only when neither a storage flag nor `-c` was given, so a bare invocation works inside a container that has `DATABASE_URL` set and no config file mounted.
+
+#### Other notable flags
+
+- `retrieve` / `transform`: `-m` / `--message` is the inbound message to retrieve for; `--active-tags` supplies a comma-separated working set to simulate; `transform` also takes `--budget` to override the token budget.
+- `recall`: `--limit` caps returned segments (default 5).
+- `init`: `--force` overwrites an existing config file.
