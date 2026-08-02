@@ -438,7 +438,7 @@ def test_schema_with_snapshot_binds_handles_only():
     )
     rendered = json.dumps(defs)
 
-    selectable = {"vc_find_quote", "vc_query_facts", "vc_remember_when"}
+    selectable = {"vc_find_quote", "vc_query_facts"}
     for definition in defs:
         schema = definition["input_schema"]
         properties = schema.get("properties", {})

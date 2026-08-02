@@ -8,10 +8,10 @@ that the selection had been ignored — the reader then attributed all of
 them to the participant it had asked about.
 
 Selection is now resolved with the same validated helper the quote path
-uses. A fact exposes an author only when its attribution is role-local, so
-model-assisted facts cannot be filtered on; that case fails open on the
-results but never silently — the response says the facts are NOT
-attributable to the selected participant.
+uses. A fact exposes an author only when its attribution is role-local.
+Non-filtering hints preserve the ordinary result set with an attribution
+warning, while ``speaker_only`` excludes model-assisted, unattributed, and
+other-speaker facts rather than widening the result.
 """
 from __future__ import annotations
 
@@ -75,8 +75,9 @@ def _context():
 
 
 class _Engine:
-    def __init__(self, facts):
+    def __init__(self, facts, linked=()):
         self._facts_list = facts
+        self._linked = list(linked)
         self.config = SimpleNamespace(
             search=SimpleNamespace(
                 speaker_selection_enabled=True,
@@ -95,7 +96,12 @@ class _Engine:
         )
 
     def query_facts(self, **kwargs):
-        return {"facts": list(self._facts_list)}
+        return {
+            "facts": list(self._facts_list),
+            "linked_facts": list(self._linked),
+            "total_all_statuses": len(self._facts_list),
+            "all_statuses": {"active": len(self._facts_list)},
+        }
 
 
 def _run(engine, tool_input):
@@ -105,6 +111,16 @@ def _run(engine, tool_input):
         tool_input,
         speaker_context=_context(),
         roster_snapshot=_snapshot(),
+    )
+
+
+def _run_without_identity_context(engine, tool_input):
+    return execute_vc_tool(
+        engine,
+        "vc_query_facts",
+        tool_input,
+        speaker_context=None,
+        roster_snapshot=None,
     )
 
 
@@ -137,6 +153,97 @@ def test_speaker_only_filters_role_local_facts():
     assert payload["filter_applied"] is True
     assert payload["excluded_other_speakers"] == 1
     assert "speaker_selection_note" not in payload
+    assert "total_all_statuses" not in payload
+
+
+def test_speaker_only_excludes_unattributed_facts_instead_of_widening():
+    engine = _Engine([
+        _fact("f1", "retatrutide", "", version=1, role=""),
+        _fact("f2", "MOTS-c", "", version=2, role="unattributed"),
+    ])
+
+    payload = _payload(_run(
+        engine, {"speaker": "roo", "speaker_only": True},
+    ))
+
+    assert payload["count"] == 0
+    assert payload["facts"] == []
+    assert payload["filter_applied"] is True
+    assert payload["excluded_other_speakers"] == 2
+
+
+def test_invalid_speaker_only_returns_no_facts():
+    engine = _Engine([
+        _fact("f1", "other topic", OTHER, version=2, role="requester"),
+    ])
+
+    payload = _payload(_run(
+        engine, {"speaker": "not_in_roster", "speaker_only": True},
+    ))
+
+    assert payload["count"] == 0
+    assert payload["facts"] == []
+    assert payload["filter_applied"] is False
+    assert payload["speaker_hint"] == "unresolved"
+    assert "no facts were returned" in payload["speaker_selection_note"]
+
+
+def test_speaker_only_without_request_identity_context_fails_closed():
+    engine = _Engine([
+        _fact("f1", "other topic", OTHER, version=2, role="requester"),
+    ])
+
+    payload = _payload(_run_without_identity_context(
+        engine, {"speaker": "roo", "speaker_only": True},
+    ))
+
+    assert payload["count"] == 0
+    assert payload["facts"] == []
+    assert payload["filter_applied"] is False
+    assert payload["speaker_hint"] == "unresolved"
+    assert "no facts were returned" in payload["speaker_selection_note"]
+
+
+def test_speaker_only_without_handle_fails_closed_and_discloses_why():
+    engine = _Engine([
+        _fact("f1", "other topic", OTHER, version=2, role="requester"),
+    ])
+
+    payload = _payload(_run(engine, {"speaker_only": True}))
+
+    assert payload["count"] == 0
+    assert payload["facts"] == []
+    assert payload["filter_applied"] is False
+    assert "speaker_hint" not in payload
+    assert "no facts were returned" in payload["speaker_selection_note"]
+
+
+def test_speaker_only_filters_linked_fact_enrichment_too():
+    roo_fact = _fact(
+        "f1", "roo topic", ROO, version=2, role="requester",
+    )
+    other_fact = _fact(
+        "f2", "other linked topic", OTHER, version=2, role="requester",
+    )
+    linked = [
+        SimpleNamespace(
+            fact=roo_fact, relation_type="related",
+            linked_from_fact_id="source-roo", confidence=0.9,
+        ),
+        SimpleNamespace(
+            fact=other_fact, relation_type="related",
+            linked_from_fact_id="source-other", confidence=0.9,
+        ),
+    ]
+    payload = _payload(_run(
+        _Engine([roo_fact, other_fact], linked),
+        {"speaker": "roo", "speaker_only": True},
+    ))
+
+    assert [item["subject"] for item in payload["linked_facts"]] == [
+        "roo topic",
+    ]
+    assert "other linked topic" not in json.dumps(payload)
 
 
 def test_speaker_hint_ranks_without_dropping_other_facts():

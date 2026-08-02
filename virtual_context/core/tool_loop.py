@@ -406,12 +406,12 @@ def _runtime_supports_restore(tool_runtime: VCToolRuntime | None) -> bool:
 
 
 # Tools whose request-local schema may carry an explicit ``speaker``
-# selection: raw quote retrieval, fact retrieval, and temporal recall over
-# those sources. Aggregate-only tools never advertise a speaker input.
+# selection. Only tools whose execution actually consumes that selection are
+# listed here. Aggregate-only tools and temporal recall stay unadvertised until
+# they can honor the same request-local attribution contract.
 _SPEAKER_SELECTABLE_TOOLS: frozenset[str] = frozenset({
     "vc_find_quote",
     "vc_query_facts",
-    "vc_remember_when",
 })
 
 # Fixed prose. Roster names are presentation data and are NEVER interpolated
@@ -441,6 +441,12 @@ _FACTS_UNATTRIBUTED_NOTE = (
     "attributable to that participant. Do not present them as that "
     "participant's statements; use find_quote with a speaker selection for "
     "verifiable per-speaker statements."
+)
+
+_SPEAKER_ONLY_UNRESOLVED_NOTE = (
+    "speaker_only was requested but no valid speaker selection from this "
+    "request's roster was provided; no facts were returned. Retry with a "
+    "handle from the current speaker roster."
 )
 
 _SPEAKER_ONLY_PROPERTY_DESCRIPTION = (
@@ -642,10 +648,12 @@ def _resolve_speaker_conditioning(
     """Resolve the single conditioning target before candidate generation.
 
     Returns ``None`` — and consumes nothing from *tool_input* — unless the
-    ``speaker_selection_enabled`` gate is on AND the speaker-aware
-    annotation branch is active for this request (annotations gate on plus
-    a proved audience). Gate-off execution is byte-identical to the
-    pre-selection behavior.
+    ``speaker_selection_enabled`` gate is on AND either the speaker-aware
+    annotation branch is active for this request or ``speaker_only`` was
+    explicitly requested.  The latter is represented as unresolved when the
+    request lacks a proved audience, so an exact-speaker request fails closed
+    instead of silently widening to every participant. Gate-off execution is
+    byte-identical to the pre-selection behavior.
 
     When active, exactly one target is resolved with contract precedence:
     a valid explicit roster handle; otherwise the trusted requester when
@@ -663,14 +671,23 @@ def _resolve_speaker_conditioning(
     # merely truthy must not activate the unit.
     if getattr(search_config, "speaker_selection_enabled", False) is not True:
         return None
-    if annotation_speaker_context(config, speaker_context) is None:
-        return None
     if not isinstance(tool_input, dict):
         tool_input = {}
 
     raw_speaker = tool_input.get("speaker")
     hint_arrived = "speaker" in tool_input and raw_speaker is not None
     speaker_only_requested = tool_input.get("speaker_only") is True
+
+    if annotation_speaker_context(config, speaker_context) is None:
+        if not speaker_only_requested:
+            return None
+        return SpeakerConditioning(
+            conditioning_source="none",
+            filter_active=False,
+            hint_arrived=hint_arrived,
+            hint_unresolved=hint_arrived,
+            speaker_only_requested=True,
+        )
 
     if hint_arrived:
         actor = _validate_speaker_handle(
@@ -909,6 +926,7 @@ def _attach_related_facts(
     presented_fact_ids: set[str] | None = None,
     *,
     annotation_context: SpeakerRetrievalContext | None = None,
+    speaker_conditioning: SpeakerConditioning | None = None,
 ) -> object:
     """Search facts by the find_quote query and attach matching ones.
 
@@ -921,6 +939,13 @@ def _attach_related_facts(
     facts, the audience-scoped speaker fields; fact-backed segment
     excerpts are marked with an honest aggregate speaker scope. ``None``
     leaves the serialization byte-identical.
+
+    A valid ``speaker_only`` selection is also a boundary for every
+    enrichment added after quote search.  Related facts therefore survive
+    only when their durable role-local author exactly matches the selected
+    actor.  Aggregate fact segments and reverse-supersession summaries are
+    omitted in that mode because neither is a role-local excerpt.  Without
+    an active filter this function preserves its legacy behavior.
 
     TODO: session_date is currently resolved via a JOIN from
     fact.segment_ref → segments.metadata_json at query time.  This is
@@ -940,6 +965,18 @@ def _attach_related_facts(
     except Exception:
         return result
 
+    speaker_filter_active = bool(
+        speaker_conditioning is not None
+        and speaker_conditioning.filter_active
+        and speaker_conditioning.conditioning_actor_id
+    )
+    if speaker_filter_active:
+        selected_actor = speaker_conditioning.conditioning_actor_id
+        facts = [
+            fact for fact in facts
+            if fact_author_actor_id(fact) == selected_actor
+        ]
+
     if not facts:
         return result
 
@@ -954,20 +991,21 @@ def _attach_related_facts(
     # is always NULL.  The useful signal is the *reverse* direction:
     # "this current fact replaced these older ones."
     supersedes_map: dict[str, list[dict[str, str]]] = {}
-    try:
-        fact_ids = [f.id for f in facts if f.id]
-        if fact_ids:
-            rows = engine._store.get_superseded_facts(fact_ids)
-            for row in rows:
-                target_id = row["superseded_by"]
-                old_entry = {
-                    "subject": row["subject"],
-                    "verb": row["verb"],
-                    "object": row["object"],
-                }
-                supersedes_map.setdefault(target_id, []).append(old_entry)
-    except Exception:
-        pass  # non-critical enrichment
+    if not speaker_filter_active:
+        try:
+            fact_ids = [f.id for f in facts if f.id]
+            if fact_ids:
+                rows = engine._store.get_superseded_facts(fact_ids)
+                for row in rows:
+                    target_id = row["superseded_by"]
+                    old_entry = {
+                        "subject": row["subject"],
+                        "verb": row["verb"],
+                        "object": row["object"],
+                    }
+                    supersedes_map.setdefault(target_id, []).append(old_entry)
+        except Exception:
+            pass  # non-critical enrichment
 
     speaker_labels_map: dict[str, str] = {}
     if annotation_context is not None:
@@ -1024,38 +1062,44 @@ def _attach_related_facts(
         (r.get("session", ""), r.get("topic", ""))
         for r in existing_results if isinstance(r, dict)
     }
-    try:
-        seen_refs: set[str] = set()
-        for f in facts:
-            if not f.segment_ref or f.segment_ref in seen_refs:
-                continue
-            seen_refs.add(f.segment_ref)
-            seg = engine._store.get_segment(f.segment_ref, conversation_id=engine.config.conversation_id)
-            if not seg or not seg.full_text:
-                continue
-            # Derive session label from segment metadata
-            meta = seg.metadata
-            session_label = getattr(meta, "session_date", "") if meta else ""
-            if (session_label, seg.primary_tag) in existing_session_topics:
-                continue  # already have an excerpt from this session+topic
-            # Truncate to a reasonable size
-            text = seg.full_text
-            if len(text) > 800:
-                text = text[:800] + "..."
-            segment_entry: dict[str, object] = {
-                "excerpt": text,
-                "topic": seg.primary_tag,
-                "session": session_label,
-                "source": "fact_segment",
-            }
-            if annotation_context is not None:
-                # Segment text spans sources with no per-speaker
-                # provenance; disclose the scope instead of guessing.
-                annotate_aggregate_entry(segment_entry)
-            existing_results.append(segment_entry)
-            existing_session_topics.add((session_label, seg.primary_tag))
-    except Exception:
-        pass  # non-critical enrichment
+    if not speaker_filter_active:
+        try:
+            seen_refs: set[str] = set()
+            for f in facts:
+                if not f.segment_ref or f.segment_ref in seen_refs:
+                    continue
+                seen_refs.add(f.segment_ref)
+                seg = engine._store.get_segment(
+                    f.segment_ref,
+                    conversation_id=engine.config.conversation_id,
+                )
+                if not seg or not seg.full_text:
+                    continue
+                # Derive session label from segment metadata
+                meta = seg.metadata
+                session_label = (
+                    getattr(meta, "session_date", "") if meta else ""
+                )
+                if (session_label, seg.primary_tag) in existing_session_topics:
+                    continue  # already have an excerpt from this session+topic
+                # Truncate to a reasonable size
+                text = seg.full_text
+                if len(text) > 800:
+                    text = text[:800] + "..."
+                segment_entry: dict[str, object] = {
+                    "excerpt": text,
+                    "topic": seg.primary_tag,
+                    "session": session_label,
+                    "source": "fact_segment",
+                }
+                if annotation_context is not None:
+                    # Segment text spans sources with no per-speaker
+                    # provenance; disclose the scope instead of guessing.
+                    annotate_aggregate_entry(segment_entry)
+                existing_results.append(segment_entry)
+                existing_session_topics.add((session_label, seg.primary_tag))
+        except Exception:
+            pass  # non-critical enrichment
 
     # Track these facts so they won't be repeated in subsequent calls.
     if presented_fact_ids is not None:
@@ -1533,6 +1577,7 @@ def execute_vc_tool(
             result = _attach_related_facts(
                 engine, result, fq_query, presented_fact_ids,
                 annotation_context=annotation_ctx,
+                speaker_conditioning=_fq_conditioning,
             )
         elif name == "vc_search_summaries":
             fq_query = tool_input.get("query", "")
@@ -1595,34 +1640,55 @@ def execute_vc_tool(
             )
             _qf_note = ""
             _qf_excluded = 0
-            if _qf_conditioning is not None and _qf_actor:
-                # A fact exposes an author only when its attribution is
-                # role-local; a model-assisted guess deliberately does not.
-                _qf_attributable = [
-                    f for f in facts if fact_author_actor_id(f)
+            _qf_speaker_only = bool(
+                _qf_conditioning is not None
+                and _qf_conditioning.speaker_only_requested
+            )
+            _qf_filter_active = bool(
+                _qf_conditioning is not None
+                and _qf_conditioning.filter_active
+                and _qf_actor
+            )
+            if _qf_speaker_only and not _qf_filter_active:
+                # Exact-speaker requests never widen to all participants.
+                facts = []
+                _qf_note = _SPEAKER_ONLY_UNRESOLVED_NOTE
+                meta["facts"] = facts
+            elif _qf_conditioning is not None and _qf_actor:
+                _qf_matching = [
+                    f for f in facts
+                    if fact_author_actor_id(f) == _qf_actor
                 ]
-                if not _qf_attributable:
-                    # Nothing to filter ON. Fail open on the results (the
-                    # unconditioned set the reader would have received anyway)
-                    # but never silently: the note is the whole point.
-                    _qf_note = _FACTS_UNATTRIBUTED_NOTE
+                if _qf_filter_active:
+                    # Empty or model-assisted authorship is not evidence for
+                    # the selected participant and is excluded, not widened.
+                    _qf_excluded = len(facts) - len(_qf_matching)
+                    facts = _qf_matching
                 else:
-                    _qf_matching = [
-                        f for f in facts
-                        if fact_author_actor_id(f) == _qf_actor
+                    # A non-filtering hint preserves the legacy fail-open
+                    # behavior, but says when no role-local authorship exists.
+                    _qf_attributable = [
+                        f for f in facts if fact_author_actor_id(f)
                     ]
-                    if getattr(_qf_conditioning, "filter_active", False):
-                        _qf_excluded = len(facts) - len(_qf_matching)
-                        facts = _qf_matching
+                    if not _qf_attributable:
+                        _qf_note = _FACTS_UNATTRIBUTED_NOTE
                     else:
-                        # Hint, not filter: the selected speaker's facts lead,
-                        # the rest survive in their existing order.
                         _qf_rest = [
                             f for f in facts
                             if fact_author_actor_id(f) != _qf_actor
                         ]
                         facts = _qf_matching + _qf_rest
                 meta["facts"] = facts
+
+            _qf_linked = list(meta.get("linked_facts") or [])
+            if _qf_filter_active:
+                _qf_linked = [
+                    linked for linked in _qf_linked
+                    if fact_author_actor_id(linked.fact) == _qf_actor
+                ]
+            elif _qf_speaker_only:
+                _qf_linked = []
+            meta["linked_facts"] = _qf_linked
             fact_entries: list[dict] = [
                 {
                     "subject": f.subject,
@@ -1659,14 +1725,15 @@ def execute_vc_tool(
             # Disclose the selection outcome whenever one was attempted, so a
             # filter that could not be applied is visible rather than implied.
             if _qf_conditioning is not None and (
-                _qf_conditioning.hint_arrived or _qf_actor
+                _qf_conditioning.hint_arrived
+                or _qf_actor
+                or _qf_speaker_only
             ):
                 result["conditioning_source"] = (
                     _qf_conditioning.conditioning_source
                 )
                 result["filter_applied"] = bool(
-                    _qf_actor
-                    and _qf_conditioning.filter_active
+                    _qf_filter_active
                     and not _qf_note
                 )
                 if _qf_excluded:
@@ -1685,7 +1752,10 @@ def execute_vc_tool(
             # When a status filter was used, show the total across ALL
             # statuses so the reader can see the grand total without
             # making separate per-status calls.
-            if meta.get("total_all_statuses") is not None:
+            if (
+                not _qf_speaker_only
+                and meta.get("total_all_statuses") is not None
+            ):
                 result["total_all_statuses"] = meta["total_all_statuses"]
                 result["all_statuses_breakdown"] = meta["all_statuses"]
             # Annotate so the reader knows what broadening happened

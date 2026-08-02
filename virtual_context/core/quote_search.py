@@ -48,7 +48,7 @@ class SpeakerConditioning:
     response reports only ``conditioning_source``. ``filter_active`` is
     true only for a VALID ``speaker_only`` selection; an unresolved or
     absent selection with ``speaker_only`` requested keeps it false so the
-    exact unconditioned path runs with the mandatory warning.
+    exact-speaker path can fail closed with the mandatory warning.
     """
 
     conditioning_actor_id: str = field(default="", repr=False)
@@ -64,8 +64,8 @@ class SpeakerConditioning:
 # names an actor.
 _NO_ATTRIBUTION_FILTER_WARNING = (
     "speaker_only was requested but no valid speaker selection from this "
-    "request's roster was provided; NO attribution filter was applied and "
-    "the results below are the ordinary unfiltered search results."
+    "request's roster was provided; no conversation results were returned. "
+    "Retry with a handle from the current speaker roster."
 )
 
 # ``speaker_only`` fetches more candidates from each source so the actor
@@ -3274,7 +3274,8 @@ def _apply_speaker_conditioning_metadata(
     the unconditioned response. A valid ``speaker_only`` reports
     ``filter_applied=true`` plus the three disjoint audience-scoped counts;
     ``speaker_only`` without a valid selection reports
-    ``filter_applied=false`` and the mandatory sanitized warning.
+    ``filter_applied=false`` and the mandatory sanitized warning; its caller
+    returns no conversation content rather than widening to all speakers.
     """
     if conditioning is None:
         return
@@ -3329,13 +3330,30 @@ def find_quote(
     affinity without touching candidate eligibility, thresholds, or source
     limits; a valid ``speaker_only`` filters role-locally at each source
     before that source's limit and reports its audience-scoped exclusion
-    counts. An unresolved selection runs this exact unconditioned path and
-    only adds the unresolved-hint metadata.
+    counts. An unresolved ``speaker_only`` selection returns no content;
+    silently widening an exact-speaker request to every participant would
+    defeat the attribution boundary.
     """
     if not query.strip():
         return {"error": "empty query"}
 
     mode = _normalize_find_quote_mode(mode)
+    if (
+        speaker_conditioning is not None
+        and speaker_conditioning.speaker_only_requested
+        and not speaker_conditioning.filter_active
+    ):
+        response: dict[str, object] = {
+            "query": query,
+            "mode": mode,
+            "found": False,
+            "results": [],
+            "message": "No exact speaker-filtered search was performed.",
+        }
+        _apply_speaker_conditioning_metadata(
+            response, speaker_conditioning, None,
+        )
+        return response
     query_intent = _detect_query_intent(query)
     if query_intent == "default" and intent_context.strip():
         query_intent = _detect_query_intent(intent_context)

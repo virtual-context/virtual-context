@@ -6,8 +6,8 @@ result below an unfiltered source top-N is still found. One classification
 pass populates three disjoint, audience-scoped counts; aggregate source
 classes and out-of-audience candidates are ineligible before counting and
 contribute nothing. An absent or invalid selection with ``speaker_only``
-runs the exact unfiltered path, reports ``filter_applied=false`` with the
-mandatory warning, and performs no speculative count scan.
+fails closed with no conversation content, reports ``filter_applied=false``
+with the mandatory warning, and performs no speculative count scan.
 """
 
 from __future__ import annotations
@@ -18,12 +18,15 @@ from types import SimpleNamespace
 from virtual_context.core.quote_search import SpeakerConditioning, find_quote
 from virtual_context.core.tool_loop import execute_vc_tool
 from virtual_context.types import (
+    Fact,
     QuoteResult,
     SearchConfig,
+    SegmentMetadata,
     SourceProvenance,
     SpeakerRetrievalContext,
     SpeakerRosterEntry,
     SpeakerRosterSnapshot,
+    StoredSegment,
 )
 
 OWNER = "conv-g"
@@ -116,6 +119,38 @@ class LimitStore:
 
     def search_facts(self, query, limit=10, conversation_id=None):
         return []
+
+
+class FactLeakStore(LimitStore):
+    def __init__(self, corpus, facts):
+        super().__init__(corpus)
+        self.facts = list(facts)
+
+    def search_facts(self, query, limit=10, conversation_id=None):
+        return list(self.facts[:limit])
+
+    def get_superseded_facts(self, fact_ids):
+        return [{
+            "superseded_by": "fact-bea",
+            "subject": "Alex",
+            "verb": "said",
+            "object": "foreign superseded peptide detail",
+        }]
+
+    def get_segment(self, segment_ref, conversation_id=None):
+        return StoredSegment(
+            ref=segment_ref,
+            conversation_id=OWNER,
+            primary_tag="peptide",
+            full_text=(
+                "Bea described her peptide plan.\n"
+                "Alex disclosed a foreign private peptide detail."
+            ),
+            metadata=SegmentMetadata(
+                turn_count=2,
+                session_date="2026/08/02",
+            ),
+        )
 
 
 class SemanticStub:
@@ -343,17 +378,27 @@ class TestRoleLocalPredicatesAndDisjointCounts:
 
 
 class TestInvalidSelectionWithSpeakerOnly:
-    def test_invalid_selection_runs_unfiltered_with_mandatory_warning(self):
+    def test_missing_request_identity_context_fails_closed(self):
+        corpus = [_qr("bea peptide note", 4, actor=BEA)]
+        bad_store = LimitStore(corpus)
+        got = json.loads(execute_vc_tool(
+            _engine(bad_store), "vc_find_quote",
+            {"query": "peptide", "mode": "lookup",
+             "speaker": "bea", "speaker_only": True},
+            speaker_context=None, roster_snapshot=None,
+        ))
+        assert got["results"] == []
+        assert got["found"] is False
+        assert got["filter_applied"] is False
+        assert got["speaker_hint"] == "unresolved"
+        assert "no conversation results were returned" in got["warning"]
+        assert bad_store.limits_seen == []
+
+    def test_invalid_selection_fails_closed_with_mandatory_warning(self):
         corpus = [
             _qr("alex peptide note", 5, actor=ALEX),
             _qr("bea peptide note", 4, actor=BEA),
         ]
-        plain_store = LimitStore(corpus)
-        plain = json.loads(execute_vc_tool(
-            _engine(plain_store), "vc_find_quote",
-            {"query": "peptide", "mode": "lookup"},
-            speaker_context=_ctx(), roster_snapshot=_snapshot(),
-        ))
         bad_store = LimitStore(corpus)
         got = json.loads(execute_vc_tool(
             _engine(bad_store), "vc_find_quote",
@@ -361,16 +406,15 @@ class TestInvalidSelectionWithSpeakerOnly:
              "speaker": "zoe", "speaker_only": True},
             speaker_context=_ctx(), roster_snapshot=_snapshot(),
         ))
-        # Exact unfiltered result set, mandatory warning, no counts.
-        assert got["results"] == plain["results"]
-        assert got["found"] == plain["found"]
+        assert got["results"] == []
+        assert got["found"] is False
         assert got["filter_applied"] is False
         assert got["speaker_hint"] == "unresolved"
-        assert "attribution filter" in got["warning"]
+        assert "no conversation results were returned" in got["warning"]
         for key in COUNT_KEYS:
             assert key not in got
-        # No speculative exclusion scan: identical source limits.
-        assert bad_store.limits_seen == plain_store.limits_seen
+        # No speculative or unfiltered source scan occurred.
+        assert bad_store.limits_seen == []
 
     def test_speaker_only_without_any_selection_also_degrades(self):
         corpus = [_qr("bea peptide note", 4, actor=BEA)]
@@ -380,7 +424,9 @@ class TestInvalidSelectionWithSpeakerOnly:
             speaker_context=_ctx(), roster_snapshot=_snapshot(),
         ))
         assert got["filter_applied"] is False
-        assert "attribution filter" in got["warning"]
+        assert got["results"] == []
+        assert got["found"] is False
+        assert "no conversation results were returned" in got["warning"]
         assert "speaker_hint" not in got
         for key in COUNT_KEYS:
             assert key not in got
@@ -423,3 +469,110 @@ class TestEndToEndThroughExecution:
         assert len(got["results"]) == 2
         assert "filter_applied" not in got
         assert "warning" not in got
+
+    def test_speaker_only_remains_active_through_fact_enrichment(self):
+        facts = [
+            Fact(
+                id="fact-bea",
+                subject="Bea",
+                verb="uses",
+                object="bea peptide plan",
+                what="Bea uses the selected peptide plan.",
+                segment_ref="mixed-segment",
+                conversation_id=OWNER,
+                author_actor_id=BEA,
+                author_attribution_version=2,
+                author_source_role="requester",
+            ),
+            Fact(
+                id="fact-alex",
+                subject="Alex",
+                verb="uses",
+                object="foreign peptide plan",
+                what="Alex uses a foreign peptide plan.",
+                segment_ref="mixed-segment",
+                conversation_id=OWNER,
+                author_actor_id=ALEX,
+                author_attribution_version=2,
+                author_source_role="requester",
+            ),
+            Fact(
+                id="fact-unknown",
+                subject="Someone",
+                verb="uses",
+                object="unattributed peptide plan",
+                what="Someone uses an unattributed peptide plan.",
+                segment_ref="mixed-segment",
+                conversation_id=OWNER,
+                author_actor_id="",
+                author_attribution_version=2,
+                author_source_role="unattributed",
+            ),
+        ]
+        presented: set[str] = set()
+        out = execute_vc_tool(
+            _engine(FactLeakStore([
+                _qr("bea peptide note", 5, actor=BEA),
+                _qr("alex peptide note", 4, actor=ALEX),
+            ], facts)),
+            "vc_find_quote",
+            {
+                "query": "peptide",
+                "mode": "lookup",
+                "speaker": "bea",
+                "speaker_only": True,
+            },
+            presented_fact_ids=presented,
+            speaker_context=_ctx(),
+            roster_snapshot=_snapshot(),
+        )
+
+        got = json.loads(out)
+        assert got["filter_applied"] is True
+        assert got["related_facts_count"] == 1
+        assert got["related_facts"][0]["subject"] == "Bea"
+        assert "replaces_older_facts" not in got["related_facts"][0]
+        assert not any(
+            row.get("source") == "fact_segment"
+            for row in got["results"]
+        )
+        assert "Alex" not in out
+        assert "foreign" not in out
+        assert "unattributed" not in out
+        assert presented == {"fact-bea"}
+
+    def test_speaker_only_with_no_authored_facts_adds_no_fact_payload(self):
+        facts = [Fact(
+            id="fact-alex",
+            subject="Alex",
+            verb="uses",
+            object="foreign peptide plan",
+            what="Alex uses a foreign peptide plan.",
+            segment_ref="mixed-segment",
+            conversation_id=OWNER,
+            author_actor_id=ALEX,
+            author_attribution_version=2,
+            author_source_role="requester",
+        )]
+        got = json.loads(execute_vc_tool(
+            _engine(FactLeakStore([
+                _qr("bea peptide note", 5, actor=BEA),
+            ], facts)),
+            "vc_find_quote",
+            {
+                "query": "peptide",
+                "mode": "lookup",
+                "speaker": "bea",
+                "speaker_only": True,
+            },
+            speaker_context=_ctx(),
+            roster_snapshot=_snapshot(),
+        ))
+
+        assert got["filter_applied"] is True
+        assert "related_facts" not in got
+        assert "related_facts_count" not in got
+        assert all(
+            row.get("source") != "fact_segment"
+            for row in got["results"]
+        )
