@@ -11,7 +11,9 @@ import logging
 import re
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
+
+from .discord_snowflake import snowflake_to_datetime
 from itertools import product
 
 from ..types import (
@@ -1303,6 +1305,39 @@ def _candidate_identity(
     return ("text", qr.text)
 
 
+
+def _within_send_window(
+    results: list[QuoteResult],
+    *,
+    after: "datetime | None",
+    before: "datetime | None",
+) -> list[QuoteResult]:
+    """Keep only results whose send time is provable and inside the window.
+
+    Send time is decoded from the matched row's own message id, carried on
+    the provenance captured at candidate construction, so a result is judged
+    on the row it actually came from. A candidate with no decodable id — a
+    segment-backed hit, or a row ingested without one — cannot prove it
+    belongs inside the window and is dropped rather than assumed in. The
+    decode runs over an already-bounded candidate list, not the table: the
+    store-level bounds do the indexed work.
+    """
+    kept: list[QuoteResult] = []
+    for result in results:
+        provenance = getattr(result, "provenance", None)
+        sent = snowflake_to_datetime(
+            getattr(provenance, "source_message_id", "") if provenance else "",
+        )
+        if sent is None:
+            continue
+        if after is not None and sent < after:
+            continue
+        if before is not None and sent > before:
+            continue
+        kept.append(result)
+    return kept
+
+
 def _search_find_quote_candidates(
     store: ContextStore,
     semantic: SemanticSearchManager,
@@ -1316,6 +1351,8 @@ def _search_find_quote_candidates(
     speaker_context: SpeakerRetrievalContext | None = None,
     speaker_conditioning: SpeakerConditioning | None = None,
     exclusion_counts: dict[str, int] | None = None,
+    after: "datetime | None" = None,
+    before: "datetime | None" = None,
 ) -> list[QuoteResult]:
     results: list[QuoteResult] = []
     lexical_limit = limit
@@ -1424,11 +1461,17 @@ def _search_find_quote_candidates(
         by_actor = getattr(store, "search_canonical_turns_by_actor", None)
         if callable(by_actor):
             try:
+                _recall_window = {}
+                if after is not None:
+                    _recall_window["after"] = after
+                if before is not None:
+                    _recall_window["before"] = before
                 recalled = by_actor(
                     speaker_conditioning.conditioning_actor_id,
                     limit,
                     conversation_id,
                     speaker_context=speaker_context,
+                    **_recall_window,
                 )
             except Exception:
                 logger.debug(
@@ -3307,6 +3350,8 @@ def find_quote(
     speaker_context: SpeakerRetrievalContext | None = None,
     speaker_conditioning: SpeakerConditioning | None = None,
     speaker_handles: dict[str, str] | None = None,
+    after: "datetime | None" = None,
+    before: "datetime | None" = None,
 ) -> dict:
     """Search canonical archived turns only.
 
@@ -3387,7 +3432,11 @@ def find_quote(
         speaker_context=speaker_context,
         speaker_conditioning=speaker_conditioning,
         exclusion_counts=exclusion_counts,
+        after=after,
+        before=before,
     )
+    if after is not None or before is not None:
+        results = _within_send_window(results, after=after, before=before)
     results = _rerank_quote_results(
         results,
         query,
