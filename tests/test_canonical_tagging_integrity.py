@@ -43,6 +43,14 @@ def _immutable_projection(row) -> dict:
     }
 
 
+def _immutable_projection_dict(row_dict: dict) -> dict:
+    return {
+        key: value
+        for key, value in row_dict.items()
+        if key not in _TAG_FIELDS
+    }
+
+
 def test_tag_only_cas_cannot_change_content_or_discord_provenance(tmp_path):
     store = SQLiteStore(tmp_path / "tag-integrity.db")
     conversation_id = "sk:agent:vast:discord:guild:men"
@@ -846,3 +854,262 @@ def test_stamped_identity_cannot_be_reindexed_under_another_turn_number(tmp_path
         rows_by_group={1: rows},
     )
     assert resolved is None
+
+
+def test_durable_resume_aborts_when_body_diverges_from_its_identity_hash(
+    tmp_path, caplog,
+):
+    """One altered body character must abort the resume write, not graft it.
+
+    Production shape: a pending group's stored body no longer agrees with the
+    identity hash that row carries, which is exactly the drift the incident
+    writer produced when it rebuilt pending work and matched rows by
+    user/assistant role shape.  The already-tagged group belongs to a
+    different speaker and sits at the physical tail, so a shape-or-position
+    resolver would land on it.  Durable resume must refuse the mapping and
+    leave every row's body, actor id, Discord source id and turn hash exactly
+    as found — no partial write, no appended replacement row.
+    """
+    import logging
+
+    from virtual_context.engine import VirtualContextEngine
+    from virtual_context.proxy.state import ProxyState
+    from virtual_context.types import (
+        KeywordTagConfig,
+        StorageConfig,
+        TagGeneratorConfig,
+        TurnTagEntry,
+        VirtualContextConfig,
+    )
+
+    conversation_id = "resume-hash-drift"
+    config = VirtualContextConfig(
+        conversation_id=conversation_id,
+        storage=StorageConfig(
+            backend="sqlite",
+            sqlite_path=str(tmp_path / "resume-drift.db"),
+        ),
+        tag_generator=TagGeneratorConfig(
+            type="keyword",
+            keyword_fallback=KeywordTagConfig(
+                tag_keywords={
+                    "legal": ["court", "motion"],
+                    "biology": ["enzyme", "protein"],
+                },
+            ),
+        ),
+    )
+    state = ProxyState(VirtualContextEngine(config=config))
+    store = state.engine._store
+    now = datetime.now(timezone.utc).isoformat()
+
+    def save_half(
+        *,
+        row_id: str,
+        group: int,
+        sort_key: float,
+        body: str,
+        role: str,
+        source_message_id: str,
+        actor_id: str,
+        sender: str,
+        tagged: bool = False,
+        hash_body: str | None = None,
+    ) -> None:
+        user_content = body if role == "user" else ""
+        assistant_content = body if role == "assistant" else ""
+        _, normalized_user, normalized_assistant = compute_turn_hash_from_raw(
+            user_content, assistant_content, version=1,
+        )
+        # ``hash_body`` is the body the row's identity hash was computed over.
+        # When it differs from ``body`` by a single character the row's stored
+        # content no longer proves its own identity.
+        hashed = body if hash_body is None else hash_body
+        turn_hash, _, _ = compute_turn_hash_from_raw(
+            hashed if role == "user" else "",
+            hashed if role == "assistant" else "",
+            version=1,
+        )
+        store.save_canonical_turn(
+            conversation_id,
+            int(sort_key),
+            user_content,
+            assistant_content,
+            user_raw_content=user_content or None,
+            assistant_raw_content=assistant_content or None,
+            primary_tag="baseline" if tagged else "_general",
+            tags=["baseline"] if tagged else [],
+            session_date="2026-08-01T20:00:00",
+            sender=sender,
+            created_at=now,
+            updated_at=now,
+            canonical_turn_id=row_id,
+            sort_key=sort_key,
+            turn_hash=turn_hash,
+            hash_version=1,
+            normalized_user_text=normalized_user,
+            normalized_assistant_text=normalized_assistant,
+            tagged_at=now if tagged else None,
+            first_seen_at=now,
+            last_seen_at=now,
+            source_batch_id=f"batch-{group}",
+            turn_group_number=group,
+            origin_channel_id="discord-channel",
+            origin_channel_label="vasttest",
+            sender_actor_id=actor_id,
+            source_message_id=source_message_id,
+            audience_conversation_id=conversation_id,
+            audience_attribution_version=1,
+        )
+
+    victim_ids = {
+        "00000000-0000-4000-8000-000000000001",
+        "00000000-0000-4000-8000-000000000002",
+    }
+    drifted_id = "11111111-0000-4000-8000-000000000001"
+
+    try:
+        # Pending group 1: the user half's body says "motion", its identity
+        # hash was taken over "notion" — one character.
+        save_half(
+            row_id=drifted_id,
+            group=1,
+            sort_key=3000.0,
+            body="Please file the motion in court",
+            hash_body="Please file the notion in court",
+            role="user",
+            source_message_id="discord-user-1",
+            actor_id="actor:user:1",
+            sender="Cashew King",
+        )
+        save_half(
+            row_id="11111111-0000-4000-8000-000000000002",
+            group=1,
+            sort_key=4000.0,
+            body="The court motion is ready",
+            role="assistant",
+            source_message_id="discord-bot-1",
+            actor_id="actor:vast",
+            sender="Vast",
+        )
+        # Pending group 2 is clean; it must not be tagged by the aborted
+        # strict pass on group 1's behalf.
+        save_half(
+            row_id="22222222-0000-4000-8000-000000000001",
+            group=2,
+            sort_key=5000.0,
+            body="Which enzyme changes this protein?",
+            role="user",
+            source_message_id="discord-user-2",
+            actor_id="actor:user:2",
+            sender="Kuw9239",
+        )
+        save_half(
+            row_id="22222222-0000-4000-8000-000000000002",
+            group=2,
+            sort_key=6000.0,
+            body="That enzyme modifies the protein",
+            role="assistant",
+            source_message_id="discord-bot-2",
+            actor_id="actor:vast",
+            sender="Vast",
+        )
+        # Victim group 0 belongs to another speaker and is the physical tail.
+        save_half(
+            row_id="00000000-0000-4000-8000-000000000001",
+            group=0,
+            sort_key=9000.0,
+            body="victim user body must remain byte-identical",
+            role="user",
+            source_message_id="discord-user-0",
+            actor_id="actor:user:0",
+            sender="Roo",
+            tagged=True,
+        )
+        save_half(
+            row_id="00000000-0000-4000-8000-000000000002",
+            group=0,
+            sort_key=10000.0,
+            body="victim assistant body must remain byte-identical",
+            role="assistant",
+            source_message_id="discord-bot-0",
+            actor_id="actor:vast",
+            sender="Vast",
+            tagged=True,
+        )
+
+        before_rows = store.get_all_canonical_turns(conversation_id)
+        before = {row.canonical_turn_id: asdict(row) for row in before_rows}
+        bodies_by_source = {
+            row.source_message_id: (row.user_content, row.assistant_content)
+            for row in before_rows
+        }
+
+        state.engine._turn_tag_index.append(TurnTagEntry(
+            turn_number=0,
+            message_hash="baseline",
+            tags=["baseline"],
+            primary_tag="baseline",
+        ))
+        state.engine._engine_state.last_indexed_turn = 0
+        state.engine._engine_state.last_completed_turn = 2
+        store.upsert_ingestion_episode(
+            conversation_id=conversation_id,
+            lifecycle_epoch=1,
+            worker_id=state._worker_id,
+            raw_payload_entries=6,
+        )
+        assert store.set_phase(
+            conversation_id=conversation_id,
+            lifecycle_epoch=1,
+            phase="ingesting",
+        ) is True
+
+        with caplog.at_level(logging.ERROR):
+            assert state.resume_pending_ingestion_if_needed() is True
+            worker = state._ingestion_thread
+            assert worker is not None
+            worker.join(timeout=15.0)
+            assert not worker.is_alive(), "durable resume did not finish"
+
+        after_rows = store.get_all_canonical_turns(conversation_id)
+        after = {row.canonical_turn_id: asdict(row) for row in after_rows}
+
+        # No row appended, replaced or dropped.
+        assert set(after) == set(before)
+
+        # The other speaker's rows are byte-identical in every column.
+        for row_id in victim_ids:
+            assert after[row_id] == before[row_id]
+
+        # Every remaining row keeps its body, hash and provenance.
+        for row_id, row_after in after.items():
+            assert _immutable_projection_dict(row_after) == (
+                _immutable_projection_dict(before[row_id])
+            )
+
+        # No body moved onto a foreign Discord source id / actor.
+        assert {
+            row.source_message_id: (row.user_content, row.assistant_content)
+            for row in after_rows
+        } == bodies_by_source
+
+        drifted = after[drifted_id]
+        assert drifted["user_content"] == "Please file the motion in court"
+        assert drifted["source_message_id"] == "discord-user-1"
+        assert drifted["sender_actor_id"] == "actor:user:1"
+        assert drifted["sender"] == "Cashew King"
+
+        # And the refusal was the strict mapping failing closed, not a
+        # silently skipped turn.
+        assert any(
+            "strict canonical tagging could not prove exact row identity "
+            "for logical turn 1" in record.getMessage()
+            or "strict canonical tagging could not prove exact row identity "
+            "for logical turn 1" in str(
+                record.exc_info[1] if record.exc_info else "",
+            )
+            for record in caplog.records
+        ), "expected the strict resume mapping to abort for logical turn 1"
+    finally:
+        state.shutdown(wait=True)
