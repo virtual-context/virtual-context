@@ -1330,6 +1330,40 @@ class CompactionPipeline:
         if refreshed is None or refreshed.card_dirty or (
             refreshed.card_input_hash != input_hash
         ):
+            # Distinguish losing the build marker from a bad write. Any
+            # mutation to a conversation this actor speaks in re-dirties the
+            # profile and clears the marker, so a rebuild whose model call
+            # spans a live message reaches the commit holding a marker that
+            # is no longer installed, and the replacement declines it. The
+            # card is untouched and still dirty, and the next consolidation
+            # rebuilds it against the newer evidence — the same protection,
+            # reported for what it is. On a busy conversation this is the
+            # expected outcome rather than the exceptional one, so it is
+            # neither raised nor counted as a failed attempt.
+            #
+            # Proving it takes both halves: our input hash did not land
+            # (nothing of ours was written) AND the marker is no longer
+            # ours (someone else moved first). ``written == 0`` alone
+            # cannot say this, because a clean-empty card also writes zero
+            # rows.
+            if (
+                refreshed is not None
+                and refreshed.card_input_hash != input_hash
+                and (refreshed.card_build_marker or "") != build_marker
+            ):
+                _record_status("superseded", written_count=written)
+                logger.info(
+                    "ACTOR_CARD_REBUILD actor=%s sources=%d raw=%d "
+                    "accepted=%d written=%d outcome=superseded "
+                    "response_hash=%s",
+                    actor_id[:24],
+                    len(fact_sources) + len(turn_sources),
+                    len(raw_entries),
+                    len(normalized),
+                    written,
+                    response_hash[:16],
+                )
+                return 0
             _record_status("stale_or_rejected_write", written_count=written)
             raise RuntimeError("actor card replacement did not commit cleanly")
         outcome = (

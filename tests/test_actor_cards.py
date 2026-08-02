@@ -1195,11 +1195,12 @@ def test_new_turn_during_model_call_cannot_be_lost_by_card_commit(store):
         RacingCurator(),
         admission=_AdmitAll(),
     )
-    with pytest.raises(
-        RuntimeError,
-        match="replacement did not commit cleanly",
-    ):
-        pipeline._rebuild_actor_card(OPTICS)
+    # The protection is unchanged: the stale card is not written and the
+    # profile stays dirty, so the turn that arrived mid-build is folded in by
+    # the next consolidation. Only the report changes — declining the write
+    # because a newer mutation moved first is the fence working, not a failed
+    # commit, so it returns "nothing written" instead of raising.
+    assert pipeline._rebuild_actor_card(OPTICS) == 0
 
     profile = store.get_actor_profile("t1", OPTICS)
     assert profile is not None and profile.card_dirty is True
@@ -1213,7 +1214,10 @@ def test_new_turn_during_model_call_cannot_be_lost_by_card_commit(store):
     ) is None
     status = store.get_actor_card_rebuild_status("t1", OPTICS)
     assert status is not None
-    assert status["outcome"] == "stale_or_rejected_write"
+    assert status["outcome"] == "superseded"
+    # A race loss must not accumulate toward terminal suppression: three of
+    # them would lock a busy actor out of rebuilds for being busy.
+    assert int(status["failure_count"] or 0) == 0
 
 
 def test_compaction_card_builder_rejects_any_unknown_fact_citation(
@@ -4155,3 +4159,99 @@ def test_deleted_audience_route_cannot_read_cross_context_entries(store):
         "t1", OPTICS, owner_conversation_id="dm",
         audience_conversation_id="dm", audience_channel_id="chan-dm",
     ) is None
+
+
+@pytest.mark.regression("BUG-050")
+def test_superseded_rebuild_stays_rebuildable(store):
+    """A race loss leaves the actor eligible; the next pass writes the card."""
+    _conversation(store, "guild")
+    _turn(
+        store,
+        "ct-guild",
+        "guild",
+        OPTICS,
+        "guild",
+        "chan-guild",
+        content="I am leading the Atlas migration.",
+    )
+    _segment(store, "seg-guild", "guild", ["ct-guild"])
+    _fact(store, "f-guild", "guild", "seg-guild", OPTICS)
+    store.upsert_actor_profile_from_turn(
+        "guild", OPTICS, "Optics", seen_at=_now(),
+    )
+
+    class Curator:
+        def complete(self, **kwargs):
+            turn_id = json.loads(kwargs["user"])["turns"][0]["id"]
+            return json.dumps(_curation([{
+                "kind": CARD_KIND_ACTIVE_GOAL,
+                "body": "Is leading the Atlas migration.",
+                "confidence": 0.9,
+                "turn_ids": [turn_id],
+            }])), {}
+
+    pipeline = _card_pipeline(store, Curator(), admission=_AdmitAll())
+
+    # Three consecutive race losses, mirroring a conversation that keeps
+    # talking through every rebuild.
+    real_replace = store.replace_actor_card
+
+    def racing_replace(*args, **kwargs):
+        store.mark_actor_card_dirty("t1", OPTICS, build_input_hash="")
+        return real_replace(*args, **kwargs)
+
+    store.replace_actor_card = racing_replace
+    for _ in range(3):
+        assert pipeline._rebuild_actor_card(OPTICS) == 0
+    status = store.get_actor_card_rebuild_status("t1", OPTICS)
+    assert status["outcome"] == "superseded"
+    assert int(status["failure_count"] or 0) == 0
+
+    # Once the conversation goes quiet the very next rebuild commits.
+    store.replace_actor_card = real_replace
+    assert pipeline._rebuild_actor_card(OPTICS) == 1
+    profile = store.get_actor_profile("t1", OPTICS)
+    assert profile.card_dirty is False
+    assert profile.card_input_hash != ""
+
+
+@pytest.mark.regression("BUG-050")
+def test_missing_profile_after_replace_still_fails_hard(store):
+    """The genuine bad-write signal keeps its hard failure."""
+    _conversation(store, "guild")
+    _turn(
+        store,
+        "ct-guild",
+        "guild",
+        OPTICS,
+        "guild",
+        "chan-guild",
+        content="I am leading the Atlas migration.",
+    )
+    _segment(store, "seg-guild", "guild", ["ct-guild"])
+    _fact(store, "f-guild", "guild", "seg-guild", OPTICS)
+    store.upsert_actor_profile_from_turn(
+        "guild", OPTICS, "Optics", seen_at=_now(),
+    )
+
+    class Curator:
+        def complete(self, **kwargs):
+            turn_id = json.loads(kwargs["user"])["turns"][0]["id"]
+            return json.dumps(_curation([{
+                "kind": CARD_KIND_ACTIVE_GOAL,
+                "body": "Is leading the Atlas migration.",
+                "confidence": 0.9,
+                "turn_ids": [turn_id],
+            }])), {}
+
+    pipeline = _card_pipeline(store, Curator(), admission=_AdmitAll())
+    real_replace = store.replace_actor_card
+
+    def replace(*args, **kwargs):
+        written = real_replace(*args, **kwargs)
+        store.get_actor_profile = lambda *a, **k: None
+        return written
+
+    store.replace_actor_card = replace
+    with pytest.raises(RuntimeError, match="did not commit cleanly"):
+        pipeline._rebuild_actor_card(OPTICS)

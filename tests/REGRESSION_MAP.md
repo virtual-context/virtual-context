@@ -406,6 +406,16 @@ Use `pytest -m regression` to run all regression tests.
   - `test_ingest_projected_rows.py::test_projected_row_cannot_be_written_back`
   - `test_ingest_projected_rows.py::test_unsupported_backend_falls_back_to_the_full_load`
 
+### BUG-050 — An actor card rebuild that loses its build marker to live traffic is reported as a failed commit
+
+- **Symptom**: `RuntimeError: actor card replacement did not commit cleanly` aborts actor card consolidation on an actively-used conversation. Four occurrences in one production log, all on the same busy guild, with rebuild spans of 20.6s, 43.4s, 76.5s and 181.1s, and live rows written inside three of the four windows. The wording reads as data corruption, which is what put it on a blocker list; in fact nothing was written and the same actor rebuilt successfully ten minutes later with a matching input hash.
+- **Root cause**: `_rebuild_actor_card` is optimistic-concurrency. It installs a unique `build_marker` on the profile, enumerates inputs, calls the curation and admission models, then commits under a compare-and-set on that marker; `replace_actor_card` declines the write when the marker is no longer installed. A database trigger clears the marker on every canonical turn inserted for a conversation the actor speaks in. So on a conversation that keeps talking, any rebuild slower than the gap between two messages loses the CAS by construction — the expected outcome, not the exceptional one. The caller could not tell that decline apart from a write that reported success but left the row wrong: both raised, and both recorded `stale_or_rejected_write`, which is a failed outcome at the storage layer and increments `failure_count` toward permanent suppression at three.
+- **Fix**: the caller classifies the decline. When our input hash did not land AND the marker is no longer ours, the attempt is recorded as `superseded`, logged at info, and returns zero written without raising; the card is left untouched and still dirty, so the next consolidation rebuilds it against the newer evidence. `superseded` is not a failed outcome, so a busy actor is no longer counted toward suppression for being busy. Both halves of the test are required because `written == 0` alone cannot prove a decline — a clean-empty card also writes zero rows. Every genuine bad-write signal keeps its hard failure, and the replacement transaction, its CAS and its lock domain are unchanged.
+- **Tests**:
+  - `test_actor_cards.py::test_new_turn_during_model_call_cannot_be_lost_by_card_commit` (the protection is unchanged — stale card not written, profile still dirty, no card readable — only the report changes)
+  - `test_actor_cards.py::test_superseded_rebuild_stays_rebuildable` (three consecutive race losses accumulate no failures, and the next quiet pass commits)
+  - `test_actor_cards.py::test_missing_profile_after_replace_still_fails_hard`
+
 ### BUG-049 — Tools that cannot scope by speaker accepted `speaker` / `speaker_only` and silently ignored them
 
 - **Symptom**: A `vc_remember_when` call carrying `speaker=<handle>` and `speaker_only=true` returned HTTP 200 with results covering every participant in the window. The response was byte-identical to the same call without the arguments (same md5), while a `vc_find_quote` control differed. A question asked about one participant was answered with another participant's material, and the reader attributed it to the participant named in the question.
@@ -606,6 +616,7 @@ Use `pytest -m regression` to run all regression tests.
 | `test_ingest_anchor_incremental.py` | BUG-047 |
 | `test_ingest_projected_rows.py` | BUG-048 |
 | `test_speaker_scoping_refusal.py` | BUG-049 |
+| `test_actor_cards.py` | BUG-050 |
 | `test_protected_window_gate.py` | BUG-044, BUG-045, BUG-046 |
 | `test_canonical_turn_id_stamping.py` | BUG-046 |
 | `test_retrieval_assembler_protected_window_merge.py` | BUG-045 |
