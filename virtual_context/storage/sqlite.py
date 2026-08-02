@@ -30,6 +30,10 @@ from ..core.canonical_turns import (
     select_recent_logical_turn_rows,
     utcnow_iso,
 )
+from ..core.discord_snowflake import (
+    datetime_to_snowflake_ceil,
+    datetime_to_snowflake_floor,
+)
 from ..core.progress_snapshot import (
     ActiveCompactionSnapshot,
     ActiveEpisodeSnapshot,
@@ -8597,6 +8601,9 @@ CREATE TABLE IF NOT EXISTS request_captures (
         conversation_id: str | None,
         *,
         speaker_context: SpeakerRetrievalContext,
+        after: datetime | None = None,
+        before: datetime | None = None,
+        channel_ids: list[str] | None = None,
     ) -> list[QuoteResult]:
         """One participant's own statements, most recent first.
 
@@ -8640,6 +8647,29 @@ CREATE TABLE IF NOT EXISTS request_captures (
         if conversation_id:
             sql += " AND conversation_id = ?"
             params.append(conversation_id)
+        # Send time comes from the message id, which encodes it; a stored
+        # ingest timestamp records when the row was written and diverges
+        # across a backfill. The all-digits guard is the two-GLOB idiom
+        # because SQLite has no regex operator, and it is what excludes a
+        # row with no provable send time: SQLite's CAST would otherwise
+        # silently read a non-numeric id as 0 and place it at the epoch.
+        _numeric_id = (
+            " AND source_message_id GLOB '[0-9]*'"
+            " AND source_message_id NOT GLOB '*[^0-9]*'"
+        )
+        if after is not None:
+            sql += _numeric_id
+            sql += " AND CAST(source_message_id AS INTEGER) >= ?"
+            params.append(datetime_to_snowflake_floor(after))
+        if before is not None:
+            if after is None:
+                sql += _numeric_id
+            sql += " AND CAST(source_message_id AS INTEGER) <= ?"
+            params.append(datetime_to_snowflake_ceil(before))
+        if channel_ids:
+            placeholders = ",".join("?" for _ in channel_ids)
+            sql += f" AND origin_channel_id IN ({placeholders})"
+            params.extend(list(channel_ids))
         sql += " ORDER BY sort_key DESC LIMIT ?"
         params.append(int(limit))
 

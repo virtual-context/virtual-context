@@ -620,14 +620,30 @@ class CompositeStore:
         conversation_id: str | None,
         *,
         speaker_context,
+        after=None,
+        before=None,
+        channel_ids=None,
     ):
         fn = getattr(self._segments, "search_canonical_turns_by_actor", None)
-        if callable(fn):
-            return fn(
-                actor_id, limit, conversation_id,
-                speaker_context=speaker_context,
-            )
-        return []
+        if not callable(fn):
+            return []
+        # A window is a narrowing the caller asked for, so it must never be
+        # dropped on the way through: a backend that cannot honour it has to
+        # fail loudly rather than answer the unwindowed question. Only the
+        # bounds actually supplied are forwarded, which keeps an older
+        # backend working for every existing caller.
+        extra = {}
+        if after is not None:
+            extra["after"] = after
+        if before is not None:
+            extra["before"] = before
+        if channel_ids:
+            extra["channel_ids"] = channel_ids
+        return fn(
+            actor_id, limit, conversation_id,
+            speaker_context=speaker_context,
+            **extra,
+        )
 
     def resolve_request_audience(
         self,

@@ -18,6 +18,10 @@ from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
 from ..core.canonical_turns import STRIP_WHITESPACE
+from ..core.discord_snowflake import (
+    datetime_to_snowflake_ceil,
+    datetime_to_snowflake_floor,
+)
 from ..core.store import ContextStore
 from ..core.canonical_turns import (
     HASH_VERSION,
@@ -8920,6 +8924,9 @@ class PostgresStore(ContextStore):
         conversation_id: str | None,
         *,
         speaker_context: SpeakerRetrievalContext,
+        after: datetime | None = None,
+        before: datetime | None = None,
+        channel_ids: list[str] | None = None,
     ) -> list[QuoteResult]:
         """One participant's own statements, most recent first.
 
@@ -8938,6 +8945,21 @@ class PostgresStore(ContextStore):
         candidate carrying that actor. The audience predicate is the same one
         the roster admits members under, so a participant's statements in one
         audience can never surface in another.
+
+        ``after`` / ``before`` bound the window by SEND time, inclusive at
+        both ends. Send time comes from ``source_message_id``, which encodes
+        it, not from a stored ingest timestamp — that records when a row was
+        written and diverges across a backfill or a repair. The bounds are
+        converted to integer message-id limits once and compared in SQL, so
+        the filter reads the stored id instead of decoding every candidate.
+        A row with no numeric message id has no provable send time and is
+        excluded whenever a bound is supplied, rather than silently riding
+        along inside a window it was never shown to belong to.
+
+        ``channel_ids`` restricts to an explicit allowlist of origin channels.
+
+        All three default to ``None``, leaving the query byte-identical for
+        every caller that does not ask for them.
         """
         actor = (actor_id or "").strip()
         if not actor or limit <= 0:
@@ -8965,6 +8987,29 @@ class PostgresStore(ContextStore):
         if conversation_id:
             sql += " AND conversation_id = %s"
             params.append(conversation_id)
+        # The cast is guarded INSIDE a CASE rather than beside the regex in
+        # the same AND chain: SQL does not promise predicate evaluation
+        # order, so a sibling ``CAST(... AS BIGINT)`` may be evaluated
+        # against a non-numeric id and abort the whole query. CASE is
+        # defined to evaluate its branches in order, which makes the guard
+        # actually guard.
+        if after is not None:
+            sql += (
+                " AND CASE WHEN source_message_id ~ '^[0-9]+$'"
+                " THEN CAST(source_message_id AS BIGINT) >= %s"
+                " ELSE FALSE END"
+            )
+            params.append(datetime_to_snowflake_floor(after))
+        if before is not None:
+            sql += (
+                " AND CASE WHEN source_message_id ~ '^[0-9]+$'"
+                " THEN CAST(source_message_id AS BIGINT) <= %s"
+                " ELSE FALSE END"
+            )
+            params.append(datetime_to_snowflake_ceil(before))
+        if channel_ids:
+            sql += " AND origin_channel_id = ANY(%s)"
+            params.append(list(channel_ids))
         sql += " ORDER BY sort_key DESC LIMIT %s"
         params.append(int(limit))
 

@@ -151,6 +151,9 @@ class SegmentStore(Protocol):
         conversation_id: str | None,
         *,
         speaker_context,
+        after=None,
+        before=None,
+        channel_ids=None,
     ) -> list: ...
     def update_canonical_turn_senders_if_empty(
         self,
