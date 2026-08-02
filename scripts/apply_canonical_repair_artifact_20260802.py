@@ -44,22 +44,24 @@ ACCOUNT_ID = "vast"
 # intentional update of this attestation block before it can be applied.
 EXPECTED_ARTIFACT_VERSION = 4
 EXPECTED_SNAPSHOT_VERSION = 5
-EXPECTED_CANONICAL_ROWS = 3188
-EXPECTED_GROUPS = 1594
-EXPECTED_SOURCE_MEMBERSHIPS = 1594
+EXPECTED_CANONICAL_ROWS = 3194
+EXPECTED_GROUPS = 1597
+EXPECTED_SOURCE_MEMBERSHIPS = 1597
 EXPECTED_ACTORS = 18
-EXPECTED_OLD_GROUPS = 1894
+EXPECTED_OLD_GROUPS = 1911
 EXPECTED_DISPOSITION = {
-    "sha256": "bff6c25c08b66b1254412c7c2b47aa82efa830730c00d24cbbce648972ac12b8",
-    "raw_vast_deliveries": 2204,
-    "canonical_deliveries": 1961,
-    "excluded_deliveries": 237,
+    "sha256": "c89868fb29fd2af1dc8fa7882d6f188865c228855938d7294508b3c75f89dfd2",
+    "raw_vast_deliveries": 2208,
+    "canonical_deliveries": 1964,
+    "excluded_deliveries": 238,
     "quarantined_deliveries": 6,
-    "canonical_groups": 1594,
+    "canonical_groups": 1597,
 }
 EXPECTED_TRANSCRIPT = {
-    "sha256": "2f90cfd63159ba2428cb4c0ec7de067b6d7e2785bcef4a1461a7b6ae402d4eb6",
-    "rows": 11667,
+    "sha256": "30ef6d84eca1c592729cc547826b1b450e236040b2919b53144af4601eaad83d",
+    "manifest_sha256": "466fd15ba853d130ceff60f885a44714645dcce1b6e0d1e51171537abc3cfc8b",
+    "response_groups_sha256": "a759edc082d88d6ee98ba54ff2357d17f50661e7f44ee29d1c85d78d320df6f9",
+    "rows": 11677,
 }
 EXPECTED_RECOVERY_BUNDLE = {
     "sha256": "ccb0ffd142caf902afe5dc1793fe3b8c1d0a711b84d9f76cca9a506b56a95cdb",
@@ -492,16 +494,107 @@ def _run_postgres_tool(
         )
 
 
+def _postgres_major_from_version(output: str, executable: str) -> int:
+    banner = str(output or "").strip()
+    match = re.fullmatch(
+        rf"{re.escape(executable)} \(PostgreSQL\) "
+        r"(\d+)(?:\.\d+)+(?:\s+.*)?",
+        banner,
+    )
+    if match is None:
+        raise RepairError(
+            f"{executable} PostgreSQL client version output is unparseable"
+        )
+    return int(match.group(1))
+
+
+def _postgres_tool_major(executable: str) -> int:
+    path = shutil.which(executable)
+    if path is None:
+        raise RepairError(f"{executable} is required but was not found")
+    completed = subprocess.run(
+        [path, "--version"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RepairError(f"{executable} --version failed")
+    return _postgres_major_from_version(
+        completed.stdout or completed.stderr,
+        executable,
+    )
+
+
+def _verify_custom_dump_catalog(path: Path, *, expected_major: int) -> int:
+    pg_restore_major = _postgres_tool_major("pg_restore")
+    if pg_restore_major != expected_major:
+        raise RepairError(
+            "current pg_restore major differs from the snapshot toolchain"
+        )
+    executable = shutil.which("pg_restore")
+    assert executable is not None
+    completed = subprocess.run(
+        [executable, "--list", str(path)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+    if completed.returncode != 0:
+        detail = (completed.stderr or "").strip()[-2000:]
+        raise RepairError(f"pg_restore cannot read backup catalog: {detail}")
+    catalog = completed.stdout or ""
+    from_match = re.search(
+        r"(?m)^;\s*Dumped from database version:\s*"
+        r"(\d+)(?:\.\d+)*(?:\s+.*)?$",
+        catalog,
+    )
+    by_match = re.search(
+        r"(?m)^;\s*Dumped by pg_dump version:\s*"
+        r"(\d+)(?:\.\d+)*(?:\s+.*)?$",
+        catalog,
+    )
+    if from_match is None or by_match is None:
+        raise RepairError("pg_restore backup catalog lacks version provenance")
+    dumped_from_major = int(from_match.group(1))
+    dumped_by_major = int(by_match.group(1))
+    if (
+        dumped_from_major != expected_major
+        or dumped_by_major != expected_major
+    ):
+        raise RepairError(
+            "backup catalog PostgreSQL majors differ from the snapshot: "
+            f"expected={expected_major} dumped_from={dumped_from_major} "
+            f"dumped_by={dumped_by_major}"
+        )
+    return pg_restore_major
+
+
 def _create_exported_snapshot_dump(
     *,
     dsn: str,
     exported_snapshot: str,
     backup_path: Path,
+    server_major: int,
 ) -> dict[str, Any]:
     """Create a custom dump of the exact still-open exported snapshot."""
     resolved = backup_path.expanduser().resolve(strict=False)
     if resolved.exists():
         raise RepairError(f"refusing to overwrite database backup: {resolved}")
+    pg_dump_major = _postgres_tool_major("pg_dump")
+    pg_restore_major = _postgres_tool_major("pg_restore")
+    if pg_dump_major != server_major or pg_restore_major != server_major:
+        raise RepairError(
+            "PostgreSQL backup tools must match the server major: "
+            f"server={server_major} pg_dump={pg_dump_major} "
+            f"pg_restore={pg_restore_major}"
+        )
     resolved.parent.mkdir(parents=True, exist_ok=True)
     _run_postgres_tool(
         "pg_dump",
@@ -517,10 +610,20 @@ def _create_exported_snapshot_dump(
     _fsync_directory(resolved.parent)
     digest = _sha256_file(resolved)
     verified = _verify_backup_file(resolved, digest)
+    catalog_major = _verify_custom_dump_catalog(
+        resolved,
+        expected_major=server_major,
+    )
     return {
         **verified,
         "format": "postgres-custom",
         "exported_snapshot": exported_snapshot,
+        "toolchain": {
+            "server_major": server_major,
+            "pg_dump_major": pg_dump_major,
+            "pg_restore_major": catalog_major,
+            "catalog_list_verified": True,
+        },
     }
 
 
@@ -534,6 +637,13 @@ def _connect(dsn_env: str):
     if not dsn:
         raise RepairError(f"environment variable {dsn_env} is empty")
     return psycopg.connect(dsn, row_factory=dict_row)
+
+
+def _server_major(conn) -> int:
+    server_version_num = int(
+        conn.execute("SHOW server_version_num").fetchone()["server_version_num"]
+    )
+    return server_version_num // 10000
 
 
 def _current_canonical_rows(conn, owner: str) -> list[dict[str, Any]]:
@@ -669,10 +779,12 @@ def snapshot(
             "clock_timestamp()::text AS observed_at, "
             "current_database()::text AS database_name"
         ).fetchone()
+        server_major = _server_major(conn)
         verified_backup = _create_exported_snapshot_dump(
             dsn=dsn,
             exported_snapshot=str(database_snapshot["exported_snapshot"]),
             backup_path=Path(backup_path),
+            server_major=server_major,
         )
         _assert_schema(conn)
         conversation = _conversation_row(conn, owner)
@@ -939,6 +1051,7 @@ def _load_artifact(
 def _load_snapshot_manifest(path: Path) -> dict[str, Any]:
     manifest = json.loads(path.read_text(encoding="utf-8"))
     backup = manifest.get("database_backup") or {}
+    toolchain = backup.get("toolchain") or {}
     if (
         manifest.get("version") != EXPECTED_SNAPSHOT_VERSION
         or
@@ -951,6 +1064,11 @@ def _load_snapshot_manifest(path: Path) -> dict[str, Any]:
         or not isinstance(backup.get("bytes"), int)
         or int(backup.get("bytes") or 0) <= 0
         or backup.get("format") != "postgres-custom"
+        or not isinstance(toolchain, dict)
+        or not isinstance(toolchain.get("server_major"), int)
+        or toolchain.get("pg_dump_major") != toolchain.get("server_major")
+        or toolchain.get("pg_restore_major") != toolchain.get("server_major")
+        or toolchain.get("catalog_list_verified") is not True
         or manifest.get("maintenance_freeze_confirmed") is not True
     ):
         raise RepairError("snapshot manifest is incomplete or not backup-attested")
@@ -972,6 +1090,14 @@ def _load_snapshot_manifest(path: Path) -> dict[str, Any]:
     ):
         raise RepairError("snapshot canonical file does not match its manifest")
     verified_backup = _verify_backup_file(backup["path"], backup["sha256"])
+    catalog_major = _verify_custom_dump_catalog(
+        Path(verified_backup["path"]),
+        expected_major=int(toolchain["server_major"]),
+    )
+    if catalog_major != int(toolchain["server_major"]):
+        raise RepairError(
+            "current pg_restore major differs from the snapshot toolchain"
+        )
     if verified_backup["bytes"] != int(backup["bytes"]):
         raise RepairError("database backup size changed after snapshot")
     evidence_files = manifest.get("evidence_files")
@@ -1033,6 +1159,15 @@ def verify_restore(
             "vc_disposable_* database"
         )
     with _connect(restore_dsn_env) as target:
+        restore_server_major = _server_major(target)
+        expected_server_major = int(
+            snapshot_manifest["database_backup"]["toolchain"]["server_major"]
+        )
+        if restore_server_major != expected_server_major:
+            raise RepairError(
+                "restore target PostgreSQL major differs from the snapshot: "
+                f"target={restore_server_major} snapshot={expected_server_major}"
+            )
         existing = int(target.execute(
             """SELECT COUNT(*) AS n
                  FROM information_schema.tables
@@ -1056,6 +1191,8 @@ def verify_restore(
         dsn=target_dsn,
     )
     with _connect(restore_dsn_env) as restored:
+        if _server_major(restored) != restore_server_major:
+            raise RepairError("restore target PostgreSQL major changed during restore")
         restored_rows = _current_canonical_rows(restored, OWNER)
         canonical_sha, canonical_count = _hash_rows(restored_rows)
         if (
@@ -1101,6 +1238,7 @@ def verify_restore(
         "backup_bytes": backup["bytes"],
         "backup_exported_snapshot": backup["exported_snapshot"],
         "restore_database": target_name,
+        "restore_server_major": restore_server_major,
         "canonical_rows": canonical_count,
         "canonical_rows_sha256": canonical_sha,
         "evidence_files": evidence_proof,
@@ -1140,6 +1278,9 @@ def _load_restore_proof(
         or not str(proof.get("restore_database") or "").startswith(
             ("vc_restore_", "vc_disposable_")
         )
+        or type(proof.get("restore_server_major")) is not int
+        or proof["restore_server_major"]
+           != int(backup["toolchain"]["server_major"])
     ):
         raise RepairError("restore proof is missing or not snapshot-bound")
     expected_evidence = snapshot_manifest["evidence_files"]
@@ -1849,6 +1990,15 @@ def apply_repair(
     )
 
     with _connect(dsn_env) as conn:
+        live_server_major = _server_major(conn)
+        snapshot_server_major = int(
+            snapshot_manifest["database_backup"]["toolchain"]["server_major"]
+        )
+        if live_server_major != snapshot_server_major:
+            raise RepairError(
+                "live PostgreSQL major differs from the rehearsed snapshot: "
+                f"live={live_server_major} snapshot={snapshot_server_major}"
+            )
         _assert_schema(conn)
         conversation = _conversation_row(conn, OWNER)
         current_rows = _current_canonical_rows(conn, OWNER)
@@ -1877,6 +2027,7 @@ def apply_repair(
             "owner_conversation_id": OWNER,
             "tenant_id": tenant_id,
             "lifecycle_epoch": lifecycle_epoch,
+            "live_server_major": live_server_major,
             "backup": snapshot_manifest["database_backup"],
             "restore_proof": {
                 "path": str(restore_proof_path),

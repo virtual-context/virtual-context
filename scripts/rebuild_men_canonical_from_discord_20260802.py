@@ -47,26 +47,32 @@ PLATFORM = "discord"
 PROJECTION_VERSION = "discord-history-raw-v1"
 DELETED_PROJECTION_VERSION = "discord-snowflake+archived-session-chain-v1"
 DISPOSITION_SHA256 = (
-    "bff6c25c08b66b1254412c7c2b47aa82efa830730c00d24cbbce648972ac12b8"
+    "c89868fb29fd2af1dc8fa7882d6f188865c228855938d7294508b3c75f89dfd2"
 )
 TRANSCRIPT_SHA256 = (
-    "2f90cfd63159ba2428cb4c0ec7de067b6d7e2785bcef4a1461a7b6ae402d4eb6"
+    "30ef6d84eca1c592729cc547826b1b450e236040b2919b53144af4601eaad83d"
+)
+TRANSCRIPT_MANIFEST_SHA256 = (
+    "466fd15ba853d130ceff60f885a44714645dcce1b6e0d1e51171537abc3cfc8b"
+)
+RESPONSE_GROUPS_SHA256 = (
+    "a759edc082d88d6ee98ba54ff2357d17f50661e7f44ee29d1c85d78d320df6f9"
 )
 RECOVERY_SESSION_BUNDLE_SHA256 = (
     "ccb0ffd142caf902afe5dc1793fe3b8c1d0a711b84d9f76cca9a506b56a95cdb"
 )
-EXPECTED_RAW_DISCORD_MESSAGES = 11667
-EXPECTED_RAW_VAST_DELIVERIES = 2204
-EXPECTED_CANONICAL_DELIVERIES = 1961
-EXPECTED_EXCLUDED_DELIVERIES = 237
+EXPECTED_RAW_DISCORD_MESSAGES = 11677
+EXPECTED_RAW_VAST_DELIVERIES = 2208
+EXPECTED_CANONICAL_DELIVERIES = 1964
+EXPECTED_EXCLUDED_DELIVERIES = 238
 EXPECTED_QUARANTINED_DELIVERIES = 6
-EXPECTED_CANONICAL_GROUPS = 1594
+EXPECTED_CANONICAL_GROUPS = 1597
 EXPECTED_MULTI_CHUNK_GROUPS = 215
 EXPECTED_MAX_CHUNKS = 18
 EXPECTED_RECOVERY_EVIDENCE_RECORDS = 533
 EXPECTED_RECOVERY_SESSION_FILES = 14
-EXPECTED_CANONICAL_ROWS = 3188
-EXPECTED_SOURCE_MEMBERSHIPS = 1594
+EXPECTED_CANONICAL_ROWS = 3194
+EXPECTED_SOURCE_MEMBERSHIPS = 1597
 EXPECTED_ACTORS = 18
 DELETED_TRIGGER_ID = "1533227206493605888"
 CANONICAL_NAMESPACE = uuid.uuid5(
@@ -136,9 +142,46 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _file_corpus_attestation(paths: list[Path]) -> dict[str, Any]:
+    files = [
+        {
+            "filename": path.name,
+            "bytes": path.stat().st_size,
+            "sha256": _sha256_file(path),
+        }
+        for path in sorted(paths, key=lambda value: value.name)
+    ]
+    if len({row["filename"] for row in files}) != len(files):
+        raise EvidenceError("attested file corpus has duplicate filenames")
+    digest = hashlib.sha256()
+    for row in files:
+        digest.update(
+            json.dumps(
+                row,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        digest.update(b"\n")
+    return {"sha256": digest.hexdigest(), "files": files}
+
+
 def _iso_to_ms(value: str) -> int:
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     return int(parsed.timestamp() * 1000)
+
+
+def _iso_instant(value: Any) -> datetime:
+    text = str(value or "").strip()
+    if not text:
+        raise EvidenceError("Discord timestamp is empty")
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise EvidenceError(f"invalid Discord timestamp: {text!r}") from exc
+    if parsed.tzinfo is None:
+        raise EvidenceError("Discord timestamp lacks a timezone")
+    return parsed.astimezone(timezone.utc)
 
 
 def _snowflake_ms(message_id: str) -> int:
@@ -252,7 +295,11 @@ def _project_assistant_group(
 
 def _load_openclaw_users(
     sessions_dir: Path,
-) -> tuple[dict[tuple[str, str, int], list[OpenClawUserEvent]], dict[str, int]]:
+) -> tuple[
+    dict[tuple[str, str, int], list[OpenClawUserEvent]],
+    dict[str, int],
+    dict[str, Any],
+]:
     sessions_path = sessions_dir / "sessions.json"
     sessions = json.loads(sessions_path.read_text(encoding="utf-8"))
     if not isinstance(sessions, dict):
@@ -310,7 +357,25 @@ def _load_openclaw_users(
             indexed[(channel_id, sender_id, timestamp_ms)].append(event)
             stats["unique_user_events"] += 1
     stats["channel_sessions"] = len(session_to_channel)
-    return indexed, dict(stats)
+    corpus_paths = [sessions_path, *(
+        sessions_dir / f"{session_id}.jsonl"
+        for session_id in sorted(session_to_channel)
+    )]
+    return indexed, dict(stats), _file_corpus_attestation(corpus_paths)
+
+
+def _repair_script_bundle() -> dict[str, Any]:
+    script_dir = Path(__file__).resolve().parent
+    names = (
+        "export_discord_guild_transcript_20260802.py",
+        "extend_men_vast_disposition_20260802.py",
+        "rebuild_men_canonical_from_discord_20260802.py",
+        "apply_canonical_repair_artifact_20260802.py",
+    )
+    paths = [script_dir / name for name in names]
+    if any(not path.is_file() for path in paths):
+        raise EvidenceError("repair script bundle is incomplete")
+    return _file_corpus_attestation(paths)
 
 
 def _exact_openclaw_match(
@@ -456,6 +521,16 @@ def _load_disposition_groups(
     records = disposition.get("records")
     if not isinstance(records, list):
         raise EvidenceError("all-delivery disposition records are missing")
+    disposition_inputs = disposition.get("inputs")
+    if not isinstance(disposition_inputs, dict) or (
+        disposition_inputs.get("final_transcript_manifest_sha256")
+        != TRANSCRIPT_MANIFEST_SHA256
+        or disposition_inputs.get("previous_disposition_sha256")
+        != "bff6c25c08b66b1254412c7c2b47aa82efa830730c00d24cbbce648972ac12b8"
+        or disposition_inputs.get("previous_delivery_count") != 2204
+        or disposition_inputs.get("new_delivery_count") != 4
+    ):
+        raise EvidenceError("final disposition provenance changed")
 
     expected_decisions = {
         "canonical_response_member": EXPECTED_CANONICAL_DELIVERIES,
@@ -519,7 +594,12 @@ def _load_disposition_groups(
             "attachment_filenames": raw_attachment_filenames,
         }
         for field, expected in exact_fields.items():
-            if record.get(field) != expected:
+            unchanged = (
+                _iso_instant(record.get(field)) == _iso_instant(expected)
+                if field == "timestamp"
+                else record.get(field) == expected
+            )
+            if not unchanged:
                 raise EvidenceError(
                     f"disposition response {response_id} disagrees with Discord field {field}"
                 )
@@ -591,7 +671,7 @@ def _load_disposition_groups(
         grouped[trigger_id].append((record, raw_response))
 
     expected_categories = {
-        "native_referenced_response": 1428,
+        "native_referenced_response": 1431,
         "recovered_literal": 445,
         "recovered_fence": 78,
         "recovered_whitespace": 8,
@@ -737,12 +817,39 @@ def build_artifact(
     disposition_path: Path,
     output_dir: Path,
 ) -> dict[str, Any]:
+    transcript_manifest_path = transcript_dir / "manifest.json"
+    transcript_manifest_sha = _sha256_file(transcript_manifest_path)
+    if transcript_manifest_sha != TRANSCRIPT_MANIFEST_SHA256:
+        raise EvidenceError("unexpected Discord transcript manifest checksum")
+    transcript_manifest = json.loads(
+        transcript_manifest_path.read_text(encoding="utf-8")
+    )
     messages_path = transcript_dir / "messages.jsonl"
+    response_groups_path = transcript_dir / "vast-response-groups.jsonl"
     transcript_sha = _sha256_file(messages_path)
+    response_groups_sha = _sha256_file(response_groups_path)
     if transcript_sha != TRANSCRIPT_SHA256:
         raise EvidenceError(
             f"unexpected Discord transcript checksum: {transcript_sha}"
         )
+    transcript_counts = transcript_manifest.get("counts") or {}
+    transcript_files = transcript_manifest.get("files") or {}
+    if (
+        transcript_manifest.get("schema")
+        != "virtual-context.discord-guild-transcript.v2"
+        or transcript_manifest.get("guild_id") != MEN_GUILD_ID
+        or transcript_manifest.get("bot_user_id") != VAST_USER_ID
+        or transcript_manifest.get("maintenance_freeze_confirmed") is not True
+        or transcript_counts.get("messages") != EXPECTED_RAW_DISCORD_MESSAGES
+        or transcript_counts.get("vast_messages") != EXPECTED_RAW_VAST_DELIVERIES
+        or transcript_counts.get("post_high_water_messages_observed") != 0
+        or transcript_counts.get("post_high_water_vast_messages_observed") != 0
+        or transcript_files.get("messages.jsonl") != transcript_sha
+        or response_groups_sha != RESPONSE_GROUPS_SHA256
+        or transcript_files.get("vast-response-groups.jsonl")
+        != response_groups_sha
+    ):
+        raise EvidenceError("frozen Discord transcript manifest changed")
     all_messages = list(_read_jsonl(messages_path))
     if len(all_messages) != EXPECTED_RAW_DISCORD_MESSAGES:
         raise EvidenceError("raw Discord transcript message count changed")
@@ -752,7 +859,11 @@ def build_artifact(
         if str(message.get("id") or "")
     }
     names_by_id = _build_name_index(all_messages)
-    openclaw_index, openclaw_stats = _load_openclaw_users(sessions_dir)
+    (
+        openclaw_index,
+        openclaw_stats,
+        openclaw_session_corpus,
+    ) = _load_openclaw_users(sessions_dir)
     recovery_session_bundle = _recovery_session_bundle(
         disposition_path,
         sessions_dir,
@@ -1210,9 +1321,13 @@ def build_artifact(
             "discord_transcript": {
                 "filename": messages_path.name,
                 "sha256": transcript_sha,
+                "manifest_sha256": transcript_manifest_sha,
+                "response_groups_sha256": response_groups_sha,
                 "rows": len(all_messages),
             },
             "recovery_session_bundle": recovery_session_bundle,
+            "openclaw_session_corpus": openclaw_session_corpus,
+            "repair_script_bundle": _repair_script_bundle(),
             "old_canonical": {
                 "filename": old_canonical_path.name,
                 "sha256": old_canonical_sha,

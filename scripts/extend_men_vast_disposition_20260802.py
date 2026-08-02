@@ -17,6 +17,7 @@ import hashlib
 import json
 import os
 from collections import Counter
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -27,6 +28,25 @@ PREVIOUS_DISPOSITION_SHA256 = (
     "bff6c25c08b66b1254412c7c2b47aa82efa830730c00d24cbbce648972ac12b8"
 )
 PREVIOUS_DELIVERIES = 2204
+REVIEWED_EXTENSION_DELIVERIES = {
+    "1530030327643373578": {
+        "channel_id": "1530029511763038329",
+        "channel_name": "Poker Night",
+        "timestamp": "2026-07-24T01:54:16.699000+00:00",
+        "discord_type": 0,
+        "attachment_filenames": [],
+        "content_sha256": (
+            "a678bc6b6dcb9dfb1f3a0488dec411aaf421fe67a1829b72475620736d6092c5"
+        ),
+        "decision": "exclude_from_canonical_response_membership",
+        "category": "direct_activity_invite_tool_send",
+        "evidence": {
+            "delivery_mode": "direct operational Discord Activity invite",
+            "raw_discord_reference_message_id": "",
+            "reviewed_against_final_high_water": True,
+        },
+    },
+}
 
 
 class DispositionError(RuntimeError):
@@ -64,6 +84,60 @@ def _exact_fields(raw: dict[str, Any]) -> dict[str, Any]:
             for attachment in raw.get("attachments") or []
             if isinstance(attachment, dict)
         ],
+    }
+
+
+def _timestamp_instant(value: Any) -> datetime:
+    text = str(value or "").strip()
+    if not text:
+        raise DispositionError("reviewed Discord timestamp is empty")
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise DispositionError(f"invalid reviewed Discord timestamp: {text!r}") from exc
+    if parsed.tzinfo is None:
+        raise DispositionError("reviewed Discord timestamp lacks a timezone")
+    return parsed.astimezone(timezone.utc)
+
+
+def _reviewed_extension_record(
+    response_id: str,
+    raw: dict[str, Any],
+) -> dict[str, Any] | None:
+    reviewed = REVIEWED_EXTENSION_DELIVERIES.get(response_id)
+    if reviewed is None:
+        return None
+    exact = _exact_fields(raw)
+    for field in (
+        "channel_id",
+        "channel_name",
+        "discord_type",
+        "attachment_filenames",
+    ):
+        if exact[field] != reviewed[field]:
+            raise DispositionError(
+                f"reviewed extension {response_id} changed Discord field {field}"
+            )
+    if _timestamp_instant(exact["timestamp"]) != _timestamp_instant(
+        reviewed["timestamp"]
+    ):
+        raise DispositionError(
+            f"reviewed extension {response_id} changed Discord field timestamp"
+        )
+    content_sha256 = hashlib.sha256(exact["content"].encode("utf-8")).hexdigest()
+    if content_sha256 != reviewed["content_sha256"]:
+        raise DispositionError(
+            f"reviewed extension {response_id} changed Discord field content"
+        )
+    if str(raw.get("reference_message_id") or ""):
+        raise DispositionError(
+            f"reviewed direct extension {response_id} unexpectedly gained a reply edge"
+        )
+    return {
+        **_base_record(raw),
+        "decision": reviewed["decision"],
+        "category": reviewed["category"],
+        "evidence": reviewed["evidence"],
     }
 
 
@@ -155,15 +229,27 @@ def extend(
 
     records: list[dict[str, Any]] = []
     unclassified: list[str] = []
+    reviewed_extensions_seen: set[str] = set()
     for response_id, raw in sorted(raw_vast_by_id.items(), key=lambda item: int(item[0])):
         prior = previous_by_id.get(response_id)
         if prior is not None:
             for field, value in _exact_fields(raw).items():
-                if prior.get(field) != value:
+                unchanged = (
+                    _timestamp_instant(prior.get(field)) == _timestamp_instant(value)
+                    if field == "timestamp"
+                    else prior.get(field) == value
+                )
+                if not unchanged:
                     raise DispositionError(
                         f"reviewed response {response_id} changed Discord field {field}"
                     )
             records.append(prior)
+            continue
+
+        reviewed_extension = _reviewed_extension_record(response_id, raw)
+        if reviewed_extension is not None:
+            records.append(reviewed_extension)
+            reviewed_extensions_seen.add(response_id)
             continue
 
         evidence = native.get(response_id)
@@ -188,6 +274,8 @@ def extend(
             "category": "native_referenced_response",
             "evidence": evidence,
         })
+    if reviewed_extensions_seen != set(REVIEWED_EXTENSION_DELIVERIES):
+        raise DispositionError("reviewed extension delivery coverage changed")
     if unclassified:
         raise DispositionError(
             "new Vast deliveries require explicit evidence review: "

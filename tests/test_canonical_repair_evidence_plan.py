@@ -5,6 +5,7 @@ from scripts.apply_canonical_repair_artifact_20260802 import (
     RepairError,
     _evidence_remap_plan,
     _invalidate_actor_cards,
+    _postgres_major_from_version,
 )
 
 
@@ -70,3 +71,33 @@ def test_actor_card_invalidation_refuses_cross_tenant_sources() -> None:
         assert str(exc) == "cross-tenant actor-card evidence cites Men history"
     else:
         raise AssertionError("cross-tenant actor-card evidence was not refused")
+
+
+def test_postgres_client_major_parser_distinguishes_16_from_17() -> None:
+    assert _postgres_major_from_version(
+        "pg_dump (PostgreSQL) 16.14 (Ubuntu 16.14-0ubuntu0.24.04.1)",
+        "pg_dump",
+    ) == 16
+    assert _postgres_major_from_version(
+        "pg_restore (PostgreSQL) 17.10 (Debian 17.10-0+deb13u1)",
+        "pg_restore",
+    ) == 17
+
+
+def test_postgres_client_major_parser_fails_closed() -> None:
+    try:
+        _postgres_major_from_version("pg_dump unknown", "pg_dump")
+    except RepairError as exc:
+        assert "unparseable" in str(exc)
+    else:
+        raise AssertionError("unparseable PostgreSQL client version was accepted")
+
+    try:
+        _postgres_major_from_version(
+            "wrapper 16.0; pg_restore (PostgreSQL) 17.2",
+            "pg_restore",
+        )
+    except RepairError:
+        pass
+    else:
+        raise AssertionError("noisy PostgreSQL client wrapper banner was accepted")
