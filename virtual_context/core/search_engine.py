@@ -59,8 +59,6 @@ class SearchEngine:
         *,
         speaker_context: SpeakerRetrievalContext | None = None,
         speaker_handles: dict[str, str] | None = None,
-        after=None,
-        before=None,
     ) -> dict:
         """Turn-first quote search over stored canonical history.
 
@@ -92,8 +90,6 @@ class SearchEngine:
             speaker_handles=(
                 speaker_handles if speaker_context is not None else None
             ),
-            after=after,
-            before=before,
         )
 
     def _route_speaker_context(

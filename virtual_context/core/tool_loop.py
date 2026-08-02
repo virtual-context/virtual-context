@@ -14,7 +14,6 @@ import json
 import logging
 import re
 import time
-from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import httpx
@@ -162,18 +161,6 @@ def vc_tool_definitions() -> list[dict]:
                             "The word or phrase to search for. Use the most specific and "
                             "distinctive terms — e.g. 'magnesium glycinate' rather than "
                             "'supplement', or 'reservation 7pm' rather than 'dinner'."
-                        ),
-                    },
-                    "after": {
-                        "type": "string",
-                        "description": _TIME_WINDOW_PROPERTY_DESCRIPTION.format(
-                            edge="earliest",
-                        ),
-                    },
-                    "before": {
-                        "type": "string",
-                        "description": _TIME_WINDOW_PROPERTY_DESCRIPTION.format(
-                            edge="latest",
                         ),
                     },
                     "mode": {
@@ -463,75 +450,6 @@ SPEAKER_SCOPING_TOOLS: frozenset[str] = (
 )
 
 _SPEAKER_ARGUMENT_NAMES: tuple[str, ...] = ("speaker", "speaker_only")
-
-_TIME_WINDOW_ARGUMENT_NAMES: tuple[str, ...] = ("after", "before")
-
-# Tools whose execution can prove a result's send time and therefore honor a
-# window. A bound arriving at anything else is refused by the same rule that
-# refuses an unhonorable speaker selection.
-_TIME_WINDOW_TOOLS: frozenset[str] = frozenset({"vc_find_quote"})
-
-_TIME_WINDOW_PROPERTY_DESCRIPTION = (
-    "Optional {edge} bound on when a message was SENT, as an ISO-8601 date "
-    "(YYYY-MM-DD) or timestamp. Inclusive. A date with no timezone is read "
-    "as UTC. Results that cannot prove their send time are excluded once "
-    "either bound is given, so a bounded search answers only from evidence "
-    "whose timing is provable."
-)
-
-
-class _TimeWindowError(ValueError):
-    """An arriving window bound that cannot be honored as written."""
-
-
-def _parse_window_bound(name: str, raw: object) -> "datetime | None":
-    """Parse one ISO-8601 bound, or raise.
-
-    A bound that cannot be parsed is REFUSED rather than dropped. Ignoring it
-    would silently answer an unbounded question while the caller believes the
-    answer is bounded — the same defect class as a silently ignored speaker
-    selection, and harder to notice because the results still look right.
-    """
-    if raw is None:
-        return None
-    if isinstance(raw, datetime):
-        moment = raw
-    else:
-        if not isinstance(raw, str) or not raw.strip():
-            raise _TimeWindowError(
-                f"{name} must be an ISO-8601 date (YYYY-MM-DD) or timestamp; "
-                f"got an empty value"
-            )
-        try:
-            moment = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
-        except ValueError:
-            raise _TimeWindowError(
-                f"{name}={raw!r} is not an ISO-8601 date (YYYY-MM-DD) or "
-                "timestamp. Re-issue with an explicit calendar date, or omit "
-                f"{name} to search without a {name} bound."
-            ) from None
-    if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=timezone.utc)
-    return moment
-
-
-def _resolve_time_window(tool_input: dict) -> dict:
-    """Validated ``after`` / ``before`` for a tool call, or raise."""
-    window: dict = {}
-    for name in _TIME_WINDOW_ARGUMENT_NAMES:
-        if name not in tool_input:
-            continue
-        value = _parse_window_bound(name, tool_input.get(name))
-        if value is not None:
-            window[name] = value
-    after, before = window.get("after"), window.get("before")
-    if after is not None and before is not None and after > before:
-        raise _TimeWindowError(
-            f"after={after.isoformat()} is later than "
-            f"before={before.isoformat()}, so the window selects nothing. "
-            "Re-issue with after earlier than before."
-        )
-    return window
 
 
 def _refused_speaker_arguments(name: str, tool_input: object) -> list[str]:
@@ -1329,22 +1247,6 @@ def execute_vc_tool(
     # failure is invisible to the caller precisely because the call
     # succeeds. Refusing is recoverable: the model is told which tools do
     # enforce a selection and can re-issue.
-    # A window bound that cannot be parsed is refused before anything runs:
-    # returning unbounded results to a caller who asked for a bounded search
-    # is a wrong answer that looks like a right one.
-    time_window: dict = {}
-    if name in _TIME_WINDOW_TOOLS and isinstance(tool_input, dict):
-        try:
-            time_window = _resolve_time_window(tool_input)
-        except _TimeWindowError as exc:
-            logger.warning(
-                "TIME_WINDOW_REFUSED tool=%s conv=%s reason=%s",
-                name,
-                str(getattr(engine.config, "conversation_id", ""))[:12],
-                exc,
-            )
-            return json.dumps({"error": str(exc)})
-
     refused = _refused_speaker_arguments(name, tool_input)
     if refused:
         alternatives = ", ".join(sorted(SPEAKER_SCOPING_TOOLS))
@@ -1714,7 +1616,6 @@ def execute_vc_tool(
                     speaker_context=speaker_context,
                     speaker_conditioning=_fq_conditioning,
                     speaker_handles=_fq_handles,
-                    **time_window,
                 )
             else:
                 # The context is forwarded only when the caller derived one,
@@ -1727,11 +1628,6 @@ def execute_vc_tool(
                     _fq_kwargs["speaker_context"] = speaker_context
                 if _fq_handles is not None:
                     _fq_kwargs["speaker_handles"] = _fq_handles
-                # A window is a narrowing the caller asked for. An engine
-                # seam predating the argument must not answer the unbounded
-                # question in its place, so the bounds are forwarded and a
-                # TypeError surfaces rather than being swallowed.
-                _fq_kwargs.update(time_window)
                 result = engine.find_quote(
                     query=fq_query,
                     max_results=_fq_max,
