@@ -91,6 +91,28 @@ search:
   speaker_audience_scope: "channel"   # or "conversation"
 ```
 
+### Reading Speaker Fields on a Result
+
+**`source_role` distinguishes authorship from being quoted.** `requester` is the person who wrote the excerpt; `subject` is the person being replied to. The same `speaker_label` appears in both cases, so reading the label without the role cannot tell "she said this" from "this was said to her".
+
+Annotated results also carry two independent judgements, and a consumer must read both:
+
+- **`speaker_verified` / `speaker_actor_known`** answer *do we know, durably and role-locally, which actor authored this?*
+- **`speaker_label`** answers *can that actor be safely named to this audience?*
+
+These can disagree, and the disagreement is meaningful. A label is derived only from that actor's own audience-admissible canonical user row: matching audience, current attribution version, exact channel when the request is channel-bound, within a bounded recent scan. Tenant-global `actor_profiles.display_name` is deliberately never consulted, because a DM may have refreshed it with a private nickname that is not safe to show this audience.
+
+**`speaker_verified: true` with an empty `speaker_label` therefore means authorship is known but the speaker cannot be safely named to this audience.** Render it as unnamed — omit the attribution, or say "a participant". Never substitute a nearby name, a roster entry, or `actor_profiles.display_name`. A blank rendered beside verified content invites the reader to attribute it to whoever is adjacent, which is the misattribution this subsystem exists to prevent.
+
+This state is ordinary on a subject lane: you can be replied to without having recently spoken in that audience, so a reply subject often has no qualifying row to draw a label from.
+
+The two result classes differ in how far they can degrade:
+
+- **Quote results** distinguish a missing actor from an unnameable one. No actor yields `speaker_verified: false`, and on a subject lane the stored reply label surfaces as `claimed_speaker_label` — an explicitly unverified claim that must never be rendered as attribution.
+- **Fact results** have no such branch: a fact is role-local only when its durable author actor is non-empty, so `speaker_verified` is always true and **the empty label is the only degraded signal available.**
+
+Results with no single human speaker carry `speaker_scope` (`mixed` or `unknown`) instead of speaker fields, and must not be attributed to anyone.
+
 ## Unified Guilds (Server-Wide Conversations)
 
 A server-style community can be unified into one conversation deliberately, via the caller-asserted stable-key namespace: conversation keys of the form `sk:agent:<name>:<platform>:<kind>:<id>` carry a `kind` segment, and `guild` is a first-class kind alongside `channel`, `group`, `direct`, and `dm`. A guild-kind key makes every channel of the server share one conversation owner: one memory, one fact base, one actor space for the whole community.
