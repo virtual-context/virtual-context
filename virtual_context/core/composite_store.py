@@ -1229,6 +1229,29 @@ class CompositeStore:
             return list(fn(tenant_id, actor_id))
         return []
 
+    def resolve_actor_card_carryover_evidence(
+        self,
+        tenant_id: str,
+        actor_id: str,
+        *,
+        fact_ids: list[str],
+        turn_ids: list[str],
+    ) -> tuple[list, list]:
+        fn = getattr(
+            self._facts,
+            "resolve_actor_card_carryover_evidence",
+            None,
+        )
+        if callable(fn):
+            facts, turns = fn(
+                tenant_id,
+                actor_id,
+                fact_ids=fact_ids,
+                turn_ids=turn_ids,
+            )
+            return list(facts), list(turns)
+        return [], []
+
     def get_actor_profile(self, tenant_id: str, actor_id: str):
         fn = getattr(self._facts, "get_actor_profile", None)
         return fn(tenant_id, actor_id) if callable(fn) else None

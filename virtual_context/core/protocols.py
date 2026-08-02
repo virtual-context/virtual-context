@@ -534,6 +534,14 @@ class FactStore(Protocol):
     def list_actor_card_carryovers(
         self, tenant_id: str, actor_id: str,
     ) -> list: ...
+    def resolve_actor_card_carryover_evidence(
+        self,
+        tenant_id: str,
+        actor_id: str,
+        *,
+        fact_ids: list[str],
+        turn_ids: list[str],
+    ) -> tuple[list, list]: ...
     def get_actor_profile(self, tenant_id: str, actor_id: str): ...
     def mark_actor_card_dirty(
         self, tenant_id: str, actor_id: str, *, build_input_hash: str = "",

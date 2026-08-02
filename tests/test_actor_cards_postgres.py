@@ -258,6 +258,79 @@ def test_pg_list_actor_turn_sources_is_tenant_and_audience_scoped(store):
     ) == []
 
 
+def test_pg_exact_carryover_resolver_omits_hostile_nonexact_ids(store):
+    w = World(store)
+
+    facts, turns = store.resolve_actor_card_carryover_evidence(
+        w.tenant,
+        w.optics,
+        fact_ids=[w.f_dm, f" {w.f_guild} ", 7],
+        turn_ids=[w.ct_dm, "not-a-uuid", w.ct_guild.upper(), 7],
+    )
+
+    assert [source.fact.id for source in facts] == [w.f_dm]
+    assert [source.turn.canonical_turn_id for source in turns] == [w.ct_dm]
+
+
+@pytest.mark.parametrize("source_name", ["dm", "guild"])
+def test_pg_actor_card_sources_reject_soft_deleted_active_conversation(
+    store,
+    source_name,
+):
+    w = World(store)
+    conversation_id = getattr(w, source_name)
+    fact_id = getattr(w, f"f_{source_name}")
+    turn_id = getattr(w, f"ct_{source_name}")
+    channel_id = f"chan-{source_name}"
+
+    with store.pool.connection() as conn:
+        conn.execute(
+            "UPDATE conversations SET deleted_at = %s "
+            "WHERE conversation_id = %s",
+            (_now(), conversation_id),
+        )
+
+    facts, turns = store.resolve_actor_card_carryover_evidence(
+        w.tenant,
+        w.optics,
+        fact_ids=[fact_id],
+        turn_ids=[turn_id],
+    )
+    assert facts == []
+    assert turns == []
+    assert fact_id not in {
+        source.fact.id
+        for source in store.list_actor_facts(w.tenant, w.optics, limit=10)
+    }
+    assert turn_id not in {
+        source.turn.canonical_turn_id
+        for source in store.list_actor_turn_sources(
+            w.tenant,
+            w.optics,
+            limit=10,
+        )
+    }
+
+    entry_id = _uid("soft-deleted")
+    assert store.replace_actor_card(
+        w.tenant,
+        w.optics,
+        [(
+            _entry(entry_id, "relevant_history", "Exact source."),
+            [_source(
+                entry_id,
+                w.tenant,
+                conversation_id,
+                conversation_id,
+                fact_id,
+                channel_id,
+            )],
+        )],
+        input_hash="soft-deleted",
+        expected_source_epochs={conversation_id: 1},
+    ) == 0
+
+
 def test_pg_turn_sourced_card_delete_is_synchronously_invalidated(store):
     w = World(store)
     entry_id = _uid("turn-entry")

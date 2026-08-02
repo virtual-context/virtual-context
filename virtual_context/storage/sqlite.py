@@ -12534,6 +12534,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 WHERE f.author_actor_id = ?
                   AND c.tenant_id = ?
                   AND c.phase NOT IN ('deleted', 'merged')
+                  AND c.deleted_at IS NULL
                   AND f.superseded_by IS NULL
                   AND f.author_attribution_version > 0
                 ORDER BY f.mentioned_at DESC, f.id""",
@@ -12553,7 +12554,8 @@ CREATE TABLE IF NOT EXISTS request_captures (
             arow = conn.execute(
                 """SELECT lifecycle_epoch FROM conversations
                     WHERE conversation_id = ? AND tenant_id = ?
-                      AND phase <> 'deleted'""",
+                      AND phase <> 'deleted'
+                      AND deleted_at IS NULL""",
                 (audience_id, tenant_id),
             ).fetchone()
             if arow is None:
@@ -12616,6 +12618,8 @@ CREATE TABLE IF NOT EXISTS request_captures (
                       AND audience.tenant_id = ?
                       AND owner.phase NOT IN ('deleted', 'merged')
                       AND audience.phase <> 'deleted'
+                      AND owner.deleted_at IS NULL
+                      AND audience.deleted_at IS NULL
                       AND ct.audience_attribution_version = ?
                       AND ct.audience_conversation_id <> ''
                       AND ct.user_content <> ''
@@ -12657,6 +12661,118 @@ CREATE TABLE IF NOT EXISTS request_captures (
             )
             for row in rows or ()
         ]
+
+    def resolve_actor_card_carryover_evidence(
+        self,
+        tenant_id: str,
+        actor_id: str,
+        *,
+        fact_ids: list[str],
+        turn_ids: list[str],
+    ) -> tuple[list[ActorFactSource], list[ActorTurnSource]]:
+        """Resolve exact carryover citations with current provenance proof."""
+        actor_id = (actor_id or "").strip()
+        wanted_facts = sorted({
+            value for value in fact_ids
+            if isinstance(value, str) and value
+        })
+        wanted_turns = sorted({
+            value for value in turn_ids
+            if isinstance(value, str) and value
+        })
+        if not actor_id or (not wanted_facts and not wanted_turns):
+            return [], []
+        conn = self._get_conn()
+        facts: list[ActorFactSource] = []
+        turns: list[ActorTurnSource] = []
+        if wanted_facts:
+            placeholders = ",".join("?" for _ in wanted_facts)
+            rows = conn.execute(
+                f"""SELECT f.*, c.lifecycle_epoch AS _owner_epoch
+                       FROM facts f
+                       JOIN conversations c
+                         ON c.conversation_id = f.conversation_id
+                      WHERE f.id IN ({placeholders})
+                        AND f.author_actor_id = ?
+                        AND f.superseded_by IS NULL
+                        AND f.author_attribution_version > 0
+                        AND c.tenant_id = ?
+                        AND c.phase NOT IN ('deleted', 'merged')
+                        AND c.deleted_at IS NULL
+                      ORDER BY f.id""",
+                (*wanted_facts, actor_id, tenant_id),
+            ).fetchall()
+            for row in rows:
+                fact = Fact.from_dict(dict(row), dt_parser=_str_to_dt)
+                derived = self._fact_audience(conn, fact)
+                if derived is None:
+                    continue
+                audience_id, channel_id = derived
+                audience = conn.execute(
+                    """SELECT lifecycle_epoch FROM conversations
+                        WHERE conversation_id = ? AND tenant_id = ?
+                          AND phase <> 'deleted'
+                          AND deleted_at IS NULL""",
+                    (audience_id, tenant_id),
+                ).fetchone()
+                if audience is None:
+                    continue
+                facts.append(ActorFactSource(
+                    fact=fact,
+                    tenant_id=tenant_id,
+                    owner_conversation_id=fact.conversation_id,
+                    audience_conversation_id=audience_id,
+                    audience_channel_id=channel_id,
+                    owner_lifecycle_epoch=int(row["_owner_epoch"] or 0),
+                    audience_lifecycle_epoch=int(audience[0] or 0),
+                ))
+        if wanted_turns:
+            placeholders = ",".join("?" for _ in wanted_turns)
+            rows = conn.execute(
+                f"""SELECT ct.*,
+                            owner.lifecycle_epoch AS _owner_epoch,
+                            audience.lifecycle_epoch AS _audience_epoch
+                       FROM canonical_turns ct
+                       JOIN conversations owner
+                         ON owner.conversation_id = ct.conversation_id
+                       JOIN conversations audience
+                         ON audience.conversation_id =
+                            ct.audience_conversation_id
+                      WHERE ct.canonical_turn_id IN ({placeholders})
+                        AND ct.sender_actor_id = ?
+                        AND ct.user_content <> ''
+                        AND ct.audience_conversation_id <> ''
+                        AND ct.audience_attribution_version = ?
+                        AND owner.tenant_id = ?
+                        AND audience.tenant_id = ?
+                        AND owner.phase NOT IN ('deleted', 'merged')
+                        AND audience.phase <> 'deleted'
+                        AND owner.deleted_at IS NULL
+                        AND audience.deleted_at IS NULL
+                      ORDER BY ct.canonical_turn_id""",
+                (
+                    *wanted_turns,
+                    actor_id,
+                    AUDIENCE_ATTRIBUTION_VERSION,
+                    tenant_id,
+                    tenant_id,
+                ),
+            ).fetchall()
+            turns = [
+                ActorTurnSource(
+                    turn=_row_to_canonical_turn(row),
+                    tenant_id=tenant_id,
+                    owner_conversation_id=row["conversation_id"] or "",
+                    audience_conversation_id=(
+                        row["audience_conversation_id"] or ""
+                    ),
+                    audience_channel_id=row["origin_channel_id"] or "",
+                    owner_lifecycle_epoch=int(row["_owner_epoch"] or 0),
+                    audience_lifecycle_epoch=int(row["_audience_epoch"] or 0),
+                )
+                for row in rows
+            ]
+        return facts, turns
 
     def get_actor_profile(self, tenant_id: str, actor_id: str) -> ActorProfile | None:
         row = self._get_conn().execute(
@@ -12744,7 +12860,8 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 row = conn.execute(
                     """SELECT lifecycle_epoch FROM conversations
                         WHERE conversation_id = ? AND tenant_id = ?
-                          AND phase <> 'deleted'""",
+                          AND phase <> 'deleted'
+                          AND deleted_at IS NULL""",
                     (conv_id, tenant_id),
                 ).fetchone()
                 if row is None or int(row[0] or 0) != int(epoch):
@@ -12792,7 +12909,8 @@ CREATE TABLE IF NOT EXISTS request_captures (
                                   AND c.tenant_id = ?
                                   AND c.phase NOT IN (
                                       'deleted', 'merged'
-                                  )""",
+                                  )
+                                  AND c.deleted_at IS NULL""",
                             (fact_id, actor_id, tenant_id),
                         ).fetchone()
                         if fact_row is None:
@@ -12811,7 +12929,8 @@ CREATE TABLE IF NOT EXISTS request_captures (
                                  FROM conversations
                                 WHERE conversation_id = ?
                                   AND tenant_id = ?
-                                  AND phase <> 'deleted'""",
+                                  AND phase <> 'deleted'
+                                  AND deleted_at IS NULL""",
                             (audience_id, tenant_id),
                         ).fetchone()
                         owner_id = fact.conversation_id
@@ -12845,7 +12964,9 @@ CREATE TABLE IF NOT EXISTS request_captures (
                                   AND owner.phase NOT IN (
                                       'deleted', 'merged'
                                   )
-                                  AND audience.phase <> 'deleted'""",
+                                  AND audience.phase <> 'deleted'
+                                  AND owner.deleted_at IS NULL
+                                  AND audience.deleted_at IS NULL""",
                             (
                                 turn_id,
                                 actor_id,

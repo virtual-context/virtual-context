@@ -44,6 +44,36 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _ACTOR_CARD_CITATION_LIMIT = 16
+_ACTOR_CARD_POLICY_VERSION = 13
+_ACTOR_CARD_SEMANTIC_CONTRACT = (
+    "Semantic contract for every candidate: communication_pref means only "
+    "how this actor wants the agent to communicate, respond, format answers, "
+    "or engage with them. When the evidence is an instruction to the agent, "
+    "the body must make that direction explicit, for example 'Wants the agent "
+    "to ...'; never recast it as something the actor does. interaction_style "
+    "means only a durable pattern in how this actor themselves communicates "
+    "or behaves in interactions. A role, persona, identity, tone, or behavior "
+    "that the actor assigns to the agent is not the actor's interaction_style. "
+    "A durable instruction that the agent maintain a persona, identity, tone, "
+    "or behavior may instead be communication_pref only when the body "
+    "explicitly keeps the agent as its subject. "
+    "active_goal means only an unresolved outcome, project, or change that "
+    "this actor intends to pursue. relevant_history means durable factual "
+    "context about this actor, including experiences, regimen, medications, "
+    "health, location, or recurring topics, when no narrower goal or "
+    "communication preference applies. The four kinds are mutually exclusive; "
+    "medication use, procedures, biography, and other actor facts are not "
+    "communication_pref. Keep grammatical subject and predicate roles exact. "
+    "Preserve speaker, doer, possessor, addressee, quoted-speaker, and "
+    "third-party roles. Actor authorship does not make every person or property "
+    "described in a message a property of the actor. In particular, imperative "
+    "or second-person evidence directed at the agent must never become a claim "
+    "that the actor follows, uses, is, or does the requested thing. Exact source "
+    "messages outrank derived facts whenever their role or kind implications "
+    "disagree. Every cited id must itself materially support the body; do not "
+    "add invocation, acknowledgement, or merely adjacent messages as extra "
+    "citations. "
+)
 
 
 class _ActorCardAdmissionError(RuntimeError):
@@ -426,6 +456,80 @@ class CompactionPipeline:
                 if callable(carryover_getter)
                 else []
             )
+            required_fact_ids = sorted({
+                source.fact_id
+                for _entry, sources in carryovers
+                for source in sources
+                if source.fact_id
+            })
+            required_turn_ids = sorted({
+                source.canonical_turn_id
+                for _entry, sources in carryovers
+                for source in sources
+                if source.canonical_turn_id
+            })
+            fact_by_id = {source.fact.id: source for source in facts}
+            turn_by_id = {
+                source.turn.canonical_turn_id: source for source in turns
+            }
+            missing_fact_ids = [
+                source_id for source_id in required_fact_ids
+                if source_id not in fact_by_id
+            ]
+            missing_turn_ids = [
+                source_id for source_id in required_turn_ids
+                if source_id not in turn_by_id
+            ]
+            resolver = getattr(
+                self._store,
+                "resolve_actor_card_carryover_evidence",
+                None,
+            )
+            if (
+                callable(resolver)
+                and (missing_fact_ids or missing_turn_ids)
+            ):
+                resolved_facts, resolved_turns = resolver(
+                    tenant_id,
+                    actor_id,
+                    fact_ids=missing_fact_ids,
+                    turn_ids=missing_turn_ids,
+                )
+                for source in resolved_facts:
+                    source_id = source.fact.id
+                    if (
+                        source_id in missing_fact_ids
+                        and source.tenant_id == tenant_id
+                        and source.fact.author_actor_id == actor_id
+                    ):
+                        fact_by_id[source_id] = source
+                for source in resolved_turns:
+                    source_id = source.turn.canonical_turn_id
+                    if (
+                        source_id in missing_turn_ids
+                        and source.tenant_id == tenant_id
+                        and source.turn.sender_actor_id == actor_id
+                    ):
+                        turn_by_id[source_id] = source
+            # Put carryover citations first so the aggregate prompt bound cannot
+            # hide the exact evidence needed to reconsider a live entry. Any
+            # unresolved or truncated citation still fails closed downstream.
+            facts = [
+                fact_by_id[source_id]
+                for source_id in required_fact_ids
+                if source_id in fact_by_id
+            ] + [
+                source for source in facts
+                if source.fact.id not in set(required_fact_ids)
+            ]
+            turns = [
+                turn_by_id[source_id]
+                for source_id in required_turn_ids
+                if source_id in turn_by_id
+            ] + [
+                source for source in turns
+                if source.turn.canonical_turn_id not in set(required_turn_ids)
+            ]
             fact_payload = [
                 {
                     "id": source.fact.id,
@@ -499,7 +603,7 @@ class CompactionPipeline:
             )
             digest = hashlib.sha256(json.dumps(
                 {
-                    "policy": 12,
+                    "policy": _ACTOR_CARD_POLICY_VERSION,
                     "curation_model": curation_model,
                     "curation_fallback_model": curation_fallback_model,
                     "admission_model": admission_model,
@@ -1387,8 +1491,8 @@ class CompactionPipeline:
             "or soften a candidate because of its subject. If the actor "
             "explicitly and unambiguously asks that particular information "
             "not be retained or reused, do not propose it for the card. Do not "
-            "infer such a request from the topic, from a DM, or from context."
-        )
+            "infer such a request from the topic, from a DM, or from context. "
+        ) + _ACTOR_CARD_SEMANTIC_CONTRACT
         user = json.dumps({
             "facts": prompt_facts,
             "turns": prompt_turns,
@@ -1608,6 +1712,7 @@ class CompactionPipeline:
         sources: list,
         candidate_fact_ids: set[str],
         *,
+        required_fact_ids: set[str] | None = None,
         max_chars: int = 64_000,
     ) -> tuple[list[dict], set[tuple[str, str]]]:
         """Return bounded actor-authored turns from candidate-cited segments.
@@ -1624,12 +1729,22 @@ class CompactionPipeline:
             for source in sources
             if source.audience_conversation_id == audience_conversation_id
         }
+        required_fact_ids = set(required_fact_ids or ())
         candidate_refs = {
             (
                 source_by_id[fact_id].owner_conversation_id,
                 source_by_id[fact_id].fact.segment_ref,
             )
             for fact_id in candidate_fact_ids
+            if fact_id in source_by_id
+            and source_by_id[fact_id].fact.segment_ref
+        }
+        required_refs = {
+            (
+                source_by_id[fact_id].owner_conversation_id,
+                source_by_id[fact_id].fact.segment_ref,
+            )
+            for fact_id in required_fact_ids
             if fact_id in source_by_id
             and source_by_id[fact_id].fact.segment_ref
         }
@@ -1704,6 +1819,10 @@ class CompactionPipeline:
         ordered = sorted(
             by_ref.values(),
             key=lambda item: (
+                0 if (
+                    item["owner_conversation_id"],
+                    item["segment_ref"],
+                ) in required_refs else 1,
                 -item["_newest_time"],
                 item["owner_conversation_id"],
                 item["segment_ref"],
@@ -1760,12 +1879,20 @@ class CompactionPipeline:
             for source in entry_sources
             if source.fact_id
         }
+        required_fact_ids = {
+            source.fact_id
+            for entry, entry_sources in normalized
+            if entry.id in existing_entry_ids
+            for source in entry_sources
+            if source.fact_id
+        }
         evidence_segments, evidence_refs = (
             self._actor_card_evidence_segments(
                 actor_id,
                 audience_conversation_id,
                 fact_sources,
                 candidate_fact_ids,
+                required_fact_ids=required_fact_ids,
             )
         )
         fact_source_by_id = {
@@ -1783,7 +1910,10 @@ class CompactionPipeline:
                 192_000,
             )),
         )
-        visible_turn_ids = {turn["id"] for turn in actor_turns}
+        visible_turn_ids = {
+            turn["id"] for turn in actor_turns
+            if not turn.get("truncated")
+        }
         candidates: list[dict] = []
         eligible: dict[
             str, tuple["ActorCardEntry", list["ActorCardEntrySource"]]
@@ -1807,9 +1937,14 @@ class CompactionPipeline:
                 if fact_id in fact_source_by_id
             }
             is_existing = entry.id in existing_entry_ids
+            if any(
+                fact_id not in fact_source_by_id
+                for fact_id in fact_ids
+            ):
+                rejection_counts["evidence_unavailable"] += 1
+                continue
             if (
-                not is_existing
-                and refs
+                refs
                 and not refs.issubset(evidence_refs)
             ):
                 rejection_counts["evidence_unavailable"] += 1
@@ -1818,7 +1953,7 @@ class CompactionPipeline:
                 turn_id not in turn_source_by_id
                 or turn_id not in visible_turn_ids
                 for turn_id in turn_ids
-            ) and not is_existing:
+            ):
                 rejection_counts["evidence_unavailable"] += 1
                 continue
             if not fact_ids and not turn_ids:
@@ -1878,16 +2013,27 @@ class CompactionPipeline:
             "\"durable\", \"temporary\", \"test_probe\", "
             "\"stopped_or_replaced\", \"completed\", \"contradicted\", "
             "\"insufficient_evidence\", \"not_durable\", "
-            "\"not_person_card\", \"redundant\", or "
+            "\"not_person_card\", \"wrong_subject\", \"wrong_kind\", "
+            "\"irrelevant_citation\", \"redundant\", or "
             "\"explicit_privacy_request\". Use reason "
             "\"durable\" if and only if admit is true. "
             "Candidate origin is either fresh or existing. An existing "
             "candidate is an immutable entry that a prior independent "
-            "admission accepted from its cited evidence. Curator omission is "
-            "not evidence against it. Re-admit an existing candidate unless "
-            "later actor-authored evidence explicitly stops, replaces, "
-            "completes, or contradicts it, or a materially better fresh "
-            "candidate makes it redundant. When fresh and existing candidates "
+            "admission accepted under an earlier policy. Curator omission is "
+            "not evidence against it, but prior acceptance is not proof under "
+            "this policy. Apply every subject, kind, citation, durability, "
+            "privacy, and revocation check equally to fresh and existing "
+            "candidates. Re-admit an existing candidate only if it still "
+            "passes all current checks. Apply the shared semantic contract "
+            "before judging durability. Reject with wrong_subject when the "
+            "candidate violates its role-preservation clauses. Reject with "
+            "wrong_kind when kind does not fit the immutable body and exact "
+            "source. Reject with irrelevant_citation when any citation violates "
+            "the contract's material-support rule. Apply those reasons in that "
+            "order: a role error is wrong_subject even when the kind is also "
+            "wrong; use wrong_kind only after subject and roles are correct. "
+            "When fresh and existing "
+            "candidates "
             "substantially overlap, prefer the existing candidate for "
             "continuity unless the fresh one materially corrects, updates, or "
             "better preserves the evidence; reject the other as redundant or "
@@ -1928,8 +2074,8 @@ class CompactionPipeline:
             "be retained or reused; never infer privacy from the topic, from a "
             "DM, or from context. A visibly truncated turn cannot prove a "
             "claim whose qualifier may be in omitted text. When uncertain, "
-            "reject."
-        )
+            "reject. "
+        ) + _ACTOR_CARD_SEMANTIC_CONTRACT
         user = json.dumps({
             "curator_substantive_claim": curator_substantive,
             "candidates": candidates,
@@ -2008,6 +2154,9 @@ class CompactionPipeline:
                 "insufficient_evidence",
                 "not_durable",
                 "not_person_card",
+                "wrong_subject",
+                "wrong_kind",
+                "irrelevant_citation",
                 "redundant",
                 "explicit_privacy_request",
             }

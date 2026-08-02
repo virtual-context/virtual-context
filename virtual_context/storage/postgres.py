@@ -13040,6 +13040,7 @@ class PostgresStore(ContextStore):
                     WHERE f.author_actor_id = %s
                       AND c.tenant_id = %s
                       AND c.phase NOT IN ('deleted', 'merged')
+                      AND c.deleted_at IS NULL
                       AND f.superseded_by IS NULL
                       AND f.author_attribution_version > 0
                     ORDER BY f.mentioned_at DESC, f.id""",
@@ -13059,7 +13060,8 @@ class PostgresStore(ContextStore):
                 arow = conn.execute(
                     """SELECT lifecycle_epoch FROM conversations
                         WHERE conversation_id = %s AND tenant_id = %s
-                          AND phase <> 'deleted'""",
+                          AND phase <> 'deleted'
+                          AND deleted_at IS NULL""",
                     (audience_id, tenant_id),
                 ).fetchone()
                 if arow is None:
@@ -13125,6 +13127,8 @@ class PostgresStore(ContextStore):
                           AND audience.tenant_id = %s
                           AND owner.phase NOT IN ('deleted', 'merged')
                           AND audience.phase <> 'deleted'
+                          AND owner.deleted_at IS NULL
+                          AND audience.deleted_at IS NULL
                           AND ct.audience_attribution_version = %s
                           AND ct.audience_conversation_id <> ''
                           AND ct.user_content <> ''
@@ -13165,6 +13169,132 @@ class PostgresStore(ContextStore):
             )
             for row in rows or ()
         ]
+
+    def resolve_actor_card_carryover_evidence(
+        self,
+        tenant_id: str,
+        actor_id: str,
+        *,
+        fact_ids: list[str],
+        turn_ids: list[str],
+    ) -> tuple[list[ActorFactSource], list[ActorTurnSource]]:
+        """Resolve exact carryover citations with current provenance proof."""
+        actor_id = (actor_id or "").strip()
+        wanted_facts = sorted({
+            value for value in fact_ids
+            if isinstance(value, str) and value
+        })
+        wanted_turns = sorted({
+            value for value in turn_ids
+            if isinstance(value, str) and value
+        })
+        if wanted_turns:
+            import uuid as _uuid
+
+            canonical_turns: list[str] = []
+            for value in wanted_turns:
+                try:
+                    parsed = _uuid.UUID(value)
+                except (ValueError, AttributeError):
+                    continue
+                if str(parsed) == value:
+                    canonical_turns.append(value)
+            wanted_turns = canonical_turns
+        if not actor_id or (not wanted_facts and not wanted_turns):
+            return [], []
+        facts: list[ActorFactSource] = []
+        turns: list[ActorTurnSource] = []
+        with self.pool.connection() as conn:
+            if wanted_facts:
+                rows = conn.execute(
+                    """SELECT f.*, c.lifecycle_epoch AS _owner_epoch
+                         FROM facts f
+                         JOIN conversations c
+                           ON c.conversation_id = f.conversation_id
+                        WHERE f.id = ANY(%s)
+                          AND f.author_actor_id = %s
+                          AND f.superseded_by IS NULL
+                          AND f.author_attribution_version > 0
+                          AND c.tenant_id = %s
+                          AND c.phase NOT IN ('deleted', 'merged')
+                          AND c.deleted_at IS NULL
+                        ORDER BY f.id""",
+                    (wanted_facts, actor_id, tenant_id),
+                ).fetchall()
+                for row in rows:
+                    fact = self._row_to_fact(row)
+                    derived = self._fact_audience(conn, fact)
+                    if derived is None:
+                        continue
+                    audience_id, channel_id = derived
+                    audience = conn.execute(
+                        """SELECT lifecycle_epoch FROM conversations
+                            WHERE conversation_id = %s AND tenant_id = %s
+                              AND phase <> 'deleted'
+                              AND deleted_at IS NULL""",
+                        (audience_id, tenant_id),
+                    ).fetchone()
+                    if audience is None:
+                        continue
+                    facts.append(ActorFactSource(
+                        fact=fact,
+                        tenant_id=tenant_id,
+                        owner_conversation_id=fact.conversation_id,
+                        audience_conversation_id=audience_id,
+                        audience_channel_id=channel_id,
+                        owner_lifecycle_epoch=int(row["_owner_epoch"] or 0),
+                        audience_lifecycle_epoch=int(
+                            audience["lifecycle_epoch"] or 0
+                        ),
+                    ))
+            if wanted_turns:
+                rows = conn.execute(
+                    """SELECT ct.*,
+                              owner.lifecycle_epoch AS _owner_epoch,
+                              audience.lifecycle_epoch AS _audience_epoch
+                         FROM canonical_turns ct
+                         JOIN conversations owner
+                           ON owner.conversation_id = ct.conversation_id
+                         JOIN conversations audience
+                           ON audience.conversation_id =
+                              ct.audience_conversation_id
+                        WHERE ct.canonical_turn_id = ANY(%s)
+                          AND ct.sender_actor_id = %s
+                          AND ct.user_content <> ''
+                          AND ct.audience_conversation_id <> ''
+                          AND ct.audience_attribution_version = %s
+                          AND owner.tenant_id = %s
+                          AND audience.tenant_id = %s
+                          AND owner.phase NOT IN ('deleted', 'merged')
+                          AND audience.phase <> 'deleted'
+                          AND owner.deleted_at IS NULL
+                          AND audience.deleted_at IS NULL
+                        ORDER BY ct.canonical_turn_id""",
+                    (
+                        wanted_turns,
+                        actor_id,
+                        AUDIENCE_ATTRIBUTION_VERSION,
+                        tenant_id,
+                        tenant_id,
+                    ),
+                ).fetchall()
+                turns = [
+                    ActorTurnSource(
+                        turn=_row_to_canonical_turn(row),
+                        tenant_id=tenant_id,
+                        owner_conversation_id=row["conversation_id"] or "",
+                        audience_conversation_id=(
+                            row["audience_conversation_id"] or ""
+                        ),
+                        audience_channel_id=row["origin_channel_id"] or "",
+                        owner_lifecycle_epoch=int(row["_owner_epoch"] or 0),
+                        audience_lifecycle_epoch=int(
+                            row["_audience_epoch"] or 0
+                        ),
+                    )
+                    for row in rows
+                ]
+        return facts, turns
 
     def get_actor_profile(self, tenant_id: str, actor_id: str) -> ActorProfile | None:
         with self.pool.connection() as conn:
@@ -13282,7 +13412,8 @@ class PostgresStore(ContextStore):
                     row = conn.execute(
                         """SELECT lifecycle_epoch FROM conversations
                             WHERE conversation_id = %s AND tenant_id = %s
-                              AND phase <> 'deleted'""",
+                              AND phase <> 'deleted'
+                              AND deleted_at IS NULL""",
                         (conv_id, tenant_id),
                     ).fetchone()
                     if row is None or int(row["lifecycle_epoch"] or 0) != int(epoch):
@@ -13324,7 +13455,8 @@ class PostgresStore(ContextStore):
                                       AND c.tenant_id = %s
                                       AND c.phase NOT IN (
                                           'deleted', 'merged'
-                                      )""",
+                                      )
+                                      AND c.deleted_at IS NULL""",
                                 (fact_id, actor_id, tenant_id),
                             ).fetchone()
                             if fact_row is None:
@@ -13339,7 +13471,8 @@ class PostgresStore(ContextStore):
                                      FROM conversations
                                     WHERE conversation_id = %s
                                       AND tenant_id = %s
-                                      AND phase <> 'deleted'""",
+                                      AND phase <> 'deleted'
+                                      AND deleted_at IS NULL""",
                                 (audience_id, tenant_id),
                             ).fetchone()
                             owner_id = fact.conversation_id
@@ -13373,7 +13506,9 @@ class PostgresStore(ContextStore):
                                       AND owner.phase NOT IN (
                                           'deleted', 'merged'
                                       )
-                                      AND audience.phase <> 'deleted'""",
+                                      AND audience.phase <> 'deleted'
+                                      AND owner.deleted_at IS NULL
+                                      AND audience.deleted_at IS NULL""",
                                 (
                                     turn_id,
                                     actor_id,

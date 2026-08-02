@@ -918,6 +918,23 @@ class ContextStore(ABC):
         """
         return []
 
+    def resolve_actor_card_carryover_evidence(
+        self,
+        tenant_id: str,
+        actor_id: str,
+        *,
+        fact_ids: list[str],
+        turn_ids: list[str],
+    ) -> tuple[list, list]:
+        """Resolve exact, provenance-proved evidence outside recency windows.
+
+        The returned pair is ``(fact_sources, turn_sources)``. Backends must
+        apply the same tenant, actor, audience-attribution, and lifecycle
+        checks as their bounded actor evidence readers. Missing or stale ids
+        are omitted so the caller can fail closed by exact set comparison.
+        """
+        return [], []
+
     def get_actor_profile(self, tenant_id: str, actor_id: str):
         """Return the tenant-scoped profile/cache state, or ``None``."""
         return None

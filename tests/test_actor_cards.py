@@ -1973,6 +1973,403 @@ def test_semantic_admission_rejects_candidate_without_rewriting_card(store):
     assert status["failure_count"] == 3
 
 
+def test_semantic_gate_revalidates_existing_subject_kind_and_citations(store):
+    """A carryover receives no exemption from the current semantic contract."""
+    _conversation(store, "guild")
+    _turn(
+        store,
+        "ct-agent-persona",
+        "guild",
+        OPTICS,
+        "guild",
+        "chan-guild",
+        content="@Vast You are Fae. Assert your fae identity.",
+    )
+    _turn(
+        store,
+        "ct-medication",
+        "guild",
+        OPTICS,
+        "guild",
+        "chan-guild",
+        content="I use tesamorelin.",
+    )
+    _turn(
+        store,
+        "ct-atlas",
+        "guild",
+        OPTICS,
+        "guild",
+        "chan-guild",
+        content="I am leading the Atlas migration.",
+    )
+    _turn(
+        store,
+        "ct-response-pref",
+        "guild",
+        OPTICS,
+        "guild",
+        "chan-guild",
+        content="For future replies to me, keep answers concise.",
+    )
+    _turn(
+        store,
+        "ct-invocation",
+        "guild",
+        OPTICS,
+        "guild",
+        "chan-guild",
+        content="@Vast",
+    )
+    store.upsert_actor_profile_from_turn(
+        "guild",
+        OPTICS,
+        "Optics",
+        seen_at=_now(),
+    )
+    bad_subject = _entry(
+        "e-bad-subject",
+        CARD_KIND_INTERACTION_STYLE,
+        "Adopts a fae persona.",
+        scope=CARD_SCOPE_CROSS_CONTEXT,
+    )
+    bad_kind = _entry(
+        "e-bad-kind",
+        CARD_KIND_COMMUNICATION_PREF,
+        "Uses tesamorelin.",
+        scope=CARD_SCOPE_CROSS_CONTEXT,
+    )
+    bad_citation = _entry(
+        "e-bad-citation",
+        CARD_KIND_COMMUNICATION_PREF,
+        "Wants the agent to keep replies concise.",
+        scope=CARD_SCOPE_CROSS_CONTEXT,
+    )
+    assert store.replace_actor_card(
+        "t1",
+        OPTICS,
+        [
+            (
+                bad_subject,
+                [_turn_source(
+                    bad_subject.id,
+                    "guild",
+                    "guild",
+                    "ct-agent-persona",
+                    "chan-guild",
+                )],
+            ),
+            (
+                bad_kind,
+                [_turn_source(
+                    bad_kind.id,
+                    "guild",
+                    "guild",
+                    "ct-medication",
+                    "chan-guild",
+                )],
+            ),
+            (
+                bad_citation,
+                [
+                    _turn_source(
+                        bad_citation.id,
+                        "guild",
+                        "guild",
+                        "ct-response-pref",
+                        "chan-guild",
+                    ),
+                    _turn_source(
+                        bad_citation.id,
+                        "guild",
+                        "guild",
+                        "ct-invocation",
+                        "chan-guild",
+                    ),
+                ],
+            ),
+        ],
+        input_hash="old-policy",
+        expected_source_epochs={"guild": 1},
+    )
+
+    class Curator:
+        system = ""
+
+        def complete(self, **kwargs):
+            self.system = kwargs["system"]
+            return json.dumps(_curation([{
+                "kind": CARD_KIND_ACTIVE_GOAL,
+                "body": "Is leading the Atlas migration.",
+                "confidence": 0.9,
+                "turn_ids": ["ct-atlas"],
+            }])), {}
+
+    class Admission:
+        system = ""
+
+        def complete(self, **kwargs):
+            self.system = kwargs["system"]
+            prompt = json.loads(kwargs["user"])
+            reasons = {
+                "e-bad-subject": "wrong_subject",
+                "e-bad-kind": "wrong_kind",
+                "e-bad-citation": "irrelevant_citation",
+            }
+            decisions = []
+            for candidate in prompt["candidates"]:
+                reason = reasons.get(candidate["candidate_id"], "durable")
+                decisions.append({
+                    "candidate_id": candidate["candidate_id"],
+                    "admit": reason == "durable",
+                    "reason": reason,
+                })
+            return json.dumps(_admission(decisions)), {}
+
+    curator = Curator()
+    admission = Admission()
+    pipeline = _card_pipeline(store, curator, admission=admission)
+
+    assert pipeline._rebuild_actor_card(OPTICS) == 1
+    assert _bodies(store.get_actor_card(
+        "t1",
+        OPTICS,
+        owner_conversation_id="guild",
+        audience_conversation_id="guild",
+        audience_channel_id="chan-guild",
+    )) == ["Is leading the Atlas migration."]
+    assert "imperative or second-person evidence directed at the agent" in (
+        curator.system
+    )
+    assert "Every cited id must itself materially support the body" in (
+        curator.system
+    )
+    assert "Apply the shared semantic contract" in admission.system
+    assert "Reject with wrong_subject" in admission.system
+    assert "Reject with wrong_kind" in admission.system
+    assert "Reject with irrelevant_citation" in admission.system
+    assert "use wrong_kind only after subject and roles are correct" in (
+        admission.system
+    )
+    status = store.get_actor_card_rebuild_status("t1", OPTICS)
+    assert status is not None
+    assert status["rejected_counts"] == {
+        "semantic_irrelevant_citation": 1,
+        "semantic_wrong_kind": 1,
+        "semantic_wrong_subject": 1,
+    }
+
+
+def test_actor_card_policy_version_reconsiders_a_clean_card(store, monkeypatch):
+    """A policy revision changes the input hash without new conversation data."""
+    import virtual_context.core.compaction_pipeline as pipeline_module
+
+    _single_guild_card_source(store)
+
+    class Curator:
+        calls = 0
+
+        def complete(self, **_kwargs):
+            self.calls += 1
+            return json.dumps(_curation([{
+                "kind": CARD_KIND_ACTIVE_GOAL,
+                "body": "Is leading the Atlas migration.",
+                "confidence": 0.9,
+                "turn_ids": ["ct-guild"],
+            }])), {}
+
+    curator = Curator()
+    pipeline = _card_pipeline(store, curator, admission=_AdmitAll())
+
+    monkeypatch.setattr(pipeline_module, "_ACTOR_CARD_POLICY_VERSION", 12)
+    assert pipeline._rebuild_actor_card(OPTICS) == 1
+    old_hash = store.get_actor_profile("t1", OPTICS).card_input_hash
+    assert curator.calls == 1
+
+    monkeypatch.setattr(pipeline_module, "_ACTOR_CARD_POLICY_VERSION", 13)
+    assert pipeline._rebuild_actor_card(OPTICS) == 1
+    new_hash = store.get_actor_profile("t1", OPTICS).card_input_hash
+    assert curator.calls == 2
+    assert new_hash != old_hash
+
+
+def test_out_of_window_carryover_hydrates_exact_source_before_admission(store):
+    """An old carryover cannot bypass the evidence window as an opaque id."""
+    _conversation(store, "guild")
+    _turn(
+        store,
+        "ct-old-persona",
+        "guild",
+        OPTICS,
+        "guild",
+        "chan-guild",
+        content="@Vast You are Fae. Assert your fae identity.",
+    )
+    _turn(
+        store,
+        "ct-new-goal",
+        "guild",
+        OPTICS,
+        "guild",
+        "chan-guild",
+        content="I am leading the Atlas migration.",
+    )
+    store.upsert_actor_profile_from_turn(
+        "guild",
+        OPTICS,
+        "Optics",
+        seen_at=_now(),
+    )
+    legacy = _entry(
+        "e-old-persona",
+        CARD_KIND_INTERACTION_STYLE,
+        "Adopts a fae persona.",
+        scope=CARD_SCOPE_CROSS_CONTEXT,
+    )
+    assert store.replace_actor_card(
+        "t1",
+        OPTICS,
+        [(legacy, [_turn_source(
+            legacy.id,
+            "guild",
+            "guild",
+            "ct-old-persona",
+            "chan-guild",
+        )])],
+        input_hash="policy-12",
+        expected_source_epochs={"guild": 1},
+    )
+
+    requested = []
+    resolver = store.resolve_actor_card_carryover_evidence
+
+    def resolve(*args, **kwargs):
+        requested.append(kwargs)
+        return resolver(*args, **kwargs)
+
+    store.resolve_actor_card_carryover_evidence = resolve
+
+    from virtual_context.core.composite_store import CompositeStore
+    from virtual_context.core.conversation_store import ConversationStoreView
+
+    composite = CompositeStore(
+        segments=store,
+        facts=store,
+        fact_links=store,
+        state=store,
+        search=store,
+    )
+    production_view = ConversationStoreView(
+        composite,
+        conversation_id="guild",
+        generation=0,
+    )
+
+    class Curator:
+        def complete(self, **_kwargs):
+            return json.dumps(_curation([{
+                "kind": CARD_KIND_ACTIVE_GOAL,
+                "body": "Is leading the Atlas migration.",
+                "confidence": 0.9,
+                "turn_ids": ["ct-new-goal"],
+            }])), {}
+
+    class Admission:
+        prompt = None
+
+        def complete(self, **kwargs):
+            self.prompt = json.loads(kwargs["user"])
+            decisions = []
+            for candidate in self.prompt["candidates"]:
+                existing = candidate["candidate_id"] == legacy.id
+                decisions.append({
+                    "candidate_id": candidate["candidate_id"],
+                    "admit": not existing,
+                    "reason": "wrong_subject" if existing else "durable",
+                })
+            return json.dumps(_admission(decisions)), {}
+
+    admission = Admission()
+    pipeline = _card_pipeline(
+        production_view,
+        Curator(),
+        admission=admission,
+    )
+    pipeline._config.assembler.actor_card_turn_limit = 1
+
+    assert pipeline._rebuild_actor_card(OPTICS) == 1
+    assert requested == [
+        {
+            "fact_ids": [],
+            "turn_ids": ["ct-old-persona"],
+        },
+        {
+            "fact_ids": [],
+            "turn_ids": ["ct-old-persona"],
+        },
+    ]
+    old_turn = next(
+        turn
+        for turn in admission.prompt["actor_turns"]
+        if turn["id"] == "ct-old-persona"
+    )
+    assert old_turn["content"] == "@Vast You are Fae. Assert your fae identity."
+    assert old_turn["truncated"] is False
+    assert _bodies(store.get_actor_card(
+        "t1",
+        OPTICS,
+        owner_conversation_id="guild",
+        audience_conversation_id="guild",
+        audience_channel_id="chan-guild",
+    )) == ["Is leading the Atlas migration."]
+    status = store.get_actor_card_rebuild_status("t1", OPTICS)
+    assert status["rejected_counts"] == {"semantic_wrong_subject": 1}
+
+
+def test_unresolved_existing_citation_fails_closed_before_model(store):
+    """Existing origin does not excuse an opaque citation from exact evidence."""
+    legacy = _entry(
+        "e-opaque",
+        CARD_KIND_INTERACTION_STYLE,
+        "Adopts a fae persona.",
+        scope=CARD_SCOPE_CROSS_CONTEXT,
+    )
+    source = _turn_source(
+        legacy.id,
+        "guild",
+        "guild",
+        "ct-not-loaded",
+        "chan-guild",
+    )
+
+    class Admission:
+        def complete(self, **kwargs):
+            prompt = json.loads(kwargs["user"])
+            assert prompt["candidates"] == []
+            return json.dumps(_admission(
+                [],
+                substantive=False,
+                coverage_reason="no_durable_context",
+            )), {}
+
+    pipeline = _card_pipeline(store, object(), admission=Admission())
+    admitted, _response, rejected, substantive = (
+        pipeline._admit_actor_card_entries(
+            OPTICS,
+            "guild",
+            [],
+            [],
+            [(legacy, [source])],
+            curator_substantive=False,
+            existing_entry_ids={legacy.id},
+        )
+    )
+
+    assert admitted == []
+    assert rejected == {"evidence_unavailable": 1}
+    assert substantive is False
+
+
 def test_fallback_supplied_initial_judgment_is_not_counted_twice(store):
     """One fallback model cannot manufacture a 2-of-3 majority."""
     _single_guild_card_source(store)
@@ -2534,6 +2931,69 @@ def test_semantic_evidence_keeps_late_revocation_and_excludes_other_actor(store)
     )
     assert bounded == []
     assert bounded_refs == set()
+
+
+def test_semantic_evidence_cap_keeps_old_required_fact_before_new_fresh(store):
+    """A live carryover's old fact evidence wins the segment prompt bound."""
+    _conversation(store, "guild")
+    _turn(
+        store,
+        "ct-old",
+        "guild",
+        OPTICS,
+        "guild",
+        "chan",
+        content="Old required evidence.",
+    )
+    _turn(
+        store,
+        "ct-new",
+        "guild",
+        OPTICS,
+        "guild",
+        "chan",
+        content="New optional evidence.",
+    )
+    _segment(store, "seg-old", "guild", ["ct-old"])
+    _segment(store, "seg-new", "guild", ["ct-new"])
+    _fact(store, "fact-old", "guild", "seg-old", OPTICS)
+    _fact(store, "fact-new", "guild", "seg-new", OPTICS)
+    conn = store._get_conn()
+    conn.execute(
+        "UPDATE segments SET end_timestamp = ? WHERE ref = ?",
+        ("2020-01-01T00:00:00+00:00", "seg-old"),
+    )
+    conn.execute(
+        "UPDATE segments SET end_timestamp = ? WHERE ref = ?",
+        ("2026-01-01T00:00:00+00:00", "seg-new"),
+    )
+    conn.commit()
+
+    pipeline = object.__new__(CompactionPipeline)
+    pipeline._store = store
+    sources = list(store.list_actor_facts("t1", OPTICS, limit=60))
+    old_only, _ = pipeline._actor_card_evidence_segments(
+        OPTICS,
+        "guild",
+        sources,
+        {"fact-old"},
+    )
+    one_segment_cap = len(json.dumps(
+        old_only[0],
+        separators=(",", ":"),
+    ))
+
+    evidence, refs = pipeline._actor_card_evidence_segments(
+        OPTICS,
+        "guild",
+        sources,
+        {"fact-old", "fact-new"},
+        required_fact_ids={"fact-old"},
+        max_chars=one_segment_cap,
+    )
+
+    assert [item["segment_ref"] for item in evidence] == ["seg-old"]
+    assert refs == {("guild", "seg-old")}
 
 
 def test_list_actor_facts_is_tenant_scoped(store):
@@ -3436,6 +3896,127 @@ def test_stale_builder_cannot_resurrect_after_epoch_change(store):
         "t1", OPTICS, owner_conversation_id="dm",
         audience_conversation_id="dm", audience_channel_id="chan-dm",
     ) is None
+
+
+@pytest.mark.parametrize("deleted_conversation", ["owner", "audience"])
+def test_actor_card_sources_reject_soft_deleted_active_conversation(
+    store,
+    deleted_conversation,
+):
+    """deleted_at is authoritative even when phase was left active."""
+    _conversation(store, "owner")
+    _conversation(store, "audience")
+    _turn(
+        store,
+        "ct-soft-deleted",
+        "owner",
+        OPTICS,
+        "audience",
+        "chan",
+        content="Durable exact source.",
+    )
+    _segment(store, "seg-soft-deleted", "owner", ["ct-soft-deleted"])
+    _fact(store, "fact-soft-deleted", "owner", "seg-soft-deleted", OPTICS)
+    store.upsert_actor_profile_from_turn(
+        "owner",
+        OPTICS,
+        "Optics",
+        seen_at=_now(),
+    )
+
+    assert [
+        source.fact.id
+        for source in store.list_actor_facts("t1", OPTICS, limit=60)
+    ] == ["fact-soft-deleted"]
+    assert [
+        source.turn.canonical_turn_id
+        for source in store.list_actor_turn_sources("t1", OPTICS, limit=500)
+    ] == ["ct-soft-deleted"]
+
+    conn = store._get_conn()
+    conn.execute(
+        "UPDATE conversations SET deleted_at = ? WHERE conversation_id = ?",
+        (_now(), deleted_conversation),
+    )
+    conn.commit()
+
+    assert store.list_actor_facts("t1", OPTICS, limit=60) == []
+    assert store.list_actor_turn_sources("t1", OPTICS, limit=500) == []
+    resolved_facts, resolved_turns = (
+        store.resolve_actor_card_carryover_evidence(
+            "t1",
+            OPTICS,
+            fact_ids=["fact-soft-deleted"],
+            turn_ids=["ct-soft-deleted"],
+        )
+    )
+    assert resolved_facts == []
+    assert resolved_turns == []
+    assert store.replace_actor_card(
+        "t1",
+        OPTICS,
+        [(
+            _entry(
+                "entry-soft-deleted",
+                CARD_KIND_RELEVANT_HISTORY,
+                "Durable exact source.",
+            ),
+            [_source(
+                "entry-soft-deleted",
+                "owner",
+                "audience",
+                "fact-soft-deleted",
+                "chan",
+            )],
+        )],
+        input_hash="soft-deleted",
+        expected_source_epochs={"owner": 1, "audience": 1},
+    ) == 0
+
+
+def test_exact_carryover_resolver_preserves_ids_and_rejects_empty_audience(
+    store,
+):
+    """Exact lookup neither normalizes hostile IDs nor accepts no audience."""
+    _dm_and_guild(store)
+
+    facts, turns = store.resolve_actor_card_carryover_evidence(
+        "t1",
+        OPTICS,
+        fact_ids=["f-guild"],
+        turn_ids=["ct-guild"],
+    )
+    assert [source.fact.id for source in facts] == ["f-guild"]
+    assert [source.turn.canonical_turn_id for source in turns] == [
+        "ct-guild",
+    ]
+
+    facts, turns = store.resolve_actor_card_carryover_evidence(
+        "t1",
+        OPTICS,
+        fact_ids=[" f-guild ", 7],
+        turn_ids=[" ct-guild ", 7],
+    )
+    assert facts == []
+    assert turns == []
+
+    _conversation(store, "empty-owner")
+    _conversation(store, "")
+    _turn(
+        store,
+        "ct-empty-audience",
+        "empty-owner",
+        OPTICS,
+        "",
+        content="Must not resolve without a proved audience.",
+    )
+    _facts, turns = store.resolve_actor_card_carryover_evidence(
+        "t1",
+        OPTICS,
+        fact_ids=[],
+        turn_ids=["ct-empty-audience"],
+    )
+    assert turns == []
 
 
 def test_fact_redistillation_epoch_fence_preserves_existing_facts(store):
