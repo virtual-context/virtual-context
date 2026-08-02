@@ -315,7 +315,12 @@ def vc_tool_definitions() -> list[dict]:
                 "evidence retrieval across the window, mode='summarize_over_time' "
                 "for broad temporal synthesis questions, and mode='window_overview' "
                 "for query-agnostic browse questions like what we worked on "
-                "during a specific day or week."
+                "during a specific day or week. "
+                "This tool CANNOT restrict results to one participant and "
+                "accepts no speaker argument: its results cover everyone who "
+                "spoke in the window. For 'what did <participant> say', use "
+                "vc_find_quote or vc_query_facts, which enforce a speaker "
+                "selection."
             ),
             "input_schema": {
                 "type": "object",
@@ -419,7 +424,10 @@ _SPEAKER_SELECTABLE_TOOLS: frozenset[str] = frozenset({
 _SPEAKER_PROPERTY_DESCRIPTION = (
     "Optional speaker handle selected from this request's speaker-roster "
     "list. Choose a listed handle only when the question is about what that "
-    "specific participant said; omit it otherwise."
+    "specific participant said; omit it otherwise. On its own this only "
+    "PREFERS that participant when ranking — results may still include "
+    "other participants. To RESTRICT results to that participant, also set "
+    "speaker_only=true."
 )
 
 # Tools whose execution implements exact-attribution filtering. Advertised
@@ -429,6 +437,37 @@ _SPEAKER_ONLY_TOOLS: frozenset[str] = frozenset({
     "vc_find_quote",
     "vc_query_facts",
 })
+
+# The tools whose execution reads ``speaker`` / ``speaker_only`` at all —
+# the only ones for which those arguments change what comes back. Every
+# other tool must REFUSE them rather than drop them: not advertising an
+# argument does not stop a caller sending it, and a dropped speaker
+# selection returns every participant's material to a question asked about
+# one participant. Public so the refusal contract can be asserted against
+# execution rather than restated by hand.
+SPEAKER_SCOPING_TOOLS: frozenset[str] = (
+    _SPEAKER_SELECTABLE_TOOLS | _SPEAKER_ONLY_TOOLS
+)
+
+_SPEAKER_ARGUMENT_NAMES: tuple[str, ...] = ("speaker", "speaker_only")
+
+
+def _refused_speaker_arguments(name: str, tool_input: object) -> list[str]:
+    """Speaker arguments a non-scoping tool was asked to honor.
+
+    "Asked" is decided with the same predicates the scoping tools use, so a
+    serializer that emits ``speaker: null`` or ``speaker_only: false`` has
+    requested nothing and is not refused. Returns ``[]`` for every tool that
+    implements scoping and for every call that carries no request.
+    """
+    if name in SPEAKER_SCOPING_TOOLS or not isinstance(tool_input, dict):
+        return []
+    requested = []
+    if "speaker" in tool_input and tool_input.get("speaker") is not None:
+        requested.append("speaker")
+    if tool_input.get("speaker_only") is True:
+        requested.append("speaker_only")
+    return requested
 
 # Fixed prose for a fact selection that cannot be honored. A fact carries a
 # usable author only when its attribution is role-local; a model-assisted or
@@ -1201,6 +1240,31 @@ def execute_vc_tool(
     )
     if guarded is not None:
         return guarded
+
+    # A tool that cannot scope by speaker refuses the argument instead of
+    # dropping it. Dropping it answers "what did X say" with every
+    # participant's material, which the reader then attributes to X — the
+    # failure is invisible to the caller precisely because the call
+    # succeeds. Refusing is recoverable: the model is told which tools do
+    # enforce a selection and can re-issue.
+    refused = _refused_speaker_arguments(name, tool_input)
+    if refused:
+        alternatives = ", ".join(sorted(SPEAKER_SCOPING_TOOLS))
+        logger.warning(
+            "SPEAKER_SCOPING_REFUSED tool=%s args=%s conv=%s",
+            name, ",".join(refused),
+            str(getattr(engine.config, "conversation_id", ""))[:12],
+        )
+        return json.dumps({"error": (
+            f"{name} cannot scope results by speaker. "
+            f"{' and '.join(refused)} "
+            f"{'were' if len(refused) > 1 else 'was'} refused rather than "
+            "ignored, because ignoring the selection would return every "
+            "participant's material for a question asked about one "
+            f"participant. Re-issue {name} without "
+            f"{' or '.join(refused)}, or use {alternatives}, whose results "
+            "are restricted to the selected speaker."
+        )})
 
     # Annotation authority for this execution: the exact request context
     # only when the annotation gate is on AND the request proved its

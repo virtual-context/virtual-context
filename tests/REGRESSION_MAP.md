@@ -406,6 +406,19 @@ Use `pytest -m regression` to run all regression tests.
   - `test_ingest_projected_rows.py::test_projected_row_cannot_be_written_back`
   - `test_ingest_projected_rows.py::test_unsupported_backend_falls_back_to_the_full_load`
 
+### BUG-049 — Tools that cannot scope by speaker accepted `speaker` / `speaker_only` and silently ignored them
+
+- **Symptom**: A `vc_remember_when` call carrying `speaker=<handle>` and `speaker_only=true` returned HTTP 200 with results covering every participant in the window. The response was byte-identical to the same call without the arguments (same md5), while a `vc_find_quote` control differed. A question asked about one participant was answered with another participant's material, and the reader attributed it to the participant named in the question.
+- **Root cause**: `speaker` / `speaker_only` are read in exactly one place, `_resolve_speaker_conditioning`, reached from exactly two tools: `vc_find_quote` and `vc_query_facts`. The schema correctly withheld the properties from the other six tools, but withholding a property does not stop a caller sending it, and `execute_vc_tool` dispatched on tool name without ever inspecting unsupported arguments. The six non-scoping tools therefore accepted the selection, dropped it, and emitted no telemetry saying so. Silence is the defect: an argument that errors teaches the caller, an argument that is dropped produces a confident wrong attribution that looks like a successful call.
+- **Fix**: `SPEAKER_SCOPING_TOOLS` derives the supported set from the two tools whose execution consumes the arguments, and `execute_vc_tool` refuses a speaker selection addressed to anything else before dispatch, naming the tool, the refused arguments and the tools that do enforce a selection, and logging `SPEAKER_SCOPING_REFUSED`. "Requested" uses the same predicates the scoping tools use, so `speaker: null` and `speaker_only: false` are not requests and are not refused. `vc_remember_when`'s description now states it cannot restrict to one participant and names the two tools that can, and the `speaker` property description says that on its own it only prefers a participant when ranking and that `speaker_only=true` is what restricts. Speaker filtering inside `remember_when` is deliberately not implemented here; refusing is the safe half.
+- **Tests**:
+  - `test_speaker_scoping_refusal.py::test_non_scoping_tool_refuses_speaker_arguments` (every non-scoping tool x each of the three request shapes; asserts no tool body ran)
+  - `test_speaker_scoping_refusal.py::test_remember_when_refusal_names_the_supported_tools`
+  - `test_speaker_scoping_refusal.py::test_non_scoping_tool_still_runs_without_speaker_arguments` (the refusal is scoped to the argument, not the tool)
+  - `test_speaker_scoping_refusal.py::test_explicit_null_speaker_is_not_a_request_to_scope`
+  - `test_speaker_scoping_refusal.py::test_scoping_tools_are_exactly_the_ones_that_read_the_arguments`
+  - `test_speaker_scoping_refusal.py::test_remember_when_description_states_it_cannot_scope_by_speaker`
+
 ### BUG-047 — Anchor refresh rewrites the whole conversation's anchor table on every ingest
 
 - **Symptom**: Ingest cost grows linearly with stored conversation size and is independent of what the caller sent. A 15-message request against a 9,173-row conversation costs the same as a 490 KB one. On the largest production conversation the prepare path exceeded the client's timeout often enough that a quarter of prepares were abandoned before a response was sent.
@@ -592,6 +605,7 @@ Use `pytest -m regression` to run all regression tests.
 | `test_embedding_reserved_seats.py` | BUG-043 |
 | `test_ingest_anchor_incremental.py` | BUG-047 |
 | `test_ingest_projected_rows.py` | BUG-048 |
+| `test_speaker_scoping_refusal.py` | BUG-049 |
 | `test_protected_window_gate.py` | BUG-044, BUG-045, BUG-046 |
 | `test_canonical_turn_id_stamping.py` | BUG-046 |
 | `test_retrieval_assembler_protected_window_merge.py` | BUG-045 |
