@@ -17,11 +17,11 @@ Four bugs to pin:
 * **Bug A** — ``TurnTagEntry`` restore paths violated the dataclass
   contract (``default_factory=list``) by passing ``None`` for empty
   ``fact_signals`` / ``tags`` / ``code_refs``. ``list(None)`` crashes.
-* **Bug B** — strict canonical tagging slid its window by a fixed
-  per-pair count, which misaligned whenever a prior tagger crashed
-  mid-pair and left an orphan half at the head of
-  ``iter_untagged_canonical_rows``. Every subsequent pair looked
-  unmappable.
+* **Bug B** — strict canonical tagging slid a positional window and accepted
+  the first role-shaped rows after an orphan. That later proved unsafe: a
+  shifted payload could overwrite those rows' content while retaining their
+  Discord source and actor. Strict tagging must now resolve exact row identity
+  or exact turn-group+hash and fail closed on any shift.
 * **Bug C** — (cloud) ``resolve`` called ``_create_conversation``
   outside ``self._lock`` on the tombstoned-fast-path branch, so two
   concurrent resolves of the same tombstoned conv both spawned a new
@@ -44,6 +44,7 @@ from virtual_context.core.progress_snapshot import (
     ActiveEpisodeSnapshot,
     ProgressSnapshot,
 )
+from virtual_context.core.canonical_turns import compute_turn_hash_from_raw
 from virtual_context.core.tagging_pipeline import TaggingPipeline
 from virtual_context.core.turn_tag_index import TurnTagIndex
 from virtual_context.proxy.metrics import ProxyMetrics
@@ -170,7 +171,11 @@ def _make_canonical_row(
         source_batch_id="",
         created_at="2026-04-17T00:00:00Z",
         turn_group_number=turn_group_number,
-        turn_hash="",
+        turn_hash=compute_turn_hash_from_raw(
+            user_content,
+            assistant_content,
+            version=1,
+        )[0],
         hash_version=1,
         normalized_user_text="",
         normalized_assistant_text="",
@@ -186,6 +191,7 @@ def _make_canonical_row(
         tagged_at=None,
         updated_at=None,
         covered_ingestible_entries=1,
+        source_message_id="",
     )
 
 
@@ -197,67 +203,63 @@ def _make_pipeline_stub():
     pipeline = TaggingPipeline.__new__(TaggingPipeline)
     pipeline._store = MagicMock()
     pipeline._store.save_canonical_turn = MagicMock(return_value=None)
+    pipeline._store.update_canonical_row_tagging_if_unchanged = MagicMock(
+        return_value=True,
+    )
     pipeline.config = SimpleNamespace(conversation_id="conv-b")
     return pipeline
 
 
-def test_strict_canonical_resume_skips_orphan_half_at_head_of_window():
-    """Scenario: a prior tagger tagged the user half of a pair, then crashed
-    before tagging the assistant half. ``iter_untagged_canonical_rows``
-    returns the orphan assistant half as the first row. The new pair in the
-    resumed payload should still be matchable — the persister must skip the
-    orphan and find the role-shape-compatible pair further down the window.
-    """
+def test_strict_canonical_resume_rejects_shifted_role_compatible_window():
+    """A shifted payload must not graft turn 2 bodies onto turn 1 rows."""
     pipeline = _make_pipeline_stub()
 
-    # Existing rows at the head of the window:
-    # [0] orphan assistant half (no user content, assistant content populated)
-    # [1,2] fresh untagged user+assistant pair
     rows = [
-        _make_canonical_row(  # orphan half — incompatible with "user" role
-            canonical_turn_id="r-orphan",
+        _make_canonical_row(
+            canonical_turn_id="r-user-victim",
             sort_key=100,
-            user_content="",
-            assistant_content="leftover from previous tagger",
-            turn_group_number=0,
+            user_content="victim user body",
+            turn_group_number=1,
         ),
         _make_canonical_row(
-            canonical_turn_id="r-user-new",
+            canonical_turn_id="r-asst-victim",
             sort_key=101,
-            user_content="",
-            assistant_content="",
+            assistant_content="victim assistant body",
             turn_group_number=1,
         ),
         _make_canonical_row(
-            canonical_turn_id="r-asst-new",
+            canonical_turn_id="r-user-incoming",
             sort_key=102,
+            user_content="new user",
+            turn_group_number=2,
+        ),
+        _make_canonical_row(
+            canonical_turn_id="r-asst-incoming",
+            sort_key=103,
             user_content="",
-            assistant_content="",
-            turn_group_number=1,
+            assistant_content="new asst",
+            turn_group_number=2,
         ),
     ]
 
     user_msg = Message(role="user", content="new user")
     asst_msg = Message(role="assistant", content="new asst")
 
-    entry = TurnTagEntry(
-        turn_number=1, message_hash="h1", tags=["t"], primary_tag="t",
-    )
-    consumed = pipeline._persist_existing_canonical_rows(
-        entry,
+    resolved = pipeline._resolve_strict_pair_rows(
         [user_msg, asst_msg],
-        rows,
+        turn_number=1,
+        rows_by_id={row.canonical_turn_id: row for row in rows},
+        rows_by_group={
+            1: rows[:2],
+            2: rows[2:],
+        },
     )
-
-    # Persister should report 3 rows consumed (1 orphan skipped + 2 matched),
-    # NOT 0 (which would trigger strict-mode RuntimeError), and NOT 2
-    # (which would leave the orphan in the window for the next pair).
-    assert consumed == 3, (
-        "Persister must report match_offset (1 orphan) + needed (2 matched) "
-        f"= 3 rows consumed; got {consumed}."
+    assert resolved is None
+    assert pipeline._store.save_canonical_turn.call_count == 0
+    assert (
+        pipeline._store.update_canonical_row_tagging_if_unchanged.call_count
+        == 0
     )
-    # It must have updated both new rows with the entry's canonical_turn_id.
-    assert pipeline._store.save_canonical_turn.call_count == 2
 
 
 def test_strict_canonical_resume_returns_zero_when_no_compatible_window():

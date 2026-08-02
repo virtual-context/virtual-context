@@ -7,6 +7,7 @@ from contextlib import nullcontext
 from datetime import datetime, timedelta
 
 from ..types import (
+    CANONICAL_TAGGING_IDENTITY_KEY,
     CanonicalTurnChunkEmbedding,
     CanonicalTurnRow,
     ChunkEmbedding,
@@ -75,7 +76,11 @@ def _group_canonical_rows(rows: list) -> list[list]:
     return groups
 
 
-def canonical_rows_to_history(rows: list) -> list[Message]:
+def canonical_rows_to_history(
+    rows: list,
+    *,
+    include_tagging_identity: bool = False,
+) -> list[Message]:
     """Convert canonical rows into a chat history of ``Message`` objects.
 
     Rows are folded into logical turns first, so a user/assistant pair split
@@ -94,23 +99,51 @@ def canonical_rows_to_history(rows: list) -> list[Message]:
         user_text = ""
         sender = ""
         asst_text = ""
+        user_row = None
+        assistant_row = None
         for row in group:
             candidate_user = getattr(row, "user_content", "") or ""
             if not user_text and candidate_user:
                 user_text = candidate_user
                 sender = (getattr(row, "sender", "") or "").strip()
+                user_row = row
             candidate_asst = getattr(row, "assistant_content", "") or ""
             if not asst_text and candidate_asst:
                 asst_text = candidate_asst
+                assistant_row = row
         if not asst_text.strip():
             continue
+
+        def _metadata(row, *, sender_name: str = "") -> dict | None:
+            metadata: dict = {}
+            if include_tagging_identity:
+                metadata[CANONICAL_TAGGING_IDENTITY_KEY] = {
+                    "canonical_turn_id": (
+                        getattr(row, "canonical_turn_id", "") or ""
+                    ),
+                    "turn_hash": getattr(row, "turn_hash", "") or "",
+                    "turn_group_number": int(
+                        getattr(row, "turn_group_number", -1) or 0
+                    ),
+                    "source_message_id": (
+                        getattr(row, "source_message_id", "") or ""
+                    ),
+                }
+            if sender_name:
+                metadata["sender"] = {"name": sender_name}
+            return metadata or None
+
         if user_text:
             history.append(Message(
                 role="user",
                 content=user_text,
-                metadata={"sender": {"name": sender}} if sender else None,
+                metadata=_metadata(user_row, sender_name=sender),
             ))
-        history.append(Message(role="assistant", content=asst_text))
+        history.append(Message(
+            role="assistant",
+            content=asst_text,
+            metadata=_metadata(assistant_row),
+        ))
     return history
 
 
@@ -611,6 +644,51 @@ class ContextStore(ABC):
         rows also return ``False`` (the ``tagged_at IS NULL`` predicate
         filters them out), which makes the call safely idempotent on retry.
         Concrete backends MUST implement.
+        """
+        raise NotImplementedError
+
+    def update_canonical_row_tagging_if_unchanged(
+        self,
+        *,
+        canonical_turn_id: str,
+        conversation_id: str,
+        expected_turn_hash: str,
+        expected_lifecycle_epoch: int,
+        primary_tag: str,
+        tags: list[str],
+        session_date: str,
+        fact_signals: list[FactSignal],
+        code_refs: list[dict],
+        require_untagged: bool = False,
+        tagged_at: str | None = None,
+    ) -> bool:
+        """CAS tag-derived fields without touching canonical content.
+
+        Concrete stores must match the exact row id, content hash, and
+        lifecycle epoch in the same statement that updates tag fields.  They
+        must not update content, sender, source ids, channel/audience data,
+        reply attribution, ordering, or any other canonical provenance.
+        """
+        raise NotImplementedError
+
+    def backfill_canonical_row_hash_if_empty(
+        self,
+        *,
+        canonical_turn_id: str,
+        conversation_id: str,
+        expected_lifecycle_epoch: int,
+        expected_user_content: str,
+        expected_assistant_content: str,
+        turn_hash: str,
+        hash_version: int,
+        normalized_user_text: str,
+        normalized_assistant_text: str,
+    ) -> bool:
+        """Repair a legacy hashless row from an unchanged stored body.
+
+        Concrete stores must compare both stored body halves and the live
+        lifecycle in the same statement.  Only hash/version/normalization
+        fields may change; content and provenance remain immutable.
         """
         raise NotImplementedError
 

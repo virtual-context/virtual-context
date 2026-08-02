@@ -22,6 +22,8 @@ class ConversationStoreView:
         "save_tag_summary",
         "save_tool_call",
         "save_canonical_turn",
+        "update_canonical_row_tagging_if_unchanged",
+        "backfill_canonical_row_hash_if_empty",
         "delete_canonical_turns",
         "store_canonical_turn_chunk_embeddings",
         "delete_canonical_turn_chunk_embeddings",

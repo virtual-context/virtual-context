@@ -20,6 +20,7 @@ from pathlib import Path
 
 import pytest
 
+from virtual_context.core.canonical_turns import compute_turn_hash_from_raw
 from virtual_context.core.lifecycle_epoch import LifecycleEpochMismatch
 from virtual_context.proxy.formats import (
     detect_format,
@@ -189,6 +190,13 @@ def test_proxy_ingest_history_strict_mode_accepts_legacy_combined_canonical_row(
     try:
         conv_id = state.engine.config.conversation_id
         now = datetime.now(timezone.utc).isoformat()
+        legacy_hash, legacy_user_norm, legacy_assistant_norm = (
+            compute_turn_hash_from_raw(
+                "legacy hello",
+                "legacy hi",
+                version=1,
+            )
+        )
         state.engine._store.save_canonical_turn(
             conv_id,
             0,
@@ -196,10 +204,10 @@ def test_proxy_ingest_history_strict_mode_accepts_legacy_combined_canonical_row(
             "legacy hi",
             canonical_turn_id="legacy-row",
             sort_key=1000.0,
-            turn_hash="legacy-hash",
+            turn_hash=legacy_hash,
             hash_version=1,
-            normalized_user_text="legacy hello",
-            normalized_assistant_text="legacy hi",
+            normalized_user_text=legacy_user_norm,
+            normalized_assistant_text=legacy_assistant_norm,
             first_seen_at=now,
             last_seen_at=now,
             created_at=now,

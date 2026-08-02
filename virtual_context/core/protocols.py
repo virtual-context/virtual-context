@@ -227,6 +227,34 @@ class SegmentStore(Protocol):
         *,
         tagged_at: str | None = None,
     ) -> int: ...
+    def update_canonical_row_tagging_if_unchanged(
+        self,
+        *,
+        canonical_turn_id: str,
+        conversation_id: str,
+        expected_turn_hash: str,
+        expected_lifecycle_epoch: int,
+        primary_tag: str,
+        tags: list[str],
+        session_date: str,
+        fact_signals: list,
+        code_refs: list[dict],
+        require_untagged: bool = False,
+        tagged_at: str | None = None,
+    ) -> bool: ...
+    def backfill_canonical_row_hash_if_empty(
+        self,
+        *,
+        canonical_turn_id: str,
+        conversation_id: str,
+        expected_lifecycle_epoch: int,
+        expected_user_content: str,
+        expected_assistant_content: str,
+        turn_hash: str,
+        hash_version: int,
+        normalized_user_text: str,
+        normalized_assistant_text: str,
+    ) -> bool: ...
     def mark_canonical_turns_compacted(
         self,
         conversation_id: str,

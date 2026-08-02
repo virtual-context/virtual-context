@@ -2031,6 +2031,74 @@ class CompositeStore:
             ))
         raise NotImplementedError
 
+    def update_canonical_row_tagging_if_unchanged(
+        self,
+        *,
+        canonical_turn_id: str,
+        conversation_id: str,
+        expected_turn_hash: str,
+        expected_lifecycle_epoch: int,
+        primary_tag: str,
+        tags: list[str],
+        session_date: str,
+        fact_signals: list,
+        code_refs: list[dict],
+        require_untagged: bool = False,
+        tagged_at: str | None = None,
+    ) -> bool:
+        fn = getattr(
+            self._segments,
+            "update_canonical_row_tagging_if_unchanged",
+            None,
+        )
+        if callable(fn):
+            return bool(fn(
+                canonical_turn_id=canonical_turn_id,
+                conversation_id=conversation_id,
+                expected_turn_hash=expected_turn_hash,
+                expected_lifecycle_epoch=expected_lifecycle_epoch,
+                primary_tag=primary_tag,
+                tags=tags,
+                session_date=session_date,
+                fact_signals=fact_signals,
+                code_refs=code_refs,
+                require_untagged=require_untagged,
+                tagged_at=tagged_at,
+            ))
+        raise NotImplementedError
+
+    def backfill_canonical_row_hash_if_empty(
+        self,
+        *,
+        canonical_turn_id: str,
+        conversation_id: str,
+        expected_lifecycle_epoch: int,
+        expected_user_content: str,
+        expected_assistant_content: str,
+        turn_hash: str,
+        hash_version: int,
+        normalized_user_text: str,
+        normalized_assistant_text: str,
+    ) -> bool:
+        fn = getattr(
+            self._segments,
+            "backfill_canonical_row_hash_if_empty",
+            None,
+        )
+        if callable(fn):
+            return bool(fn(
+                canonical_turn_id=canonical_turn_id,
+                conversation_id=conversation_id,
+                expected_lifecycle_epoch=expected_lifecycle_epoch,
+                expected_user_content=expected_user_content,
+                expected_assistant_content=expected_assistant_content,
+                turn_hash=turn_hash,
+                hash_version=hash_version,
+                normalized_user_text=normalized_user_text,
+                normalized_assistant_text=normalized_assistant_text,
+            ))
+        raise NotImplementedError
+
     def store_tool_output(
         self,
         ref: str,

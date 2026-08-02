@@ -22,7 +22,7 @@ from .ingest_reconciler import IngestReconciler
 from .segmenter import pair_messages_into_turns
 from .store import ContextStore
 from .turn_tag_index import TurnTagIndex
-from ..types import Message
+from ..types import CANONICAL_TAGGING_IDENTITY_KEY, Message
 
 if TYPE_CHECKING:
     from .compactor import DomainCompactor
@@ -375,6 +375,7 @@ class TaggingPipeline:
         pair_messages: list["Message"] | None = None,
         existing_rows: list["CanonicalTurnRow"] | None = None,
         append_missing: bool = True,
+        expected_lifecycle_epoch: int | None = None,
     ) -> int:
         """Persist/enrich a single logical-turn pair.
 
@@ -388,6 +389,7 @@ class TaggingPipeline:
                 entry,
                 pair_messages or [],
                 existing_rows,
+                expected_lifecycle_epoch=expected_lifecycle_epoch,
             )
             if consumed > 0:
                 return consumed
@@ -397,15 +399,24 @@ class TaggingPipeline:
                     f"existing rows for logical turn {entry.turn_number}"
                 )
 
-        user_hash, user_norm, _ = compute_turn_hash_from_raw(
+        user_hash, _, _ = compute_turn_hash_from_raw(
             user_msg.content,
             "",
             version=HASH_VERSION,
         )
-        assistant_hash, _, assistant_norm = compute_turn_hash_from_raw(
+        assistant_hash, _, _ = compute_turn_hash_from_raw(
             "",
             asst_msg.content,
             version=HASH_VERSION,
+        )
+        epoch = int(
+            expected_lifecycle_epoch
+            if expected_lifecycle_epoch is not None
+            else getattr(
+                getattr(self, "_engine_state", None),
+                "lifecycle_epoch",
+                1,
+            )
         )
         rows = list(self._store.get_all_canonical_turns(self.config.conversation_id))
         matched_pair: tuple[object, object] | None = None
@@ -427,90 +438,44 @@ class TaggingPipeline:
         if matched_pair is not None:
             user_row, assistant_row = matched_pair
             tagged_at = utcnow_iso()
-            # Channel metadata IS available here, so derive per physical
-            # message and fall back to the stored value field-by-field. The
-            # upsert overwrites omitted fields with defaults, so a rewrite
-            # that passed nothing would erase stored provenance.
-            user_channel_id, user_channel_label = self._merge_row_channel(
-                user_msg, user_row,
-            )
-            asst_channel_id, asst_channel_label = self._merge_row_channel(
-                asst_msg, assistant_row,
-            )
-            user_actor_id = self._merge_row_actor(user_msg, user_row, role="user")
-            asst_actor_id = self._merge_row_actor(
-                asst_msg, assistant_row, role="assistant",
-            )
-            self._store.save_canonical_turn(
-                self.config.conversation_id,
-                entry.turn_number,
-                user_msg.content,
-                "",
-                user_raw_content=json.dumps(user_msg.raw_content) if user_msg.raw_content else None,
-                assistant_raw_content=None,
-                primary_tag=entry.primary_tag,
-                tags=list(entry.tags or []),
-                session_date=entry.session_date,
-                # Storage upserts overwrite ``sender`` unconditionally, so a
-                # direct rewrite must merge one-way: prefer the freshly derived
-                # value, else keep whatever the row already carries.
-                sender=entry.sender or user_row.sender,
-                fact_signals=list(entry.fact_signals or []),
-                code_refs=list(entry.code_refs or []),
+            user_updated = self._store.update_canonical_row_tagging_if_unchanged(
                 canonical_turn_id=user_row.canonical_turn_id,
-                sort_key=user_row.sort_key,
-                turn_hash=user_hash,
-                hash_version=HASH_VERSION,
-                normalized_user_text=user_norm,
-                normalized_assistant_text="",
-                tagged_at=tagged_at,
-                compacted_at=user_row.compacted_at,
-                first_seen_at=user_row.first_seen_at,
-                last_seen_at=user_row.last_seen_at or tagged_at,
-                source_batch_id=user_row.source_batch_id,
-                created_at=user_row.created_at,
-                updated_at=tagged_at,
-                turn_group_number=entry.turn_number,
-                origin_channel_id=user_channel_id,
-                origin_channel_label=user_channel_label,
-                sender_actor_id=user_actor_id,
-                **self._row_reply_edge(user_row),
-            )
-            self._store.save_canonical_turn(
-                self.config.conversation_id,
-                entry.turn_number + 1,
-                "",
-                asst_msg.content,
-                user_raw_content=None,
-                assistant_raw_content=json.dumps(asst_msg.raw_content) if asst_msg.raw_content else None,
+                conversation_id=self.config.conversation_id,
+                expected_turn_hash=user_hash,
+                expected_lifecycle_epoch=epoch,
                 primary_tag=entry.primary_tag,
                 tags=list(entry.tags or []),
                 session_date=entry.session_date,
-                # An assistant-only row is never newly labeled with the human
-                # speaker; an existing legacy value is preserved as-is.
-                sender=assistant_row.sender,
                 fact_signals=list(entry.fact_signals or []),
                 code_refs=list(entry.code_refs or []),
-                canonical_turn_id=assistant_row.canonical_turn_id,
-                sort_key=assistant_row.sort_key,
-                turn_hash=assistant_hash,
-                hash_version=HASH_VERSION,
-                normalized_user_text="",
-                normalized_assistant_text=assistant_norm,
                 tagged_at=tagged_at,
-                compacted_at=assistant_row.compacted_at,
-                first_seen_at=assistant_row.first_seen_at,
-                last_seen_at=assistant_row.last_seen_at or tagged_at,
-                source_batch_id=assistant_row.source_batch_id,
-                created_at=assistant_row.created_at,
-                updated_at=tagged_at,
-                turn_group_number=entry.turn_number,
-                origin_channel_id=asst_channel_id,
-                origin_channel_label=asst_channel_label,
-                sender_actor_id=asst_actor_id,
-                **self._row_reply_edge(assistant_row),
             )
-            entry.canonical_turn_id = user_row.canonical_turn_id or entry.canonical_turn_id
+            assistant_updated = self._store.update_canonical_row_tagging_if_unchanged(
+                canonical_turn_id=assistant_row.canonical_turn_id,
+                conversation_id=self.config.conversation_id,
+                expected_turn_hash=assistant_hash,
+                expected_lifecycle_epoch=epoch,
+                primary_tag=entry.primary_tag,
+                tags=list(entry.tags or []),
+                session_date=entry.session_date,
+                fact_signals=list(entry.fact_signals or []),
+                code_refs=list(entry.code_refs or []),
+                tagged_at=tagged_at,
+            )
+            if not user_updated or not assistant_updated:
+                if not append_missing:
+                    raise RuntimeError(
+                        "canonical tag-only CAS rejected an exact hash match"
+                    )
+                logger.warning(
+                    "Canonical tag-only CAS raced for logical turn %d; "
+                    "deferring without stale reconciliation",
+                    entry.turn_number,
+                )
+                return 0
+            entry.canonical_turn_id = (
+                user_row.canonical_turn_id or entry.canonical_turn_id
+            )
             # Fallback hash-search path: 0 rows consumed from
             # ``existing_rows`` (we bypassed it).
             return 0
@@ -540,194 +505,237 @@ class TaggingPipeline:
             user_sender_actor_id=user_actor_id,
             fact_signals=list(entry.fact_signals or []),
             code_refs=list(entry.code_refs or []),
-            expected_lifecycle_epoch=self._engine_state.lifecycle_epoch,
+            expected_lifecycle_epoch=epoch,
         )
         if result.rows:
             entry.canonical_turn_id = result.rows[0].canonical_turn_id or entry.canonical_turn_id
         # Append-missing path did not consume any ``existing_rows`` entry.
         return 0
 
+    @staticmethod
+    def _canonical_tagging_identity(message: "Message") -> dict | None:
+        metadata = message.metadata if isinstance(message.metadata, dict) else None
+        value = metadata.get(CANONICAL_TAGGING_IDENTITY_KEY) if metadata else None
+        return value if isinstance(value, dict) else None
+
+    def _resolve_strict_pair_rows(
+        self,
+        pair_messages: list["Message"],
+        *,
+        turn_number: int,
+        rows_by_id: dict[str, "CanonicalTurnRow"],
+        rows_by_group: dict[int, list["CanonicalTurnRow"]],
+    ) -> list["CanonicalTurnRow"] | None:
+        """Resolve a payload pair without positional or role-only matching."""
+        source_messages = [
+            message
+            for message in pair_messages
+            if message.role in {"user", "assistant"}
+        ]
+        if not source_messages:
+            return None
+
+        identities = [
+            self._canonical_tagging_identity(message)
+            for message in source_messages
+        ]
+        if any(identity is not None for identity in identities):
+            # A partly stamped pair is not permission to infer its sibling.
+            if not all(identity is not None for identity in identities):
+                return None
+            resolved: list["CanonicalTurnRow"] = []
+            for message, identity in zip(
+                source_messages, identities, strict=True,
+            ):
+                assert identity is not None
+                row_id = identity.get("canonical_turn_id")
+                expected_hash = identity.get("turn_hash")
+                expected_source_id = identity.get("source_message_id", "")
+                expected_group = identity.get("turn_group_number")
+                if not isinstance(row_id, str) or not row_id:
+                    return None
+                if not isinstance(expected_hash, str) or not expected_hash:
+                    return None
+                row = rows_by_id.get(row_id)
+                if row is None or row.turn_hash != expected_hash:
+                    return None
+                if (
+                    not isinstance(expected_group, int)
+                    or expected_group != turn_number
+                    or int(row.turn_group_number) != expected_group
+                ):
+                    return None
+                if (
+                    isinstance(expected_source_id, str)
+                    and expected_source_id
+                    and row.source_message_id != expected_source_id
+                ):
+                    return None
+                resolved.append(row)
+
+            unique_rows = list(dict.fromkeys(
+                row.canonical_turn_id for row in resolved
+            ))
+            if len(unique_rows) == 1 and len(source_messages) >= 2:
+                row = resolved[0]
+                user_msg, asst_msg = self._split_pair_messages(pair_messages)
+                combined_hash, _, _ = compute_turn_hash_from_raw(
+                    user_msg.content,
+                    asst_msg.content,
+                    version=row.hash_version or HASH_VERSION,
+                )
+                return [row] if combined_hash == row.turn_hash else None
+
+            for row, message in zip(resolved, source_messages, strict=True):
+                if not self._row_shape_matches_role(row, message.role):
+                    return None
+                message_hash, _, _ = compute_turn_hash_from_raw(
+                    message.content if message.role == "user" else "",
+                    message.content if message.role == "assistant" else "",
+                    version=row.hash_version or HASH_VERSION,
+                )
+                if message_hash != row.turn_hash:
+                    return None
+            if len(unique_rows) != len(resolved):
+                return None
+            return resolved
+
+        group_rows = sorted(
+            rows_by_group.get(turn_number, []),
+            key=lambda row: (row.sort_key, row.canonical_turn_id),
+        )
+        if not group_rows:
+            return None
+        if len(group_rows) == 1 and len(source_messages) >= 2:
+            row = group_rows[0]
+            user_msg, asst_msg = self._split_pair_messages(pair_messages)
+            combined_hash, _, _ = compute_turn_hash_from_raw(
+                user_msg.content,
+                asst_msg.content,
+                version=row.hash_version or HASH_VERSION,
+            )
+            return [row] if combined_hash == row.turn_hash else None
+        if len(group_rows) != len(source_messages):
+            return None
+
+        remaining = list(group_rows)
+        resolved = []
+        for message in source_messages:
+            candidates = []
+            for row in remaining:
+                if not self._row_shape_matches_role(row, message.role):
+                    continue
+                message_hash, _, _ = compute_turn_hash_from_raw(
+                    message.content if message.role == "user" else "",
+                    message.content if message.role == "assistant" else "",
+                    version=row.hash_version or HASH_VERSION,
+                )
+                if row.turn_hash == message_hash:
+                    candidates.append(row)
+            if len(candidates) != 1:
+                return None
+            matched = candidates[0]
+            remaining.remove(matched)
+            resolved.append(matched)
+        return resolved if not remaining else None
+
     def _persist_existing_canonical_rows(
         self,
         entry: "TurnTagEntry",
         pair_messages: list["Message"],
         existing_rows: list["CanonicalTurnRow"],
+        *,
+        expected_lifecycle_epoch: int | None = None,
     ) -> int:
-        """Update pre-persisted canonical rows in-place for payload ingest.
+        """Apply tag fields to an exact, content-verified canonical mapping.
 
-        ``handle_prepare_payload`` persists canonical rows before the legacy
-        pair-based tagger runs. During that follow-up tagging pass we must only
-        enrich and mark those existing rows; appending fresh canonical rows here
-        would inflate the DB-derived denominator mid-run.
-
-        Returns the number of rows consumed from ``existing_rows`` (0 means
-        "could not map" — callers in strict mode surface this as an error).
-        The caller is responsible for advancing its cursor by the returned
-        count.
-
-        Matching is role-shape aware AND resilient to a prefix of untagged
-        rows that has been left mid-pair by a crashed tagger on another
-        worker. When a strict role-shape match at the head of ``existing_rows``
-        fails, we skip over any leading "orphan halves" (rows whose role
-        shape does not match the expected first payload message) before
-        attempting the pair match again.
+        ``existing_rows`` is already resolved to this logical turn by exact
+        physical identity or by exact turn-group plus per-message hash.  This
+        method intentionally has no positional/role-shape search and never
+        calls the full-row canonical upsert.  A stale or mismatched mapping
+        therefore fails closed instead of grafting payload text onto another
+        row's Discord source and actor provenance.
         """
 
         source_messages = [msg for msg in pair_messages if msg.role in {"user", "assistant"}]
         if not source_messages or not existing_rows:
             return 0
-        sorted_rows = sorted(existing_rows, key=lambda row: (row.sort_key, row.canonical_turn_id))
+        epoch = int(
+            expected_lifecycle_epoch
+            if expected_lifecycle_epoch is not None
+            else getattr(
+                getattr(self, "_engine_state", None),
+                "lifecycle_epoch",
+                1,
+            )
+        )
+        tagged_at = utcnow_iso()
 
         # Older conversations can still contain a single legacy canonical row
-        # that stores the whole logical user/assistant turn. Strict tagging
-        # should enrich that row in place instead of treating it as unmappable.
-        if len(sorted_rows) == 1 and len(source_messages) >= 2:
-            row = sorted_rows[0]
+        # that stores the whole logical user/assistant turn.  It is safe only
+        # when the combined incoming hash exactly matches the stored hash.
+        if len(existing_rows) == 1 and len(source_messages) >= 2:
+            row = existing_rows[0]
             user_msg, asst_msg = self._split_pair_messages(pair_messages)
-            turn_hash, normalized_user_text, normalized_assistant_text = compute_turn_hash_from_raw(
+            turn_hash, _, _ = compute_turn_hash_from_raw(
                 user_msg.content,
                 asst_msg.content,
                 version=row.hash_version or HASH_VERSION,
             )
-            tagged_at = utcnow_iso()
-            # A legacy combined row has two source messages but one provenance
-            # pair. Use user-first, missing-field-only precedence: the user's
-            # derivation fills what it can, the assistant's fills what remains,
-            # and the stored value survives when neither derives.
-            combined_channel_id, combined_channel_label = self._merge_row_channel(
-                user_msg, row,
-            )
-            if not combined_channel_id or not combined_channel_label:
-                asst_id, asst_label = self._merge_row_channel(asst_msg, row)
-                combined_channel_id = combined_channel_id or asst_id
-                combined_channel_label = combined_channel_label or asst_label
-            # A legacy combined row carries both halves, so it IS a user row:
-            # derive from the user message only, never from the assistant one.
-            combined_actor_id = self._merge_row_actor(user_msg, row, role="user")
-            self._store.save_canonical_turn(
-                self.config.conversation_id,
-                entry.turn_number,
-                user_msg.content,
-                asst_msg.content,
-                user_raw_content=json.dumps(user_msg.raw_content) if user_msg.raw_content else None,
-                assistant_raw_content=json.dumps(asst_msg.raw_content) if asst_msg.raw_content else None,
+            if not row.turn_hash or row.turn_hash != turn_hash:
+                return 0
+            updated = self._store.update_canonical_row_tagging_if_unchanged(
+                canonical_turn_id=row.canonical_turn_id,
+                conversation_id=self.config.conversation_id,
+                expected_turn_hash=row.turn_hash,
+                expected_lifecycle_epoch=epoch,
                 primary_tag=entry.primary_tag,
                 tags=list(entry.tags or []),
                 session_date=entry.session_date,
-                # Legacy combined row carries the whole logical turn, so the
-                # logical-turn sender applies; merge one-way against the stored
-                # value because the upsert would otherwise blank it.
-                sender=entry.sender or row.sender,
                 fact_signals=list(entry.fact_signals or []),
                 code_refs=list(entry.code_refs or []),
-                canonical_turn_id=row.canonical_turn_id,
-                sort_key=row.sort_key,
-                turn_hash=turn_hash,
-                hash_version=row.hash_version or HASH_VERSION,
-                normalized_user_text=normalized_user_text,
-                normalized_assistant_text=normalized_assistant_text,
                 tagged_at=tagged_at,
-                compacted_at=row.compacted_at,
-                first_seen_at=row.first_seen_at,
-                last_seen_at=row.last_seen_at or tagged_at,
-                source_batch_id=row.source_batch_id,
-                created_at=row.created_at,
-                updated_at=tagged_at,
-                turn_group_number=row.turn_group_number,
-                origin_channel_id=combined_channel_id,
-                origin_channel_label=combined_channel_label,
-                sender_actor_id=combined_actor_id,
-                **self._row_reply_edge(row),
             )
+            if not updated:
+                return 0
             entry.canonical_turn_id = row.canonical_turn_id or entry.canonical_turn_id
             return 1
 
-        # Locate a role-shape-compatible contiguous window of
-        # ``len(source_messages)`` rows inside ``sorted_rows``. This tolerates
-        # a prefix of "orphan" rows left behind by a crashed tagger on another
-        # worker (e.g. the user half of a prior pair was tagged but the
-        # assistant half was not — ``iter_untagged_canonical_rows`` returns
-        # the remaining assistant half as the first row, which would otherwise
-        # misalign a naive slice-by-position cursor).
-        needed = len(source_messages)
-        if len(sorted_rows) < needed:
+        if len(existing_rows) != len(source_messages):
             return 0
-        match_offset = -1
-        for start in range(0, len(sorted_rows) - needed + 1):
-            window = sorted_rows[start : start + needed]
-            if all(
-                self._row_shape_matches_role(row, message.role)
-                for row, message in zip(window, source_messages, strict=True)
-            ):
-                match_offset = start
-                break
-        if match_offset < 0:
-            return 0
-
-        window = sorted_rows[match_offset : match_offset + needed]
-        tagged_at = utcnow_iso()
-        for row, message in zip(window, source_messages, strict=True):
+        for row, message in zip(existing_rows, source_messages, strict=True):
             role = message.role
             user_content = message.content if role == "user" else ""
             assistant_content = message.content if role == "assistant" else ""
-
-            turn_hash, normalized_user_text, normalized_assistant_text = compute_turn_hash_from_raw(
+            turn_hash, _, _ = compute_turn_hash_from_raw(
                 user_content,
                 assistant_content,
                 version=row.hash_version or HASH_VERSION,
             )
-            if role == "user":
-                user_raw_content = json.dumps(message.raw_content) if message.raw_content else None
-                assistant_raw_content = None
-            else:
-                user_raw_content = None
-                assistant_raw_content = json.dumps(message.raw_content) if message.raw_content else None
-            # Role-aware sender merge: only a user row may take the freshly
-            # derived speaker name. An assistant row keeps whatever it stored
-            # (possibly a legacy logical-turn value) and gains nothing new.
-            row_sender = (entry.sender or row.sender) if role == "user" else row.sender
-            # Per-entry channel derivation: this physical message's own
-            # metadata, else the row's stored value, per field.
-            row_channel_id, row_channel_label = self._merge_row_channel(message, row)
-            row_actor_id = self._merge_row_actor(message, row, role=role)
-            self._store.save_canonical_turn(
-                self.config.conversation_id,
-                entry.turn_number,
-                user_content,
-                assistant_content,
-                user_raw_content=user_raw_content,
-                assistant_raw_content=assistant_raw_content,
+            if (
+                not row.turn_hash
+                or row.turn_hash != turn_hash
+                or not self._row_shape_matches_role(row, role)
+            ):
+                return 0
+
+        for row in existing_rows:
+            updated = self._store.update_canonical_row_tagging_if_unchanged(
+                canonical_turn_id=row.canonical_turn_id,
+                conversation_id=self.config.conversation_id,
+                expected_turn_hash=row.turn_hash,
+                expected_lifecycle_epoch=epoch,
                 primary_tag=entry.primary_tag,
                 tags=list(entry.tags or []),
                 session_date=entry.session_date,
-                sender=row_sender,
                 fact_signals=list(entry.fact_signals or []),
                 code_refs=list(entry.code_refs or []),
-                canonical_turn_id=row.canonical_turn_id,
-                sort_key=row.sort_key,
-                turn_hash=turn_hash,
-                hash_version=row.hash_version or HASH_VERSION,
-                normalized_user_text=normalized_user_text,
-                normalized_assistant_text=normalized_assistant_text,
                 tagged_at=tagged_at,
-                compacted_at=row.compacted_at,
-                first_seen_at=row.first_seen_at,
-                last_seen_at=row.last_seen_at or tagged_at,
-                source_batch_id=row.source_batch_id,
-                created_at=row.created_at,
-                updated_at=tagged_at,
-                turn_group_number=row.turn_group_number,
-                origin_channel_id=row_channel_id,
-                origin_channel_label=row_channel_label,
-                sender_actor_id=row_actor_id,
-                **self._row_reply_edge(row),
             )
-        entry.canonical_turn_id = window[0].canonical_turn_id or entry.canonical_turn_id
-        # Report rows consumed from the head of ``existing_rows``: the offset
-        # we skipped over PLUS the pair we matched. The caller advances its
-        # strict cursor by this count so subsequent pairs continue to pick
-        # up where this one left off.
-        return match_offset + needed
+            if not updated:
+                return 0
+        entry.canonical_turn_id = existing_rows[0].canonical_turn_id or entry.canonical_turn_id
+        return len(existing_rows)
 
     def _hydrate_entry_from_tagged_rows(
         self,
@@ -759,37 +767,31 @@ class TaggingPipeline:
         ]
         if not source_messages or not existing_rows:
             return None
-        sorted_rows = sorted(
-            existing_rows, key=lambda row: (row.sort_key, row.canonical_turn_id)
-        )
-        needed = len(source_messages)
-        if len(sorted_rows) < needed:
-            return None
-        match_offset = -1
-        for start_idx in range(0, len(sorted_rows) - needed + 1):
-            window = sorted_rows[start_idx : start_idx + needed]
-            if not all(row.tagged_at for row in window):
-                continue
-            matched = True
-            for row, message in zip(window, source_messages):
+        if len(existing_rows) == 1 and len(source_messages) >= 2:
+            user_msg, asst_msg = self._split_pair_messages(pair_messages)
+            combined_hash, _, _ = compute_turn_hash_from_raw(
+                user_msg.content,
+                asst_msg.content,
+                version=existing_rows[0].hash_version or HASH_VERSION,
+            )
+            if existing_rows[0].turn_hash != combined_hash:
+                return None
+        elif len(existing_rows) == len(source_messages):
+            for row, message in zip(existing_rows, source_messages, strict=True):
                 user_content = message.content if message.role == "user" else ""
-                assistant_content = (
-                    message.content if message.role == "assistant" else ""
-                )
+                assistant_content = message.content if message.role == "assistant" else ""
                 message_hash, _, _ = compute_turn_hash_from_raw(
                     user_content,
                     assistant_content,
                     version=row.hash_version or HASH_VERSION,
                 )
                 if row.turn_hash != message_hash:
-                    matched = False
-                    break
-            if matched:
-                match_offset = start_idx
-                break
-        if match_offset < 0:
+                    return None
+        else:
             return None
-        window = sorted_rows[match_offset : match_offset + needed]
+        if not all(row.tagged_at for row in existing_rows):
+            return None
+        window = existing_rows
         tags: list[str] = []
         primary_tag = ""
         sender = ""
@@ -821,7 +823,7 @@ class TaggingPipeline:
             fact_signals=fact_signals,
             code_refs=code_refs,
         )
-        return entry, match_offset + needed
+        return entry, len(window)
 
     @staticmethod
     def _row_shape_matches_role(row: "CanonicalTurnRow", role: str) -> bool:
@@ -1294,22 +1296,31 @@ class TaggingPipeline:
         )
         return result
 
-    def tag_canonical_row(self, row: "CanonicalTurnRow") -> None:
-        """Tag a single canonical row in-place (background backfill entry).
+    def tag_canonical_row(
+        self,
+        row: "CanonicalTurnRow",
+        *,
+        expected_lifecycle_epoch: int | None = None,
+    ) -> bool:
+        """Tag one exact canonical row with a content-hash CAS.
 
         Unlike ``tag_turn``, this is designed for the background tagger loop
         which processes REST-ingested rows after ``IngestReconciler`` has
         persisted them without tags. It runs the tag generator on the row's
-        content, assigns a primary tag + tag list, and re-saves the row via
-        ``save_canonical_turn`` preserving all other fields. It does NOT:
+        content and assigns a primary tag + tag list. The storage operation
+        can update only tag-derived fields and ``tagged_at``; it does NOT:
 
         * build or consult ``conversation_history`` (one-row scope only),
         * fire compaction signals (``_monitor.check`` is intentionally
           skipped — those signals belong to the live ``tag_turn`` flow),
         * mutate ``TurnTagIndex`` (the index is owned by proxy-flow callers
           via ``ingest_history`` and ``tag_turn``),
-        * stamp ``tagged_at`` (the outer ``_tagger_run`` loop flips that
-          atomically via ``mark_canonical_row_tagged`` on the same row).
+        * rewrite content, non-empty hashes, senders, actors, source ids, channels,
+          reply edges, audience provenance, ordering, or compaction state.
+
+        A legacy row whose hash is empty is repaired once from its exact stored
+        body under a body/lifecycle CAS before tagging.  That repair changes
+        only hash/version/normalization fields and cannot alter provenance.
 
         Row text selection: canonical rows carry one side only
         (user_content OR assistant_content) per the split-ingest layout in
@@ -1323,6 +1334,50 @@ class TaggingPipeline:
         user_text = (row.user_content or "").strip()
         asst_text = (row.assistant_content or "").strip()
         combined_text = f"{user_text} {asst_text}".strip()
+        epoch = int(
+            expected_lifecycle_epoch
+            if expected_lifecycle_epoch is not None
+            else getattr(
+                getattr(self, "_engine_state", None),
+                "lifecycle_epoch",
+                1,
+            )
+        )
+        expected_hash = (row.turn_hash or "").strip()
+        if not expected_hash:
+            hash_version = int(row.hash_version or HASH_VERSION)
+            (
+                expected_hash,
+                normalized_user,
+                normalized_assistant,
+            ) = compute_turn_hash_from_raw(
+                row.user_content or "",
+                row.assistant_content or "",
+                version=hash_version,
+            )
+            repaired = self._store.backfill_canonical_row_hash_if_empty(
+                canonical_turn_id=row.canonical_turn_id,
+                conversation_id=self.config.conversation_id,
+                expected_lifecycle_epoch=epoch,
+                expected_user_content=row.user_content or "",
+                expected_assistant_content=row.assistant_content or "",
+                turn_hash=expected_hash,
+                hash_version=hash_version,
+                normalized_user_text=normalized_user,
+                normalized_assistant_text=normalized_assistant,
+            )
+            if not repaired:
+                logger.warning(
+                    "TAGGER_HASH_BACKFILL_REJECTED conv=%s turn_id=%s",
+                    self.config.conversation_id[:12],
+                    row.canonical_turn_id[:12],
+                )
+                return False
+            logger.warning(
+                "TAGGER_HASH_BACKFILLED conv=%s turn_id=%s",
+                self.config.conversation_id[:12],
+                row.canonical_turn_id[:12],
+            )
 
         # Fast-path: empty or stub content → assign `_stub` and persist.
         if not combined_text or (
@@ -1356,44 +1411,19 @@ class TaggingPipeline:
             if extracted:
                 session_date = extracted
 
-        # Persist the enriched fields. We DO NOT set ``tagged_at`` here —
-        # the outer ``_tagger_run`` loop owns the epoch-guarded flip via
-        # ``mark_canonical_row_tagged``. We re-supply every existing field so
-        # the UPSERT does not clobber pre-existing metadata.
-        self._store.save_canonical_turn(
-            self.config.conversation_id,
-            row.turn_number,
-            row.user_content,
-            row.assistant_content,
-            user_raw_content=row.user_raw_content,
-            assistant_raw_content=row.assistant_raw_content,
+        return bool(self._store.update_canonical_row_tagging_if_unchanged(
+            canonical_turn_id=row.canonical_turn_id,
+            conversation_id=self.config.conversation_id,
+            expected_turn_hash=expected_hash,
+            expected_lifecycle_epoch=epoch,
             primary_tag=tag_result.primary,
             tags=list(tag_result.tags),
             session_date=session_date,
-            sender=row.sender,
             fact_signals=list(tag_result.fact_signals) or list(row.fact_signals),
             code_refs=list(tag_result.code_refs) or list(row.code_refs),
-            canonical_turn_id=row.canonical_turn_id,
-            sort_key=row.sort_key,
-            turn_hash=row.turn_hash,
-            hash_version=row.hash_version,
-            normalized_user_text=row.normalized_user_text,
-            normalized_assistant_text=row.normalized_assistant_text,
-            tagged_at=row.tagged_at,  # intentionally None — outer loop flips it
-            compacted_at=row.compacted_at,
-            first_seen_at=row.first_seen_at,
-            last_seen_at=row.last_seen_at,
-            source_batch_id=row.source_batch_id,
-            created_at=row.created_at,
-            updated_at=row.updated_at,
-            turn_group_number=row.turn_group_number,
-            # No message metadata on the background sweep: pass the stored
-            # provenance straight back so the upsert cannot default it away.
-            origin_channel_id=row.origin_channel_id,
-            origin_channel_label=row.origin_channel_label,
-            sender_actor_id=row.sender_actor_id,
-            **self._row_reply_edge(row),
-        )
+            require_untagged=True,
+            tagged_at=utcnow_iso(),
+        ))
 
     def retag_canonical_turns(
         self,
@@ -1561,44 +1591,35 @@ class TaggingPipeline:
                 continue
 
             report["retagged_pairs"] += 1
-            report["rows_updated"] += len(pair_rows)
             if dry_run:
+                report["rows_updated"] += len(pair_rows)
                 continue
 
             tagged_at = utcnow_iso()
             for row in pair_rows:
-                self._store.save_canonical_turn(
-                    conversation_id,
-                    row.turn_number,
-                    row.user_content,
-                    row.assistant_content,
-                    user_raw_content=row.user_raw_content,
-                    assistant_raw_content=row.assistant_raw_content,
+                updated = self._store.update_canonical_row_tagging_if_unchanged(
+                    canonical_turn_id=row.canonical_turn_id,
+                    conversation_id=conversation_id,
+                    expected_turn_hash=row.turn_hash,
+                    expected_lifecycle_epoch=int(
+                        self._engine_state.lifecycle_epoch
+                    ),
                     primary_tag=tag_result.primary,
                     tags=list(tag_result.tags),
                     session_date=row.session_date,
-                    sender=row.sender,
                     fact_signals=list(row.fact_signals or []),
                     code_refs=list(row.code_refs or []),
-                    canonical_turn_id=row.canonical_turn_id,
-                    sort_key=row.sort_key,
-                    turn_hash=row.turn_hash,
-                    hash_version=row.hash_version or HASH_VERSION,
-                    normalized_user_text=row.normalized_user_text,
-                    normalized_assistant_text=row.normalized_assistant_text,
+                    require_untagged=False,
                     tagged_at=tagged_at,
-                    compacted_at=row.compacted_at,
-                    first_seen_at=row.first_seen_at,
-                    last_seen_at=row.last_seen_at,
-                    source_batch_id=row.source_batch_id,
-                    created_at=row.created_at,
-                    updated_at=tagged_at,
-                    turn_group_number=row.turn_group_number,
-                    origin_channel_id=row.origin_channel_id,
-                    origin_channel_label=row.origin_channel_label,
-                    sender_actor_id=row.sender_actor_id,
-                    **self._row_reply_edge(row),
                 )
+                if updated:
+                    report["rows_updated"] += 1
+                else:
+                    logger.warning(
+                        "RETAG_CAS_REJECTED conv=%s turn_id=%s",
+                        conversation_id[:12],
+                        row.canonical_turn_id[:12],
+                    )
             for tag in tag_result.tags:
                 if tag not in store_tags:
                     store_tags.append(tag)
@@ -1653,16 +1674,9 @@ class TaggingPipeline:
         history_turns = pair_messages_into_turns(list(history_messages))
         _total_turns = len(history_turns)
         n_context = self.config.tag_generator.context_lookback_pairs
-        strict_rows: list["CanonicalTurnRow"] = []
-        strict_row_cursor = 0
+        strict_rows_by_id: dict[str, "CanonicalTurnRow"] = {}
+        strict_rows_by_group: dict[int, list["CanonicalTurnRow"]] = {}
         if require_existing_canonical:
-            expected_entries = sum(
-                1 for msg in history_messages if msg.role in {"user", "assistant"}
-            )
-            # Epoch guard (preserved from the untagged-only fetch this
-            # replaces): a stale caller sees zero rows and fails the
-            # coverage check below rather than tagging a resurrected
-            # lifecycle's rows.
             epoch_ok = True
             if expected_lifecycle_epoch is not None:
                 try:
@@ -1673,35 +1687,23 @@ class TaggingPipeline:
                     observed_epoch = None
                 if observed_epoch is not None:
                     epoch_ok = observed_epoch == int(expected_lifecycle_epoch)
-            all_rows: list["CanonicalTurnRow"] = []
-            if epoch_ok:
-                all_rows = sorted(
-                    self._store.get_all_canonical_turns(self.config.conversation_id),
-                    key=lambda row: (row.sort_key, row.canonical_turn_id),
-                )
-            # Tail slice covering the payload's entries. This INCLUDES
-            # already-tagged rows: a row tagged between the prepare and
-            # this pass — by another worker's row sweep or a prior pass
-            # over an overlapping payload — still covers its payload
-            # entry. Requiring untagged-only coverage here spuriously
-            # aborted whole batches on multi-worker conversations. Pairs
-            # whose rows are already tagged hydrate their index entries
-            # from the stored tags in the pair loop below.
-            coverage = 0
-            start = len(all_rows)
-            while start > 0 and coverage < expected_entries:
-                start -= 1
-                coverage += max(
-                    1,
-                    int(getattr(all_rows[start], "covered_ingestible_entries", 1) or 1),
-                )
-            strict_rows = all_rows[start:]
-            if coverage < expected_entries:
+            if not epoch_ok:
                 raise RuntimeError(
-                    "strict canonical tagging expected at least "
-                    f"{expected_entries} covered ingestible entries, found "
-                    f"{coverage} across {len(strict_rows)} rows"
+                    "strict canonical tagging lifecycle epoch changed"
                 )
+            all_rows = sorted(
+                self._store.get_all_canonical_turns(self.config.conversation_id),
+                key=lambda row: (row.sort_key, row.canonical_turn_id),
+            )
+            strict_rows_by_id = {
+                row.canonical_turn_id: row
+                for row in all_rows
+                if row.canonical_turn_id
+            }
+            for row in all_rows:
+                strict_rows_by_group.setdefault(
+                    int(row.turn_group_number), [],
+                ).append(row)
         # Seed from DB when resuming bulk ingest mid-conversation: the caller
         # passes turn_offset > 0 when there are already-persisted turns that
         # preceded this batch. Without seeding, the first few turns of the
@@ -1718,35 +1720,21 @@ class TaggingPipeline:
                     running_session_date = row.session_date.strip()
                     break
 
-        # Strict-mode cursor windowing: previously we sliced ``strict_rows``
-        # into a fixed ``pair_row_count`` window per payload pair and advanced
-        # the cursor by that fixed count. That works when the untagged row
-        # list is perfectly pair-aligned — which breaks when a prior tagger
-        # on another worker tagged one half of a pair and then crashed
-        # before tagging the other half. ``iter_untagged_canonical_rows``
-        # returns the orphan half as the first row, misaligning the cursor
-        # with the payload's pair structure for every subsequent pair.
-        #
-        # Fix: pass a larger window (``pair_row_count + STRICT_WINDOW_SLACK``)
-        # so ``_persist_existing_canonical_rows`` can skip orphan halves at
-        # the head of the window before matching, and then advance the cursor
-        # by the number of rows the persister actually consumed (return
-        # value from ``_persist_canonical_turn``).
-        STRICT_WINDOW_SLACK = 4
-
         for batch_turn, pair in enumerate(history_turns):
             user_msg, asst_msg = self._split_pair_messages(pair.messages)
             strict_pair_rows: list["CanonicalTurnRow"] | None = None
-            pair_row_count = 0
             if require_existing_canonical:
-                pair_row_count = sum(
-                    1 for msg in pair.messages if msg.role in {"user", "assistant"}
+                strict_pair_rows = self._resolve_strict_pair_rows(
+                    pair.messages,
+                    turn_number=turn_offset + batch_turn,
+                    rows_by_id=strict_rows_by_id,
+                    rows_by_group=strict_rows_by_group,
                 )
-                strict_pair_rows = strict_rows[
-                    strict_row_cursor: strict_row_cursor
-                    + pair_row_count
-                    + STRICT_WINDOW_SLACK
-                ]
+                if strict_pair_rows is None:
+                    raise RuntimeError(
+                        "strict canonical tagging could not prove exact row "
+                        f"identity for logical turn {turn_offset + batch_turn}"
+                    )
             turn_tool_refs = None
             if tool_output_refs_by_turn is not None:
                 turn_tool_refs = tool_output_refs_by_turn.get(batch_turn, [])
@@ -1760,8 +1748,7 @@ class TaggingPipeline:
             # Hydrate fast-path: a pair whose backing rows are ALL already
             # tagged (concurrent worker sweep, prior overlapping pass) gets
             # its index entry from the stored row tags — no tag-generator
-            # call, no row rewrite. Consumes the strict cursor like the
-            # normal persist path so subsequent pairs stay aligned.
+            # call and no row rewrite.
             if require_existing_canonical and strict_pair_rows:
                 hydrated = self._hydrate_entry_from_tagged_rows(
                     pair.messages,
@@ -1769,7 +1756,7 @@ class TaggingPipeline:
                     turn_offset + batch_turn,
                 )
                 if hydrated is not None:
-                    entry, consumed = hydrated
+                    entry, _consumed = hydrated
                     if not entry.sender:
                         entry.sender = sender or ""
                     if entry.session_date:
@@ -1777,7 +1764,6 @@ class TaggingPipeline:
                     elif running_session_date:
                         entry.session_date = running_session_date
                     self._turn_tag_index.append(entry)
-                    strict_row_cursor += consumed
                     self._link_turn_tool_outputs(entry.turn_number, turn_tool_refs)
                     ingested += 1
                     if progress_callback:
@@ -1805,13 +1791,14 @@ class TaggingPipeline:
                 )
                 self._turn_tag_index.append(entry)
                 try:
-                    consumed = self._persist_canonical_turn(
+                    self._persist_canonical_turn(
                         entry,
                         user_msg,
                         asst_msg,
                         pair_messages=pair.messages,
                         existing_rows=strict_pair_rows,
                         append_missing=not require_existing_canonical,
+                        expected_lifecycle_epoch=expected_lifecycle_epoch,
                     )
                 except RuntimeError:
                     # Strict-mode mapping failure — propagate for
@@ -1820,9 +1807,6 @@ class TaggingPipeline:
                     # lease transition to another worker. Never swallow.
                     if require_existing_canonical:
                         raise
-                    consumed = 0
-                if require_existing_canonical and strict_pair_rows is not None:
-                    strict_row_cursor += consumed if consumed else pair_row_count
                 self._link_turn_tool_outputs(entry.turn_number, turn_tool_refs)
                 ingested += 1
                 continue
@@ -1866,20 +1850,18 @@ class TaggingPipeline:
                 )
                 self._turn_tag_index.append(entry)
                 try:
-                    consumed = self._persist_canonical_turn(
+                    self._persist_canonical_turn(
                         entry,
                         user_msg,
                         asst_msg,
                         pair_messages=pair.messages,
                         existing_rows=strict_pair_rows,
                         append_missing=not require_existing_canonical,
+                        expected_lifecycle_epoch=expected_lifecycle_epoch,
                     )
                 except RuntimeError:
                     if require_existing_canonical:
                         raise
-                    consumed = 0
-                if require_existing_canonical and strict_pair_rows is not None:
-                    strict_row_cursor += consumed if consumed else pair_row_count
                 self._link_turn_tool_outputs(entry.turn_number, turn_tool_refs)
                 ingested += 1
                 logger.info(
@@ -1996,20 +1978,18 @@ class TaggingPipeline:
             )
             self._turn_tag_index.append(entry)
             try:
-                consumed = self._persist_canonical_turn(
+                self._persist_canonical_turn(
                     entry,
                     user_msg,
                     asst_msg,
                     pair_messages=pair.messages,
                     existing_rows=strict_pair_rows,
                     append_missing=not require_existing_canonical,
+                    expected_lifecycle_epoch=expected_lifecycle_epoch,
                 )
             except RuntimeError:
                 if require_existing_canonical:
                     raise
-                consumed = 0
-            if require_existing_canonical and strict_pair_rows is not None:
-                strict_row_cursor += consumed if consumed else pair_row_count
             self._link_turn_tool_outputs(entry.turn_number, turn_tool_refs)
             ingested += 1
 

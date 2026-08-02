@@ -775,19 +775,18 @@ class ProxyState:
         the caller's lifecycle — i.e. the episode was completed (or was
         already completed by another worker) and the phase is ``active``.
         Returns ``False`` when the sweep exited early on an epoch boundary
-        check or a rejected row-mark write. Callers use the return value to
+        check or a rejected tag/hash CAS. Callers use the return value to
         trigger post-ingestion side effects (watermark, compaction,
         SessionState transition) that ``_finalize_legacy_ingestion`` would
         otherwise own — ``_finalize_legacy_ingestion`` returns False after
         this sweep because the episode is already ``completed``.
 
-        Four boundary ``verify_epoch`` checks ensure a stale tagger cannot
+        Three boundary ``verify_epoch`` checks ensure a stale tagger cannot
         affect a new lifecycle even if raced:
 
         1. Top of loop — before the row fetch.
         2. Before the completion write.
-        3. Before each row-mark write.
-        4. Before each heartbeat refresh.
+        3. After each tag CAS and before its heartbeat/progress writes.
 
         ``my_epoch`` is captured at spawn time. Every SQL call filters on
         ``my_epoch`` so stale-epoch writes are rejected at the DB level even
@@ -863,7 +862,10 @@ class ProxyState:
                 # we leave ``tagged_at`` NULL so a later run can retry the
                 # row without dropping it on the floor.
                 try:
-                    self._run_tagging_pipeline(row)
+                    tagged = self._run_tagging_pipeline(
+                        row,
+                        expected_lifecycle_epoch=my_epoch,
+                    )
                 except Exception:
                     logger.exception(
                         "Tagger %s failed to tag row %s",
@@ -873,25 +875,18 @@ class ProxyState:
                     # retry if tagged_at is still NULL.
                     continue
 
-                # Boundary check #3 — before the row-mark write.
-                if not _verify_or_exit():
-                    return False
-
-                marked = self.engine._store.mark_canonical_row_tagged(
-                    canonical_turn_id=row.canonical_turn_id,
-                    conversation_id=conversation_id,
-                    expected_lifecycle_epoch=my_epoch,
-                )
-                if not marked:
+                if not tagged:
                     logger.info(
-                        "Tagger %s exiting: mark_canonical_row_tagged"
-                        " rejected (epoch mismatch); tagged_at untouched"
-                        " for turn_id=%s",
-                        self._worker_id, row.canonical_turn_id[:12],
+                        "Tagger %s exiting: tag-only CAS rejected for "
+                        "turn_id=%s (content hash, row id, tagged state, or "
+                        "lifecycle changed)",
+                        self._worker_id,
+                        row.canonical_turn_id[:12],
                     )
                     return False
 
-                # Boundary check #4 — before the heartbeat write.
+                # Boundary check #3 — after the atomic tag CAS and before
+                # any subsequent heartbeat/progress write.
                 if not _verify_or_exit():
                     return False
 
@@ -913,19 +908,23 @@ class ProxyState:
                     total=snap.total_ingestible,
                 ))
 
-    def _run_tagging_pipeline(self, row) -> None:
+    def _run_tagging_pipeline(
+        self,
+        row,
+        *,
+        expected_lifecycle_epoch: int,
+    ) -> bool:
         """Run the real tagging pipeline on a single canonical row.
 
         Delegates to ``TaggingPipeline.tag_canonical_row`` which runs the
         configured tag generator against the row's combined user/assistant
-        text and re-saves the row with ``primary_tag``, ``tags``,
-        ``fact_signals``, and ``code_refs`` populated. ``tagged_at`` is left
-        untouched — the outer ``_tagger_run`` loop flips it atomically via
-        ``mark_canonical_row_tagged`` on the next step, which keeps the
-        epoch guard as the single source of truth for "this row has been
-        processed in this lifecycle".
+        text, then atomically writes only tag-derived fields plus
+        ``tagged_at`` under the exact row-id/content-hash/lifecycle guard.
         """
-        self.engine._tagging.tag_canonical_row(row)
+        return bool(self.engine._tagging.tag_canonical_row(
+            row,
+            expected_lifecycle_epoch=expected_lifecycle_epoch,
+        ))
 
     # ------------------------------------------------------------------
     # Compaction lifecycle (Task A29)
@@ -1619,23 +1618,82 @@ class ProxyState:
 
             baseline = self._indexed_turn_count()
             total = self._completed_turn_count()
-            pending_rows = list(getattr(self.engine, "_restored_pending_turns", []) or [])
-            if not pending_rows:
-                turn_numbers = list(range(baseline, total))
-                try:
-                    rows = self.engine._store.get_canonical_turn_rows(conversation_id, turn_numbers)
-                except Exception:
+            try:
+                physical_rows = sorted(
+                    self.engine._store.get_all_canonical_turns(conversation_id),
+                    key=lambda row: (row.sort_key, row.canonical_turn_id),
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to load physical canonical rows for durable "
+                    "resume (conv=%s)",
+                    conversation_id[:12],
+                    exc_info=True,
+                )
+                return False
+
+            rows_by_group: dict[int, list] = {}
+            for row in physical_rows:
+                group_number = int(getattr(row, "turn_group_number", -1))
+                rows_by_group.setdefault(group_number, []).append(row)
+
+            selected_rows: list = []
+            expected_turn = baseline
+            while expected_turn < total:
+                group_rows = rows_by_group.get(expected_turn)
+                if not group_rows:
                     logger.warning(
-                        "Failed to load pending canonical turns for durable resume (conv=%s)",
+                        "Durable resume gap at turn %d for conversation %s; "
+                        "stopping before any positional inference",
+                        expected_turn,
                         conversation_id[:12],
-                        exc_info=True,
                     )
-                    return False
-                for turn_number in turn_numbers:
-                    row = rows.get(turn_number)
-                    if row is None:
-                        continue
-                    pending_rows.append(
+                    break
+                if not any(
+                    (getattr(row, "assistant_content", "") or "").strip()
+                    for row in group_rows
+                ):
+                    logger.warning(
+                        "Durable resume found incomplete turn %d for "
+                        "conversation %s; stopping before the next group",
+                        expected_turn,
+                        conversation_id[:12],
+                    )
+                    break
+                selected_rows.extend(group_rows)
+                expected_turn += 1
+
+            if selected_rows:
+                from ..core.store import canonical_rows_to_history
+
+                messages = canonical_rows_to_history(
+                    selected_rows,
+                    include_tagging_identity=True,
+                )
+            else:
+                # Compatibility fallback for old cached state and lightweight
+                # test stores that do not expose physical rows. These bare
+                # messages still cannot authorize a positional rewrite: the
+                # strict tagger must independently resolve exact group+hash
+                # rows and otherwise falls through to the row-based sweep.
+                pending_rows = list(
+                    getattr(self.engine, "_restored_pending_turns", []) or []
+                )
+                if not pending_rows:
+                    turn_numbers = list(range(baseline, total))
+                    try:
+                        merged = self.engine._store.get_canonical_turn_rows(
+                            conversation_id, turn_numbers,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Failed to load merged canonical rows for durable "
+                            "resume fallback (conv=%s)",
+                            conversation_id[:12],
+                            exc_info=True,
+                        )
+                        merged = {}
+                    pending_rows = [
                         (
                             turn_number,
                             row.user_content,
@@ -1643,28 +1701,20 @@ class ProxyState:
                             row.user_raw_content,
                             row.assistant_raw_content,
                         )
-                    )
-
-            if not pending_rows:
-                return False
-
-            messages: list[Message] = []
-            expected_turn = baseline
-            for row in sorted(pending_rows, key=lambda item: item[0]):
-                turn_number, user_content, assistant_content, *_rest = row
-                if turn_number < baseline:
-                    continue
-                if turn_number != expected_turn:
-                    logger.warning(
-                        "Durable resume gap at turn %d for conversation %s; pending resume will stop at turn %d",
-                        expected_turn,
-                        conversation_id[:12],
-                        turn_number - 1,
-                    )
-                    break
-                messages.append(Message(role="user", content=user_content))
-                messages.append(Message(role="assistant", content=assistant_content))
-                expected_turn += 1
+                        for turn_number in turn_numbers
+                        if (row := merged.get(turn_number)) is not None
+                    ]
+                messages = []
+                expected_turn = baseline
+                for pending in sorted(pending_rows, key=lambda item: item[0]):
+                    turn_number, user_content, assistant_content, *_rest = pending
+                    if turn_number < baseline:
+                        continue
+                    if turn_number != expected_turn:
+                        break
+                    messages.append(Message(role="user", content=user_content))
+                    messages.append(Message(role="assistant", content=assistant_content))
+                    expected_turn += 1
 
             if not messages:
                 return False

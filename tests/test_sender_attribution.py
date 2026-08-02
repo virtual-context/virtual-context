@@ -16,7 +16,8 @@ These tests pin the write half:
   resend that carries no sender.
 * The batch-alignment fast-skip durably upgrades an empty stored sender when
   the incoming payload finally carries one, without a full-row rewrite.
-* Direct tagger rewrites are role-aware.
+* Tagging never writes sender attribution; reconciliation owns the narrow
+  missing-field CAS.
 """
 from __future__ import annotations
 
@@ -516,7 +517,7 @@ class TestFastSkipSenderUpgrade:
 
 
 # ---------------------------------------------------------------------------
-# W2 — role-aware tagger direct updates
+# W2 — tagger cannot write sender attribution
 # ---------------------------------------------------------------------------
 
 class TestTaggerRoleAwareSenderRewrite:
@@ -538,7 +539,7 @@ class TestTaggerRoleAwareSenderRewrite:
         pipeline.config = config
         return pipeline
 
-    def test_existing_rows_update_labels_user_but_not_assistant(self, tmp_path: Path):
+    def test_existing_rows_do_not_take_sender_from_tagger_entry(self, tmp_path: Path):
         from virtual_context.types import Message, TurnTagEntry
 
         store = _store(tmp_path)
@@ -565,10 +566,9 @@ class TestTaggerRoleAwareSenderRewrite:
         )
         assert consumed == 2
         after = _rows(store)
-        assert after[0].sender == "BigTex"
+        assert after[0].sender == ""
         assert after[1].sender == "", (
-            "I5: a direct tagger rewrite must not create a human sender "
-            "on an assistant-only row"
+            "tagging must not create a human sender on any canonical row"
         )
 
     def test_existing_assistant_row_keeps_legacy_sender(self, tmp_path: Path):
@@ -602,7 +602,7 @@ class TestTaggerRoleAwareSenderRewrite:
         assert after[0].sender == "Legacy"
         assert after[1].sender == "Legacy"
 
-    def test_legacy_combined_row_takes_entry_sender(self, tmp_path: Path):
+    def test_legacy_combined_row_does_not_take_entry_sender(self, tmp_path: Path):
         from virtual_context.types import Message, TurnTagEntry
 
         store = _store(tmp_path)
@@ -613,10 +613,18 @@ class TestTaggerRoleAwareSenderRewrite:
         )
         # Collapse to a single legacy combined row.
         store.delete_canonical_turns("c")
+        from virtual_context.core.canonical_turns import compute_turn_hash_from_raw
+
+        legacy_hash, user_norm, assistant_norm = compute_turn_hash_from_raw(
+            "u1", "a1", version=1,
+        )
         store.save_canonical_turn(
             "c", 0, "u1", "a1",
             canonical_turn_id="legacy-1", sort_key=1000.0,
-            turn_hash="lh", sender="",
+            turn_hash=legacy_hash, hash_version=1,
+            normalized_user_text=user_norm,
+            normalized_assistant_text=assistant_norm,
+            sender="",
         )
         rows = _rows(store)
         assert len(rows) == 1
@@ -633,4 +641,4 @@ class TestTaggerRoleAwareSenderRewrite:
             rows,
         )
         assert consumed == 1
-        assert _rows(store)[0].sender == "BigTex"
+        assert _rows(store)[0].sender == ""

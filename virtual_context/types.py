@@ -352,6 +352,11 @@ SOURCE_CONVERSATION_KEY = "_vc_source_conversation_key"
 REPLY_SUBJECT_KEY = "_vc_reply_subject"
 CURRENT_CONVERSATION_KEY = "_vc_current_conversation"
 SOURCE_CANONICAL_TURN_IDS_KEY = "_vc_source_canonical_turn_ids"
+# Private identity carried only between canonical reconstruction/resume and
+# the tagger.  It is never derived from message text and must never be trusted
+# as permission to rewrite canonical content; the storage CAS independently
+# proves the row id, content hash, and lifecycle before updating tag fields.
+CANONICAL_TAGGING_IDENTITY_KEY = "_vc_canonical_tagging_identity"
 
 # The platform segment of a caller-asserted stable conversation key, e.g.
 # ``sk:agent:bast:discord:channel:152497...``. Deliberately distinct from

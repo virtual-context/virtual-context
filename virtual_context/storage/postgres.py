@@ -10114,10 +10114,144 @@ class PostgresStore(ContextStore):
                        SELECT 1 FROM conversations c
                         WHERE c.conversation_id = %s
                           AND c.lifecycle_epoch = %s
+                          AND c.deleted_at IS NULL
+                          AND c.phase NOT IN ('deleted', 'merged')
                    )
                 """,
                 (now, now, canonical_turn_id, conversation_id,
                  conversation_id, expected_lifecycle_epoch),
+            )
+            return int(cur.rowcount or 0) == 1
+
+    def update_canonical_row_tagging_if_unchanged(
+        self,
+        *,
+        canonical_turn_id: str,
+        conversation_id: str,
+        expected_turn_hash: str,
+        expected_lifecycle_epoch: int,
+        primary_tag: str,
+        tags: list[str],
+        session_date: str,
+        fact_signals: list[FactSignal],
+        code_refs: list[dict],
+        require_untagged: bool = False,
+        tagged_at: str | None = None,
+    ) -> bool:
+        """Atomically enrich one unchanged row without rewriting its source."""
+        if not canonical_turn_id or not expected_turn_hash:
+            return False
+        now = _dt_to_str(datetime.now(timezone.utc))
+        tagged = tagged_at or now
+        fact_signal_payload = [
+            {
+                "subject": fs.subject,
+                "verb": fs.verb,
+                "object": fs.object,
+                "status": fs.status,
+                "fact_type": getattr(fs, "fact_type", ""),
+                "what": getattr(fs, "what", ""),
+            }
+            for fs in (fact_signals or [])
+        ]
+        with self.pool.connection() as conn:
+            cur = conn.execute(
+                """
+                UPDATE canonical_turns
+                   SET primary_tag = %s,
+                       tags_json = %s,
+                       session_date = CASE
+                           WHEN btrim(COALESCE(session_date, '')) = ''
+                            AND btrim(%s) <> '' THEN %s
+                           ELSE session_date
+                       END,
+                       fact_signals_json = %s,
+                       code_refs_json = %s,
+                       tagged_at = %s,
+                       updated_at = %s
+                 WHERE canonical_turn_id = %s
+                   AND conversation_id = %s
+                   AND turn_hash = %s
+                   AND (NOT %s OR tagged_at IS NULL)
+                   AND EXISTS (
+                       SELECT 1 FROM conversations c
+                        WHERE c.conversation_id = %s
+                          AND c.lifecycle_epoch = %s
+                          AND c.deleted_at IS NULL
+                          AND c.phase NOT IN ('deleted', 'merged')
+                   )
+                """,
+                (
+                    primary_tag or "_general",
+                    json.dumps(list(tags or [])),
+                    session_date or "",
+                    session_date or "",
+                    json.dumps(fact_signal_payload),
+                    json.dumps(list(code_refs or [])),
+                    tagged,
+                    now,
+                    canonical_turn_id,
+                    conversation_id,
+                    expected_turn_hash,
+                    bool(require_untagged),
+                    conversation_id,
+                    expected_lifecycle_epoch,
+                ),
+            )
+            return int(cur.rowcount or 0) == 1
+
+    def backfill_canonical_row_hash_if_empty(
+        self,
+        *,
+        canonical_turn_id: str,
+        conversation_id: str,
+        expected_lifecycle_epoch: int,
+        expected_user_content: str,
+        expected_assistant_content: str,
+        turn_hash: str,
+        hash_version: int,
+        normalized_user_text: str,
+        normalized_assistant_text: str,
+    ) -> bool:
+        """CAS-repair hash fields for one unchanged legacy hashless row."""
+        if not canonical_turn_id or not turn_hash or int(hash_version) <= 0:
+            return False
+        now = _dt_to_str(datetime.now(timezone.utc))
+        with self.pool.connection() as conn:
+            cur = conn.execute(
+                """
+                UPDATE canonical_turns
+                   SET turn_hash = %s,
+                       hash_version = %s,
+                       normalized_user_text = %s,
+                       normalized_assistant_text = %s,
+                       updated_at = %s
+                 WHERE canonical_turn_id = %s
+                   AND conversation_id = %s
+                   AND btrim(COALESCE(turn_hash, '')) = ''
+                   AND COALESCE(user_content, '') = %s
+                   AND COALESCE(assistant_content, '') = %s
+                   AND EXISTS (
+                       SELECT 1 FROM conversations c
+                        WHERE c.conversation_id = %s
+                          AND c.lifecycle_epoch = %s
+                          AND c.deleted_at IS NULL
+                          AND c.phase NOT IN ('deleted', 'merged')
+                   )
+                """,
+                (
+                    turn_hash,
+                    int(hash_version),
+                    normalized_user_text,
+                    normalized_assistant_text,
+                    now,
+                    canonical_turn_id,
+                    conversation_id,
+                    expected_user_content or "",
+                    expected_assistant_content or "",
+                    conversation_id,
+                    int(expected_lifecycle_epoch),
+                ),
             )
             return int(cur.rowcount or 0) == 1
 

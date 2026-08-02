@@ -715,7 +715,7 @@ class TestFastSkipChannelUpgrade:
 
 
 # ---------------------------------------------------------------------------
-# W2 — tagger rewrite paths
+# W2 — tagger tag-only paths
 # ---------------------------------------------------------------------------
 
 class TestTaggerChannelRewrite:
@@ -771,10 +771,8 @@ class TestTaggerChannelRewrite:
         assert (after[0].origin_channel_id, after[0].origin_channel_label) == ("7", "#a")
         assert (after[1].origin_channel_id, after[1].origin_channel_label) == ("", "")
 
-    def test_strict_role_window_rewrite_derives_per_physical_message(self, tmp_path: Path):
-        """An assistant message carrying its own envelope populates its own
-        row; the user's values are never copied onto it.
-        """
+    def test_strict_tagging_does_not_derive_canonical_provenance(self, tmp_path: Path):
+        """Only reconciliation may write channel/source provenance."""
         from virtual_context.types import Message, TurnTagEntry
 
         store = _store(tmp_path)
@@ -799,10 +797,10 @@ class TestTaggerChannelRewrite:
             _rows(store),
         )
         after = _rows(store)
-        assert (after[0].origin_channel_id, after[0].origin_channel_label) == ("7", "#a")
+        assert (after[0].origin_channel_id, after[0].origin_channel_label) == ("", "")
         assert (after[1].origin_channel_id, after[1].origin_channel_label) == ("", "")
 
-    def test_legacy_combined_row_rewrite_uses_user_first_precedence(self, tmp_path: Path):
+    def test_legacy_combined_row_tagging_does_not_write_provenance(self, tmp_path: Path):
         from virtual_context.types import Message, TurnTagEntry
 
         store = _store(tmp_path)
@@ -830,8 +828,7 @@ class TestTaggerChannelRewrite:
         entry = TurnTagEntry(
             turn_number=0, primary_tag="topic", tags=["topic"], session_date="",
         )
-        # User has the label only; assistant has the id only. User-first,
-        # missing-field-only: each column fills from the first source that has it.
+        # Tagging must not infer missing source provenance from either message.
         consumed = pipeline._persist_existing_canonical_rows(
             entry,
             [
@@ -844,7 +841,7 @@ class TestTaggerChannelRewrite:
         )
         assert consumed == 1
         row = _rows(store)[0]
-        assert (row.origin_channel_id, row.origin_channel_label) == ("7", "#a")
+        assert (row.origin_channel_id, row.origin_channel_label) == ("", "")
 
     def test_background_row_tagging_preserves_channel(self, tmp_path: Path):
         store = self._seed(tmp_path)
