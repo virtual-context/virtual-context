@@ -4069,6 +4069,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 ),
                 origin_channel_id=row["origin_channel_id"] or "",
                 claimed_subject_label=claimed_subject_label or "",
+                source_message_id=row["source_message_id"] or "",
             )
 
         results: list[QuoteResult] = []
@@ -4079,6 +4080,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
                         user_content, assistant_content, primary_tag,
                         tags_json, session_date, sender, origin_channel_id,
                         origin_channel_label, sender_actor_id,
+                        source_message_id,
                         audience_conversation_id, audience_attribution_version
                  FROM canonical_turns_ordinal
                  WHERE (user_content LIKE ?
@@ -8637,6 +8639,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
                         user_content, assistant_content, primary_tag,
                         tags_json, session_date, sender, origin_channel_id,
                         origin_channel_label, sender_actor_id,
+                        source_message_id,
                         audience_conversation_id, audience_attribution_version
                  FROM canonical_turns_ordinal
                  WHERE sender_actor_id = ?
@@ -8711,6 +8714,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
                     ),
                     origin_channel_id=row["origin_channel_id"] or "",
                     claimed_subject_label="",
+                    source_message_id=row["source_message_id"] or "",
                 ),
             ))
         return results

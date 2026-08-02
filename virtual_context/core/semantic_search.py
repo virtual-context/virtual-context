@@ -758,6 +758,7 @@ class SemanticSearchManager:
                 ),
                 origin_channel_id=row.origin_channel_id or "",
                 claimed_subject_label=claimed_subject_label,
+                source_message_id=getattr(row, "source_message_id", "") or "",
             ),
         )
 

@@ -36,6 +36,9 @@ CANARY = "XyZZy77"
 CONV = "conv-secrecy"
 ALPHA = f"actor:discord:{CANARY}-alpha"
 BRAVO = f"actor:discord:{CANARY}-bravo"
+# A message id is internal provenance too: it identifies the exact source
+# row and must never reach a model-visible or observability surface.
+CANARY_MSG = "7731773177317731773"
 
 
 class _NoSemantic:
@@ -60,6 +63,7 @@ def rig(tmp_path):
             CONV, n, text, "",
             canonical_turn_id=f"ct-{n}", turn_hash=f"h-{n}",
             sort_key=float(n), sender=sender, sender_actor_id=actor,
+            source_message_id=f"{CANARY_MSG}{n}",
             audience_conversation_id=CONV, audience_attribution_version=1,
         )
 
@@ -105,6 +109,17 @@ def test_canary_actor_absent_from_all_model_and_observability_surfaces(
     # surfaces below are built from.
     assert any(CANARY in e.actor_id for e in rig.snapshot.entries)
     assert CANARY in rig.context.requester_actor_id
+    # ... and the message-id canary really rides on the provenance the
+    # surfaces below are built from. Without this the sweep for CANARY_MSG
+    # would pass by sweeping something that never carried it.
+    _probe = rig.store.search_canonical_turns_by_actor(
+        BRAVO, 5, CONV, speaker_context=rig.context,
+    )
+    assert _probe, "probe returned nothing; the sweep would be vacuous"
+    assert any(
+        CANARY_MSG in (r.provenance.source_message_id or "")
+        for r in _probe
+    ), "provenance does not carry the message id; nothing to leak-test"
 
     surfaces: dict[str, str] = {}
 
@@ -144,6 +159,9 @@ def test_canary_actor_absent_from_all_model_and_observability_surfaces(
 
     for name, text in surfaces.items():
         assert CANARY not in text, f"canary leaked through {name}"
+        assert CANARY_MSG not in text, (
+            f"message-id canary leaked through {name}"
+        )
 
     # The sweep exercised real surfaces, not empty strings.
     assert "bravo" in surfaces["roster_text"]

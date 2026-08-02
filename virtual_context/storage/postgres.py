@@ -7717,6 +7717,7 @@ class PostgresStore(ContextStore):
                 ),
                 origin_channel_id=row["origin_channel_id"] or "",
                 claimed_subject_label=claimed_subject_label or "",
+                source_message_id=row["source_message_id"] or "",
             )
 
         results: list[QuoteResult] = []
@@ -7727,6 +7728,7 @@ class PostgresStore(ContextStore):
                             user_content, assistant_content, primary_tag,
                             tags_json, session_date, sender, origin_channel_id,
                             origin_channel_label, sender_actor_id,
+                            source_message_id,
                             audience_conversation_id, audience_attribution_version
                      FROM canonical_turns_ordinal
                      WHERE (user_content ILIKE %s
@@ -7811,6 +7813,7 @@ class PostgresStore(ContextStore):
                             reply_target_body, reply_subject_actor_id,
                             reply_subject_label, primary_tag, tags_json,
                             session_date, origin_channel_id, origin_channel_label,
+                            source_message_id,
                             audience_conversation_id, audience_attribution_version
                      FROM canonical_turns_ordinal
                      WHERE reply_target_body ILIKE %s
@@ -8975,6 +8978,7 @@ class PostgresStore(ContextStore):
                         user_content, assistant_content, primary_tag,
                         tags_json, session_date, sender, origin_channel_id,
                         origin_channel_label, sender_actor_id,
+                        source_message_id,
                         audience_conversation_id, audience_attribution_version
                  FROM canonical_turns_ordinal
                  WHERE sender_actor_id = %s
@@ -9051,6 +9055,7 @@ class PostgresStore(ContextStore):
                         ),
                         origin_channel_id=row["origin_channel_id"] or "",
                         claimed_subject_label="",
+                        source_message_id=row["source_message_id"] or "",
                     ),
                 ))
         return results

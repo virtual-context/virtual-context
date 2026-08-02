@@ -1769,6 +1769,14 @@ class SourceProvenance:
     audience_attribution_version: int = 0
     origin_channel_id: str = ""
     claimed_subject_label: str = ""
+    # The matched row's immutable external identifier, carried so a caller
+    # that must verify a result against its original source verifies the row
+    # that was actually retrieved. It travels here for the same reason the
+    # rest of this carrier does: captured at candidate construction, it
+    # cannot drift onto a neighbour during dedupe, merging, or reranking.
+    # Internal provenance like ``actor_id`` — excluded from ``repr`` and
+    # never projected into model-visible output.
+    source_message_id: str = field(default="", repr=False)
 
 
 @dataclass
