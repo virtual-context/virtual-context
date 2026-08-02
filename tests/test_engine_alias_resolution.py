@@ -828,6 +828,29 @@ def test_engine_init_cross_tenant_alias_target_raises(engine_factory_tenant) -> 
     assert excinfo.value.target_id == "target-tenant-A"
 
 
+def test_rowless_alias_rejection_does_not_claim_source_for_wrong_tenant(
+    engine_factory_tenant,
+) -> None:
+    """Resolving a rowless alias must be read-only for its source id."""
+    from virtual_context.core.exceptions import EngineConstructionError
+
+    seeder = engine_factory_tenant("seeder-rowless", tenant_id="tenant-A")
+    raw = _underlying_store(seeder)
+    _seed_attachable_target(raw, "target-rowless-A", tenant_id="tenant-A")
+    raw.save_conversation_alias("source-rowless", "target-rowless-A")
+
+    with pytest.raises(EngineConstructionError) as excinfo:
+        engine_factory_tenant("source-rowless", tenant_id="tenant-B")
+    assert excinfo.value.reason == "alias_target_unattachable"
+    assert raw._segments._get_conn().execute(
+        "SELECT 1 FROM conversations WHERE conversation_id = ?",
+        ("source-rowless",),
+    ).fetchone() is None
+
+    attached = engine_factory_tenant("source-rowless", tenant_id="tenant-A")
+    assert attached.config.conversation_id == "target-rowless-A"
+
+
 # ---------------------------------------------------------------------------
 # Regression bundle for user-reported "vc_find_quote returns source-side hits"
 # symptom (per plan v1.2 line 922). Each test exercises a downstream

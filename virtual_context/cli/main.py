@@ -2172,6 +2172,31 @@ def cmd_admin_retag_canonical_turns(args):
         config.tenant_id = tenant_id
     _apply_storage_overrides(config, args)
 
+    canonical_turn_ids: set[str] | None = None
+    ids_file = getattr(args, "canonical_turn_ids_file", None)
+    if ids_file:
+        try:
+            raw_ids = Path(ids_file).read_text(encoding="utf-8").splitlines()
+            canonical_turn_ids = {
+                value.strip() for value in raw_ids if value.strip()
+            }
+        except Exception as exc:  # noqa: BLE001
+            print(json.dumps({
+                "status": "error",
+                "stage": "canonical_turn_ids_file",
+                "conversation_id": conversation_id,
+                "error": repr(exc),
+            }))
+            sys.exit(1)
+        if not canonical_turn_ids:
+            print(json.dumps({
+                "status": "error",
+                "stage": "canonical_turn_ids_file",
+                "conversation_id": conversation_id,
+                "error": "selection file is empty",
+            }))
+            sys.exit(1)
+
     try:
         engine = VirtualContextEngine(config=config)
     except Exception as exc:  # noqa: BLE001
@@ -2189,6 +2214,7 @@ def cmd_admin_retag_canonical_turns(args):
             until=getattr(args, "until", None),
             only_general=not bool(getattr(args, "all_tags", False)),
             dry_run=bool(getattr(args, "dry_run", False)),
+            canonical_turn_ids=canonical_turn_ids,
         )
         payload = {
             "status": "ok",
@@ -3063,6 +3089,13 @@ def main():
         "--dry-run",
         action="store_true",
         help="Report what would be re-tagged without writing",
+    )
+    retag_parser.add_argument(
+        "--canonical-turn-ids-file",
+        help=(
+            "Newline-delimited exact canonical row ids. Unknown ids fail "
+            "closed; selecting either half re-tags its complete logical pair."
+        ),
     )
     retag_parser.add_argument(
         "--storage-backend",

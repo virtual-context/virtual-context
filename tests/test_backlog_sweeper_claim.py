@@ -264,13 +264,20 @@ class TestT13_BacklogBelowThresholdAborts:
 
 
 class TestT14_UntaggedRowAborts:
-    def test_untagged_row_aborts(self, tmp_path: Path):
+    def test_taggable_untagged_group_aborts(self, tmp_path: Path):
         store = SQLiteStore(tmp_path / "t14.db")
         _seed_conv(store, conv_id="conv-untag")
         _seed_turns(store, conv_id="conv-untag", count=50, tagged=True)
         # One untagged row appeared between detection and claim.
         _seed_turns(store, conv_id="conv-untag", count=1, tagged=False,
                     sort_key_base=9999.0, id_prefix="u")
+        conn = store._get_conn()
+        conn.execute(
+            "UPDATE canonical_turns SET turn_group_number = 100, "
+            "user_content = 'u', assistant_content = 'a' "
+            "WHERE canonical_turn_id = 'ct-conv-untag-u0'"
+        )
+        conn.commit()
         ok = store.claim_compaction_backlog(
             candidate=_candidate("conv-untag"),
             new_operation_id=uuid.uuid4().hex,
@@ -279,6 +286,31 @@ class TestT14_UntaggedRowAborts:
         )
         assert ok is False
         assert _phase_of(store, "conv-untag") == "active"
+
+    def test_newest_one_sided_group_allows_claim(self, tmp_path: Path):
+        store = SQLiteStore(tmp_path / "t14-trailing.db")
+        _seed_conv(store, conv_id="conv-trailing")
+        _seed_turns(store, conv_id="conv-trailing", count=50, tagged=True)
+        _seed_turns(
+            store, conv_id="conv-trailing", count=1, tagged=False,
+            sort_key_base=9999.0, id_prefix="trail",
+        )
+        conn = store._get_conn()
+        conn.execute(
+            "UPDATE canonical_turns SET turn_group_number = 100, "
+            "user_content = 'awaiting reply' "
+            "WHERE canonical_turn_id = 'ct-conv-trailing-trail0'"
+        )
+        conn.commit()
+
+        ok = store.claim_compaction_backlog(
+            candidate=_candidate("conv-trailing"),
+            new_operation_id=uuid.uuid4().hex,
+            owner_worker_id="w-sweeper", phase_count=7,
+            min_backlog_turns=20, grace_s=300.0,
+        )
+        assert ok is True
+        assert _phase_of(store, "conv-trailing") == "compacting"
 
 
 # ---------------------------------------------------------------------------

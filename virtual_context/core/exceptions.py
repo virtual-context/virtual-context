@@ -73,6 +73,16 @@ class MergeBusy(Exception):
         self.code = code
 
 
+class CanonicalSourceConflict(RuntimeError):
+    """An immutable transport message disagreed with canonical storage.
+
+    Source identity is a storage fence, not a reconciliation hint.  Reusing a
+    scoped platform message for another canonical row, actor, or body must
+    stop the write instead of choosing whichever record was seen most
+    recently.
+    """
+
+
 class LifecycleEpochMismatch(Exception):
     """Raised when the source's or target's `lifecycle_epoch` advanced
     between cloud's reservation step (which captured the epochs) and the

@@ -2405,18 +2405,20 @@ class CompactionPipeline:
                     break
                 except (TypeError, ValueError):
                     continue
-            messages.append(Message(
-                role="user",
-                content=row.user_content,
-                timestamp=timestamp,
-                metadata=user_metadata,
-            ))
-            messages.append(Message(
-                role="assistant",
-                content=row.assistant_content,
-                timestamp=timestamp,
-                metadata=assistant_metadata,
-            ))
+            if (row.user_content or "").strip():
+                messages.append(Message(
+                    role="user",
+                    content=row.user_content,
+                    timestamp=timestamp,
+                    metadata=user_metadata,
+                ))
+            if (row.assistant_content or "").strip():
+                messages.append(Message(
+                    role="assistant",
+                    content=row.assistant_content,
+                    timestamp=timestamp,
+                    metadata=assistant_metadata,
+                ))
         return rows, messages
 
     def _refresh_compaction_watermark(self) -> None:
@@ -2469,9 +2471,22 @@ class CompactionPipeline:
                 _flush_pending()
             _flush_pending()
 
+        compacted_messages = 0
         last_prefix_turn = -1
         for turn_number, group_rows in grouped_rows:
-            if group_rows and all(getattr(row, "compacted_at", None) for row in group_rows):
+            user_halves = sum(
+                1 for row in group_rows if (row.user_content or "").strip()
+            )
+            assistant_halves = sum(
+                1 for row in group_rows
+                if (row.assistant_content or "").strip()
+            )
+            exact_pair = user_halves == 1 and assistant_halves == 1
+            if (
+                exact_pair
+                and all(getattr(row, "compacted_at", None) for row in group_rows)
+            ):
+                compacted_messages += 2
                 last_prefix_turn = turn_number
                 continue
             break
@@ -2479,7 +2494,7 @@ class CompactionPipeline:
             self._engine_state.compacted_prefix_messages = 0
             self._engine_state.last_compacted_turn = -1
             return
-        self._engine_state.compacted_prefix_messages = (last_prefix_turn + 1) * 2
+        self._engine_state.compacted_prefix_messages = compacted_messages
         self._engine_state.last_compacted_turn = last_prefix_turn
 
     # ------------------------------------------------------------------

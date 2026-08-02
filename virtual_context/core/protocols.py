@@ -129,7 +129,21 @@ class SegmentStore(Protocol):
         reply_attribution_version: int = 0,
         audience_conversation_id: str = "",
         audience_attribution_version: int = 0,
+        source_claim: dict | None = None,
     ) -> None: ...
+    def save_attested_canonical_pair(
+        self,
+        user_row: CanonicalTurnRow,
+        assistant_row: CanonicalTurnRow,
+        *,
+        user_turn_number: int,
+        assistant_turn_number: int,
+        expected_conversation_generation: int,
+        expected_lifecycle_epoch: int,
+    ) -> None: ...
+    def resolve_or_claim_conversation_for_tenant(
+        self, *, tenant_id: str, conversation_id: str,
+    ) -> str: ...
     def search_canonical_turns_by_actor(
         self,
         actor_id: str,
@@ -181,6 +195,16 @@ class SegmentStore(Protocol):
         audience_conversation_id: str = "",
         origin_channel_id: str = "",
     ) -> "CanonicalTurnRow | None": ...
+    def find_attested_canonical_user_source(
+        self,
+        row: "CanonicalTurnRow",
+    ) -> "CanonicalTurnRow | None": ...
+    def attest_canonical_user_source(
+        self,
+        row: "CanonicalTurnRow",
+        *,
+        observed_at: str,
+    ) -> None: ...
     def find_actor_ids_by_display_label(
         self,
         conversation_id: str,
@@ -214,6 +238,19 @@ class SegmentStore(Protocol):
         self,
         conversation_id: str,
     ) -> list[CanonicalTurnRow]: ...
+    def has_complete_untagged_canonical_group(
+        self,
+        *,
+        conversation_id: str,
+        expected_lifecycle_epoch: int,
+    ) -> bool: ...
+    def iter_complete_untagged_canonical_groups(
+        self,
+        *,
+        conversation_id: str,
+        expected_lifecycle_epoch: int,
+        batch_size: int = 32,
+    ) -> list[list[CanonicalTurnRow]]: ...
     def get_uncompacted_canonical_turns(
         self,
         conversation_id: str,
@@ -242,6 +279,30 @@ class SegmentStore(Protocol):
         require_untagged: bool = False,
         tagged_at: str | None = None,
     ) -> bool: ...
+    def update_canonical_group_tagging_if_unchanged(
+        self,
+        *,
+        conversation_id: str,
+        turn_group_number: int,
+        canonical_turn_ids: list[str],
+        expected_turn_hashes: list[str],
+        expected_lifecycle_epoch: int,
+        primary_tag: str,
+        tags: list[str],
+        session_date: str,
+        fact_signals: list,
+        code_refs: list[dict],
+        tagged_at: str | None = None,
+    ) -> bool: ...
+    def claim_ingestion_for_complete_group(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        worker_id: str,
+        raw_payload_entries: int,
+        lease_ttl_s: float,
+    ) -> str: ...
     def backfill_canonical_row_hash_if_empty(
         self,
         *,

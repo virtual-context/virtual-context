@@ -145,6 +145,66 @@ def test_recompute_canonical_turn_groups_assigns_explicit_groups_pg():
     assert [row.turn_group_number for row in rows_after] == [0, 0, 1]
 
 
+def test_terminal_one_sided_group_is_taggable_but_trailing_half_waits_pg():
+    """Postgres must use the same terminal-group boundary as SQLite."""
+    s = _store()
+    cid = _cid()
+    s.upsert_conversation(tenant_id="t", conversation_id=cid)
+    now = _now()
+    conn = pg_test_conn()
+    conn.execute(
+        """INSERT INTO conversation_lifecycle
+               (conversation_id, generation, deleted, updated_at)
+           VALUES (%s, 0, FALSE, %s)
+           ON CONFLICT (conversation_id) DO NOTHING""",
+        (cid, now),
+    )
+    fixture = [
+        (str(uuid.uuid4()), 0, "first user", "", 1000.0),
+        (str(uuid.uuid4()), 1, "second user", "", 2000.0),
+        (str(uuid.uuid4()), 1, "", "second reply", 3000.0),
+        (str(uuid.uuid4()), 2, "trailing user", "", 4000.0),
+    ]
+    for turn_id, group_number, user_text, assistant_text, sort_key in fixture:
+        conn.execute(
+            """
+            INSERT INTO canonical_turns (
+                canonical_turn_id, conversation_id, turn_group_number,
+                turn_hash, hash_version, normalized_user_text,
+                normalized_assistant_text, user_content, assistant_content,
+                sort_key, source_batch_id, first_seen_at, last_seen_at,
+                covered_ingestible_entries, created_at, updated_at
+            ) VALUES (%s, %s, %s, %s, 1, %s, %s, %s, %s, %s, %s, %s, %s, 1, %s, %s)
+            """,
+            (
+                turn_id, cid, group_number, f"h-{turn_id}",
+                user_text, assistant_text, user_text, assistant_text,
+                sort_key, str(uuid.uuid4()), now, now, now, now,
+            ),
+        )
+
+    groups = s.iter_complete_untagged_canonical_groups(
+        conversation_id=cid,
+        expected_lifecycle_epoch=1,
+        batch_size=10,
+    )
+    assert [[row.turn_group_number for row in group] for group in groups] == [
+        [0], [1, 1],
+    ]
+    assert s.has_complete_untagged_canonical_group(
+        conversation_id=cid,
+        expected_lifecycle_epoch=1,
+    ) is True
+    claim = s.claim_ingestion_for_complete_group(
+        conversation_id=cid,
+        lifecycle_epoch=1,
+        worker_id="terminal-group-pg",
+        raw_payload_entries=4,
+        lease_ttl_s=30.0,
+    )
+    assert claim.startswith("claimed")
+
+
 def test_read_progress_snapshot_includes_active_episode_pg():
     s = _store()
     cid = _cid()

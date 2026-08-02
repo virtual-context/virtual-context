@@ -101,6 +101,47 @@ def test_tagger_exits_on_epoch_mismatch(tmp_path: Path):
     assert row[0] is None
 
 
+def test_tagger_failure_attempts_group_once_and_leaves_it_for_later(tmp_path: Path):
+    """A broken tag provider must not hot-loop the same durable group."""
+    from tests.test_handle_prepare_payload import _make_proxy_state, _inner_store
+
+    state = _make_proxy_state(tmp_path)
+    conv_id = state.engine.config.conversation_id
+    inner = _inner_store(state.engine)
+    _seed_canonical_row(inner, conv_id, "tag-fails-once", 1000.0)
+    with inner._get_conn() as conn:
+        conn.execute(
+            "UPDATE canonical_turns SET turn_group_number = 0 "
+            "WHERE canonical_turn_id = ?",
+            ("tag-fails-once",),
+        )
+    inner.upsert_ingestion_episode(
+        conversation_id=conv_id, lifecycle_epoch=1,
+        worker_id=state._worker_id, raw_payload_entries=0,
+    )
+    inner.claim_ingestion_lease(
+        conversation_id=conv_id, lifecycle_epoch=1,
+        worker_id=state._worker_id, lease_ttl_s=30.0,
+    )
+    inner.set_phase(
+        conversation_id=conv_id, lifecycle_epoch=1, phase="ingesting",
+    )
+    attempts = {"count": 0}
+
+    def fail_once(*args, **kwargs):
+        attempts["count"] += 1
+        raise RuntimeError("provider unavailable")
+
+    state._run_tagging_pipeline = fail_once
+    assert state._tagger_run() is False
+    assert attempts["count"] == 1
+    row = inner._get_conn().execute(
+        "SELECT tagged_at FROM canonical_turns WHERE canonical_turn_id = ?",
+        ("tag-fails-once",),
+    ).fetchone()
+    assert row["tagged_at"] is None
+
+
 def _make_proxy_state_with_keyword_tags(tmp_path: Path):
     """Proxy state where the keyword tagger maps ``court`` → ``legal``.
 

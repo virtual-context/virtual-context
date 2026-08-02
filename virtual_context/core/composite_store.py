@@ -6,7 +6,7 @@ from datetime import timedelta
 from typing import TYPE_CHECKING
 
 from .protocols import FactLinkStore, FactStore, SearchStore, SegmentStore, StateStore
-from .exceptions import ConversationLifecycleConflict
+from .exceptions import CanonicalSourceConflict, ConversationLifecycleConflict
 from ..types import (
     BacklogCandidate,
     ChunkEmbedding,
@@ -310,6 +310,7 @@ class CompositeStore:
         reply_attribution_version: int = 0,
         audience_conversation_id: str = "",
         audience_attribution_version: int = 0,
+        source_claim: dict | None = None,
     ) -> None:
         return self._segments.save_canonical_turn(
             conversation_id,
@@ -349,6 +350,45 @@ class CompositeStore:
             reply_attribution_version=reply_attribution_version,
             audience_conversation_id=audience_conversation_id,
             audience_attribution_version=audience_attribution_version,
+            source_claim=source_claim,
+        )
+
+    def save_attested_canonical_pair(
+        self,
+        user_row: CanonicalTurnRow,
+        assistant_row: CanonicalTurnRow,
+        *,
+        user_turn_number: int,
+        assistant_turn_number: int,
+        expected_conversation_generation: int,
+        expected_lifecycle_epoch: int,
+    ) -> None:
+        saver = getattr(self._segments, "save_attested_canonical_pair", None)
+        if not callable(saver):
+            raise CanonicalSourceConflict(
+                "canonical backend cannot atomically admit an attested pair"
+            )
+        saver(
+            user_row,
+            assistant_row,
+            user_turn_number=user_turn_number,
+            assistant_turn_number=assistant_turn_number,
+            expected_conversation_generation=expected_conversation_generation,
+            expected_lifecycle_epoch=expected_lifecycle_epoch,
+        )
+
+    def verify_lifecycle_epoch(
+        self, conversation_id: str, expected_lifecycle_epoch: int,
+    ) -> None:
+        verifier = getattr(self._segments, "verify_lifecycle_epoch", None)
+        if callable(verifier):
+            verifier(conversation_id, expected_lifecycle_epoch)
+            return
+        from .lifecycle_epoch import verify_epoch
+        verify_epoch(
+            conversation_id=conversation_id,
+            expected=int(expected_lifecycle_epoch),
+            observed=self._segments.get_lifecycle_epoch(conversation_id),
         )
 
     def recompute_canonical_turn_groups(
@@ -1037,10 +1077,22 @@ class CompositeStore:
             )
         )
 
-    def conversation_reconcile(self, conversation_id: str):
+    def conversation_reconcile(
+        self,
+        conversation_id: str,
+        *,
+        expected_generation: int | None = None,
+    ):
         locker = getattr(self._segments, "conversation_reconcile", None)
         if callable(locker):
-            return locker(conversation_id)
+            return locker(
+                conversation_id,
+                expected_generation=expected_generation,
+            )
+        if expected_generation is not None:
+            raise NotImplementedError(
+                "canonical store cannot generation-fence exact source admission"
+            )
         from contextlib import nullcontext
         return nullcontext()
 
@@ -1390,6 +1442,30 @@ class CompositeStore:
             )
         return None
 
+    def find_attested_canonical_user_source(
+        self,
+        row: "CanonicalTurnRow",
+    ) -> "CanonicalTurnRow | None":
+        fn = getattr(
+            self._segments, "find_attested_canonical_user_source", None,
+        )
+        if not callable(fn):
+            return None
+        return fn(row)
+
+    def attest_canonical_user_source(
+        self,
+        row: "CanonicalTurnRow",
+        *,
+        observed_at: str,
+    ) -> None:
+        fn = getattr(self._segments, "attest_canonical_user_source", None)
+        if not callable(fn):
+            raise NotImplementedError(
+                "segment store cannot attest canonical message sources"
+            )
+        fn(row, observed_at=observed_at)
+
     def find_actor_ids_by_display_label(
         self,
         conversation_id: str,
@@ -1429,6 +1505,35 @@ class CompositeStore:
         fn = getattr(self._segments, "upsert_conversation", None)
         if callable(fn):
             fn(tenant_id=tenant_id, conversation_id=conversation_id)
+
+    def claim_or_verify_conversation(
+        self, *, tenant_id: str, conversation_id: str,
+    ) -> None:
+        fn = getattr(self._segments, "claim_or_verify_conversation", None)
+        if not callable(fn):
+            raise NotImplementedError
+        fn(tenant_id=tenant_id, conversation_id=conversation_id)
+
+    def resolve_or_claim_conversation_for_tenant(
+        self, *, tenant_id: str, conversation_id: str,
+    ) -> str:
+        fn = getattr(
+            self._segments, "resolve_or_claim_conversation_for_tenant", None,
+        )
+        if not callable(fn):
+            raise NotImplementedError
+        return str(fn(
+            tenant_id=tenant_id,
+            conversation_id=conversation_id,
+        ))
+
+    def conversation_belongs_to_tenant(
+        self, *, tenant_id: str, conversation_id: str,
+    ) -> bool:
+        fn = getattr(self._segments, "conversation_belongs_to_tenant", None)
+        if not callable(fn):
+            return False
+        return bool(fn(tenant_id=tenant_id, conversation_id=conversation_id))
 
     def get_lifecycle_epoch(self, conversation_id: str) -> int:
         fn = getattr(self._segments, "get_lifecycle_epoch", None)
@@ -1478,6 +1583,22 @@ class CompositeStore:
         fn = getattr(self._segments, "read_progress_snapshot", None)
         if callable(fn):
             return fn(conversation_id)
+        raise NotImplementedError
+
+    def has_complete_untagged_canonical_group(
+        self,
+        *,
+        conversation_id: str,
+        expected_lifecycle_epoch: int,
+    ) -> bool:
+        fn = getattr(
+            self._segments, "has_complete_untagged_canonical_group", None,
+        )
+        if callable(fn):
+            return bool(fn(
+                conversation_id=conversation_id,
+                expected_lifecycle_epoch=expected_lifecycle_epoch,
+            ))
         raise NotImplementedError
 
     def update_request_metadata(
@@ -1740,6 +1861,28 @@ class CompositeStore:
                 worker_id=worker_id,
                 raw_payload_entries=raw_payload_entries,
             )
+        raise NotImplementedError
+
+    def claim_ingestion_for_complete_group(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        worker_id: str,
+        raw_payload_entries: int,
+        lease_ttl_s: float,
+    ) -> str:
+        fn = getattr(
+            self._segments, "claim_ingestion_for_complete_group", None,
+        )
+        if callable(fn):
+            return str(fn(
+                conversation_id=conversation_id,
+                lifecycle_epoch=lifecycle_epoch,
+                worker_id=worker_id,
+                raw_payload_entries=raw_payload_entries,
+                lease_ttl_s=lease_ttl_s,
+            ))
         raise NotImplementedError
 
     def claim_ingestion_lease(
@@ -2015,6 +2158,24 @@ class CompositeStore:
             ) or [])
         raise NotImplementedError
 
+    def iter_complete_untagged_canonical_groups(
+        self,
+        *,
+        conversation_id: str,
+        expected_lifecycle_epoch: int,
+        batch_size: int = 32,
+    ) -> list[list[CanonicalTurnRow]]:
+        fn = getattr(
+            self._segments, "iter_complete_untagged_canonical_groups", None,
+        )
+        if callable(fn):
+            return list(fn(
+                conversation_id=conversation_id,
+                expected_lifecycle_epoch=expected_lifecycle_epoch,
+                batch_size=batch_size,
+            ) or [])
+        raise NotImplementedError
+
     def mark_canonical_row_tagged(
         self,
         *,
@@ -2063,6 +2224,42 @@ class CompositeStore:
                 fact_signals=fact_signals,
                 code_refs=code_refs,
                 require_untagged=require_untagged,
+                tagged_at=tagged_at,
+            ))
+        raise NotImplementedError
+
+    def update_canonical_group_tagging_if_unchanged(
+        self,
+        *,
+        conversation_id: str,
+        turn_group_number: int,
+        canonical_turn_ids: list[str],
+        expected_turn_hashes: list[str],
+        expected_lifecycle_epoch: int,
+        primary_tag: str,
+        tags: list[str],
+        session_date: str,
+        fact_signals: list,
+        code_refs: list[dict],
+        tagged_at: str | None = None,
+    ) -> bool:
+        fn = getattr(
+            self._segments,
+            "update_canonical_group_tagging_if_unchanged",
+            None,
+        )
+        if callable(fn):
+            return bool(fn(
+                conversation_id=conversation_id,
+                turn_group_number=turn_group_number,
+                canonical_turn_ids=canonical_turn_ids,
+                expected_turn_hashes=expected_turn_hashes,
+                expected_lifecycle_epoch=expected_lifecycle_epoch,
+                primary_tag=primary_tag,
+                tags=tags,
+                session_date=session_date,
+                fact_signals=fact_signals,
+                code_refs=code_refs,
                 tagged_at=tagged_at,
             ))
         raise NotImplementedError

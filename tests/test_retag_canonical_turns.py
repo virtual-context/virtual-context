@@ -98,6 +98,20 @@ def _rows(tmp_path: Path):
         conn.close()
 
 
+def _row_ids(tmp_path: Path) -> list[str]:
+    conn = sqlite3.connect(tmp_path / "c.db")
+    try:
+        return [
+            row[0]
+            for row in conn.execute(
+                "SELECT canonical_turn_id FROM canonical_turns "
+                "WHERE conversation_id = 'c' ORDER BY sort_key"
+            )
+        ]
+    finally:
+        conn.close()
+
+
 def test_retag_replaces_general_with_real_tags(tmp_path):
     engine = _make_engine(tmp_path)
     try:
@@ -221,6 +235,42 @@ def test_dry_run_reports_without_writing(tmp_path):
         assert report["dry_run"] is True
         assert report["retagged_pairs"] == 3
         assert all(r["primary"] == "_general" for r in _rows(tmp_path))
+    finally:
+        engine.close()
+
+
+def test_exact_id_selection_retags_only_its_logical_pair(tmp_path):
+    engine = _make_engine(tmp_path)
+    try:
+        _seed_general_rows(engine, tmp_path)
+        ids = _row_ids(tmp_path)
+        report = engine.retag_canonical_turns(
+            canonical_turn_ids={ids[2]},
+        )
+        assert report["requested_canonical_turn_ids"] == 1
+        assert report["selected_pairs"] == 1
+        assert report["retagged_pairs"] == 1
+        assert report["rows_updated"] == 2
+        rows = _rows(tmp_path)
+        assert rows[0]["primary"] == "_general"
+        assert rows[1]["primary"] == "_general"
+        assert rows[2]["primary"] != "_general"
+        assert rows[3]["primary"] != "_general"
+        assert rows[4]["primary"] == "_general"
+        assert rows[5]["primary"] == "_general"
+    finally:
+        engine.close()
+
+
+def test_exact_id_selection_fails_closed_on_unknown_id(tmp_path):
+    engine = _make_engine(tmp_path)
+    try:
+        _seed_general_rows(engine, tmp_path)
+        with pytest.raises(ValueError, match="unknown rows: 1"):
+            engine.retag_canonical_turns(
+                canonical_turn_ids={"not-a-canonical-row"},
+            )
+        assert all(row["primary"] == "_general" for row in _rows(tmp_path))
     finally:
         engine.close()
 

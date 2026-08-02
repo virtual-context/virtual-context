@@ -553,6 +553,7 @@ async def prepare_payload(
     body_bytes: bytes = b"",
     inbound_conversation_id: str = "",
     current_user_metadata: dict | None = None,
+    request_local_history: bool = False,
     log_dir: Path | None = None,
     log_prefix: str = "",
 ) -> PreparedPayload:
@@ -935,6 +936,16 @@ async def prepare_payload(
         return messages
 
     _request_messages = _extract_ingestible_messages(body)
+    # Source-attested REST turns can overlap inside one guild-owned state.
+    # Their model preparation may read a request-local client snapshot, but
+    # must never append into the process-wide request/completion-order list.
+    # That list cannot represent concurrent pair boundaries. Proxy traffic and
+    # legacy REST callers retain the historical shared-state behavior.
+    _request_conversation_history = (
+        state._completed_history_messages(_request_messages)
+        if request_local_history and state is not None
+        else None
+    )
     _active_user = next(
         (message for message in reversed(_request_messages) if message.role == "user"),
         None,
@@ -1260,14 +1271,18 @@ async def prepare_payload(
                 _dispatch_history_messages = _dispatch_history_messages or state._completed_history_messages(
                     _extract_ingestible_messages(body)
                 )
-                if _dispatch_history_messages and not state.is_conversation_deleted():
+                if (
+                    _dispatch_history_messages
+                    and not state.is_conversation_deleted()
+                    and not request_local_history
+                ):
                     state.conversation_history = list(_dispatch_history_messages)
                 if _owns_ingestion_lease:
                     await asyncio.to_thread(
                         state.start_ingestion_if_needed, _dispatch_history_messages,
                     )
 
-            if not state.is_conversation_deleted():
+            if not state.is_conversation_deleted() and not request_local_history:
                 state.conversation_history.append(
                     Message(role="user", content=user_message,
                             timestamp=datetime.now(timezone.utc),
@@ -1363,7 +1378,11 @@ async def prepare_payload(
                 "temporal": False,
                 "context_tokens": 0,
                 "budget": {},
-                "history_len": len(state.conversation_history),
+                "history_len": len(
+                    _request_conversation_history
+                    if _request_conversation_history is not None
+                    else state.conversation_history
+                ),
                 "compacted_prefix_messages": 0,
                 "wait_ms": 0,
                 "inbound_ms": 0,
@@ -1466,7 +1485,7 @@ async def prepare_payload(
         _history_rebuild_stage = time.monotonic()
         _expected = len(state.engine._turn_tag_index.entries)
         _have = state._history_turn_count()
-        if _have < _expected and _expected > 0:
+        if not request_local_history and _have < _expected and _expected > 0:
             _client_messages = state._completed_history_messages(_extract_ingestible_messages(body))
             _client_turns = state._history_turn_count(_client_messages)
             if _client_messages and _client_turns > _have:
@@ -1500,6 +1519,11 @@ async def prepare_payload(
                 wait_ms += _note_prep("wait_for_prior_compact", t_compact)
 
             if not state.is_conversation_deleted():
+                live_history = (
+                    _request_conversation_history
+                    if _request_conversation_history is not None
+                    else state.conversation_history
+                )
                 # Cross-channel-mirror Tier 2 stamping (engine spec §2.5).
                 # Stamp canonical_turn_id + turn_number metadata onto the
                 # completed-history prefix of state.conversation_history
@@ -1531,7 +1555,7 @@ async def prepare_payload(
                             _drop,
                         )
                         _stamp_canonical_turn_ids(
-                            state.conversation_history, _ingest_rows,
+                            live_history, _ingest_rows,
                         )
                     except Exception:
                         logger.warning(
@@ -1540,7 +1564,7 @@ async def prepare_payload(
                             exc_info=True,
                         )
 
-                state.conversation_history.append(
+                live_history.append(
                     Message(role="user", content=user_message,
                             timestamp=datetime.now(timezone.utc),
                             raw_content=fmt.extract_user_raw_content(body),
@@ -1556,7 +1580,7 @@ async def prepare_payload(
                 assembled = await asyncio.to_thread(
                     state.engine.on_message_inbound,
                     user_message,
-                    state.conversation_history,
+                    live_history,
                     body.get("model", ""),
                     request_roles=_request_roles,
                     speaker_context=_speaker_context,

@@ -12,9 +12,9 @@ liveness predicates:
 * ``conversations.phase = 'active'`` (not ingesting, compacting,
   deleted, or merged).
 * ``conversations.deleted_at IS NULL``.
-* NO ``canonical_turns`` row at ``tagged_at IS NULL`` for the
-  conversation (the compaction loader processes all uncompacted
-  rows, not just tagged ones).
+* NO taggable ``canonical_turns`` group with an untagged row. A newest
+  one-sided group is still waiting for its counterpart and does not starve
+  compaction; once any later canonical row exists, it is terminal and blocks.
 * NO ``compaction_operation`` row at status ``'queued'`` or
   ``'running'`` for the current ``lifecycle_epoch``.
 * Most recent terminal compaction row in the current epoch (if any)
@@ -217,12 +217,12 @@ class TestT04_DeletedAtFilter:
 
 
 # ---------------------------------------------------------------------------
-# T0.5: any untagged canonical_turns row blocks detection.
+# T0.5: taggable untagged canonical work blocks detection.
 # ---------------------------------------------------------------------------
 
 
 class TestT05_UntaggedRowBlocks:
-    def test_one_untagged_row_blocks(self, tmp_path: Path):
+    def test_complete_untagged_group_blocks(self, tmp_path: Path):
         store = SQLiteStore(tmp_path / "t05.db")
         _seed_conv(store, conv_id="conv-untag")
         # 25 tagged + 1 untagged. Backlog count would qualify but the
@@ -230,6 +230,41 @@ class TestT05_UntaggedRowBlocks:
         _seed_turns(store, conv_id="conv-untag", count=25, tagged=True)
         _seed_turns(store, conv_id="conv-untag", count=1, tagged=False,
                     sort_key_base=2000.0, id_prefix="u")
+        conn = store._get_conn()
+        conn.execute(
+            "UPDATE canonical_turns SET turn_group_number = 100, "
+            "user_content = 'u', assistant_content = 'a' "
+            "WHERE canonical_turn_id = 'ct-conv-untag-u0'"
+        )
+        conn.commit()
+        assert _detect(store) == []
+
+    def test_newest_one_sided_group_does_not_starve_backlog(
+        self, tmp_path: Path,
+    ):
+        store = SQLiteStore(tmp_path / "t05-trailing.db")
+        _seed_conv(store, conv_id="conv-trailing")
+        _seed_turns(store, conv_id="conv-trailing", count=25, tagged=True)
+        _seed_turns(
+            store, conv_id="conv-trailing", count=1, tagged=False,
+            sort_key_base=2000.0, id_prefix="trail",
+        )
+        conn = store._get_conn()
+        conn.execute(
+            "UPDATE canonical_turns SET turn_group_number = 100, "
+            "user_content = 'awaiting reply' "
+            "WHERE canonical_turn_id = 'ct-conv-trailing-trail0'"
+        )
+        conn.commit()
+
+        assert [c.conversation_id for c in _detect(store)] == ["conv-trailing"]
+
+        # A later row makes the one-sided group terminal. It must now be
+        # tagged before compaction can claim this conversation.
+        _seed_turns(
+            store, conv_id="conv-trailing", count=1, tagged=True,
+            sort_key_base=3000.0, id_prefix="later",
+        )
         assert _detect(store) == []
 
 

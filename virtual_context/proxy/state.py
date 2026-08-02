@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from ..core.conversation_store import StaleConversationWriteError
+from ..core.exceptions import CanonicalSourceConflict
 from ..core.lifecycle_epoch import LifecycleEpochMismatch
 from ..core.segmenter import pair_messages_into_turns
 from ..engine import VirtualContextEngine
@@ -206,6 +207,12 @@ class ProxyState:
         self._ingestion_progress: tuple[int, int] = (0, 0)
         self._manual_passthrough = False
         self._ingestion_thread: threading.Thread | None = None
+        # One non-blocking durable-resume waiter per active ingestion worker.
+        # An exact completion can arrive while the previous worker is in its
+        # final few instructions; the waiter joins that precise worker and
+        # re-probes durable rows so the new completion cannot fall through a
+        # thread-is-alive race.
+        self._durable_resume_waiters: set[int] = set()
         self._ingestion_cancel = threading.Event()
         # Sidecar heartbeat thread: refreshes the ingestion lease every
         # ``INGESTION_LEASE_TTL_S / 2`` seconds while ``_ingestion_thread``
@@ -814,7 +821,7 @@ class ProxyState:
             if not _verify_or_exit():
                 return False
 
-            batch = self.engine._store.iter_untagged_canonical_rows(
+            batch = self.engine._store.iter_complete_untagged_canonical_groups(
                 conversation_id=conversation_id,
                 expected_lifecycle_epoch=my_epoch,
                 batch_size=32,
@@ -848,7 +855,7 @@ class ProxyState:
                 # or the lifecycle moved — not ours to finalize.
                 if not _verify_or_exit():
                     return False
-                retry_batch = self.engine._store.iter_untagged_canonical_rows(
+                retry_batch = self.engine._store.iter_complete_untagged_canonical_groups(
                     conversation_id=conversation_id,
                     expected_lifecycle_epoch=my_epoch,
                     batch_size=1,
@@ -857,31 +864,34 @@ class ProxyState:
                     return False
                 continue
 
-            for row in batch:
+            for rows in batch:
                 # Run the existing tagging pipeline on this row. On failure
                 # we leave ``tagged_at`` NULL so a later run can retry the
                 # row without dropping it on the floor.
                 try:
                     tagged = self._run_tagging_pipeline(
-                        row,
+                        rows,
                         expected_lifecycle_epoch=my_epoch,
                     )
                 except Exception:
                     logger.exception(
-                        "Tagger %s failed to tag row %s",
-                        self._worker_id, row.canonical_turn_id[:12],
+                        "Tagger %s failed to tag logical group %s",
+                        self._worker_id,
+                        getattr(rows[0], "turn_group_number", "?"),
                     )
-                    # On tagging failure, skip this row. A later run can
-                    # retry if tagged_at is still NULL.
-                    continue
+                    # End this bounded resume attempt. The row stays
+                    # untagged for a later scheduled resume; continuing the
+                    # outer sweep here would immediately refetch the same
+                    # group and hot-loop model/embedding work forever.
+                    return False
 
                 if not tagged:
                     logger.info(
                         "Tagger %s exiting: tag-only CAS rejected for "
-                        "turn_id=%s (content hash, row id, tagged state, or "
+                        "group=%s (content hash, row id, tagged state, or "
                         "lifecycle changed)",
                         self._worker_id,
-                        row.canonical_turn_id[:12],
+                        getattr(rows[0], "turn_group_number", "?"),
                     )
                     return False
 
@@ -910,21 +920,64 @@ class ProxyState:
 
     def _run_tagging_pipeline(
         self,
-        row,
+        rows,
         *,
         expected_lifecycle_epoch: int,
     ) -> bool:
-        """Run the real tagging pipeline on a single canonical row.
+        """Run the real tagging pipeline on one taggable logical group.
 
-        Delegates to ``TaggingPipeline.tag_canonical_row`` which runs the
-        configured tag generator against the row's combined user/assistant
-        text, then atomically writes only tag-derived fields plus
-        ``tagged_at`` under the exact row-id/content-hash/lifecycle guard.
+        A complete user/assistant group is tagged atomically.  An earlier
+        one-sided group is terminal once a later canonical row exists, so it
+        is tagged as that exact physical row instead of pinning ingestion and
+        compaction forever.  The newest one-sided group is never returned by
+        storage and remains eligible for a later completion.
         """
-        return bool(self.engine._tagging.tag_canonical_row(
-            row,
-            expected_lifecycle_epoch=expected_lifecycle_epoch,
-        ))
+        # Canonical retrieval chunks are derived outside the reconcile lock.
+        # Do them before the tag CAS: any provider/storage failure leaves this
+        # group untagged, and durable resume retries it on the next pass.
+        for row in rows:
+            try:
+                embedded = self.engine._semantic.embed_and_store_turn(
+                    row.conversation_id,
+                    int(row.turn_group_number),
+                    canonical_turn_id=row.canonical_turn_id,
+                    user_text=row.user_content,
+                    assistant_text=row.assistant_content,
+                    user_raw_content=row.user_raw_content,
+                    assistant_raw_content=row.assistant_raw_content,
+                    reply_target_body=row.reply_target_body or "",
+                )
+            except Exception:
+                logger.warning(
+                    "CANONICAL_GROUP_EMBED_FAILED conv=%s group=%s",
+                    row.conversation_id[:12],
+                    row.turn_group_number,
+                    exc_info=True,
+                )
+                return False
+            if not embedded:
+                logger.warning(
+                    "CANONICAL_GROUP_EMBED_INCOMPLETE conv=%s group=%s; "
+                    "leaving untagged for retry",
+                    row.conversation_id[:12],
+                    row.turn_group_number,
+                )
+                return False
+        if len(rows) == 1:
+            row = rows[0]
+            has_user = bool((row.user_content or "").strip())
+            has_assistant = bool((row.assistant_content or "").strip())
+            if has_user != has_assistant:
+                return bool(self.engine._tagging.tag_canonical_row(
+                    row,
+                    expected_lifecycle_epoch=expected_lifecycle_epoch,
+                ))
+        return bool(
+            self.engine._tagging.tag_canonical_group(
+                rows,
+                expected_lifecycle_epoch=expected_lifecycle_epoch,
+            )
+        )
 
     # ------------------------------------------------------------------
     # Compaction lifecycle (Task A29)
@@ -1211,6 +1264,28 @@ class ProxyState:
                     ),
                     current_user_metadata=current_user_metadata,
                 )
+            except CanonicalSourceConflict as exc:
+                # Source attestation is an admission fence.  A contradiction
+                # quarantines this turn's canonical write, but does not take
+                # down the user's model request or silently retry through the
+                # legacy body-alignment path.
+                source_claim = {}
+                if isinstance(current_user_metadata, dict):
+                    from ..types import get_source_attestation
+                    source_claim = get_source_attestation(current_user_metadata)
+                logger.error(
+                    "SOURCE_ATTESTATION_CONFLICT phase=prepare conv=%s "
+                    "message_id=%s actor_id=%s error=%s",
+                    conversation_id[:64],
+                    source_claim.get("message_id", ""),
+                    (
+                        f"actor:{source_claim.get('platform', '')}:"
+                        f"{source_claim.get('author_id', '')}"
+                        if source_claim else ""
+                    ),
+                    exc,
+                    exc_info=True,
+                )
             except AttributeError:
                 # No reconciler configured on engine — acceptable for
                 # test harnesses that inject a mock engine.
@@ -1381,25 +1456,16 @@ class ProxyState:
 
             # Spawn fresh compaction with preexisting_operation_id.
             #
-            # CRITICAL: use the full restored ``self.conversation_history``
-            # when available, not just the current POST body's messages. The
-            # compaction pipeline persists whatever history it was given via
-            # ``_commit_compaction_state(conversation_history)``
-            # (compaction_pipeline.py:_run_compaction → _commit_compaction_state).
-            # Seeding compaction from ``_extract_ingestible_messages(body)``
-            # alone would persist a truncated snapshot whenever the takeover
-            # POST's body is narrower than the full conversation — the exact
-            # shape a "hey just ping" follow-up takes during an active
-            # compaction. Mirror the pattern in ``_compact_after_ingestion``
-            # (state.py:2228) which reads ``self.conversation_history`` first
-            # and only falls back to the passed-in history when the engine's
-            # in-memory history hasn't been hydrated yet.
-            compact_history = (
-                self.conversation_history
-                if self.conversation_history
-                else self._completed_history_messages(
-                    _extract_ingestible_messages(body),
-                )
+            # Compaction input is reconstructed from durable canonical groups.
+            # Shared REST history records request/completion timing, not pair
+            # order, and can be malformed under concurrent guild turns. The
+            # fallback exists only for minimal legacy stores.
+            # Synchronize the message watermark from the same canonical rows
+            # that define this compaction input. A long-lived worker may carry
+            # a stale request-history checkpoint after another worker commits.
+            self._advance_compaction_watermark()
+            compact_history = self.engine._store.reconstruct_history_for_conv(
+                conversation_id,
             )
             from ..types import CompactionSignal
             signal = CompactionSignal(
@@ -1477,51 +1543,44 @@ class ProxyState:
                     phase = "active"
             return _decision(phase=phase, started_tagger=False)
 
-        # total_ingestible > done_ingestible: there IS untagged work.
-        if phase in ("init", "active"):
-            old_phase = phase
-            self.engine.verify_epoch()
-            ok = self.engine._store.set_phase(
+        # total_ingestible > done_ingestible can mean either a complete turn
+        # or only a newly prepared user half.  Storage performs the complete-
+        # group recheck, phase transition, episode upsert and lease decision
+        # in one transaction.  This closes both the user-half lease pin and
+        # the check-then-open race against a peer finalizing the last group.
+        try:
+            claim_result = self.engine._store.claim_ingestion_for_complete_group(
                 conversation_id=conversation_id,
                 lifecycle_epoch=my_epoch,
-                phase="ingesting",
+                worker_id=self._worker_id,
+                raw_payload_entries=new_raw,
+                lease_ttl_s=INGESTION_LEASE_TTL_S,
             )
-            if not ok:
-                raise LifecycleEpochMismatch(
-                    conversation_id=conversation_id,
-                    expected=my_epoch,
-                    observed=self.engine._store.get_lifecycle_epoch(
-                        conversation_id,
-                    ),
-                )
-            self._publish_phase_transition(old_phase, "ingesting")
-            phase = "ingesting"
-
-        # Step 6 — reached only when phase == 'ingesting' AND total > done
-        # (the total == done branch already returned from step 5.5).
-        #
-        # Step 6(a): ownership-free widening of the episode's raw payload
-        # bound. Inserts a running episode with this worker as initial owner
-        # if none exists; otherwise widens raw_payload_entries via MAX
-        # without touching ownership.
-        self.engine._store.upsert_ingestion_episode(
-            conversation_id=conversation_id,
-            lifecycle_epoch=my_epoch,
-            worker_id=self._worker_id,
-            raw_payload_entries=new_raw,
-        )
-
-        # Step 6(b): attempt to claim the ingestion lease. Succeeds iff the
-        # caller already owns it or the current heartbeat is stale. Epoch
-        # filter prevents a stale lifecycle from stealing a fresh lease.
-        claimed = self.engine._store.claim_ingestion_lease(
-            conversation_id=conversation_id,
-            lifecycle_epoch=my_epoch,
-            worker_id=self._worker_id,
-            lease_ttl_s=INGESTION_LEASE_TTL_S,
-        )
-
-        if claimed:
+        except (AttributeError, NotImplementedError):
+            logger.error(
+                "INGEST_COMPLETE_GROUP_ATOMIC_UNAVAILABLE conv=%s; "
+                "failing closed",
+                conversation_id[:12],
+            )
+            return _decision(phase=phase, started_tagger=False)
+        if claim_result == "stale":
+            raise LifecycleEpochMismatch(
+                conversation_id=conversation_id,
+                expected=my_epoch,
+                observed=self.engine._store.get_lifecycle_epoch(
+                    conversation_id,
+                ),
+            )
+        if claim_result == "no-work":
+            logger.info(
+                "INGEST_DEFER_INCOMPLETE_PHYSICAL_GROUP conv=%s phase=%s",
+                conversation_id[:12], phase,
+            )
+            return _decision(phase=phase, started_tagger=False)
+        if claim_result.endswith("-transitioned"):
+            self._publish_phase_transition(phase, "ingesting")
+        phase = "ingesting"
+        if claim_result.startswith("claimed"):
             # Tagger dispatch is delegated to ``start_ingestion_if_needed``
             # (legacy ``_ingestion_thread`` running ``tag_turn`` with full
             # history). Do NOT spawn the per-row tagger here — two tagger
@@ -1530,7 +1589,7 @@ class ProxyState:
             # call claimed the lease; the legacy path spawns the actual
             # worker thread downstream in the same request flow.
             return _decision(phase="ingesting", started_tagger=True)
-        return _decision(phase="ingesting", started_tagger=False)
+        return _decision(phase=phase, started_tagger=False)
 
     def _another_worker_owns_lease(self, conversation_id: str) -> bool:
         """Defense-in-depth check: return True iff an active ingestion
@@ -1583,59 +1642,123 @@ class ProxyState:
         safe.
         """
         conversation_id = self.engine.config.conversation_id
-        if not self.has_pending_indexing():
-            return False
-        # Atomic lease claim. On success the caller owns the lease (either
-        # took it over because the previous heartbeat was stale or was
-        # already the owner). On failure another worker owns a live lease.
         lifecycle_epoch = int(
             getattr(self.engine._engine_state, "lifecycle_epoch", 1) or 1
         )
+
+        def _schedule_followup_locked(active_worker: threading.Thread) -> None:
+            worker_key = id(active_worker)
+            if worker_key in self._durable_resume_waiters:
+                return
+            self._durable_resume_waiters.add(worker_key)
+
+            def _resume_after_active_worker() -> None:
+                try:
+                    active_worker.join()
+                    if not self.is_conversation_deleted():
+                        self.resume_pending_ingestion_if_needed()
+                finally:
+                    with self._ingestion_lock:
+                        self._durable_resume_waiters.discard(worker_key)
+
+            threading.Thread(
+                target=_resume_after_active_worker,
+                daemon=True,
+                name="vc-ingest-durable-followup",
+            ).start()
+
+        positional_pending = self.has_pending_indexing()
+        durable_probe_available = True
         try:
-            claimed = self.engine._store.claim_ingestion_lease(
-                conversation_id=conversation_id,
-                lifecycle_epoch=lifecycle_epoch,
-                worker_id=self._worker_id,
-                lease_ttl_s=INGESTION_LEASE_TTL_S,
+            durable_untagged = list(
+                self.engine._store.iter_complete_untagged_canonical_groups(
+                    conversation_id=conversation_id,
+                    expected_lifecycle_epoch=lifecycle_epoch,
+                    batch_size=1,
+                )
+                or []
             )
         except (AttributeError, NotImplementedError):
-            # Store backend lacks the lease API (in-memory test stores,
-            # legacy file backends). Fall through to the defense-in-depth
-            # observer check so test harnesses with MagicMock stores keep
-            # working.
-            claimed = not self._another_worker_owns_lease(conversation_id)
-        if not claimed:
-            logger.info(
-                "resume_pending_ingestion_if_needed: skipping spawn — "
-                "could not claim ingestion lease "
-                "(conv=%s, this=%s)",
-                conversation_id[:12], self._worker_id,
+            durable_probe_available = False
+            durable_untagged = []
+        except Exception:
+            logger.warning(
+                "Failed durable untagged-row probe for resume (conv=%s)",
+                conversation_id[:12],
+                exc_info=True,
             )
             return False
+        if not positional_pending and not durable_untagged:
+            return False
+
+        # A local worker already owns the lease.  Arrange an exact post-worker
+        # durable re-probe without blocking the request thread.
         with self._ingestion_lock:
-            if self._ingestion_thread is not None and self._ingestion_thread.is_alive():
+            active_worker = self._ingestion_thread
+            if active_worker is not None and active_worker.is_alive():
+                _schedule_followup_locked(active_worker)
                 return True
 
-            baseline = self._indexed_turn_count()
-            total = self._completed_turn_count()
-            try:
-                physical_rows = sorted(
-                    self.engine._store.get_all_canonical_turns(conversation_id),
-                    key=lambda row: (row.sort_key, row.canonical_turn_id),
-                )
-            except Exception:
-                logger.warning(
-                    "Failed to load physical canonical rows for durable "
-                    "resume (conv=%s)",
-                    conversation_id[:12],
-                    exc_info=True,
-                )
-                return False
+        baseline = self._indexed_turn_count()
+        total = self._completed_turn_count()
+        physical_rows_available = True
+        try:
+            physical_rows = sorted(
+                self.engine._store.get_all_canonical_turns(conversation_id),
+                key=lambda row: (row.sort_key, row.canonical_turn_id),
+            )
+        except (AttributeError, NotImplementedError):
+            physical_rows_available = False
+            physical_rows = []
+        except Exception:
+            logger.warning(
+                "Failed to load physical canonical rows for durable resume "
+                "(conv=%s)",
+                conversation_id[:12],
+                exc_info=True,
+            )
+            return False
 
+        if physical_rows_available:
             rows_by_group: dict[int, list] = {}
             for row in physical_rows:
                 group_number = int(getattr(row, "turn_group_number", -1))
                 rows_by_group.setdefault(group_number, []).append(row)
+            def _complete_group(group_rows: list) -> bool:
+                user_rows = [
+                    row for row in group_rows
+                    if (getattr(row, "user_content", "") or "").strip()
+                ]
+                assistant_rows = [
+                    row for row in group_rows
+                    if (getattr(row, "assistant_content", "") or "").strip()
+                ]
+                combined_rows = [
+                    row for row in group_rows
+                    if (getattr(row, "user_content", "") or "").strip()
+                    and (getattr(row, "assistant_content", "") or "").strip()
+                ]
+                return (
+                    len(group_rows) == 1
+                    and len(user_rows) == 1
+                    and len(assistant_rows) == 1
+                ) or (
+                    len(group_rows) == 2
+                    and len(user_rows) == 1
+                    and len(assistant_rows) == 1
+                    and not combined_rows
+                )
+
+            untagged_groups = [
+                group_number
+                for group_number, group_rows in rows_by_group.items()
+                if group_number >= 0
+                and _complete_group(group_rows)
+                and any(not getattr(row, "tagged_at", None) for row in group_rows)
+            ]
+            if untagged_groups:
+                baseline = min(baseline, min(untagged_groups))
+                total = max(total, max(untagged_groups) + 1)
 
             selected_rows: list = []
             expected_turn = baseline
@@ -1644,84 +1767,134 @@ class ProxyState:
                 if not group_rows:
                     logger.warning(
                         "Durable resume gap at turn %d for conversation %s; "
-                        "stopping before any positional inference",
+                        "deferring before lease claim",
                         expected_turn,
                         conversation_id[:12],
                     )
                     break
-                if not any(
-                    (getattr(row, "assistant_content", "") or "").strip()
-                    for row in group_rows
-                ):
+                if not _complete_group(group_rows):
                     logger.warning(
-                        "Durable resume found incomplete turn %d for "
-                        "conversation %s; stopping before the next group",
+                        "Durable resume found incomplete or ambiguous physical "
+                        "turn %d for conversation %s; deferring before lease "
+                        "claim",
                         expected_turn,
                         conversation_id[:12],
                     )
                     break
                 selected_rows.extend(group_rows)
                 expected_turn += 1
-
-            if selected_rows:
-                from ..core.store import canonical_rows_to_history
-
-                messages = canonical_rows_to_history(
-                    selected_rows,
-                    include_tagging_identity=True,
-                )
-            else:
-                # Compatibility fallback for old cached state and lightweight
-                # test stores that do not expose physical rows. These bare
-                # messages still cannot authorize a positional rewrite: the
-                # strict tagger must independently resolve exact group+hash
-                # rows and otherwise falls through to the row-based sweep.
-                pending_rows = list(
-                    getattr(self.engine, "_restored_pending_turns", []) or []
-                )
-                if not pending_rows:
-                    turn_numbers = list(range(baseline, total))
-                    try:
-                        merged = self.engine._store.get_canonical_turn_rows(
-                            conversation_id, turn_numbers,
-                        )
-                    except Exception:
-                        logger.warning(
-                            "Failed to load merged canonical rows for durable "
-                            "resume fallback (conv=%s)",
-                            conversation_id[:12],
-                            exc_info=True,
-                        )
-                        merged = {}
-                    pending_rows = [
-                        (
-                            turn_number,
-                            row.user_content,
-                            row.assistant_content,
-                            row.user_raw_content,
-                            row.assistant_raw_content,
-                        )
-                        for turn_number in turn_numbers
-                        if (row := merged.get(turn_number)) is not None
-                    ]
-                messages = []
-                expected_turn = baseline
-                for pending in sorted(pending_rows, key=lambda item: item[0]):
-                    turn_number, user_content, assistant_content, *_rest = pending
-                    if turn_number < baseline:
-                        continue
-                    if turn_number != expected_turn:
-                        break
-                    messages.append(Message(role="user", content=user_content))
-                    messages.append(Message(role="assistant", content=assistant_content))
-                    expected_turn += 1
-
-            if not messages:
+            if not selected_rows:
                 return False
+            from ..core.store import canonical_rows_to_history
+            messages = canonical_rows_to_history(
+                selected_rows,
+                include_tagging_identity=True,
+            )
+        else:
+            pending_rows = list(
+                getattr(self.engine, "_restored_pending_turns", []) or []
+            )
+            if not pending_rows:
+                turn_numbers = list(range(baseline, total))
+                try:
+                    merged = self.engine._store.get_canonical_turn_rows(
+                        conversation_id, turn_numbers,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to load merged canonical rows for durable "
+                        "resume fallback (conv=%s)",
+                        conversation_id[:12],
+                        exc_info=True,
+                    )
+                    merged = {}
+                pending_rows = [
+                    (
+                        turn_number,
+                        row.user_content,
+                        row.assistant_content,
+                        row.user_raw_content,
+                        row.assistant_raw_content,
+                    )
+                    for turn_number in turn_numbers
+                    if (row := merged.get(turn_number)) is not None
+                ]
+            messages = []
+            expected_turn = baseline
+            for pending in sorted(pending_rows, key=lambda item: item[0]):
+                turn_number, user_content, assistant_content, *_rest = pending
+                if turn_number < baseline:
+                    continue
+                if turn_number != expected_turn:
+                    break
+                if not (user_content or "").strip() or not (
+                    assistant_content or ""
+                ).strip():
+                    break
+                messages.append(Message(role="user", content=user_content))
+                messages.append(Message(role="assistant", content=assistant_content))
+                expected_turn += 1
+        if not messages:
+            return False
 
+        # Only now that at least one complete, contiguous physical pair is
+        # proven do we open and claim an ingestion episode.  This ordering is
+        # the multi-worker liveness fence: B-first/A-incomplete must never pin
+        # a 30-second lease that prevents another worker from completing A.
+        if durable_probe_available:
+            try:
+                snapshot = self.engine._store.read_progress_snapshot(
+                    conversation_id,
+                )
+                claim_result = self.engine._store.claim_ingestion_for_complete_group(
+                    conversation_id=conversation_id,
+                    lifecycle_epoch=lifecycle_epoch,
+                    worker_id=self._worker_id,
+                    raw_payload_entries=max(
+                        1, int(snapshot.total_ingestible or 0),
+                    ),
+                    lease_ttl_s=INGESTION_LEASE_TTL_S,
+                )
+            except Exception:
+                logger.warning(
+                    "Failed atomic durable resume claim (conv=%s)",
+                    conversation_id[:12],
+                    exc_info=True,
+                )
+                return False
+            if claim_result == "stale" or claim_result == "no-work":
+                return False
+            if claim_result.endswith("-transitioned"):
+                self._publish_phase_transition(
+                    snapshot.phase,
+                    "ingesting",
+                )
+            claimed = claim_result.startswith("claimed")
+        else:
+            try:
+                claimed = self.engine._store.claim_ingestion_lease(
+                    conversation_id=conversation_id,
+                    lifecycle_epoch=lifecycle_epoch,
+                    worker_id=self._worker_id,
+                    lease_ttl_s=INGESTION_LEASE_TTL_S,
+                )
+            except (AttributeError, NotImplementedError):
+                claimed = not self._another_worker_owns_lease(conversation_id)
+        if not claimed:
+            logger.info(
+                "resume_pending_ingestion_if_needed: skipping spawn — "
+                "could not claim ingestion lease (conv=%s, this=%s)",
+                conversation_id[:12], self._worker_id,
+            )
+            return False
+
+        with self._ingestion_lock:
+            active_worker = self._ingestion_thread
+            if active_worker is not None and active_worker.is_alive():
+                _schedule_followup_locked(active_worker)
+                return True
             if self.metrics:
                 self.metrics.clear_ingestion_events(conversation_id)
-
             self.engine._restored_pending_turns = []
             self._ingestion_progress = (
                 baseline,
@@ -1735,13 +1908,11 @@ class ProxyState:
                 tool_output_refs_by_turn=None,
                 ingest_thread_name="vc-ingest-resume",
             )
-            logger.info(
-                "Resuming durable ingestion for conversation %s from turn %d to %d",
-                conversation_id[:12],
-                baseline,
-                total - 1,
-            )
-            return True
+        logger.info(
+            "Resuming durable ingestion for conversation %s from turn %d to %d",
+            conversation_id[:12], baseline, total - 1,
+        )
+        return True
 
     def _transition_to(self, new_state: SessionState) -> None:
         old = self._state
@@ -2964,8 +3135,18 @@ class ProxyState:
         """
         try:
             from ..types import CompactionSignal
-            # Use conversation_history (full proxy history) not just ingestion pairs
-            compact_history = self.conversation_history if self.conversation_history else history
+            # Never compact the mutable REST history tail. Concurrent guild
+            # turns can complete out of request order even though their
+            # canonical source-ledger groups are exact. Reconstructing here
+            # makes canonical order and canonical speaker metadata the sole
+            # post-ingest input for segments, facts, summaries, and cards.
+            # Keep the compaction threshold and the compaction input on one
+            # authority. ``compacted_prefix_messages`` can lag a peer worker's
+            # durable canonical commit until this request refreshes it.
+            self._advance_compaction_watermark()
+            compact_history = self.engine._store.reconstruct_history_for_conv(
+                self.engine.config.conversation_id,
+            )
             protected = self.engine.config.monitor.protected_recent_turns * 2
             watermark = self.engine._engine_state.compacted_prefix_messages
             compactable = len(compact_history) - watermark - protected

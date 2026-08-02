@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import re
 import time
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -20,6 +22,7 @@ from ..core.canonical_turns import (
     utcnow_iso,
 )
 from ..core.semantic_search import SemanticSearchManager
+from ..core.exceptions import CanonicalSourceConflict
 from ..core.store import ContextStore
 from ..types import (
     FactSignal,
@@ -28,6 +31,7 @@ from ..types import (
     TurnTagEntry,
     get_actor_id,
     get_origin_channel,
+    get_source_attestation,
     get_sender_name,
 )
 
@@ -42,6 +46,24 @@ class _Alignment:
 
 
 logger = logging.getLogger(__name__)
+
+_ATTESTED_DISCORD_GROUP_ROUTE_RE = re.compile(
+    r"^(?:sk:)?agent:[^:]+:discord:(?:guild|channel):[^:]+$"
+)
+
+
+def requires_current_source_attestation(source_conversation_key: str) -> bool:
+    """Whether this route may admit only the attested current human turn.
+
+    Multi-speaker Discord history is useful model context, but it is not an
+    identity authority.  Once the authenticated adapter supplies native source
+    claims, historical/windowed rows must never be admitted through legacy
+    body alignment: doing so is how a full JSONL replay or a changed wrapper
+    can recreate duplicate, anonymous, or active-speaker-smeared history.
+    """
+    return bool(_ATTESTED_DISCORD_GROUP_ROUTE_RE.fullmatch(
+        (source_conversation_key or "").strip()
+    ))
 
 # An assistant physical row never receives a human reply edge.
 _EMPTY_REPLY_EDGE: dict = {
@@ -208,6 +230,21 @@ class IngestReconciler:
         self._store = store
         self._semantic = semantic
 
+    def _verify_lifecycle_epoch(
+        self, conversation_id: str, expected_lifecycle_epoch: int,
+    ) -> None:
+        """Verify without accidentally ending an active reconcile txn."""
+        verifier = getattr(self._store, "verify_lifecycle_epoch", None)
+        if callable(verifier):
+            verifier(conversation_id, int(expected_lifecycle_epoch))
+            return
+        from .lifecycle_epoch import verify_epoch
+        verify_epoch(
+            conversation_id=conversation_id,
+            expected=int(expected_lifecycle_epoch),
+            observed=self._store.get_lifecycle_epoch(conversation_id),
+        )
+
     def ingest_single(
         self,
         conversation_id: str,
@@ -237,8 +274,10 @@ class IngestReconciler:
         # edge, so a caller that cannot prove provenance writes exactly what
         # this path always wrote.
         user_reply_edge: dict | None = None,
+        user_source_claim: dict | None = None,
         fact_signals: list[FactSignal] | None = None,
         code_refs: list[dict] | None = None,
+        expected_conversation_generation: int | None = None,
         expected_lifecycle_epoch: int | None = None,
         ) -> CanonicalIngestResult:
         # ``sender`` is the legacy logical-turn argument and remains the
@@ -254,7 +293,29 @@ class IngestReconciler:
                 for name in _REPLY_EDGE_FIELDS
                 if name in user_reply_edge
             })
-        with self._conversation_merge_lock(conversation_id):
+        if user_source_claim and expected_lifecycle_epoch is None:
+            raise ValueError(
+                "attested completion requires expected_lifecycle_epoch"
+            )
+        if user_source_claim and expected_conversation_generation is None:
+            raise ValueError(
+                "attested completion requires expected_conversation_generation"
+            )
+        if expected_lifecycle_epoch is not None:
+            self._verify_lifecycle_epoch(
+                conversation_id, int(expected_lifecycle_epoch),
+            )
+        with self._conversation_merge_lock(
+            conversation_id,
+            expected_conversation_generation=(
+                int(expected_conversation_generation)
+                if user_source_claim else None
+            ),
+        ):
+            if expected_lifecycle_epoch is not None:
+                self._verify_lifecycle_epoch(
+                    conversation_id, int(expected_lifecycle_epoch),
+                )
             existing = self._load_reconcile_rows(conversation_id)
             prepared = [
                 self._prepare_message_row(
@@ -271,6 +332,7 @@ class IngestReconciler:
                     sender_actor_id=user_sender_actor_id,
                     fact_signals=fact_signals,
                     code_refs=code_refs,
+                    source_claim=user_source_claim,
                     **edge,
                 ),
                 self._prepare_message_row(
@@ -295,7 +357,25 @@ class IngestReconciler:
             # edge costs nothing here.
             if _has_reply_edge(edge):
                 self._resolve_reply_subjects(conversation_id, prepared)
-            if len(existing) >= len(prepared):
+            if user_source_claim:
+                membership = self._find_attested_source_membership(prepared[0])
+                if membership is not None:
+                    return self._complete_attested_single(
+                        conversation_id,
+                        existing=existing,
+                        prepared=prepared,
+                        membership=membership,
+                    )
+                return self._admit_new_attested_pair_locked(
+                    conversation_id,
+                    existing=existing,
+                    prepared=prepared,
+                    expected_conversation_generation=int(
+                        expected_conversation_generation
+                    ),
+                    expected_lifecycle_epoch=int(expected_lifecycle_epoch),
+                )
+            if not user_source_claim and len(existing) >= len(prepared):
                 recent_window = existing[-min(5, len(existing)):]
                 for window_start in range(0, len(recent_window) - len(prepared) + 1):
                     recent = recent_window[window_start:window_start + len(prepared)]
@@ -352,7 +432,7 @@ class IngestReconciler:
             # point. Anchor on the tail row's hash instead: mirror its
             # identity (no rewrite — the fast-skip contract) and append
             # only the assistant row.
-            if existing:
+            if existing and not user_source_claim:
                 user_row, assistant_row = prepared
                 tail = existing[-1]
                 if tail.turn_hash == user_row.turn_hash:
@@ -468,13 +548,441 @@ class IngestReconciler:
                         batch=batch,
                         rows=[user_row, assistant_row],
                     )
-            return self._ingest_prepared_turns_locked(
+            result = self._ingest_prepared_turns_locked(
                 conversation_id,
                 prepared_turns=prepared,
                 raw_turn_count=len(prepared),
                 existing=existing,
                 allow_short_overlap=False,
             )
+            return result
+
+    def _admit_new_attested_pair_locked(
+        self,
+        conversation_id: str,
+        *,
+        existing: list[CanonicalTurnRow],
+        prepared: list[CanonicalTurnRow],
+        expected_conversation_generation: int,
+        expected_lifecycle_epoch: int,
+    ) -> CanonicalIngestResult:
+        """Atomically append a new attested completion with a stable group id.
+
+        Source snowflakes prove provenance; they are not mutable canonical
+        ordinals.  Model calls from two Discord channels can finish in either
+        order.  Inserting the later completion by source chronology would
+        renumber an already tagged/compacted group and leave every derived
+        turn reference stale.  Therefore a completed pair is appended in
+        completion order and its ``turn_group_number`` is immutable.
+        """
+        user_row, assistant_row = prepared
+        self._validate_attested_source_shape(user_row)
+        source_id = (user_row.source_message_id or "").strip()
+        if not source_id.isdigit() or not 15 <= len(source_id) <= 24:
+            raise CanonicalSourceConflict(
+                "attested Discord completion lacks a valid source snowflake"
+            )
+        legacy = self._adopt_exact_legacy_source_pair_locked(
+            conversation_id,
+            existing=existing,
+            prepared=prepared,
+            expected_conversation_generation=expected_conversation_generation,
+            expected_lifecycle_epoch=expected_lifecycle_epoch,
+        )
+        if legacy is not None:
+            return legacy
+
+        insertion_index = len(existing)
+        left_key = existing[-1].sort_key if existing else None
+        keys = self._allocate_bounded_sort_keys(
+            conversation_id,
+            existing=existing,
+            rows_touched=[],
+            left_key=left_key,
+            right_key=None,
+            count=2,
+        )
+        batch_id = generate_canonical_turn_id()
+        now = utcnow_iso()
+        temporary_group = max(
+            (int(row.turn_group_number) for row in existing),
+            default=-1,
+        ) + 1
+        for row, key in zip(prepared, keys, strict=True):
+            row.canonical_turn_id = generate_canonical_turn_id()
+            row.sort_key = key
+            row.turn_group_number = temporary_group
+            row.source_batch_id = batch_id
+            row.last_seen_at = now
+
+        saver = getattr(self._store, "save_attested_canonical_pair", None)
+        if not callable(saver):
+            raise CanonicalSourceConflict(
+                "storage backend cannot atomically admit an attested pair"
+            )
+        saver(
+            user_row,
+            assistant_row,
+            user_turn_number=insertion_index,
+            assistant_turn_number=insertion_index + 1,
+            expected_conversation_generation=expected_conversation_generation,
+            expected_lifecycle_epoch=expected_lifecycle_epoch,
+        )
+
+        stored_user = self._find_attested_source_membership(user_row)
+        if stored_user is None:
+            raise CanonicalSourceConflict(
+                "atomic attested pair committed without source membership"
+            )
+        user_row.turn_group_number = stored_user.turn_group_number
+        assistant_row.turn_group_number = stored_user.turn_group_number
+
+        # Remote/vector derivation is deliberately NOT performed under the
+        # conversation reconcile lock.  The durable tag worker embeds this
+        # complete group before marking it tagged; failures leave it untagged
+        # so the ordinary resume path retries without blocking another
+        # Discord channel's exact completion.
+        batch = self._save_batch(
+            conversation_id,
+            raw_turn_count=2,
+            merge_mode="source_exact_pair_append",
+            first_turn_hash=user_row.turn_hash,
+            last_turn_hash=assistant_row.turn_hash,
+            turns_matched=0,
+            turns_appended=2,
+            turns_prepended=0,
+            turns_inserted=0,
+            batch_id=batch_id,
+        )
+        self._refresh_persisted_anchors(conversation_id)
+        return CanonicalIngestResult(
+            merge_mode=batch.merge_mode,
+            turns_written=2,
+            turns_matched=0,
+            turns_appended=2,
+            turns_prepended=0,
+            turns_inserted=0,
+            batch=batch,
+            rows=prepared,
+        )
+
+    def _adopt_exact_legacy_source_pair_locked(
+        self,
+        conversation_id: str,
+        *,
+        existing: list[CanonicalTurnRow],
+        prepared: list[CanonicalTurnRow],
+        expected_conversation_generation: int,
+        expected_lifecycle_epoch: int,
+    ) -> CanonicalIngestResult | None:
+        """Bind an exact row left by the pre-attestation prepare lane.
+
+        During a rolling deploy an older engine can persist the current user
+        before the attestation-aware completion arrives.  Treating that row as
+        a new message duplicates it; accepting a merely similar row recreates
+        the attribution bug.  This compatibility lane therefore activates
+        only for one exact source-id match and reuses the already stored row
+        byte-for-byte.  A pre-existing assistant is adopted only when it is
+        the unique role-local sibling and exactly matches this completion.
+        Both rows plus the immutable membership are then committed through the
+        same atomic pair primitive used for a brand-new completion.
+        """
+        incoming_user, incoming_assistant = prepared
+        source_id = (incoming_user.source_message_id or "").strip()
+        projected_matches = [
+            row for row in existing
+            if (row.source_message_id or "").strip() == source_id
+        ]
+        if not projected_matches:
+            return None
+        if len(projected_matches) != 1:
+            raise CanonicalSourceConflict(
+                "legacy source id appears on more than one canonical row"
+            )
+
+        # The narrow projection intentionally omits bodies.  This rare rolling
+        # deployment lane reloads full rows under the conversation reconcile
+        # lock so equality can be proved before any write.
+        full_rows = list(self._store.get_all_canonical_turns(conversation_id))
+        source_matches = [
+            row for row in full_rows
+            if (row.source_message_id or "").strip() == source_id
+        ]
+        if len(source_matches) != 1:
+            raise CanonicalSourceConflict(
+                "legacy source id cannot be resolved to one full canonical row"
+            )
+        stored_user = source_matches[0]
+        exact_user = (
+            self._row_has_user_content(stored_user)
+            and not self._row_has_assistant_content(stored_user)
+            and int(stored_user.turn_group_number) >= 0
+            and (stored_user.user_content or "")
+            == (incoming_user.user_content or "")
+            and (stored_user.turn_hash or "") == (incoming_user.turn_hash or "")
+            and (stored_user.sender_actor_id or "")
+            == (incoming_user.sender_actor_id or "")
+            and (stored_user.origin_channel_id or "")
+            == (incoming_user.origin_channel_id or "")
+            and (stored_user.audience_conversation_id or "")
+            == (incoming_user.audience_conversation_id or "")
+            and (stored_user.reply_target_message_id or "")
+            == (incoming_user.reply_target_message_id or "")
+        )
+        if not exact_user:
+            raise CanonicalSourceConflict(
+                "legacy source row disagrees with attested body, role, or identity"
+            )
+
+        group_rows = [
+            row for row in full_rows
+            if int(row.turn_group_number) == int(stored_user.turn_group_number)
+        ]
+        if stored_user not in group_rows or len(group_rows) not in (1, 2):
+            raise CanonicalSourceConflict(
+                "legacy source row belongs to an ambiguous canonical group"
+            )
+        stored_assistants = [
+            row for row in group_rows
+            if self._row_has_assistant_content(row)
+            and not self._row_has_user_content(row)
+        ]
+        if len(group_rows) == 2 and len(stored_assistants) != 1:
+            raise CanonicalSourceConflict(
+                "legacy source group has no unique physical assistant"
+            )
+
+        user_index = next(
+            index for index, row in enumerate(full_rows)
+            if row.canonical_turn_id == stored_user.canonical_turn_id
+        )
+        adopted_user = replace(
+            stored_user,
+            source_claim=dict(incoming_user.source_claim or {}),
+        )
+        batch_id = generate_canonical_turn_id()
+        if stored_assistants:
+            stored_assistant = stored_assistants[0]
+            if (
+                (stored_assistant.assistant_content or "")
+                != (incoming_assistant.assistant_content or "")
+                or (stored_assistant.turn_hash or "")
+                != (incoming_assistant.turn_hash or "")
+            ):
+                raise CanonicalSourceConflict(
+                    "legacy assistant disagrees with the exact completion"
+                )
+            adopted_assistant = replace(stored_assistant)
+            assistant_index = next(
+                index for index, row in enumerate(full_rows)
+                if row.canonical_turn_id == stored_assistant.canonical_turn_id
+            )
+            turns_written = 0
+            turns_matched = 2
+            turns_appended = 0
+            turns_inserted = 0
+            merge_mode = "source_exact_legacy_pair_adopt"
+        else:
+            next_key = (
+                full_rows[user_index + 1].sort_key
+                if user_index + 1 < len(full_rows)
+                else None
+            )
+            key = self._allocate_bounded_sort_keys(
+                conversation_id,
+                existing=full_rows,
+                rows_touched=[],
+                left_key=stored_user.sort_key,
+                right_key=next_key,
+                count=1,
+            )[0]
+            now = utcnow_iso()
+            adopted_assistant = replace(
+                incoming_assistant,
+                canonical_turn_id=generate_canonical_turn_id(),
+                sort_key=key,
+                turn_group_number=stored_user.turn_group_number,
+                source_batch_id=batch_id,
+                last_seen_at=now,
+            )
+            assistant_index = user_index + 1
+            turns_written = 1
+            turns_matched = 1
+            turns_appended = 1 if next_key is None else 0
+            turns_inserted = 0 if next_key is None else 1
+            merge_mode = "source_exact_legacy_user_adopt"
+
+        saver = getattr(self._store, "save_attested_canonical_pair", None)
+        if not callable(saver):
+            raise CanonicalSourceConflict(
+                "storage backend cannot atomically adopt an attested pair"
+            )
+        saver(
+            adopted_user,
+            adopted_assistant,
+            user_turn_number=user_index,
+            assistant_turn_number=assistant_index,
+            expected_conversation_generation=expected_conversation_generation,
+            expected_lifecycle_epoch=expected_lifecycle_epoch,
+        )
+        stored_membership = self._find_attested_source_membership(adopted_user)
+        if stored_membership is None:
+            raise CanonicalSourceConflict(
+                "legacy pair adoption committed without source membership"
+            )
+
+        batch = self._save_batch(
+            conversation_id,
+            raw_turn_count=2,
+            merge_mode=merge_mode,
+            first_turn_hash=adopted_user.turn_hash,
+            last_turn_hash=adopted_assistant.turn_hash,
+            turns_matched=turns_matched,
+            turns_appended=turns_appended,
+            turns_prepended=0,
+            turns_inserted=turns_inserted,
+            batch_id=batch_id,
+        )
+        self._refresh_persisted_anchors(conversation_id)
+        return CanonicalIngestResult(
+            merge_mode=merge_mode,
+            turns_written=turns_written,
+            turns_matched=turns_matched,
+            turns_appended=turns_appended,
+            turns_prepended=0,
+            turns_inserted=turns_inserted,
+            batch=batch,
+            rows=[adopted_user, adopted_assistant],
+        )
+
+    def _complete_attested_single(
+        self,
+        conversation_id: str,
+        *,
+        existing: list[CanonicalTurnRow],
+        prepared: list[CanonicalTurnRow],
+        membership: CanonicalTurnRow,
+    ) -> CanonicalIngestResult:
+        """Complete the exact prepared user row despite channel interleaving.
+
+        The prepare request may have persisted the user row, then another
+        channel can append before this model finishes.  The old tail shortcut
+        would pair by whatever happened to be last.  Source membership gives
+        us the exact physical user row; insert its assistant immediately after
+        that row, or accept the unique already-present sibling on replay.
+        """
+        user_row, assistant_row = prepared
+        positions = {
+            row.canonical_turn_id: index
+            for index, row in enumerate(existing)
+            if row.canonical_turn_id
+        }
+        user_index = positions.get(membership.canonical_turn_id)
+        if user_index is None:
+            raise CanonicalSourceConflict(
+                "attested user membership is outside the serving owner"
+            )
+        stored_user = existing[user_index]
+        if (
+            stored_user.turn_hash != user_row.turn_hash
+            or (stored_user.sender_actor_id or "")
+            != (user_row.sender_actor_id or "")
+            or (stored_user.source_message_id or "")
+            != (user_row.source_message_id or "")
+        ):
+            raise CanonicalSourceConflict(
+                "attested user row changed before assistant completion"
+            )
+        user_row.canonical_turn_id = stored_user.canonical_turn_id
+        user_row.sort_key = stored_user.sort_key
+        user_row.turn_group_number = stored_user.turn_group_number
+        user_row.source_batch_id = stored_user.source_batch_id
+        user_row.first_seen_at = stored_user.first_seen_at or user_row.first_seen_at
+        user_row.last_seen_at = stored_user.last_seen_at or user_row.last_seen_at
+        self._preserve_existing_enrichment(user_row, stored_user)
+
+        assistants = [
+            row for row in existing
+            if row.turn_group_number == stored_user.turn_group_number
+            and self._row_has_assistant_content(row)
+            and not self._row_has_user_content(row)
+        ]
+        if assistants:
+            if len(assistants) != 1 or assistants[0].turn_hash != assistant_row.turn_hash:
+                raise CanonicalSourceConflict(
+                    "attested user already has a contradictory assistant sibling"
+                )
+            stored_assistant = assistants[0]
+            assistant_row.canonical_turn_id = stored_assistant.canonical_turn_id
+            assistant_row.sort_key = stored_assistant.sort_key
+            assistant_row.turn_group_number = stored_assistant.turn_group_number
+            assistant_row.source_batch_id = stored_assistant.source_batch_id
+            assistant_row.first_seen_at = (
+                stored_assistant.first_seen_at or assistant_row.first_seen_at
+            )
+            assistant_row.last_seen_at = (
+                stored_assistant.last_seen_at or assistant_row.last_seen_at
+            )
+            self._preserve_existing_enrichment(
+                assistant_row, stored_assistant,
+            )
+            return CanonicalIngestResult(
+                merge_mode="source_exact_resend",
+                turns_written=0,
+                turns_matched=2,
+                turns_appended=0,
+                turns_prepended=0,
+                turns_inserted=0,
+                rows=[user_row, assistant_row],
+            )
+
+        next_key = (
+            existing[user_index + 1].sort_key
+            if user_index + 1 < len(existing)
+            else None
+        )
+        keys = self._allocate_bounded_sort_keys(
+            conversation_id,
+            existing=existing,
+            rows_touched=[],
+            left_key=stored_user.sort_key,
+            right_key=next_key,
+            count=1,
+        )
+        batch_id = generate_canonical_turn_id()
+        now = utcnow_iso()
+        assistant_row.canonical_turn_id = generate_canonical_turn_id()
+        assistant_row.sort_key = keys[0]
+        assistant_row.turn_group_number = stored_user.turn_group_number
+        assistant_row.source_batch_id = batch_id
+        assistant_row.last_seen_at = now
+        self._write_turn(assistant_row, turn_number=-1)
+        # Preserve every existing group ordinal.  This compatibility lane is
+        # only for a user-only row admitted by an older prepare implementation;
+        # adding its assistant sibling must not resequence later derived data.
+        batch = self._save_batch(
+            conversation_id,
+            raw_turn_count=2,
+            merge_mode="source_interleaved_completion",
+            first_turn_hash=user_row.turn_hash,
+            last_turn_hash=assistant_row.turn_hash,
+            turns_matched=1,
+            turns_appended=0 if next_key is not None else 1,
+            turns_prepended=0,
+            turns_inserted=1 if next_key is not None else 0,
+            batch_id=batch_id,
+        )
+        self._refresh_persisted_anchors(conversation_id)
+        return CanonicalIngestResult(
+            merge_mode="source_interleaved_completion",
+            turns_written=1,
+            turns_matched=1,
+            turns_appended=0 if next_key is not None else 1,
+            turns_prepended=0,
+            turns_inserted=1 if next_key is not None else 0,
+            batch=batch,
+            rows=[user_row, assistant_row],
+        )
 
     def ingest_batch(
         self,
@@ -495,6 +1003,30 @@ class IngestReconciler:
             mode="ingest",
             current_user_metadata=current_user_metadata,
         )
+        active_user = next(
+            (message for message in reversed(entries) if message.role == "user"),
+            None,
+        )
+        current_source_claim = get_source_attestation(current_user_metadata)
+        source_attestation_required = requires_current_source_attestation(
+            source_conversation_key
+        )
+        if source_attestation_required and not current_source_claim:
+            logger.error(
+                "SOURCE_ATTESTATION_REQUIRED phase=prepare conv=%s route=%s; "
+                "canonical admission skipped",
+                conversation_id[:64],
+                source_conversation_key[:128],
+            )
+            return CanonicalIngestResult(
+                merge_mode="source_attestation_required_noop",
+                turns_written=0,
+                turns_matched=0,
+                turns_appended=0,
+                turns_prepended=0,
+                turns_inserted=0,
+                rows=[],
+            )
         # The platform segment of an actor id lives only in the RAW caller key.
         # ``conversation_id`` here is already alias-resolved, so after VCATTACH
         # it can be a UUID that names no platform. A caller that supplied a raw
@@ -560,12 +1092,34 @@ class IngestReconciler:
                         if is_user
                         else ""
                     ),
+                    source_claim=(
+                        current_source_claim
+                        if is_user and message is active_user
+                        else None
+                    ),
                     # The reply edge is role-local for the same reason: an
                     # assistant row never receives a human reply edge.
                     **edge,
                 )
             )
-        # Resolution runs after every physical row in this batch is prepared,
+        # For protected multi-speaker Discord routes, only the current native
+        # user message is a write candidate.  The rest of the OpenClaw window
+        # remains available to payload preparation but cannot create or modify
+        # canonical history without its own transport source claim.
+        profile_pairs = list(zip(entries, prepared, strict=True))
+        if source_attestation_required:
+            profile_pairs = [
+                (message, row)
+                for message, row in profile_pairs
+                if message is active_user
+            ]
+            prepared = [row for _message, row in profile_pairs]
+            if len(prepared) != 1 or not prepared[0].source_claim:
+                raise CanonicalSourceConflict(
+                    "protected Discord prepare did not isolate one attested current user"
+                )
+
+        # Resolution runs after every write-eligible physical row in this batch is prepared,
         # so a reply to a message that arrived in the SAME payload can still
         # link by its source id.
         self._resolve_reply_subjects(conversation_id, prepared)
@@ -585,7 +1139,7 @@ class IngestReconciler:
         if callable(upsert_profile):
             from ..types import get_actor_display_name
 
-            for message, row in zip(entries, prepared, strict=False):
+            for message, row in profile_pairs:
                 actor_id = (row.sender_actor_id or "").strip()
                 if message.role != "user" or not actor_id:
                     continue
@@ -804,6 +1358,173 @@ class IngestReconciler:
             )
             return []
 
+    @staticmethod
+    def _validate_attested_source_shape(row: CanonicalTurnRow) -> None:
+        claim = row.source_claim if isinstance(row.source_claim, dict) else {}
+        required = (
+            row.source_message_id,
+            row.audience_conversation_id,
+            row.origin_channel_id,
+            row.sender_actor_id,
+            row.user_content,
+        )
+        if not all((value or "").strip() for value in required):
+            raise CanonicalSourceConflict(
+                "attested current user is missing source, audience, channel, "
+                "actor, or body"
+            )
+        if (row.assistant_content or "").strip():
+            raise CanonicalSourceConflict(
+                "attested current user is not a physical user row"
+            )
+        expected_actor_id = (
+            f"actor:{claim.get('platform', '')}:{claim.get('author_id', '')}"
+        )
+        canonical_body_sha = hashlib.sha256(
+            (row.user_content or "").encode("utf-8")
+        ).hexdigest()
+        expected = (
+            type(claim.get("version")) is int
+            and claim.get("version") == 1
+            and claim.get("message_id") == row.source_message_id
+            and claim.get("channel_id") == row.origin_channel_id
+            and expected_actor_id == row.sender_actor_id
+            and claim.get("canonical_body_sha256") == canonical_body_sha
+            and str(claim.get("reply_target_message_id") or "")
+            == (row.reply_target_message_id or "")
+        )
+        if not expected:
+            raise CanonicalSourceConflict(
+                "trusted source claim disagrees with the canonical projection"
+            )
+
+    def _find_attested_source_membership(
+        self, row: CanonicalTurnRow,
+    ) -> CanonicalTurnRow | None:
+        self._validate_attested_source_shape(row)
+        finder = getattr(
+            self._store, "find_attested_canonical_user_source", None,
+        )
+        if not callable(finder):
+            raise CanonicalSourceConflict(
+                "storage backend has no immutable source-membership lookup"
+            )
+        stored = finder(row)
+        if stored is None:
+            return None
+        if (
+            (stored.user_content or "") != (row.user_content or "")
+            or (stored.turn_hash or "") != (row.turn_hash or "")
+            or (stored.sender_actor_id or "") != (row.sender_actor_id or "")
+            or (stored.source_message_id or "") != (row.source_message_id or "")
+            or (stored.audience_conversation_id or "")
+            != (row.audience_conversation_id or "")
+            or (stored.origin_channel_id or "") != (row.origin_channel_id or "")
+        ):
+            raise CanonicalSourceConflict(
+                "attested source membership disagrees with current body or identity"
+            )
+        return stored
+
+    def _validate_attested_source_alignment(
+        self,
+        existing: list[CanonicalTurnRow],
+        incoming: list[CanonicalTurnRow],
+        alignment: _Alignment | None,
+    ) -> None:
+        """Make source identity outrank content-hash alignment.
+
+        A known source must align to its exact canonical id.  A new source may
+        not be swallowed by a repeated-text overlap.  Both checks run before
+        any provenance CAS or new-row write.
+        """
+        existing_positions = {
+            row.canonical_turn_id: index
+            for index, row in enumerate(existing)
+            if row.canonical_turn_id
+        }
+        overlap_start = alignment.incoming_start if alignment else -1
+        overlap_end = (
+            alignment.incoming_start + alignment.overlap_len
+            if alignment else -1
+        )
+        for incoming_index, row in enumerate(incoming):
+            if not getattr(row, "source_claim", None):
+                continue
+            membership = self._find_attested_source_membership(row)
+            in_overlap = bool(
+                alignment
+                and overlap_start <= incoming_index < overlap_end
+            )
+            if membership is None:
+                if in_overlap:
+                    raise CanonicalSourceConflict(
+                        "new source message was content-matched to an older row"
+                    )
+                continue
+            expected_position = existing_positions.get(
+                membership.canonical_turn_id,
+            )
+            if expected_position is None or not in_overlap:
+                raise CanonicalSourceConflict(
+                    "known source message was not aligned to its canonical row"
+                )
+            mapped_position = (
+                alignment.existing_start
+                + incoming_index
+                - alignment.incoming_start
+            )
+            if mapped_position != expected_position:
+                raise CanonicalSourceConflict(
+                    "content alignment contradicted immutable source membership"
+                )
+
+    def _validate_attested_single_user_locked(
+        self,
+        conversation_id: str,
+        *,
+        row: CanonicalTurnRow,
+        raw_turn_count: int,
+        existing: list[CanonicalTurnRow],
+    ) -> CanonicalIngestResult:
+        """Validate one native current user without admitting an orphan half.
+
+        Prepare intentionally carries only the attested current Discord row,
+        but provider failure or a lost ``agent_end`` means there may never be
+        an assistant. Canonical history therefore remains read-only at prepare;
+        completion atomically admits the exact user+assistant pair. A known
+        source is still checked here so contradictory replays fail before the
+        provider call.
+        """
+        membership = self._find_attested_source_membership(row)
+        if membership is not None:
+            row.canonical_turn_id = membership.canonical_turn_id
+            row.sort_key = membership.sort_key
+            row.turn_group_number = membership.turn_group_number
+            row.source_batch_id = membership.source_batch_id
+            row.first_seen_at = membership.first_seen_at or row.first_seen_at
+            row.last_seen_at = membership.last_seen_at or row.last_seen_at
+            self._preserve_existing_enrichment(row, membership)
+            return CanonicalIngestResult(
+                merge_mode="source_exact_prepare_resend",
+                turns_written=0,
+                turns_matched=1,
+                turns_appended=0,
+                turns_prepended=0,
+                turns_inserted=0,
+                rows=[row],
+            )
+
+        return CanonicalIngestResult(
+            merge_mode="source_exact_prepare_read_only",
+            turns_written=0,
+            turns_matched=0,
+            turns_appended=0,
+            turns_prepended=0,
+            turns_inserted=0,
+            rows=[row],
+        )
+
     def ingest_prepared_turns(
         self,
         conversation_id: str,
@@ -897,12 +1618,28 @@ class IngestReconciler:
             )
             return CanonicalIngestResult("empty_payload", 0, 0, 0, 0, 0, batch=batch, rows=[])
 
+        if (
+            len(prepared_turns) == 1
+            and getattr(prepared_turns[0], "source_claim", None)
+            and self._row_has_user_content(prepared_turns[0])
+            and not self._row_has_assistant_content(prepared_turns[0])
+        ):
+            return self._validate_attested_single_user_locked(
+                conversation_id,
+                row=prepared_turns[0],
+                raw_turn_count=raw_turn_count,
+                existing=existing,
+            )
+
         _t_align = time.perf_counter()
         alignment = self._find_alignment(
             conversation_id,
             existing,
             prepared_turns,
             allow_short_overlap=allow_short_overlap,
+        )
+        self._validate_attested_source_alignment(
+            existing, prepared_turns, alignment,
         )
         if phase_timings is not None:
             phase_timings["align_ms"] = (time.perf_counter() - _t_align) * 1000.0
@@ -1507,6 +2244,7 @@ class IngestReconciler:
         fact_signals: list[FactSignal] | None = None,
         code_refs: list[dict] | None = None,
         entry: TurnTagEntry | None = None,
+        source_claim: dict | None = None,
     ) -> CanonicalTurnRow:
         if role == "assistant":
             user_content = ""
@@ -1577,6 +2315,7 @@ class IngestReconciler:
             last_seen_at=now,
             created_at=now,
             updated_at=now,
+            source_claim=source_claim,
         )
 
     def _find_alignment(
@@ -1723,6 +2462,7 @@ class IngestReconciler:
             origin_channel_id=row.origin_channel_id,
             origin_channel_label=row.origin_channel_label,
             sender_actor_id=row.sender_actor_id,
+            source_claim=getattr(row, "source_claim", None),
             **_row_reply_edge(row),
         )
         resolved_turn_number = turn_number
@@ -1750,10 +2490,18 @@ class IngestReconciler:
                     exc_info=True,
                 )
 
-    def _conversation_merge_lock(self, conversation_id: str):
+    def _conversation_merge_lock(
+        self,
+        conversation_id: str,
+        *,
+        expected_conversation_generation: int | None = None,
+    ):
         locker = getattr(self._store, "conversation_reconcile", None)
         if callable(locker):
-            return locker(conversation_id)
+            return locker(
+                conversation_id,
+                expected_generation=expected_conversation_generation,
+            )
         return nullcontext()
 
     def _save_batch(
@@ -2036,6 +2784,13 @@ class IngestReconciler:
         if flag is not None:
             return bool(flag)
         return bool((getattr(row, "user_content", "") or "").strip())
+
+    @staticmethod
+    def _row_has_assistant_content(row) -> bool:
+        flag = getattr(row, "has_assistant_content", None)
+        if flag is not None:
+            return bool(flag)
+        return bool((getattr(row, "assistant_content", "") or "").strip())
 
     def _ordinal_for_row(self, rows: list, canonical_turn_id: str) -> int:
         for idx, row in enumerate(rows):

@@ -352,6 +352,11 @@ SOURCE_CONVERSATION_KEY = "_vc_source_conversation_key"
 REPLY_SUBJECT_KEY = "_vc_reply_subject"
 CURRENT_CONVERSATION_KEY = "_vc_current_conversation"
 SOURCE_CANONICAL_TURN_IDS_KEY = "_vc_source_canonical_turn_ids"
+# A transport claim built only by a trusted adapter hook.  Unlike the
+# user-visible ``Conversation info`` envelope, this key is never parsed from
+# conversational text.  Storage still verifies every field against the
+# canonical projection before it mints an immutable source membership.
+SOURCE_ATTESTATION_KEY = "_vc_source_attestation"
 # Private identity carried only between canonical reconstruction/resume and
 # the tagger.  It is never derived from message text and must never be trusted
 # as permission to rewrite canonical content; the storage CAS independently
@@ -533,6 +538,7 @@ def build_user_turn_metadata(
     origin_channel_label: str = "",
     reply_target_message_id: str = "",
     source_conversation_key: str = "",
+    source_attestation: dict | None = None,
 ) -> dict:
     """Build normalized ``Message.metadata`` from adapter-supplied fields.
 
@@ -604,7 +610,78 @@ def build_user_turn_metadata(
         }
     if source_conversation_key:
         metadata[SOURCE_CONVERSATION_KEY] = source_conversation_key
+    normalized_attestation = normalize_source_attestation(source_attestation)
+    if normalized_attestation:
+        metadata[SOURCE_ATTESTATION_KEY] = normalized_attestation
     return metadata
+
+
+_SOURCE_ATTESTATION_FIELDS = (
+    "agent_scope_id",
+    "platform",
+    "account_id",
+    "message_id",
+    "channel_id",
+    "guild_id",
+    "author_id",
+    "transport_body_sha256",
+    "canonical_body_sha256",
+    "projection_version",
+    "reply_target_message_id",
+)
+
+
+def normalize_source_attestation(value: object) -> dict[str, object]:
+    """Normalize a trusted-adapter source claim, or return ``{}``.
+
+    Version 1 is intentionally Discord-only while this incident is repaired.
+    A partial claim is worse than no claim: the caller then follows the legacy
+    reconciliation path without minting immutable source identity.
+    """
+    if (
+        not isinstance(value, dict)
+        or type(value.get("version")) is not int
+        or value.get("version") != 1
+    ):
+        return {}
+    cleaned = {
+        field_name: _actor_clean_str(value.get(field_name))
+        for field_name in _SOURCE_ATTESTATION_FIELDS
+    }
+    required = (
+        "agent_scope_id",
+        "platform",
+        "account_id",
+        "message_id",
+        "channel_id",
+        "guild_id",
+        "author_id",
+        "transport_body_sha256",
+        "canonical_body_sha256",
+        "projection_version",
+    )
+    if not all(cleaned[name] for name in required):
+        return {}
+    if cleaned["platform"].lower() != "discord":
+        return {}
+    cleaned["platform"] = "discord"
+    digest_names = ("transport_body_sha256", "canonical_body_sha256")
+    if any(
+        len(cleaned[name]) != 64
+        or any(char not in "0123456789abcdef" for char in cleaned[name].lower())
+        for name in digest_names
+    ):
+        return {}
+    for name in digest_names:
+        cleaned[name] = cleaned[name].lower()
+    return {"version": 1, **cleaned}
+
+
+def get_source_attestation(metadata: dict | None) -> dict[str, object]:
+    """Return the normalized trusted-adapter claim carried beside one turn."""
+    if not isinstance(metadata, dict):
+        return {}
+    return normalize_source_attestation(metadata.get(SOURCE_ATTESTATION_KEY))
 
 
 def get_actor_display_name(metadata: dict | None) -> str:
@@ -1804,6 +1881,10 @@ class CanonicalTurnRow:
     # column; ``save_canonical_turn`` never writes it, so a default-empty
     # full-row rewrite cannot erase it.
     origin_conversation_id: str = ""
+    # Request-local trusted-adapter claim for the currently invoked physical
+    # user message. It is deliberately NOT persisted on ``canonical_turns``;
+    # the normalized claim is consumed atomically into the source ledger.
+    source_claim: dict[str, str] | None = None
 
 
 @dataclass

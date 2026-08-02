@@ -192,3 +192,36 @@ def test_empty_id_list_is_noop(tmp_path: Path):
     store.upsert_conversation(tenant_id="t", conversation_id=conv)
     marked = store.mark_canonical_turns_compacted(conv, [])
     assert marked == 0
+
+
+def test_terminal_singleton_is_not_compactable_or_a_two_message_watermark(
+    tmp_path: Path,
+) -> None:
+    from virtual_context.engine import VirtualContextEngine
+
+    store = SQLiteStore(tmp_path / "singleton.db")
+    conv = "conv-singleton"
+    store.upsert_conversation(tenant_id="t", conversation_id=conv)
+    now = utcnow_iso()
+    store.save_canonical_turn(
+        conv,
+        -1,
+        "abandoned invoked user message",
+        "",
+        turn_group_number=0,
+        canonical_turn_id="ct-orphan-user",
+        sort_key=1000.0,
+        turn_hash="h-orphan",
+        tagged_at=now,
+        created_at=now,
+        updated_at=now,
+        first_seen_at=now,
+        last_seen_at=now,
+    )
+
+    assert store.get_uncompacted_canonical_turns(conv) == []
+    assert store.mark_canonical_turns_compacted(conv, ["ct-orphan-user"]) == 1
+    rows = store.get_all_canonical_turns(conv)
+    assert VirtualContextEngine._canonical_prefix_watermark(
+        [(0, rows)]
+    ) == (0, -1)

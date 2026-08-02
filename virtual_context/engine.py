@@ -14,7 +14,10 @@ from pathlib import Path
 from .config import load_config
 from .core.assembler import ContextAssembler
 from .core.compactor import DomainCompactor
-from .core.ingest_reconciler import IngestReconciler
+from .core.ingest_reconciler import (
+    IngestReconciler,
+    requires_current_source_attestation,
+)
 from .core.model_catalog import ModelCatalog
 from .core.telemetry import TelemetryLedger
 from .core.monitor import ContextMonitor
@@ -98,6 +101,7 @@ def _restored_flushed_prefix_messages(
 
 from .core.compaction_pipeline import CompactionPipeline
 from .core.conversation_store import ConversationStoreView, StaleConversationWriteError
+from .core.exceptions import CanonicalSourceConflict
 from .core.event_bus import ProgressEventBus
 from .core.lifecycle_epoch import LifecycleEpochMismatch
 from .core.paging_manager import PagingManager
@@ -140,6 +144,12 @@ class VirtualContextEngine:
           (e.g. paging tool callbacks). It is not invoked on the assembly
           path; assembly relies on the benign-contention property above.
     """
+
+    # Cloud/plugin rolling-deploy handshake.  Presence means prepare is
+    # read-only for attested Discord routes and completion accepts an explicit
+    # user/assistant pair, returns a structured admission outcome, and commits
+    # through the immutable source ledger atomically.
+    exact_source_admission_version = 2
 
     def __init__(
         self,
@@ -188,8 +198,41 @@ class VirtualContextEngine:
         self._validate_actor_card_store(_raw_store)
         _raw_conv_id = self.config.conversation_id
         if _raw_conv_id:
+            # Alias resolution and ownership claim are one storage decision.
+            # Claiming first corrupts a legitimate rowless alias by attaching
+            # its source id to the current tenant before the target is known.
+            resolve_or_claim = getattr(
+                _raw_store, "resolve_or_claim_conversation_for_tenant", None,
+            )
             try:
-                _resolved = walk_conversation_alias_chain(_raw_store, _raw_conv_id)
+                _atomic_resolution = False
+                if callable(resolve_or_claim):
+                    try:
+                        _resolved = resolve_or_claim(
+                            tenant_id=self.config.tenant_id or "",
+                            conversation_id=_raw_conv_id,
+                        )
+                        _atomic_resolution = True
+                    except NotImplementedError:
+                        _resolved = walk_conversation_alias_chain(
+                            _raw_store, _raw_conv_id,
+                        )
+                else:
+                    _resolved = walk_conversation_alias_chain(
+                        _raw_store, _raw_conv_id,
+                    )
+                # Backwards-compatible stores cannot make the absent-alias
+                # decision atomic.  They still resolve first, and only claim
+                # when the resolver proved this is not an alias at all.
+                if not _atomic_resolution and _resolved == _raw_conv_id:
+                    claim_owner = getattr(
+                        _raw_store, "claim_or_verify_conversation", None,
+                    )
+                    if callable(claim_owner):
+                        claim_owner(
+                            tenant_id=self.config.tenant_id or "",
+                            conversation_id=_raw_conv_id,
+                        )
             except AliasResolutionError as exc:
                 raise EngineConstructionError(
                     reason=exc.reason,
@@ -1258,15 +1301,29 @@ class VirtualContextEngine:
 
     @staticmethod
     def _canonical_prefix_watermark(paired_rows: list[tuple[int, list[object]]]) -> tuple[int, int]:
+        compacted_messages = 0
         last_prefix_turn = -1
         for turn_number, rows in paired_rows:
-            if rows and all(getattr(row, "compacted_at", None) for row in rows):
+            user_halves = sum(
+                1 for row in rows
+                if str(getattr(row, "user_content", "") or "").strip()
+            )
+            assistant_halves = sum(
+                1 for row in rows
+                if str(getattr(row, "assistant_content", "") or "").strip()
+            )
+            exact_pair = user_halves == 1 and assistant_halves == 1
+            if (
+                exact_pair
+                and all(getattr(row, "compacted_at", None) for row in rows)
+            ):
+                compacted_messages += 2
                 last_prefix_turn = turn_number
                 continue
             break
         if last_prefix_turn < 0:
             return 0, -1
-        return ((last_prefix_turn + 1) * 2), last_prefix_turn
+        return compacted_messages, last_prefix_turn
 
     def _derive_compacted_prefix_messages_from_rows(
         self, conversation_id: str,
@@ -2130,7 +2187,11 @@ class VirtualContextEngine:
         user_turn_metadata: dict | None = None,
         completed_user_message: Message | None = None,
         completed_assistant_message: Message | None = None,
-    ) -> str:
+        expected_owner_conversation_id: str | None = None,
+        expected_conversation_generation: int | None = None,
+        expected_lifecycle_epoch: int | None = None,
+        return_outcome: bool = False,
+    ) -> str | dict[str, object]:
         """Durably record the latest completed user/assistant pair before indexing catches up.
 
         ``source_audience_conversation_id`` is the request's PROVED audience —
@@ -2154,14 +2215,28 @@ class VirtualContextEngine:
         post-persist side effect; canonical writes only dirty the cache, and a
         later successful compaction consolidates affected actors.
         """
-        grouped = pair_messages_into_turns(list(conversation_history))
-        if not grouped:
-            return ""
-        latest_turn = grouped[-1]
         explicit_pair = (
             completed_user_message is not None
             or completed_assistant_message is not None
         )
+        source_message_id = ""
+
+        def _completion_outcome(
+            actor_id: str = "",
+            *,
+            status: str,
+            reason: str = "",
+            retryable: bool = False,
+        ) -> str | dict[str, object]:
+            if not (return_outcome and explicit_pair):
+                return actor_id
+            return {
+                "status": status,
+                "reason": reason,
+                "retryable": bool(retryable),
+                "actor_id": actor_id,
+                "source_message_id": source_message_id,
+            }
         if explicit_pair:
             if (
                 completed_user_message is None
@@ -2174,16 +2249,29 @@ class VirtualContextEngine:
                 )
             user_messages = [completed_user_message]
             assistant_messages = [completed_assistant_message]
+            # Exact source admission must not depend on the mutable shared
+            # REST history. Guild requests can prepare and complete in a
+            # different order, so that list is neither a pair boundary nor a
+            # logical-turn counter. The reconciler/source ledger assigns the
+            # durable group below.
+            turn_number = max(
+                int(self._engine_state.last_completed_turn) + 1,
+                0,
+            )
         else:
+            grouped = pair_messages_into_turns(list(conversation_history))
+            if not grouped:
+                return ""
+            latest_turn = grouped[-1]
             user_messages = [
                 msg for msg in latest_turn.messages if msg.role == "user"
             ]
             assistant_messages = [
                 msg for msg in latest_turn.messages if msg.role == "assistant"
             ]
+            turn_number = len(grouped) - 1
         if not assistant_messages:
             return ""
-        turn_number = len(grouped) - 1
         user_msg = Message(
             role="user",
             content="\n".join(msg.content for msg in user_messages),
@@ -2203,6 +2291,12 @@ class VirtualContextEngine:
             raw_content=assistant_messages[-1].raw_content if assistant_messages else None,
         )
         entry = self._turn_tag_index.get_tags_for_logical_turn(turn_number)
+        if explicit_pair:
+            # A shared server-scoped history may have another invocation at
+            # this positional tail.  Exact source admission determines the
+            # durable group below; a positional TurnTagEntry is not evidence
+            # for this completion and must not donate tags or a canonical id.
+            entry = None
         # ``TurnTagEntry`` declares its list fields with ``default_factory=list``
         # so the canonical contract is that ``tags``, ``fact_signals`` and
         # ``code_refs`` are always lists. Defense in depth: older persisted
@@ -2240,6 +2334,7 @@ class VirtualContextEngine:
         # human actor, even though it may legitimately own a channel.
         user_actor_id = get_actor_id(user_msg.metadata, _actor_key)
         accepted_actor_id = ""
+        completed_group_number = turn_number
         # The user half's durable reply edge, derived exactly as the payload
         # reconcile derives it. The audience inside it is the caller's proved
         # value; an empty one versions to 0 so an unproved route stays
@@ -2247,6 +2342,59 @@ class VirtualContextEngine:
         user_reply_edge = IngestReconciler._derive_reply_edge(
             user_msg, _actor_key, source_audience_conversation_id,
         )
+        from .types import get_source_attestation
+        _source_claim = get_source_attestation(
+            user_turn_metadata if isinstance(user_turn_metadata, dict) else None
+        )
+        if requires_current_source_attestation(_actor_key) and not _source_claim:
+            logger.error(
+                "SOURCE_ATTESTATION_REQUIRED phase=completion conv=%s route=%s; "
+                "canonical admission skipped",
+                self.config.conversation_id[:64],
+                _actor_key[:128],
+            )
+            return _completion_outcome(
+                status="permanent_conflict",
+                reason="source_attestation_required",
+            )
+        if _source_claim:
+            source_message_id = str(_source_claim.get("message_id") or "")
+            # Exact completion is a continuation of one prepare generation,
+            # not permission to write into whichever owner happens to exist
+            # when a delayed provider response arrives.  Cloud v2 carries the
+            # immutable owner + lifecycle epoch returned by prepare.  Require
+            # both here as part of the engine capability contract; the store
+            # compares the epoch again under the same reconcile/write fence as
+            # the canonical pair and immutable source membership.
+            if (
+                not isinstance(expected_owner_conversation_id, str)
+                or not expected_owner_conversation_id
+                or expected_owner_conversation_id
+                != self.config.conversation_id
+            ):
+                return _completion_outcome(
+                    status="permanent_conflict",
+                    reason="exact_source_owner_mismatch",
+                )
+            if (
+                type(expected_conversation_generation) is not int
+                or expected_conversation_generation < 0
+            ):
+                return _completion_outcome(
+                    status="permanent_conflict",
+                    reason="exact_source_generation_invalid",
+                )
+            if (
+                type(expected_lifecycle_epoch) is not int
+                or expected_lifecycle_epoch < 1
+            ):
+                return _completion_outcome(
+                    status="permanent_conflict",
+                    reason="exact_source_lifecycle_epoch_invalid",
+                )
+            completion_lifecycle_epoch = expected_lifecycle_epoch
+        else:
+            completion_lifecycle_epoch = self._engine_state.lifecycle_epoch
         try:
             result = IngestReconciler(
                 self._store,
@@ -2268,9 +2416,14 @@ class VirtualContextEngine:
                 assistant_origin_channel_label=asst_channel_label,
                 user_sender_actor_id=user_actor_id,
                 user_reply_edge=user_reply_edge,
+                user_source_claim=_source_claim or None,
                 fact_signals=list(entry.fact_signals or []) if entry else [],
                 code_refs=list(entry.code_refs or []) if entry else [],
-                expected_lifecycle_epoch=self._engine_state.lifecycle_epoch,
+                expected_conversation_generation=(
+                    expected_conversation_generation
+                    if _source_claim else None
+                ),
+                expected_lifecycle_epoch=completion_lifecycle_epoch,
             )
             if user_actor_id and any(
                 (row.sender_actor_id or "").strip() == user_actor_id
@@ -2278,15 +2431,37 @@ class VirtualContextEngine:
                 for row in result.rows
             ):
                 accepted_actor_id = user_actor_id
-            if entry is not None and result.rows:
-                entry.canonical_turn_id = result.rows[0].canonical_turn_id or entry.canonical_turn_id
+            result_groups = [
+                int(row.turn_group_number)
+                for row in result.rows
+                if getattr(row, "turn_group_number", None) is not None
+                and int(row.turn_group_number) >= 0
+            ]
+            if result_groups:
+                completed_group_number = max(result_groups)
+            if (
+                entry is not None
+                and result.rows
+                and (
+                    not explicit_pair
+                    or entry.turn_number == completed_group_number
+                )
+            ):
+                entry.canonical_turn_id = (
+                    result.rows[0].canonical_turn_id
+                    or entry.canonical_turn_id
+                )
         except StaleConversationWriteError as exc:
             logger.info(
                 "Suppressed stale completed-turn persist for conversation %s: %s",
                 self.config.conversation_id[:12],
                 exc,
             )
-            return ""
+            return _completion_outcome(
+                status="stale_epoch",
+                reason="stale_conversation_write",
+                retryable=True,
+            )
         except LifecycleEpochMismatch as exc:
             # Lifecycle drift — the conversation was deleted/resurrected while
             # we were preparing the write. Log and return; the caller will
@@ -2297,7 +2472,38 @@ class VirtualContextEngine:
                 self.config.conversation_id[:12],
                 exc,
             )
-            return ""
+            if _source_claim:
+                # Lifecycle epochs are monotonic.  Retrying an outbox record
+                # from an older prepare can never make its generation current
+                # again and would eventually contaminate a recreated owner if
+                # a caller substituted the new epoch.  Permanently reject the
+                # original completion so the plugin dead-letters it intact.
+                return _completion_outcome(
+                    status="permanent_conflict",
+                    reason="exact_source_lifecycle_epoch_mismatch",
+                )
+            return _completion_outcome(
+                status="stale_epoch",
+                reason="lifecycle_epoch_mismatch",
+                retryable=True,
+            )
+        except CanonicalSourceConflict as exc:
+            # Keep the response path alive but quarantine the contradictory
+            # turn.  Never fall back to body-only reconciliation after a
+            # trusted source claim has failed its identity/body fence.
+            logger.error(
+                "SOURCE_ATTESTATION_CONFLICT phase=completion conv=%s "
+                "message_id=%s actor_id=%s error=%s",
+                self.config.conversation_id[:64],
+                _source_claim.get("message_id", "") if _source_claim else "",
+                user_actor_id,
+                exc,
+                exc_info=True,
+            )
+            return _completion_outcome(
+                status="permanent_conflict",
+                reason="canonical_source_conflict",
+            )
         except (ValueError, TypeError, json.JSONDecodeError, AttributeError) as exc:
             # Structural failures (malformed entry, encoding errors) that are
             # genuinely per-turn and should not crash subsequent turns, but
@@ -2310,12 +2516,40 @@ class VirtualContextEngine:
                 exc,
                 exc_info=True,
             )
-            return ""
+            return _completion_outcome(
+                status="permanent_conflict",
+                reason="structural_completion_error",
+            )
+        state_history = conversation_history
+        if explicit_pair:
+            # Persist a cache/checkpoint reconstructed from canonical storage,
+            # never the request/completion-order REST tail that this exact
+            # lane exists to avoid. A reconstruction failure leaves history
+            # empty rather than reintroducing misordered speakers; canonical
+            # rows remain the source of truth and will hydrate on restart.
+            try:
+                state_history = self._store.reconstruct_history_for_conv(
+                    self.config.conversation_id,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed canonical history reconstruction after exact "
+                    "completion for conversation %s",
+                    self.config.conversation_id[:12],
+                )
+                state_history = []
         self._save_state(
-            conversation_history,
-            last_completed_turn=turn_number,
+            state_history,
+            last_completed_turn=completed_group_number,
         )
-        return accepted_actor_id
+        return _completion_outcome(
+            accepted_actor_id,
+            status=(
+                "idempotent"
+                if explicit_pair and result.merge_mode == "source_exact_resend"
+                else "accepted"
+            ),
+        )
 
     def _reset_restored_state(self) -> None:
         self._turn_tag_index = TurnTagIndex()
@@ -2660,6 +2894,7 @@ class VirtualContextEngine:
         until: str | None = None,
         only_general: bool = True,
         dry_run: bool = False,
+        canonical_turn_ids: set[str] | None = None,
     ) -> dict:
         """Re-tag canonical rows carrying degraded fallback tags.
 
@@ -2675,6 +2910,7 @@ class VirtualContextEngine:
             until=until,
             only_general=only_general,
             dry_run=dry_run,
+            canonical_turn_ids=canonical_turn_ids,
         )
 
     def backfill_tag_summaries(self, *, force_rebuild: bool = False) -> int:

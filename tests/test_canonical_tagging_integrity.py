@@ -155,13 +155,8 @@ def test_tag_only_cas_rejects_stale_hash_and_epoch(tmp_path):
     assert row.tagged_at is None
 
 
-def test_non_strict_pair_cas_race_never_reconciles_stale_snapshot(
-    tmp_path,
-    monkeypatch,
-):
-    """One successful half-CAS plus one stale half must not append a pair."""
-    from virtual_context.core.ingest_reconciler import IngestReconciler
-
+def test_group_tagging_cas_rejects_stale_half_without_partial_update(tmp_path):
+    """A changed half rejects the whole group's enrichment atomically."""
     store = SQLiteStore(tmp_path / "pair-cas-race.db")
     conversation_id = "pair-cas-race"
     store.activate_conversation(conversation_id)
@@ -211,63 +206,37 @@ def test_non_strict_pair_cas_race_never_reconciles_stale_snapshot(
         audience_attribution_version=1,
     )
 
-    pipeline = TaggingPipeline.__new__(TaggingPipeline)
-    pipeline._store = store
-    pipeline._semantic = None
-    pipeline.config = SimpleNamespace(conversation_id=conversation_id)
-    pipeline._engine_state = SimpleNamespace(lifecycle_epoch=1)
-
-    original_cas = store.update_canonical_row_tagging_if_unchanged
-    calls = {"count": 0}
     new_assistant_hash, _, new_assistant_norm = compute_turn_hash_from_raw(
         "", "assistant-new", version=1,
     )
-
-    def racing_cas(**kwargs):
-        calls["count"] += 1
-        if calls["count"] == 2:
-            conn = store._get_conn()
-            conn.execute(
-                "UPDATE canonical_turns SET assistant_content = ?, "
-                "normalized_assistant_text = ?, turn_hash = ? "
-                "WHERE canonical_turn_id = ?",
-                (
-                    "assistant-new",
-                    new_assistant_norm,
-                    new_assistant_hash,
-                    assistant_id,
-                ),
-            )
-            conn.commit()
-        return original_cas(**kwargs)
-
-    store.update_canonical_row_tagging_if_unchanged = racing_cas
-
-    def stale_reconciliation_is_forbidden(*args, **kwargs):
-        raise AssertionError("stale pair reached reconciliation")
-
-    monkeypatch.setattr(
-        IngestReconciler,
-        "ingest_single",
-        stale_reconciliation_is_forbidden,
-    )
-    user_message = Message(role="user", content="user-old")
-    assistant_message = Message(role="assistant", content="assistant-old")
-    consumed = pipeline._persist_canonical_turn(
-        TurnTagEntry(
-            turn_number=0,
-            message_hash="entry",
-            tags=["chat"],
-            primary_tag="chat",
+    conn = store._get_conn()
+    conn.execute(
+        "UPDATE canonical_turns SET assistant_content = ?, "
+        "normalized_assistant_text = ?, turn_hash = ? "
+        "WHERE canonical_turn_id = ?",
+        (
+            "assistant-new",
+            new_assistant_norm,
+            new_assistant_hash,
+            assistant_id,
         ),
-        user_message,
-        assistant_message,
-        pair_messages=[user_message, assistant_message],
-        append_missing=True,
+    )
+    conn.commit()
+
+    updated = store.update_canonical_group_tagging_if_unchanged(
+        conversation_id=conversation_id,
+        turn_group_number=0,
+        canonical_turn_ids=[user_id, assistant_id],
+        expected_turn_hashes=[user_hash, assistant_hash],
         expected_lifecycle_epoch=1,
+        primary_tag="chat",
+        tags=["chat"],
+        session_date="",
+        fact_signals=[],
+        code_refs=[],
     )
 
-    assert consumed == 0
+    assert updated is False
     rows = store.get_all_canonical_turns(conversation_id)
     assert len(rows) == 2
     assert [(row.user_content, row.assistant_content) for row in rows] == [
@@ -278,6 +247,8 @@ def test_non_strict_pair_cas_race_never_reconciles_stale_snapshot(
     assert rows[0].sender_actor_id == "actor:discord:cashew"
     assert rows[1].source_message_id == "discord-assistant-old"
     assert rows[1].reply_target_message_id == "discord-user-old"
+    assert all(row.tagged_at is None for row in rows)
+    assert all(row.primary_tag == "_general" for row in rows)
 
 
 def test_canonical_resume_history_carries_each_physical_row_identity(tmp_path):
@@ -613,10 +584,10 @@ def test_durable_resume_tags_exact_physical_rows_without_tail_graft(tmp_path):
         state.shutdown(wait=True)
 
 
-def test_row_sweep_repairs_hashless_legacy_row_without_provenance_change(
+def test_hashless_incomplete_half_waits_then_group_repairs_atomically(
     tmp_path,
 ):
-    """A hashless legacy row must self-heal instead of blocking the queue."""
+    """An orphan waits; once complete, both hashes and tags self-heal."""
     from tests.test_handle_prepare_payload import _inner_store
     from virtual_context.engine import VirtualContextEngine
     from virtual_context.proxy.state import ProxyState
@@ -671,26 +642,44 @@ def test_row_sweep_repairs_hashless_legacy_row_without_provenance_change(
         conn.commit()
         before = store.get_all_canonical_turns(conversation_id)[0]
 
-        store.upsert_ingestion_episode(
+        assert store.claim_ingestion_for_complete_group(
             conversation_id=conversation_id,
             lifecycle_epoch=1,
             worker_id=state._worker_id,
             raw_payload_entries=1,
+            lease_ttl_s=30.0,
+        ) == "no-work"
+        assert state._tagger_run() is False
+        incomplete = store.get_all_canonical_turns(conversation_id)[0]
+        assert incomplete.turn_hash == ""
+        assert incomplete.tagged_at is None
+
+        assistant_id = "88888888-8888-4888-8888-888888888889"
+        store.save_canonical_turn(
+            conversation_id,
+            1,
+            "",
+            "Motion filed",
+            canonical_turn_id=assistant_id,
+            turn_group_number=0,
+            source_message_id="discord-hashless-assistant",
+            origin_channel_id="discord-channel",
+            origin_channel_label="vasttest",
+            audience_conversation_id=conversation_id,
+            audience_attribution_version=1,
         )
-        assert store.claim_ingestion_lease(
+        claim = store.claim_ingestion_for_complete_group(
             conversation_id=conversation_id,
             lifecycle_epoch=1,
             worker_id=state._worker_id,
+            raw_payload_entries=2,
             lease_ttl_s=30.0,
-        ) is True
-        assert store.set_phase(
-            conversation_id=conversation_id,
-            lifecycle_epoch=1,
-            phase="ingesting",
-        ) is True
+        )
+        assert claim.startswith("claimed")
 
         assert state._tagger_run() is True
-        after = store.get_all_canonical_turns(conversation_id)[0]
+        rows = store.get_all_canonical_turns(conversation_id)
+        after = rows[0]
         repaired_hash, normalized_user, normalized_assistant = (
             compute_turn_hash_from_raw(
                 before.user_content,
@@ -704,6 +693,12 @@ def test_row_sweep_repairs_hashless_legacy_row_without_provenance_change(
         assert after.normalized_assistant_text == normalized_assistant
         assert after.primary_tag == "legal"
         assert after.tagged_at is not None
+        assert len(rows) == 2
+        assert rows[1].turn_hash
+        assert rows[1].hash_version == 1
+        assert rows[1].primary_tag == "legal"
+        assert rows[1].tags == after.tags
+        assert rows[1].tagged_at == after.tagged_at
 
         derived = _TAG_FIELDS | {
             "turn_hash",
@@ -718,6 +713,90 @@ def test_row_sweep_repairs_hashless_legacy_row_without_provenance_change(
             key: value for key, value in asdict(before).items()
             if key not in derived
         }
+    finally:
+        state.shutdown(wait=True)
+
+
+def test_earlier_one_sided_group_is_tagged_without_starving_later_pair(
+    tmp_path,
+):
+    """A later row closes an unmatched group even without a counterpart.
+
+    Discord can produce two invoked user messages before the first completion
+    reaches the ledger. Grouping attaches the completion to the newest user;
+    the earlier user cannot ever gain an assistant half and must be tagged as
+    its own exact row. The newest user/assistant pair remains atomic.
+    """
+    from virtual_context.engine import VirtualContextEngine
+    from virtual_context.proxy.state import ProxyState
+    from virtual_context.types import (
+        KeywordTagConfig,
+        StorageConfig,
+        TagGeneratorConfig,
+        VirtualContextConfig,
+    )
+
+    conversation_id = "terminal-one-sided-group"
+    state = ProxyState(VirtualContextEngine(config=VirtualContextConfig(
+        conversation_id=conversation_id,
+        storage=StorageConfig(
+            backend="sqlite",
+            sqlite_path=str(tmp_path / "terminal-one-sided.db"),
+        ),
+        tag_generator=TagGeneratorConfig(
+            type="keyword",
+            keyword_fallback=KeywordTagConfig(
+                tag_keywords={
+                    "preference": ["concise", "preference"],
+                    "travel": ["lisbon", "trip"],
+                },
+            ),
+        ),
+    )))
+    store = state.engine._store
+    try:
+        store.save_canonical_turn(
+            conversation_id, 0,
+            "Keep my replies concise", "",
+            canonical_turn_id="99999999-9999-4999-8999-999999999990",
+            sort_key=1000.0,
+            turn_group_number=0,
+        )
+        store.save_canonical_turn(
+            conversation_id, 1,
+            "Help plan my Lisbon trip", "",
+            canonical_turn_id="99999999-9999-4999-8999-999999999991",
+            sort_key=2000.0,
+            turn_group_number=1,
+        )
+        store.save_canonical_turn(
+            conversation_id, 2,
+            "", "Start with Alfama",
+            canonical_turn_id="99999999-9999-4999-8999-999999999992",
+            sort_key=3000.0,
+            turn_group_number=1,
+        )
+        claim = store.claim_ingestion_for_complete_group(
+            conversation_id=conversation_id,
+            lifecycle_epoch=1,
+            worker_id=state._worker_id,
+            raw_payload_entries=3,
+            lease_ttl_s=30.0,
+        )
+        assert claim.startswith("claimed")
+        assert state._tagger_run() is True
+
+        rows = store.get_all_canonical_turns(conversation_id)
+        assert len(rows) == 3
+        by_group = {}
+        for row in rows:
+            by_group.setdefault(row.turn_group_number, []).append(row)
+        assert [len(by_group[n]) for n in sorted(by_group)] == [1, 2]
+        assert by_group[0][0].primary_tag == "preference"
+        assert by_group[0][0].tagged_at is not None
+        assert {row.primary_tag for row in by_group[1]} == {"travel"}
+        assert len({row.tagged_at for row in by_group[1]}) == 1
+        assert store.read_progress_snapshot(conversation_id).active_episode is None
     finally:
         state.shutdown(wait=True)
 

@@ -68,6 +68,7 @@ def test_compact_after_ingestion_wires_db_backed_lifecycle(
         snapshot_during["active_compaction"] = (
             inner.read_progress_snapshot(conv_id).active_compaction
         )
+        snapshot_during["history"] = list(history)
         if progress_callback is not None:
             # Pipeline-style callback: ``phase`` + ``phase_name`` kwargs
             # matching the planned phase list so ``advance_compaction_phase``
@@ -100,16 +101,37 @@ def test_compact_after_ingestion_wires_db_backed_lifecycle(
 
     monkeypatch.setattr(state.engine, "compact_if_needed", _fake_compact_if_needed)
 
-    # Seed enough proxy-side history so ``_compact_after_ingestion``'s
-    # ``compactable > 0`` guard passes: history must exceed the
-    # ``protected_recent_turns * 2`` floor (default 12 messages).
+    # Seed canonical history, the authority used by post-ingestion
+    # compaction. The mutable proxy tail is deliberately different so the
+    # test would catch a regression to request/completion-order history.
+    canonical_ids = []
+    for turn in range(10):
+        turn_id = f"canonical-{turn}"
+        canonical_ids.append(turn_id)
+        inner.save_canonical_turn(
+            conv_id,
+            turn,
+            f"canonical user {turn}",
+            f"canonical assistant {turn}",
+            canonical_turn_id=turn_id,
+            turn_group_number=turn,
+            sort_key=float((turn + 1) * 1000),
+        )
+    inner.mark_canonical_turns_tagged(conv_id, canonical_ids)
     state.conversation_history = [
-        Message(role="user" if i % 2 == 0 else "assistant", content=f"m{i}")
+        Message(role="user" if i % 2 == 0 else "assistant", content=f"mutable-{i}")
         for i in range(20)
     ]
+    # Simulate a stale worker cache. The call must re-derive zero from the
+    # canonical rows before applying the protected-window threshold.
+    state.engine._engine_state.compacted_prefix_messages = 200
 
     # Kick off the full post-ingestion compaction path.
     state._compact_after_ingestion(state.conversation_history)
+
+    assert len(snapshot_during["history"]) == 20
+    assert snapshot_during["history"][0].content == "canonical user 0"
+    assert state.engine._engine_state.compacted_prefix_messages == 0
 
     # --- Assertions on progress_snapshot (DB-backed state) ---
     # While the fake compactor ran, the snapshot saw the new row +

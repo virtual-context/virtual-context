@@ -438,10 +438,20 @@ class TaggingPipeline:
         if matched_pair is not None:
             user_row, assistant_row = matched_pair
             tagged_at = utcnow_iso()
-            user_updated = self._store.update_canonical_row_tagging_if_unchanged(
-                canonical_turn_id=user_row.canonical_turn_id,
+            same_group = (
+                int(user_row.turn_group_number) >= 0
+                and int(user_row.turn_group_number)
+                == int(assistant_row.turn_group_number)
+            )
+            group_updated = same_group and (
+                self._store.update_canonical_group_tagging_if_unchanged(
                 conversation_id=self.config.conversation_id,
-                expected_turn_hash=user_hash,
+                turn_group_number=int(user_row.turn_group_number),
+                canonical_turn_ids=[
+                    user_row.canonical_turn_id,
+                    assistant_row.canonical_turn_id,
+                ],
+                expected_turn_hashes=[user_hash, assistant_hash],
                 expected_lifecycle_epoch=epoch,
                 primary_tag=entry.primary_tag,
                 tags=list(entry.tags or []),
@@ -449,20 +459,9 @@ class TaggingPipeline:
                 fact_signals=list(entry.fact_signals or []),
                 code_refs=list(entry.code_refs or []),
                 tagged_at=tagged_at,
+                )
             )
-            assistant_updated = self._store.update_canonical_row_tagging_if_unchanged(
-                canonical_turn_id=assistant_row.canonical_turn_id,
-                conversation_id=self.config.conversation_id,
-                expected_turn_hash=assistant_hash,
-                expected_lifecycle_epoch=epoch,
-                primary_tag=entry.primary_tag,
-                tags=list(entry.tags or []),
-                session_date=entry.session_date,
-                fact_signals=list(entry.fact_signals or []),
-                code_refs=list(entry.code_refs or []),
-                tagged_at=tagged_at,
-            )
-            if not user_updated or not assistant_updated:
+            if not group_updated:
                 if not append_missing:
                     raise RuntimeError(
                         "canonical tag-only CAS rejected an exact hash match"
@@ -684,10 +683,11 @@ class TaggingPipeline:
             )
             if not row.turn_hash or row.turn_hash != turn_hash:
                 return 0
-            updated = self._store.update_canonical_row_tagging_if_unchanged(
-                canonical_turn_id=row.canonical_turn_id,
+            updated = self._store.update_canonical_group_tagging_if_unchanged(
                 conversation_id=self.config.conversation_id,
-                expected_turn_hash=row.turn_hash,
+                turn_group_number=int(row.turn_group_number),
+                canonical_turn_ids=[row.canonical_turn_id],
+                expected_turn_hashes=[row.turn_hash],
                 expected_lifecycle_epoch=epoch,
                 primary_tag=entry.primary_tag,
                 tags=list(entry.tags or []),
@@ -719,21 +719,24 @@ class TaggingPipeline:
             ):
                 return 0
 
-        for row in existing_rows:
-            updated = self._store.update_canonical_row_tagging_if_unchanged(
-                canonical_turn_id=row.canonical_turn_id,
-                conversation_id=self.config.conversation_id,
-                expected_turn_hash=row.turn_hash,
-                expected_lifecycle_epoch=epoch,
-                primary_tag=entry.primary_tag,
-                tags=list(entry.tags or []),
-                session_date=entry.session_date,
-                fact_signals=list(entry.fact_signals or []),
-                code_refs=list(entry.code_refs or []),
-                tagged_at=tagged_at,
-            )
-            if not updated:
-                return 0
+        group_numbers = {int(row.turn_group_number) for row in existing_rows}
+        if len(group_numbers) != 1 or next(iter(group_numbers)) < 0:
+            return 0
+        updated = self._store.update_canonical_group_tagging_if_unchanged(
+            conversation_id=self.config.conversation_id,
+            turn_group_number=next(iter(group_numbers)),
+            canonical_turn_ids=[row.canonical_turn_id for row in existing_rows],
+            expected_turn_hashes=[row.turn_hash for row in existing_rows],
+            expected_lifecycle_epoch=epoch,
+            primary_tag=entry.primary_tag,
+            tags=list(entry.tags or []),
+            session_date=entry.session_date,
+            fact_signals=list(entry.fact_signals or []),
+            code_refs=list(entry.code_refs or []),
+            tagged_at=tagged_at,
+        )
+        if not updated:
+            return 0
         entry.canonical_turn_id = existing_rows[0].canonical_turn_id or entry.canonical_turn_id
         return len(existing_rows)
 
@@ -1425,6 +1428,146 @@ class TaggingPipeline:
             tagged_at=utcnow_iso(),
         ))
 
+    def tag_canonical_group(
+        self,
+        rows: list["CanonicalTurnRow"],
+        *,
+        expected_lifecycle_epoch: int | None = None,
+    ) -> bool:
+        """Generate once and atomically enrich one complete logical turn.
+
+        Supported backing shapes are one legacy combined row or the current
+        two-row user-only/assistant-only layout.  No model call is made for an
+        incomplete or ambiguous group, and storage re-proves the exact shape,
+        ids and hashes while atomically applying the same fields/timestamp to
+        every backing row.
+        """
+        _ensure_engine_imports()
+        from ..types import TagResult
+
+        group = list(rows or [])
+        if not group or len(group) not in (1, 2):
+            return False
+        group_number = int(group[0].turn_group_number)
+        if group_number < 0 or any(
+            int(row.turn_group_number) != group_number for row in group
+        ):
+            return False
+        user_rows = [row for row in group if (row.user_content or "").strip()]
+        assistant_rows = [
+            row for row in group if (row.assistant_content or "").strip()
+        ]
+        combined_rows = [
+            row for row in group
+            if (row.user_content or "").strip()
+            and (row.assistant_content or "").strip()
+        ]
+        valid_shape = (
+            len(group) == 1
+            and len(user_rows) == 1
+            and len(assistant_rows) == 1
+        ) or (
+            len(group) == 2
+            and len(user_rows) == 1
+            and len(assistant_rows) == 1
+            and not combined_rows
+        )
+        if not valid_shape:
+            return False
+
+        epoch = int(
+            expected_lifecycle_epoch
+            if expected_lifecycle_epoch is not None
+            else getattr(self._engine_state, "lifecycle_epoch", 1)
+        )
+        for row in group:
+            if (row.turn_hash or "").strip():
+                continue
+            hash_version = int(row.hash_version or HASH_VERSION)
+            turn_hash, normalized_user, normalized_assistant = (
+                compute_turn_hash_from_raw(
+                    row.user_content or "",
+                    row.assistant_content or "",
+                    version=hash_version,
+                )
+            )
+            repaired = self._store.backfill_canonical_row_hash_if_empty(
+                canonical_turn_id=row.canonical_turn_id,
+                conversation_id=self.config.conversation_id,
+                expected_lifecycle_epoch=epoch,
+                expected_user_content=row.user_content or "",
+                expected_assistant_content=row.assistant_content or "",
+                turn_hash=turn_hash,
+                hash_version=hash_version,
+                normalized_user_text=normalized_user,
+                normalized_assistant_text=normalized_assistant,
+            )
+            if not repaired:
+                return False
+            row.turn_hash = turn_hash
+            row.hash_version = hash_version
+            row.normalized_user_text = normalized_user
+            row.normalized_assistant_text = normalized_assistant
+
+        user_text = user_rows[0].user_content.strip()
+        assistant_text = assistant_rows[0].assistant_content.strip()
+        combined_text = f"{user_text} {assistant_text}".strip()
+        if not combined_text or (
+            _is_stub_content_fn is not None
+            and _is_stub_content_fn(combined_text)
+        ):
+            result = TagResult(tags=["_stub"], primary="_stub", source="stub")
+        else:
+            store_tags = [
+                summary.tag for summary in self._store.get_all_tags(
+                    conversation_id=self.config.conversation_id,
+                )
+            ]
+            result = self._tag_generator.generate_tags(
+                combined_text,
+                store_tags,
+                context_turns=None,
+            )
+
+        session_date = next(
+            (
+                (row.session_date or "").strip()
+                for row in group
+                if (row.session_date or "").strip()
+            ),
+            "",
+        )
+        if not session_date:
+            session_date = _extract_session_date_from_content(user_text) or ""
+        fact_signals = list(result.fact_signals or [])
+        if not fact_signals:
+            for row in group:
+                for signal in row.fact_signals or []:
+                    if signal not in fact_signals:
+                        fact_signals.append(signal)
+        code_refs = list(result.code_refs or [])
+        if not code_refs:
+            seen_refs: set[str] = set()
+            for row in group:
+                for ref in row.code_refs or []:
+                    key = json.dumps(ref, sort_keys=True, default=str)
+                    if key not in seen_refs:
+                        seen_refs.add(key)
+                        code_refs.append(ref)
+        return bool(self._store.update_canonical_group_tagging_if_unchanged(
+            conversation_id=self.config.conversation_id,
+            turn_group_number=group_number,
+            canonical_turn_ids=[row.canonical_turn_id for row in group],
+            expected_turn_hashes=[row.turn_hash for row in group],
+            expected_lifecycle_epoch=epoch,
+            primary_tag=result.primary,
+            tags=list(result.tags),
+            session_date=session_date,
+            fact_signals=fact_signals,
+            code_refs=code_refs,
+            tagged_at=utcnow_iso(),
+        ))
+
     def retag_canonical_turns(
         self,
         *,
@@ -1432,6 +1575,7 @@ class TaggingPipeline:
         until: str | None = None,
         only_general: bool = True,
         dry_run: bool = False,
+        canonical_turn_ids: set[str] | None = None,
     ) -> dict:
         """Re-tag canonical rows that carry degraded fallback tags.
 
@@ -1474,6 +1618,21 @@ class TaggingPipeline:
             self._store.get_all_canonical_turns(conversation_id),
             key=lambda row: (row.sort_key, row.canonical_turn_id),
         )
+        requested_ids = {
+            str(value).strip()
+            for value in (canonical_turn_ids or set())
+            if str(value).strip()
+        }
+        if canonical_turn_ids is not None:
+            known_ids = {
+                row.canonical_turn_id for row in rows if row.canonical_turn_id
+            }
+            missing_ids = requested_ids - known_ids
+            if missing_ids:
+                raise ValueError(
+                    "retag canonical id selection contains unknown rows: "
+                    f"{len(missing_ids)}"
+                )
         messages: list[Message] = []
         message_rows: dict[int, "CanonicalTurnRow"] = {}
         for row in rows:
@@ -1510,6 +1669,8 @@ class TaggingPipeline:
             return True
 
         def _eligible(row: "CanonicalTurnRow") -> bool:
+            if canonical_turn_ids is not None and row.canonical_turn_id not in requested_ids:
+                return False
             if only_general and (row.primary_tag or "") != "_general":
                 return False
             return _in_window(row)
@@ -1532,6 +1693,7 @@ class TaggingPipeline:
             "since": since_n,
             "until": until_n,
             "only_general": bool(only_general),
+            "requested_canonical_turn_ids": len(requested_ids),
         }
 
         for batch_turn, pair in enumerate(history_turns):

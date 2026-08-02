@@ -99,16 +99,49 @@ def verify_backlog_candidate_under_lock(
     if row is None or int(_col(row, "n", 0) or 0) < int(min_backlog_turns):
         return False
 
-    # 3. No untagged canonical row exists.
+    # 3. No taggable untagged canonical group exists.  The newest one-sided
+    #    group is intentionally not taggable yet: a later delivery can still
+    #    supply its counterpart, and it must not starve an older backlog.
     row = conn.execute(
         f"""
         SELECT 1
-          FROM canonical_turns
-         WHERE conversation_id = {p}
-           AND tagged_at IS NULL
+          FROM canonical_turns ct
+         WHERE ct.conversation_id = {p}
+           AND ct.turn_group_number >= 0
+         GROUP BY ct.turn_group_number
+        HAVING SUM(CASE WHEN ct.tagged_at IS NULL THEN 1 ELSE 0 END) > 0
+           AND (
+               (COUNT(*) = 1
+                AND SUM(CASE WHEN trim(COALESCE(ct.user_content, '')) <> ''
+                             THEN 1 ELSE 0 END) = 1
+                AND SUM(CASE WHEN trim(COALESCE(ct.assistant_content, '')) <> ''
+                             THEN 1 ELSE 0 END) = 1)
+               OR
+               (COUNT(*) = 2
+                AND SUM(CASE WHEN trim(COALESCE(ct.user_content, '')) <> ''
+                             THEN 1 ELSE 0 END) = 1
+                AND SUM(CASE WHEN trim(COALESCE(ct.assistant_content, '')) <> ''
+                             THEN 1 ELSE 0 END) = 1
+                AND SUM(CASE WHEN trim(COALESCE(ct.user_content, '')) <> ''
+                                   AND trim(COALESCE(ct.assistant_content, '')) <> ''
+                             THEN 1 ELSE 0 END) = 0)
+               OR
+               (COUNT(*) = 1
+                AND MAX(ct.sort_key) < (
+                    SELECT MAX(ct_later.sort_key)
+                      FROM canonical_turns ct_later
+                     WHERE ct_later.conversation_id = {p}
+                )
+                AND (
+                    SUM(CASE WHEN trim(COALESCE(ct.user_content, '')) <> ''
+                             THEN 1 ELSE 0 END)
+                    + SUM(CASE WHEN trim(COALESCE(ct.assistant_content, '')) <> ''
+                               THEN 1 ELSE 0 END)
+                ) = 1)
+           )
          LIMIT 1
         """,
-        (candidate.conversation_id,),
+        (candidate.conversation_id, candidate.conversation_id),
     ).fetchone()
     if row is not None:
         return False

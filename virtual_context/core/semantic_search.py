@@ -274,10 +274,10 @@ class SemanticSearchManager:
         user_raw_content: str | None = None,
         assistant_raw_content: str | None = None,
         reply_target_body: str = "",
-    ) -> None:
+    ) -> bool:
         embed_fn = self.get_embed_fn()
         if embed_fn is None:
-            return
+            return True
 
         self._store.delete_canonical_turn_chunk_embeddings(
             conversation_id,
@@ -293,6 +293,7 @@ class SemanticSearchManager:
             ("assistant", (assistant_raw_content or assistant_text or "")),
             ("subject", (reply_target_body or "")),
         ]
+        complete = True
         for side, text in sides:
             chunks = chunk_turn_text(text)
             if not chunks:
@@ -300,6 +301,7 @@ class SemanticSearchManager:
             try:
                 vectors = embed_fn(chunks)
             except Exception:
+                complete = False
                 logger.warning(
                     "CANONICAL_TURN_EMBED_FAILED side=%s conv=%s turn=%d",
                     side,
@@ -320,13 +322,24 @@ class SemanticSearchManager:
                 )
                 for i, (chunk_text, vec) in enumerate(zip(chunks, vectors))
             ]
-            self._store.store_canonical_turn_chunk_embeddings(
-                conversation_id,
-                turn_number,
-                side,
-                chunk_embeddings,
-                canonical_turn_id=canonical_turn_id,
-            )
+            try:
+                self._store.store_canonical_turn_chunk_embeddings(
+                    conversation_id,
+                    turn_number,
+                    side,
+                    chunk_embeddings,
+                    canonical_turn_id=canonical_turn_id,
+                )
+            except Exception:
+                complete = False
+                logger.warning(
+                    "CANONICAL_TURN_EMBED_STORE_FAILED side=%s conv=%s turn=%d",
+                    side,
+                    conversation_id,
+                    turn_number,
+                    exc_info=True,
+                )
+        return complete
 
     def _physical_rows_by_canonical_id(
         self,

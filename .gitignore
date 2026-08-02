@@ -29,6 +29,10 @@ infrastructure/
 scripts/*
 !scripts/install.ps1
 !scripts/install.sh
+!scripts/apply_canonical_repair_artifact_20260802.py
+!scripts/export_discord_guild_transcript_20260802.py
+!scripts/extend_men_vast_disposition_20260802.py
+!scripts/rebuild_men_canonical_from_discord_20260802.py
 
 # Environment files (API keys)
 .env

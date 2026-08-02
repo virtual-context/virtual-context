@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextvars
+import hashlib
 import json
 import logging
 import os
@@ -31,6 +32,7 @@ from ..core.progress_snapshot import (
     ProgressSnapshot,
 )
 from ..core.exceptions import (
+    CanonicalSourceConflict,
     ConversationLifecycleConflict,
     ConversationReconcileBusy,
 )
@@ -80,6 +82,13 @@ from ..types import (
 from .helpers import dt_to_str as _dt_to_str, str_to_dt as _str_to_dt, extract_excerpt as _extract_excerpt
 
 logger = logging.getLogger(__name__)
+
+
+def _source_actor_platform(actor_id: str) -> str:
+    parts = (actor_id or "").strip().split(":", 2)
+    if len(parts) != 3 or parts[0] != "actor" or not parts[1] or not parts[2]:
+        return ""
+    return parts[1]
 
 
 def _sql_in_list(values: tuple[str, ...]) -> str:
@@ -629,7 +638,38 @@ SELECT c.conversation_id, c.tenant_id, c.lifecycle_epoch,
      SELECT 1
        FROM canonical_turns ct_untagged
       WHERE ct_untagged.conversation_id = c.conversation_id
-        AND ct_untagged.tagged_at IS NULL
+        AND ct_untagged.turn_group_number >= 0
+      GROUP BY ct_untagged.turn_group_number
+     HAVING SUM(CASE WHEN ct_untagged.tagged_at IS NULL THEN 1 ELSE 0 END) > 0
+        AND (
+            (COUNT(*) = 1
+             AND SUM(CASE WHEN btrim(COALESCE(ct_untagged.user_content, '')) <> ''
+                          THEN 1 ELSE 0 END) = 1
+             AND SUM(CASE WHEN btrim(COALESCE(ct_untagged.assistant_content, '')) <> ''
+                          THEN 1 ELSE 0 END) = 1)
+            OR
+            (COUNT(*) = 2
+             AND SUM(CASE WHEN btrim(COALESCE(ct_untagged.user_content, '')) <> ''
+                          THEN 1 ELSE 0 END) = 1
+             AND SUM(CASE WHEN btrim(COALESCE(ct_untagged.assistant_content, '')) <> ''
+                          THEN 1 ELSE 0 END) = 1
+             AND SUM(CASE WHEN btrim(COALESCE(ct_untagged.user_content, '')) <> ''
+                                AND btrim(COALESCE(ct_untagged.assistant_content, '')) <> ''
+                          THEN 1 ELSE 0 END) = 0)
+            OR
+            (COUNT(*) = 1
+             AND MAX(ct_untagged.sort_key) < (
+                 SELECT MAX(ct_later.sort_key)
+                   FROM canonical_turns ct_later
+                  WHERE ct_later.conversation_id = c.conversation_id
+             )
+             AND (
+                 SUM(CASE WHEN btrim(COALESCE(ct_untagged.user_content, '')) <> ''
+                          THEN 1 ELSE 0 END)
+                 + SUM(CASE WHEN btrim(COALESCE(ct_untagged.assistant_content, '')) <> ''
+                            THEN 1 ELSE 0 END)
+             ) = 1)
+        )
    )
    AND NOT EXISTS (
      SELECT 1
@@ -1129,6 +1169,20 @@ class PostgresStore(ContextStore):
     _alias_post_commit_scope: contextvars.ContextVar = contextvars.ContextVar(
         "vc_alias_post_commit_scope", default=None,
     )
+    # Set only by ``save_attested_canonical_pair``. Both physical halves and
+    # the immutable source-membership row must share one PostgreSQL
+    # transaction; ordinary canonical writes continue to use their own
+    # transaction exactly as before.
+    _attested_pair_connection: contextvars.ContextVar = contextvars.ContextVar(
+        "vc_attested_pair_connection", default=None,
+    )
+    # The outer reconcile transaction owns conversation_lifecycle's row lock.
+    # Record the generation it proved so nested canonical writes on another
+    # pooled connection can require that same monotonic lifecycle without
+    # deadlocking by trying to reacquire the outer lock.
+    _reconcile_generation_scope: contextvars.ContextVar = contextvars.ContextVar(
+        "vc_reconcile_generation_scope", default=None,
+    )
 
     def __init__(
         self,
@@ -1182,6 +1236,15 @@ class PostgresStore(ContextStore):
             )
         # OFF: silent.
 
+    @contextmanager
+    def _canonical_write_transaction(self):
+        active = self._attested_pair_connection.get()
+        if active is not None:
+            yield active
+            return
+        with self.pool.connection() as conn, conn.transaction():
+            yield conn
+
     # The reconcile takes a row lock on conversation_lifecycle and yields
     # inside that transaction, and every other store call checks out its
     # own pooled connection, so nothing it invokes can end it. A second
@@ -1191,7 +1254,12 @@ class PostgresStore(ContextStore):
     reconcile_excludes_concurrent_writers = True
 
     @contextmanager
-    def conversation_reconcile(self, conversation_id: str):
+    def conversation_reconcile(
+        self,
+        conversation_id: str,
+        *,
+        expected_generation: int | None = None,
+    ):
         with self.pool.connection() as conn:
             now = _dt_to_str(datetime.now(timezone.utc))
             with conn.transaction():
@@ -1209,14 +1277,30 @@ class PostgresStore(ContextStore):
                         ON CONFLICT (conversation_id) DO UPDATE SET updated_at = EXCLUDED.updated_at""",
                         (conversation_id, now),
                     )
-                    conn.execute(
-                        "SELECT conversation_id FROM conversation_lifecycle WHERE conversation_id = %s FOR UPDATE",
+                    lifecycle = conn.execute(
+                        "SELECT generation, deleted FROM conversation_lifecycle "
+                        "WHERE conversation_id = %s FOR UPDATE",
                         (conversation_id,),
                     ).fetchone()
                 except psycopg.errors.LockNotAvailable as exc:
                     raise ConversationReconcileBusy(
                         f"conversation reconcile busy: {conversation_id}",
                     ) from exc
+
+                observed_generation = (
+                    int(lifecycle["generation"]) if lifecycle is not None else -1
+                )
+                if expected_generation is not None and (
+                    lifecycle is None
+                    or observed_generation != int(expected_generation)
+                    or bool(lifecycle["deleted"])
+                ):
+                    raise CanonicalSourceConflict(
+                        "exact source conversation generation mismatch: "
+                        f"expected={expected_generation} "
+                        f"observed={observed_generation} "
+                        f"deleted={bool(lifecycle['deleted']) if lifecycle is not None else True}"
+                    )
 
                 # A timeout on lock acquisition protects waiters, but it does
                 # not protect against a holder thread wedging after it owns
@@ -1257,9 +1341,17 @@ class PostgresStore(ContextStore):
                     )
                     holder_timer.daemon = True
                     holder_timer.start()
+                generation_token = self._reconcile_generation_scope.set(
+                    (
+                        conversation_id,
+                        observed_generation,
+                        bool(lifecycle["deleted"]) if lifecycle is not None else True,
+                    )
+                )
                 try:
                     yield
                 finally:
+                    self._reconcile_generation_scope.reset(generation_token)
                     with holder_guard:
                         holder_active = False
                     if holder_timer is not None:
@@ -1869,6 +1961,7 @@ class PostgresStore(ContextStore):
             logger.warning("request_context unique index setup failed", exc_info=True)
         try:
             self._ensure_canonical_turn_schema()
+            self._ensure_canonical_message_source_schema()
             self._ensure_tag_summary_schema()
             # Compaction scoping columns first so the view's ct.* picks them up.
             self._ensure_compaction_scoping_columns()
@@ -1895,6 +1988,7 @@ class PostgresStore(ContextStore):
         # silently and drop identity on every write. Assert the actor column
         # on both the base table and the ordinal view, OUTSIDE those catches.
         self._assert_actor_schema()
+        self._assert_canonical_message_source_schema()
         # Same rule for the handle relation: a swallowed CREATE must not
         # become a process that silently cannot persist stable handles.
         self._assert_speaker_handle_schema()
@@ -1934,6 +2028,433 @@ class PostgresStore(ContextStore):
             ).fetchone() is None:
                 raise RuntimeError(
                     "fact_embeddings FK to facts missing after schema bootstrap"
+                )
+
+    def _ensure_canonical_message_source_schema(self) -> None:
+        """Create the immutable transport-message membership ledger.
+
+        ``canonical_turns`` owns serving order and may move between owners in
+        VCMERGE.  A source membership instead keys the audience where the
+        platform message was observed, so it survives an owner move without a
+        rewrite.  No historical canonical row is backfilled here: old source
+        columns are precisely the evidence under repair and are not authority.
+        """
+        with self.pool.connection() as conn:
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS canonical_message_sources (
+                       tenant_id TEXT NOT NULL,
+                       agent_scope_id TEXT NOT NULL,
+                       platform TEXT NOT NULL,
+                       account_id TEXT NOT NULL,
+                       message_id TEXT NOT NULL,
+                       canonical_turn_id UUID NOT NULL UNIQUE
+                           REFERENCES canonical_turns(canonical_turn_id)
+                           ON DELETE CASCADE,
+                       assistant_canonical_turn_id UUID
+                           REFERENCES canonical_turns(canonical_turn_id)
+                           ON DELETE CASCADE,
+                       assistant_turn_hash TEXT NOT NULL DEFAULT '',
+                       turn_group_number INTEGER NOT NULL DEFAULT -1,
+                       pair_version INTEGER NOT NULL DEFAULT 1,
+                       audience_conversation_id TEXT NOT NULL,
+                       channel_id TEXT NOT NULL,
+                       guild_id TEXT NOT NULL,
+                       author_id TEXT NOT NULL,
+                       source_actor_id TEXT NOT NULL,
+                       transport_body_sha256 TEXT NOT NULL,
+                       canonical_body_sha256 TEXT NOT NULL,
+                       projection_version TEXT NOT NULL,
+                       canonical_turn_hash TEXT NOT NULL,
+                       reply_target_message_id TEXT NOT NULL DEFAULT '',
+                       observed_at TEXT NOT NULL,
+                       created_at TEXT NOT NULL,
+                       PRIMARY KEY (
+                           tenant_id, agent_scope_id, platform,
+                           account_id, message_id
+                       ),
+                       CONSTRAINT canonical_message_sources_pair_shape
+                       CHECK (
+                           (pair_version = 1
+                            AND assistant_canonical_turn_id IS NOT NULL
+                            AND assistant_turn_hash <> '')
+                       )
+                   )"""
+            )
+            conn.execute(
+                """ALTER TABLE canonical_message_sources
+                   ADD COLUMN IF NOT EXISTS assistant_canonical_turn_id UUID"""
+            )
+            conn.execute(
+                """ALTER TABLE canonical_message_sources
+                   ADD COLUMN IF NOT EXISTS assistant_turn_hash TEXT
+                   NOT NULL DEFAULT ''"""
+            )
+            conn.execute(
+                """ALTER TABLE canonical_message_sources
+                   ADD COLUMN IF NOT EXISTS turn_group_number INTEGER
+                   NOT NULL DEFAULT -1"""
+            )
+            conn.execute(
+                """ALTER TABLE canonical_message_sources
+                   ADD COLUMN IF NOT EXISTS pair_version INTEGER
+                   NOT NULL DEFAULT 1"""
+            )
+            conn.execute(
+                """ALTER TABLE canonical_message_sources
+                   ALTER COLUMN pair_version SET DEFAULT 1"""
+            )
+            unsafe_pairs = conn.execute(
+                """SELECT COUNT(*) AS n FROM canonical_message_sources
+                    WHERE pair_version <> 1
+                       OR assistant_canonical_turn_id IS NULL
+                       OR assistant_turn_hash = ''"""
+            ).fetchone()["n"]
+            if int(unsafe_pairs or 0):
+                raise RuntimeError(
+                    "canonical_message_sources contains unpaired legacy "
+                    "memberships; exact-evidence repair is required"
+                )
+            conn.execute(
+                """DO $$ BEGIN
+                       IF NOT EXISTS (
+                           SELECT 1 FROM pg_constraint
+                            WHERE conrelid =
+                                  'canonical_message_sources'::regclass
+                              AND conname =
+                                  'canonical_message_sources_assistant_fk'
+                       ) THEN
+                           ALTER TABLE canonical_message_sources
+                           ADD CONSTRAINT
+                               canonical_message_sources_assistant_fk
+                           FOREIGN KEY (assistant_canonical_turn_id)
+                           REFERENCES canonical_turns(canonical_turn_id)
+                           ON DELETE CASCADE;
+                       END IF;
+                   END $$"""
+            )
+            # Replace, rather than merely create, because the first draft of
+            # this schema coupled pair identity to turn_group_number. Group is
+            # mutable placement (VCMERGE/resequencing); the durable pair is the
+            # two row ids plus their immutable hashes.
+            conn.execute(
+                """ALTER TABLE canonical_message_sources
+                   DROP CONSTRAINT IF EXISTS
+                       canonical_message_sources_pair_shape"""
+            )
+            conn.execute(
+                """ALTER TABLE canonical_message_sources
+                   ADD CONSTRAINT canonical_message_sources_pair_shape
+                   CHECK (
+                       (pair_version = 1
+                        AND assistant_canonical_turn_id IS NOT NULL
+                        AND assistant_turn_hash <> '')
+                   )"""
+            )
+            conn.execute(
+                """CREATE UNIQUE INDEX IF NOT EXISTS
+                       idx_canonical_message_sources_assistant
+                   ON canonical_message_sources (assistant_canonical_turn_id)
+                   WHERE assistant_canonical_turn_id IS NOT NULL"""
+            )
+            conn.execute(
+                """CREATE INDEX IF NOT EXISTS
+                       idx_canonical_message_sources_turn
+                   ON canonical_message_sources (canonical_turn_id)"""
+            )
+            conn.execute(
+                """CREATE INDEX IF NOT EXISTS
+                       idx_canonical_message_sources_channel
+                   ON canonical_message_sources (
+                       tenant_id, agent_scope_id, platform, account_id,
+                       channel_id, message_id
+                   )"""
+            )
+            conn.execute(
+                """CREATE OR REPLACE FUNCTION
+                       vc_guard_attested_canonical_turn_update()
+                   RETURNS trigger AS $$
+                   BEGIN
+                       IF (
+                           EXISTS (
+                               SELECT 1 FROM canonical_message_sources
+                                WHERE canonical_turn_id = OLD.canonical_turn_id
+                           ) AND (
+                               OLD.turn_hash IS DISTINCT FROM NEW.turn_hash OR
+                               OLD.hash_version IS DISTINCT FROM NEW.hash_version OR
+                               OLD.normalized_user_text IS DISTINCT FROM NEW.normalized_user_text OR
+                               OLD.normalized_assistant_text IS DISTINCT FROM NEW.normalized_assistant_text OR
+                               OLD.user_content IS DISTINCT FROM NEW.user_content OR
+                               OLD.assistant_content IS DISTINCT FROM NEW.assistant_content OR
+                               OLD.user_raw_content IS DISTINCT FROM NEW.user_raw_content OR
+                               OLD.assistant_raw_content IS DISTINCT FROM NEW.assistant_raw_content OR
+                               OLD.sender IS DISTINCT FROM NEW.sender OR
+                               OLD.origin_channel_id IS DISTINCT FROM NEW.origin_channel_id OR
+                               OLD.origin_channel_label IS DISTINCT FROM NEW.origin_channel_label OR
+                               OLD.sender_actor_id IS DISTINCT FROM NEW.sender_actor_id OR
+                               OLD.source_message_id IS DISTINCT FROM NEW.source_message_id OR
+                               OLD.reply_target_message_id IS DISTINCT FROM NEW.reply_target_message_id OR
+                               OLD.audience_conversation_id IS DISTINCT FROM NEW.audience_conversation_id OR
+                               OLD.audience_attribution_version IS DISTINCT FROM NEW.audience_attribution_version
+                           )
+                       ) OR (
+                           EXISTS (
+                               SELECT 1 FROM canonical_message_sources
+                                WHERE assistant_canonical_turn_id =
+                                      OLD.canonical_turn_id
+                           ) AND (
+                               OLD.turn_hash IS DISTINCT FROM NEW.turn_hash OR
+                               OLD.hash_version IS DISTINCT FROM NEW.hash_version OR
+                               OLD.normalized_user_text IS DISTINCT FROM NEW.normalized_user_text OR
+                               OLD.normalized_assistant_text IS DISTINCT FROM NEW.normalized_assistant_text OR
+                               OLD.user_content IS DISTINCT FROM NEW.user_content OR
+                               OLD.assistant_content IS DISTINCT FROM NEW.assistant_content OR
+                               OLD.user_raw_content IS DISTINCT FROM NEW.user_raw_content OR
+                               OLD.assistant_raw_content IS DISTINCT FROM NEW.assistant_raw_content
+                           )
+                       ) THEN
+                           RAISE EXCEPTION
+                               'attested canonical source fields are immutable'
+                               USING ERRCODE = 'integrity_constraint_violation';
+                       END IF;
+                       RETURN NEW;
+                   END;
+                   $$ LANGUAGE plpgsql"""
+            )
+            conn.execute(
+                """DROP TRIGGER IF EXISTS
+                       trg_guard_attested_canonical_turn_update
+                   ON canonical_turns"""
+            )
+            conn.execute(
+                """CREATE TRIGGER trg_guard_attested_canonical_turn_update
+                   BEFORE UPDATE ON canonical_turns
+                   FOR EACH ROW EXECUTE FUNCTION
+                       vc_guard_attested_canonical_turn_update()"""
+            )
+            conn.execute(
+                """CREATE OR REPLACE FUNCTION
+                       vc_guard_canonical_message_source_update()
+                   RETURNS trigger AS $$
+                   BEGIN
+                       IF OLD.tenant_id IS DISTINCT FROM NEW.tenant_id OR
+                          OLD.agent_scope_id IS DISTINCT FROM NEW.agent_scope_id OR
+                          OLD.platform IS DISTINCT FROM NEW.platform OR
+                          OLD.account_id IS DISTINCT FROM NEW.account_id OR
+                          OLD.message_id IS DISTINCT FROM NEW.message_id OR
+                          OLD.canonical_turn_id IS DISTINCT FROM NEW.canonical_turn_id OR
+                          OLD.assistant_canonical_turn_id IS DISTINCT FROM NEW.assistant_canonical_turn_id OR
+                          OLD.assistant_turn_hash IS DISTINCT FROM NEW.assistant_turn_hash OR
+                          OLD.turn_group_number IS DISTINCT FROM NEW.turn_group_number OR
+                          OLD.pair_version IS DISTINCT FROM NEW.pair_version OR
+                          OLD.audience_conversation_id IS DISTINCT FROM NEW.audience_conversation_id OR
+                          OLD.channel_id IS DISTINCT FROM NEW.channel_id OR
+                          OLD.guild_id IS DISTINCT FROM NEW.guild_id OR
+                          OLD.author_id IS DISTINCT FROM NEW.author_id OR
+                          OLD.source_actor_id IS DISTINCT FROM NEW.source_actor_id OR
+                          OLD.transport_body_sha256 IS DISTINCT FROM NEW.transport_body_sha256 OR
+                          OLD.canonical_body_sha256 IS DISTINCT FROM NEW.canonical_body_sha256 OR
+                          OLD.projection_version IS DISTINCT FROM NEW.projection_version OR
+                          OLD.canonical_turn_hash IS DISTINCT FROM NEW.canonical_turn_hash OR
+                          OLD.reply_target_message_id IS DISTINCT FROM NEW.reply_target_message_id OR
+                          OLD.created_at IS DISTINCT FROM NEW.created_at
+                       THEN
+                           RAISE EXCEPTION
+                               'canonical source membership is immutable'
+                               USING ERRCODE = 'integrity_constraint_violation';
+                       END IF;
+                       RETURN NEW;
+                   END;
+                   $$ LANGUAGE plpgsql"""
+            )
+            conn.execute(
+                """DROP TRIGGER IF EXISTS
+                       trg_guard_canonical_message_source_update
+                   ON canonical_message_sources"""
+            )
+            conn.execute(
+                """CREATE TRIGGER
+                       trg_guard_canonical_message_source_update
+                   BEFORE UPDATE ON canonical_message_sources
+                   FOR EACH ROW EXECUTE FUNCTION
+                       vc_guard_canonical_message_source_update()"""
+            )
+
+    def _assert_canonical_message_source_schema(self) -> None:
+        """Fail startup if the source fence could not be installed."""
+        with self.pool.connection() as conn:
+            table = conn.execute(
+                "SELECT 1 FROM information_schema.tables "
+                "WHERE table_name = 'canonical_message_sources'"
+            ).fetchone()
+            if table is None:
+                raise RuntimeError(
+                    "canonical_message_sources missing after schema bootstrap"
+                )
+            columns = {
+                str(row["column_name"])
+                for row in conn.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name = 'canonical_message_sources'"
+                ).fetchall()
+            }
+            required = {
+                "tenant_id", "agent_scope_id", "platform", "account_id",
+                "message_id", "canonical_turn_id",
+                "assistant_canonical_turn_id", "assistant_turn_hash",
+                "turn_group_number", "pair_version",
+                "audience_conversation_id", "channel_id", "guild_id",
+                "author_id", "source_actor_id", "transport_body_sha256",
+                "canonical_body_sha256", "projection_version",
+                "canonical_turn_hash", "reply_target_message_id",
+            }
+            missing = required - columns
+            if missing:
+                raise RuntimeError(
+                    "canonical_message_sources incomplete: "
+                    + ", ".join(sorted(missing))
+                )
+            primary = conn.execute(
+                """SELECT pg_get_constraintdef(oid) AS definition
+                     FROM pg_constraint
+                    WHERE conrelid = 'canonical_message_sources'::regclass
+                      AND contype = 'p'"""
+            ).fetchone()
+            expected_pk = (
+                "PRIMARY KEY (tenant_id, agent_scope_id, platform, "
+                "account_id, message_id)"
+            )
+            if primary is None or str(primary["definition"]) != expected_pk:
+                raise RuntimeError(
+                    "canonical_message_sources has an unsafe identity key"
+                )
+            assistant_fk = conn.execute(
+                """SELECT pg_get_constraintdef(oid) AS definition
+                     FROM pg_constraint
+                    WHERE conrelid = 'canonical_message_sources'::regclass
+                      AND conname =
+                          'canonical_message_sources_assistant_fk'
+                      AND contype = 'f'"""
+            ).fetchone()
+            if (
+                assistant_fk is None
+                or str(assistant_fk["definition"])
+                != "FOREIGN KEY (assistant_canonical_turn_id) REFERENCES "
+                   "canonical_turns(canonical_turn_id) ON DELETE CASCADE"
+            ):
+                raise RuntimeError(
+                    "canonical_message_sources assistant FK is missing or unsafe"
+                )
+            pair_shape = conn.execute(
+                """SELECT 1 FROM pg_constraint
+                    WHERE conrelid = 'canonical_message_sources'::regclass
+                      AND conname = 'canonical_message_sources_pair_shape'
+                      AND contype = 'c'"""
+            ).fetchone()
+            assistant_index = conn.execute(
+                """SELECT indexdef FROM pg_indexes
+                    WHERE tablename = 'canonical_message_sources'
+                      AND indexname =
+                          'idx_canonical_message_sources_assistant'"""
+            ).fetchone()
+            if (
+                pair_shape is None
+                or assistant_index is None
+                or "UNIQUE INDEX" not in str(assistant_index["indexdef"])
+                or "WHERE (assistant_canonical_turn_id IS NOT NULL)"
+                   not in str(assistant_index["indexdef"])
+            ):
+                raise RuntimeError(
+                    "canonical_message_sources pair shape/index is unsafe"
+                )
+            unsafe_pairs = conn.execute(
+                """SELECT COUNT(*) AS n FROM canonical_message_sources
+                    WHERE pair_version <> 1
+                       OR assistant_canonical_turn_id IS NULL
+                       OR assistant_turn_hash = ''"""
+            ).fetchone()["n"]
+            if int(unsafe_pairs or 0):
+                raise RuntimeError(
+                    "canonical_message_sources contains unpaired legacy "
+                    "memberships"
+                )
+            trigger = conn.execute(
+                """SELECT 1 FROM pg_trigger
+                    WHERE tgrelid = 'canonical_turns'::regclass
+                      AND tgname = 'trg_guard_attested_canonical_turn_update'
+                      AND NOT tgisinternal"""
+            ).fetchone()
+            if trigger is None:
+                raise RuntimeError(
+                    "attested canonical source immutability trigger missing"
+                )
+            source_trigger = conn.execute(
+                """SELECT 1 FROM pg_trigger
+                    WHERE tgrelid =
+                          'canonical_message_sources'::regclass
+                      AND tgname =
+                          'trg_guard_canonical_message_source_update'
+                      AND NOT tgisinternal"""
+            ).fetchone()
+            if source_trigger is None:
+                raise RuntimeError(
+                    "canonical source membership immutability trigger missing"
+                )
+
+    @staticmethod
+    def _guard_canonical_source_immutability(
+        conn,
+        *,
+        canonical_turn_id: str,
+        turn_group_number: int,
+        turn_hash: str,
+        user_content: str,
+        assistant_content: str,
+        sender_actor_id: str,
+        source_message_id: str,
+        audience_conversation_id: str,
+        origin_channel_id: str,
+    ) -> None:
+        memberships = conn.execute(
+            """SELECT * FROM canonical_message_sources
+                WHERE canonical_turn_id = %s
+                   OR assistant_canonical_turn_id = %s
+                ORDER BY message_id""",
+            (canonical_turn_id, canonical_turn_id),
+        ).fetchall()
+        if not memberships:
+            return
+        for membership in memberships:
+            is_user = str(membership["canonical_turn_id"]) == canonical_turn_id
+            if is_user:
+                body_sha = hashlib.sha256(
+                    (user_content or "").encode("utf-8")
+                ).hexdigest()
+                expected = (
+                    str(membership["canonical_turn_hash"] or "")
+                    == (turn_hash or "")
+                    and body_sha
+                    == str(membership["canonical_body_sha256"] or "")
+                    and not (assistant_content or "").strip()
+                    and (sender_actor_id or "")
+                    == str(membership["source_actor_id"] or "")
+                    and (source_message_id or "")
+                    == str(membership["message_id"] or "")
+                    and (audience_conversation_id or "")
+                    == str(membership["audience_conversation_id"] or "")
+                    and (origin_channel_id or "")
+                    == str(membership["channel_id"] or "")
+                )
+            else:
+                expected = (
+                    int(membership["pair_version"] or 0) == 1
+                    and str(membership["assistant_turn_hash"] or "")
+                    == (turn_hash or "")
+                    and not (user_content or "").strip()
+                    and bool((assistant_content or "").strip())
+                )
+            if not expected:
+                raise CanonicalSourceConflict(
+                    "canonical source fence rejected a body or provenance rewrite"
                 )
 
     # ------------------------------------------------------------------
@@ -3355,18 +3876,129 @@ class PostgresStore(ContextStore):
 
         Epoch starts at 1 on new rows; never bumped by this method.
         """
+        self.claim_or_verify_conversation(
+            tenant_id=tenant_id,
+            conversation_id=conversation_id,
+        )
+
+    def claim_or_verify_conversation(
+        self, *, tenant_id: str, conversation_id: str,
+    ) -> None:
+        tenant = str(tenant_id or "")
+        owner = str(conversation_id or "")
+        if not owner:
+            raise ValueError("conversation_id is required")
         now = datetime.now(timezone.utc)
-        with self.pool.connection() as conn:
+        with self.pool.connection() as conn, conn.transaction():
             conn.execute(
-                """
-                INSERT INTO conversations (
-                    conversation_id, tenant_id, created_at, updated_at
-                ) VALUES (%s, %s, %s, %s)
-                ON CONFLICT (conversation_id) DO UPDATE SET
-                    updated_at = EXCLUDED.updated_at
-                """,
-                (conversation_id, tenant_id, now, now),
+                """INSERT INTO conversations (
+                       conversation_id, tenant_id, created_at, updated_at
+                   ) VALUES (%s, %s, %s, %s)
+                   ON CONFLICT (conversation_id) DO NOTHING""",
+                (owner, tenant, now, now),
             )
+            row = conn.execute(
+                "SELECT tenant_id FROM conversations "
+                "WHERE conversation_id = %s FOR UPDATE",
+                (owner,),
+            ).fetchone()
+            observed = str(row["tenant_id"] if row is not None else "")
+            if row is None or observed != tenant:
+                raise PermissionError(
+                    "conversation belongs to a different tenant"
+                )
+            conn.execute(
+                "UPDATE conversations SET updated_at = %s "
+                "WHERE conversation_id = %s AND tenant_id = %s",
+                (now, owner, tenant),
+            )
+
+    def resolve_or_claim_conversation_for_tenant(
+        self, *, tenant_id: str, conversation_id: str,
+    ) -> str:
+        """Resolve an alias or claim an unaliased id in one transaction."""
+        from ..core.alias_resolution import AliasResolutionError
+
+        tenant = str(tenant_id or "")
+        source = str(conversation_id or "")
+        if not source:
+            raise ValueError("conversation_id is required")
+        with self.pool.connection() as conn, conn.transaction():
+            seen: set[str] = {source}
+            chain = [source]
+            current = source
+            followed_alias = False
+            for _ in range(8):
+                # Alias writers take this exact transaction lock before DML.
+                # SELECT ... FOR UPDATE cannot protect an absent alias row.
+                conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                    (current,),
+                )
+                row = conn.execute(
+                    "SELECT target_id FROM conversation_aliases "
+                    "WHERE alias_id = %s FOR SHARE",
+                    (current,),
+                ).fetchone()
+                target = str(row["target_id"] or "") if row is not None else ""
+                if not target:
+                    break
+                followed_alias = True
+                if target in seen:
+                    chain.append(target)
+                    raise AliasResolutionError(reason="cycle", chain=chain)
+                seen.add(target)
+                chain.append(target)
+                current = target
+            else:
+                raise AliasResolutionError(reason="max_hops", chain=chain)
+
+            if not followed_alias:
+                now = datetime.now(timezone.utc)
+                conn.execute(
+                    """INSERT INTO conversations (
+                           conversation_id, tenant_id, created_at, updated_at
+                       ) VALUES (%s, %s, %s, %s)
+                       ON CONFLICT (conversation_id) DO NOTHING""",
+                    (source, tenant, now, now),
+                )
+                owner = conn.execute(
+                    "SELECT tenant_id FROM conversations "
+                    "WHERE conversation_id = %s FOR UPDATE",
+                    (source,),
+                ).fetchone()
+                if owner is None or str(owner["tenant_id"] or "") != tenant:
+                    raise PermissionError(
+                        "conversation belongs to a different tenant"
+                    )
+                conn.execute(
+                    "UPDATE conversations SET updated_at = %s "
+                    "WHERE conversation_id = %s AND tenant_id = %s",
+                    (now, source, tenant),
+                )
+            else:
+                # Observe the terminal owner in the same transaction without
+                # creating a conversation shell for the alias source.  The
+                # engine applies the attachability fence to this terminal.
+                conn.execute(
+                    "SELECT tenant_id, phase, deleted_at FROM conversations "
+                    "WHERE conversation_id = %s FOR SHARE",
+                    (current,),
+                ).fetchone()
+            return current
+
+    def conversation_belongs_to_tenant(
+        self, *, tenant_id: str, conversation_id: str,
+    ) -> bool:
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                "SELECT tenant_id FROM conversations WHERE conversation_id = %s",
+                (conversation_id,),
+            ).fetchone()
+        return (
+            row is not None
+            and str(row["tenant_id"] or "") == str(tenant_id or "")
+        )
 
     def get_lifecycle_epoch(self, conversation_id: str) -> int:
         """Return the current lifecycle_epoch. Raises KeyError if no row exists."""
@@ -3378,6 +4010,16 @@ class PostgresStore(ContextStore):
             if row is None:
                 raise KeyError(conversation_id)
             return int(row["lifecycle_epoch"] if isinstance(row, dict) else row[0])
+
+    def verify_lifecycle_epoch(
+        self, conversation_id: str, expected_lifecycle_epoch: int,
+    ) -> None:
+        from ..core.lifecycle_epoch import verify_epoch
+        verify_epoch(
+            conversation_id=conversation_id,
+            expected=int(expected_lifecycle_epoch),
+            observed=self.get_lifecycle_epoch(conversation_id),
+        )
 
     def get_conversation_phase(self, conversation_id: str) -> str:
         """Return the current phase for the conversation.
@@ -3668,6 +4310,63 @@ class PostgresStore(ContextStore):
                 active_compaction=active_compaction,
             )
 
+    def has_complete_untagged_canonical_group(
+        self,
+        *,
+        conversation_id: str,
+        expected_lifecycle_epoch: int,
+    ) -> bool:
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT 1
+                  FROM canonical_turns AS ct
+                  JOIN conversations AS c
+                    ON c.conversation_id = ct.conversation_id
+                 WHERE ct.conversation_id = %s
+                   AND c.lifecycle_epoch = %s
+                GROUP BY ct.turn_group_number
+                HAVING ct.turn_group_number >= 0
+                   AND SUM(CASE WHEN ct.tagged_at IS NULL THEN 1 ELSE 0 END) > 0
+                   AND (
+                       (COUNT(*) = 1
+                        AND SUM(CASE WHEN btrim(COALESCE(ct.user_content, '')) <> ''
+                                     THEN 1 ELSE 0 END) = 1
+                        AND SUM(CASE WHEN btrim(COALESCE(ct.assistant_content, '')) <> ''
+                                     THEN 1 ELSE 0 END) = 1)
+                       OR
+                       (COUNT(*) = 2
+                        AND SUM(CASE WHEN btrim(COALESCE(ct.user_content, '')) <> ''
+                                     THEN 1 ELSE 0 END) = 1
+                        AND SUM(CASE WHEN btrim(COALESCE(ct.assistant_content, '')) <> ''
+                                     THEN 1 ELSE 0 END) = 1
+                        AND SUM(CASE WHEN btrim(COALESCE(ct.user_content, '')) <> ''
+                                           AND btrim(COALESCE(ct.assistant_content, '')) <> ''
+                                     THEN 1 ELSE 0 END) = 0)
+                       OR
+                       (COUNT(*) = 1
+                        AND MAX(ct.sort_key) < (
+                            SELECT MAX(ct_later.sort_key)
+                              FROM canonical_turns ct_later
+                             WHERE ct_later.conversation_id = %s
+                        )
+                        AND (
+                            SUM(CASE WHEN btrim(COALESCE(ct.user_content, '')) <> ''
+                                     THEN 1 ELSE 0 END)
+                            + SUM(CASE WHEN btrim(COALESCE(ct.assistant_content, '')) <> ''
+                                      THEN 1 ELSE 0 END)
+                        ) = 1)
+                   )
+                 LIMIT 1
+                """,
+                (
+                    conversation_id,
+                    expected_lifecycle_epoch,
+                    conversation_id,
+                ),
+            ).fetchone()
+            return row is not None
+
     # ------------------------------------------------------------------
     # Ingestion episode CRUD (epoch-guarded)
     # ------------------------------------------------------------------
@@ -3726,6 +4425,136 @@ class PostgresStore(ContextStore):
                 ),
             )
 
+    def claim_ingestion_for_complete_group(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        worker_id: str,
+        raw_payload_entries: int,
+        lease_ttl_s: float,
+    ) -> str:
+        """Atomically recheck complete work, open phase/episode and claim."""
+        import uuid
+
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(seconds=lease_ttl_s)
+        with self.pool.connection() as conn:
+            with conn.transaction():
+                lifecycle = conn.execute(
+                    "SELECT 1 FROM conversation_lifecycle "
+                    "WHERE conversation_id = %s FOR UPDATE",
+                    (conversation_id,),
+                ).fetchone()
+                if lifecycle is None:
+                    return "stale"
+                conversation = conn.execute(
+                    """
+                    SELECT lifecycle_epoch, phase
+                      FROM conversations
+                     WHERE conversation_id = %s
+                       AND deleted_at IS NULL
+                     FOR UPDATE
+                    """,
+                    (conversation_id,),
+                ).fetchone()
+                if (
+                    conversation is None
+                    or int(conversation["lifecycle_epoch"]) != lifecycle_epoch
+                ):
+                    return "stale"
+                old_phase = str(conversation["phase"])
+                if old_phase not in ("init", "active", "ingesting"):
+                    return "no-work"
+                complete = conn.execute(
+                    """
+                    SELECT 1
+                      FROM canonical_turns
+                     WHERE conversation_id = %s AND turn_group_number >= 0
+                     GROUP BY turn_group_number
+                    HAVING SUM(CASE WHEN tagged_at IS NULL THEN 1 ELSE 0 END) > 0
+                       AND (
+                           (COUNT(*) = 1
+                            AND SUM(CASE WHEN btrim(COALESCE(user_content, '')) <> ''
+                                         THEN 1 ELSE 0 END) = 1
+                            AND SUM(CASE WHEN btrim(COALESCE(assistant_content, '')) <> ''
+                                         THEN 1 ELSE 0 END) = 1)
+                           OR
+                           (COUNT(*) = 2
+                            AND SUM(CASE WHEN btrim(COALESCE(user_content, '')) <> ''
+                                         THEN 1 ELSE 0 END) = 1
+                            AND SUM(CASE WHEN btrim(COALESCE(assistant_content, '')) <> ''
+                                         THEN 1 ELSE 0 END) = 1
+                           AND SUM(CASE WHEN btrim(COALESCE(user_content, '')) <> ''
+                                               AND btrim(COALESCE(assistant_content, '')) <> ''
+                                         THEN 1 ELSE 0 END) = 0)
+                           OR
+                           (COUNT(*) = 1
+                            AND MAX(sort_key) < (
+                                SELECT MAX(ct_later.sort_key)
+                                  FROM canonical_turns ct_later
+                                 WHERE ct_later.conversation_id = %s
+                            )
+                            AND (
+                                SUM(CASE WHEN btrim(COALESCE(user_content, '')) <> ''
+                                         THEN 1 ELSE 0 END)
+                                + SUM(CASE WHEN btrim(COALESCE(assistant_content, '')) <> ''
+                                          THEN 1 ELSE 0 END)
+                            ) = 1)
+                       )
+                     LIMIT 1
+                    """,
+                    (conversation_id, conversation_id),
+                ).fetchone()
+                if complete is None:
+                    return "no-work"
+                transitioned = old_phase in ("init", "active")
+                if transitioned:
+                    cur = conn.execute(
+                        """
+                        UPDATE conversations
+                           SET phase = 'ingesting', updated_at = %s
+                         WHERE conversation_id = %s AND lifecycle_epoch = %s
+                           AND phase = %s
+                        """,
+                        (now, conversation_id, lifecycle_epoch, old_phase),
+                    )
+                    if cur.rowcount != 1:
+                        return "stale"
+                conn.execute(
+                    """
+                    INSERT INTO ingestion_episode (
+                        episode_id, conversation_id, lifecycle_epoch,
+                        raw_payload_entries, started_at, status,
+                        owner_worker_id, heartbeat_ts
+                    ) VALUES (%s, %s, %s, %s, %s, 'running', %s, %s)
+                    ON CONFLICT (conversation_id, lifecycle_epoch) WHERE status = 'running'
+                    DO UPDATE SET raw_payload_entries =
+                        GREATEST(ingestion_episode.raw_payload_entries,
+                                 EXCLUDED.raw_payload_entries)
+                    """,
+                    (
+                        uuid.uuid4(), conversation_id, lifecycle_epoch,
+                        max(1, int(raw_payload_entries)), now, worker_id, now,
+                    ),
+                )
+                cur = conn.execute(
+                    """
+                    UPDATE ingestion_episode
+                       SET owner_worker_id = %s, heartbeat_ts = %s
+                     WHERE conversation_id = %s AND lifecycle_epoch = %s
+                       AND status = 'running'
+                       AND (owner_worker_id = %s OR heartbeat_ts < %s)
+                    """,
+                    (
+                        worker_id, now, conversation_id, lifecycle_epoch,
+                        worker_id, cutoff,
+                    ),
+                )
+                claimed = cur.rowcount == 1
+                if transitioned:
+                    return "claimed-transitioned" if claimed else "busy-transitioned"
+                return "claimed" if claimed else "busy"
     def claim_ingestion_lease(
         self,
         *,
@@ -4577,7 +5406,7 @@ class PostgresStore(ContextStore):
                         ON CONFLICT (conversation_id) DO UPDATE
                           SET updated_at = EXCLUDED.updated_at
                         """,
-                        (cid, datetime.now(timezone.utc)),
+                        (cid, _dt_to_str(datetime.now(timezone.utc))),
                     )
                     conn.execute(
                         """
@@ -5400,13 +6229,45 @@ class PostgresStore(ContextStore):
                    )
                    AND owner_worker_id = %s
                    AND NOT EXISTS (
-                       SELECT 1 FROM canonical_turns
-                        WHERE conversation_id = %s AND tagged_at IS NULL
+                       SELECT 1 FROM canonical_turns ct
+                        WHERE ct.conversation_id = %s
+                          AND ct.turn_group_number >= 0
+                        GROUP BY ct.turn_group_number
+                       HAVING SUM(CASE WHEN ct.tagged_at IS NULL THEN 1 ELSE 0 END) > 0
+                          AND (
+                              (COUNT(*) = 1
+                               AND SUM(CASE WHEN btrim(COALESCE(ct.user_content, '')) <> ''
+                                            THEN 1 ELSE 0 END) = 1
+                               AND SUM(CASE WHEN btrim(COALESCE(ct.assistant_content, '')) <> ''
+                                            THEN 1 ELSE 0 END) = 1)
+                              OR
+                              (COUNT(*) = 2
+                               AND SUM(CASE WHEN btrim(COALESCE(ct.user_content, '')) <> ''
+                                            THEN 1 ELSE 0 END) = 1
+                               AND SUM(CASE WHEN btrim(COALESCE(ct.assistant_content, '')) <> ''
+                                            THEN 1 ELSE 0 END) = 1
+                              AND SUM(CASE WHEN btrim(COALESCE(ct.user_content, '')) <> ''
+                                                  AND btrim(COALESCE(ct.assistant_content, '')) <> ''
+                                            THEN 1 ELSE 0 END) = 0)
+                              OR
+                              (COUNT(*) = 1
+                               AND MAX(ct.sort_key) < (
+                                   SELECT MAX(ct_later.sort_key)
+                                     FROM canonical_turns ct_later
+                                    WHERE ct_later.conversation_id = %s
+                               )
+                               AND (
+                                   SUM(CASE WHEN btrim(COALESCE(ct.user_content, '')) <> ''
+                                            THEN 1 ELSE 0 END)
+                                   + SUM(CASE WHEN btrim(COALESCE(ct.assistant_content, '')) <> ''
+                                             THEN 1 ELSE 0 END)
+                               ) = 1)
+                          )
                    )
                 """,
                 (
                     now, conversation_id, lifecycle_epoch, conversation_id,
-                    worker_id, conversation_id,
+                    worker_id, conversation_id, conversation_id,
                 ),
             )
             return cur.rowcount == 1
@@ -6174,13 +7035,41 @@ class PostgresStore(ContextStore):
                     SELECT pending_raw_payload_entries, lifecycle_epoch,
                            phase,
                            EXISTS (
-                             SELECT 1 FROM canonical_turns
-                              WHERE conversation_id = %s AND tagged_at IS NULL
+                             SELECT 1 FROM canonical_turns ct
+                              WHERE ct.conversation_id = %s
+                                AND ct.turn_group_number >= 0
+                              GROUP BY ct.turn_group_number
+                             HAVING SUM(CASE WHEN ct.tagged_at IS NULL THEN 1 ELSE 0 END) > 0
+                                AND (
+                                    (COUNT(*) = 1
+                                     AND SUM(CASE WHEN btrim(COALESCE(ct.user_content, '')) <> '' THEN 1 ELSE 0 END) = 1
+                                     AND SUM(CASE WHEN btrim(COALESCE(ct.assistant_content, '')) <> '' THEN 1 ELSE 0 END) = 1)
+                                    OR
+                                    (COUNT(*) = 2
+                                     AND SUM(CASE WHEN btrim(COALESCE(ct.user_content, '')) <> '' THEN 1 ELSE 0 END) = 1
+                                     AND SUM(CASE WHEN btrim(COALESCE(ct.assistant_content, '')) <> '' THEN 1 ELSE 0 END) = 1
+                           AND SUM(CASE WHEN btrim(COALESCE(ct.user_content, '')) <> ''
+                                               AND btrim(COALESCE(ct.assistant_content, '')) <> ''
+                                         THEN 1 ELSE 0 END) = 0)
+                           OR
+                           (COUNT(*) = 1
+                            AND MAX(ct.sort_key) < (
+                                SELECT MAX(ct_later.sort_key)
+                                  FROM canonical_turns ct_later
+                                 WHERE ct_later.conversation_id = %s
+                            )
+                            AND (
+                                SUM(CASE WHEN btrim(COALESCE(ct.user_content, '')) <> ''
+                                         THEN 1 ELSE 0 END)
+                                + SUM(CASE WHEN btrim(COALESCE(ct.assistant_content, '')) <> ''
+                                          THEN 1 ELSE 0 END)
+                            ) = 1)
+                       )
                            )
                       FROM conversations
                      WHERE conversation_id = %s
                     """,
-                    (conversation_id, conversation_id),
+                    (conversation_id, conversation_id, conversation_id),
                 ).fetchone()
                 if row is None:
                     return None
@@ -7957,6 +8846,10 @@ class PostgresStore(ContextStore):
         defaults to 1 via the table's column default) and
         ``expected_target_lifecycle_epoch`` for VCMERGE.
         """
+        conn.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+            (alias_id,),
+        )
         if epoch is None:
             conn.execute(
                 """INSERT INTO conversation_aliases (alias_id, target_id)
@@ -8005,10 +8898,9 @@ class PostgresStore(ContextStore):
                 scope["hooks"].append((on_committed, event))
             return
 
-        with self.pool.connection() as conn:
+        with self.pool.connection() as conn, conn.transaction():
             self._save_alias_on_conn(conn, alias_id, target_id, epoch=epoch)
-        # Connection auto-commits at __exit__ (autocommit=True). Callback
-        # fires after the commit is durable.
+        # Callback fires after the explicit lock-bearing transaction commits.
         if on_committed is not None:
             event = self._build_alias_created_event(alias_id, target_id)
             on_committed(event)
@@ -8171,6 +9063,10 @@ class PostgresStore(ContextStore):
 
         if scope is not None:
             scope["conn"].execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (alias_id,),
+            )
+            scope["conn"].execute(
                 "DELETE FROM conversation_aliases WHERE alias_id = %s",
                 (alias_id,),
             )
@@ -8178,7 +9074,11 @@ class PostgresStore(ContextStore):
                 scope["hooks"].append((on_committed, event))
             return
 
-        with self.pool.connection() as conn:
+        with self.pool.connection() as conn, conn.transaction():
+            conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (alias_id,),
+            )
             conn.execute(
                 "DELETE FROM conversation_aliases WHERE alias_id = %s",
                 (alias_id,),
@@ -8244,6 +9144,7 @@ class PostgresStore(ContextStore):
         reply_attribution_version: int = 0,
         audience_conversation_id: str = "",
         audience_attribution_version: int = 0,
+        source_claim: dict | None = None,
     ) -> None:
         now = _dt_to_str(datetime.now(timezone.utc))
         created = created_at or now
@@ -8269,7 +9170,7 @@ class PostgresStore(ContextStore):
             }
             for fs in (fact_signals or [])
         ]
-        with self.pool.connection() as conn:
+        with self._canonical_write_transaction() as conn:
             if canonical_turn_id is None and turn_number >= 0:
                 slot_row = conn.execute(
                     "SELECT canonical_turn_id FROM canonical_turns WHERE conversation_id = %s AND sort_key = %s",
@@ -8297,6 +9198,18 @@ class PostgresStore(ContextStore):
                         (conversation_id,),
                     ).fetchone()
                     sort_key = float((tail["max_sort_key"] or 0.0) + 1000.0)
+            self._guard_canonical_source_immutability(
+                conn,
+                canonical_turn_id=str(canonical_turn_id),
+                turn_group_number=int(turn_group_number),
+                turn_hash=turn_hash,
+                user_content=user_content,
+                assistant_content=assistant_content,
+                sender_actor_id=sender_actor_id or "",
+                source_message_id=source_message_id or "",
+                audience_conversation_id=audience_conversation_id or "",
+                origin_channel_id=origin_channel_id or "",
+            )
             conn.execute(
                 """INSERT INTO canonical_turns
                 (canonical_turn_id, conversation_id, turn_group_number, sort_key, turn_hash, hash_version,
@@ -8383,6 +9296,148 @@ class PostgresStore(ContextStore):
                     updated,
                 ),
             )
+            if source_claim:
+                self._attest_canonical_user_source_on_connection(
+                    conn,
+                    CanonicalTurnRow(
+                        conversation_id=conversation_id,
+                        canonical_turn_id=str(canonical_turn_id),
+                        turn_hash=turn_hash,
+                        user_content=user_content,
+                        assistant_content=assistant_content,
+                        sender_actor_id=sender_actor_id or "",
+                        source_message_id=source_message_id or "",
+                        reply_target_message_id=reply_target_message_id or "",
+                        audience_conversation_id=audience_conversation_id or "",
+                        origin_channel_id=origin_channel_id or "",
+                        source_claim=source_claim,
+                    ),
+                    observed_at=last_seen,
+                )
+
+    def save_attested_canonical_pair(
+        self,
+        user_row: CanonicalTurnRow,
+        assistant_row: CanonicalTurnRow,
+        *,
+        user_turn_number: int,
+        assistant_turn_number: int,
+        expected_conversation_generation: int,
+        expected_lifecycle_epoch: int,
+    ) -> None:
+        """Commit both physical halves and source membership atomically."""
+        if (
+            user_row.conversation_id != assistant_row.conversation_id
+            or not getattr(user_row, "source_claim", None)
+            or (assistant_row.user_content or "").strip()
+            or not (assistant_row.assistant_content or "").strip()
+        ):
+            raise CanonicalSourceConflict("invalid attested canonical pair")
+
+        reconcile_scope = self._reconcile_generation_scope.get()
+        if reconcile_scope is None:
+            with self.conversation_reconcile(
+                user_row.conversation_id,
+                expected_generation=expected_conversation_generation,
+            ):
+                self.save_attested_canonical_pair(
+                    user_row,
+                    assistant_row,
+                    user_turn_number=user_turn_number,
+                    assistant_turn_number=assistant_turn_number,
+                    expected_conversation_generation=(
+                        expected_conversation_generation
+                    ),
+                    expected_lifecycle_epoch=expected_lifecycle_epoch,
+                )
+            return
+        if reconcile_scope != (
+            user_row.conversation_id,
+            int(expected_conversation_generation),
+            False,
+        ):
+            raise CanonicalSourceConflict(
+                "attested canonical pair generation is stale or deleted"
+            )
+
+        def save(row: CanonicalTurnRow, turn_number: int, *, source_claim=None) -> None:
+            self.save_canonical_turn(
+                row.conversation_id,
+                turn_number,
+                row.user_content,
+                row.assistant_content,
+                user_raw_content=row.user_raw_content,
+                assistant_raw_content=row.assistant_raw_content,
+                primary_tag=row.primary_tag,
+                tags=list(row.tags or []),
+                session_date=row.session_date,
+                sender=row.sender,
+                fact_signals=list(row.fact_signals or []),
+                code_refs=list(row.code_refs or []),
+                created_at=row.created_at or None,
+                updated_at=row.updated_at or None,
+                canonical_turn_id=row.canonical_turn_id or None,
+                sort_key=row.sort_key,
+                turn_hash=row.turn_hash,
+                hash_version=row.hash_version or HASH_VERSION,
+                normalized_user_text=row.normalized_user_text,
+                normalized_assistant_text=row.normalized_assistant_text,
+                tagged_at=row.tagged_at,
+                compacted_at=row.compacted_at,
+                first_seen_at=row.first_seen_at or None,
+                last_seen_at=row.last_seen_at or None,
+                source_batch_id=row.source_batch_id or None,
+                turn_group_number=row.turn_group_number,
+                origin_channel_id=row.origin_channel_id,
+                origin_channel_label=row.origin_channel_label,
+                sender_actor_id=row.sender_actor_id,
+                source_message_id=row.source_message_id,
+                reply_target_message_id=row.reply_target_message_id,
+                reply_subject_actor_id=row.reply_subject_actor_id,
+                reply_subject_label=row.reply_subject_label,
+                reply_target_body=row.reply_target_body,
+                reply_attribution_version=row.reply_attribution_version,
+                audience_conversation_id=row.audience_conversation_id,
+                audience_attribution_version=row.audience_attribution_version,
+                source_claim=source_claim,
+            )
+
+        with self.pool.connection() as conn, conn.transaction():
+            token = self._attested_pair_connection.set(conn)
+            try:
+                from ..core.lifecycle_epoch import verify_epoch
+                # ``conversation_reconcile`` already owns the matching
+                # conversation_lifecycle row lock before this transaction is
+                # opened. Lock the progress row second, matching delete's
+                # lifecycle -> conversations order without trying to
+                # reacquire our own outer lock through another pool checkout.
+                epoch_row = conn.execute(
+                    "SELECT lifecycle_epoch, phase FROM conversations "
+                    "WHERE conversation_id = %s FOR UPDATE",
+                    (user_row.conversation_id,),
+                ).fetchone()
+                verify_epoch(
+                    conversation_id=user_row.conversation_id,
+                    expected=int(expected_lifecycle_epoch),
+                    observed=(
+                        int(epoch_row["lifecycle_epoch"])
+                        if epoch_row is not None else -1
+                    ),
+                )
+                if str(epoch_row["phase"]) in {"deleted", "merged"}:
+                    raise CanonicalSourceConflict(
+                        "attested canonical pair targets a non-writable lifecycle"
+                    )
+                save(user_row, user_turn_number)
+                save(assistant_row, assistant_turn_number)
+                self._attest_canonical_user_source_on_connection(
+                    conn,
+                    user_row,
+                    observed_at=user_row.last_seen_at or utcnow_iso(),
+                    assistant_row=assistant_row,
+                )
+            finally:
+                self._attested_pair_connection.reset(token)
 
     def shift_canonical_turn_sort_keys(
         self,
@@ -9636,6 +10691,328 @@ class PostgresStore(ContextStore):
             return None
         return _row_to_canonical_turn(rows[0])
 
+    @staticmethod
+    def _validated_source_claim(row: "CanonicalTurnRow") -> dict[str, str]:
+        claim = row.source_claim if isinstance(row.source_claim, dict) else {}
+        fields = (
+            "agent_scope_id", "platform", "account_id", "message_id",
+            "channel_id", "guild_id", "author_id",
+            "transport_body_sha256", "canonical_body_sha256",
+            "projection_version", "reply_target_message_id",
+        )
+        values = {
+            name: str(claim.get(name) or "").strip()
+            for name in fields
+        }
+        required = fields[:-1]
+        body_sha = hashlib.sha256(
+            (row.user_content or "").encode("utf-8")
+        ).hexdigest()
+        expected_actor = (
+            f"actor:{values['platform']}:{values['author_id']}"
+        )
+        if (
+            type(claim.get("version")) is not int
+            or claim.get("version") != 1
+            or not all(values[name] for name in required)
+            or values["platform"] != "discord"
+            or values["message_id"] != (row.source_message_id or "")
+            or values["channel_id"] != (row.origin_channel_id or "")
+            or values["canonical_body_sha256"] != body_sha
+            or values["reply_target_message_id"]
+            != (row.reply_target_message_id or "")
+            or expected_actor != (row.sender_actor_id or "")
+            or not (row.audience_conversation_id or "").strip()
+            or not (row.user_content or "").strip()
+            or (row.assistant_content or "").strip()
+        ):
+            raise CanonicalSourceConflict(
+                "trusted source claim disagrees with canonical user row"
+            )
+        return values
+
+    def find_attested_canonical_user_source(
+        self,
+        row: "CanonicalTurnRow",
+    ) -> "CanonicalTurnRow | None":
+        claim = self._validated_source_claim(row)
+        with self.pool.connection() as conn:
+            rows = conn.execute(
+                """SELECT ct.*,
+                          cms.agent_scope_id AS ledger_agent_scope_id,
+                          cms.platform AS ledger_platform,
+                          cms.account_id AS ledger_account_id,
+                          cms.message_id AS ledger_message_id,
+                          cms.channel_id AS ledger_channel_id,
+                          cms.guild_id AS ledger_guild_id,
+                          cms.author_id AS ledger_author_id,
+                          cms.source_actor_id AS ledger_source_actor_id,
+                          cms.transport_body_sha256 AS ledger_transport_body_sha256,
+                          cms.canonical_body_sha256 AS ledger_canonical_body_sha256,
+                          cms.projection_version AS ledger_projection_version,
+                          cms.canonical_turn_hash AS ledger_canonical_turn_hash,
+                          cms.reply_target_message_id AS ledger_reply_target_message_id,
+                          cms.audience_conversation_id AS ledger_audience_conversation_id,
+                          cms.assistant_canonical_turn_id AS ledger_assistant_id,
+                          cms.assistant_turn_hash AS ledger_assistant_hash,
+                          cms.pair_version AS ledger_pair_version,
+                          paired.conversation_id AS paired_conversation_id,
+                          paired.turn_group_number AS paired_group_number,
+                          paired.turn_hash AS paired_turn_hash,
+                          paired.assistant_content AS paired_assistant_content
+                     FROM canonical_message_sources cms
+                     JOIN canonical_turns ct
+                       ON ct.canonical_turn_id = cms.canonical_turn_id
+                     JOIN conversations owner
+                       ON owner.conversation_id = ct.conversation_id
+                      AND owner.tenant_id = cms.tenant_id
+                     LEFT JOIN canonical_turns paired
+                       ON paired.canonical_turn_id =
+                          cms.assistant_canonical_turn_id
+                    WHERE ct.conversation_id = %s
+                      AND cms.agent_scope_id = %s
+                      AND cms.platform = %s
+                      AND cms.account_id = %s
+                      AND cms.message_id = %s
+                    LIMIT 2""",
+                (
+                    row.conversation_id, claim["agent_scope_id"],
+                    claim["platform"], claim["account_id"],
+                    claim["message_id"],
+                ),
+            ).fetchall()
+        if not rows:
+            return None
+        if len(rows) != 1 or str(rows[0]["conversation_id"]) != row.conversation_id:
+            raise CanonicalSourceConflict(
+                "attested source belongs to another serving owner"
+            )
+        stored = rows[0]
+        immutable_claim = {
+            "agent_scope_id": claim["agent_scope_id"],
+            "platform": claim["platform"],
+            "account_id": claim["account_id"],
+            "message_id": claim["message_id"],
+            "channel_id": claim["channel_id"],
+            "guild_id": claim["guild_id"],
+            "author_id": claim["author_id"],
+            "source_actor_id": row.sender_actor_id or "",
+            "transport_body_sha256": claim["transport_body_sha256"],
+            "canonical_body_sha256": claim["canonical_body_sha256"],
+            "projection_version": claim["projection_version"],
+            "canonical_turn_hash": row.turn_hash or "",
+            "reply_target_message_id": claim["reply_target_message_id"],
+            "audience_conversation_id": row.audience_conversation_id or "",
+        }
+        if any(
+            str(
+                stored[f"ledger_{name}"]
+                if stored[f"ledger_{name}"] is not None else ""
+            )
+            != str(value)
+            for name, value in immutable_claim.items()
+        ):
+            raise CanonicalSourceConflict(
+                "attested source replay changed immutable transport evidence"
+            )
+        if (
+            int(stored["ledger_pair_version"] or 0) != 1
+            or not str(stored["ledger_assistant_id"] or "")
+            or str(stored["paired_conversation_id"] or "")
+            != row.conversation_id
+            or int(
+                stored["paired_group_number"]
+                if stored["paired_group_number"] is not None else -1
+            )
+            != int(stored["turn_group_number"])
+            or str(stored["ledger_assistant_hash"] or "")
+            != str(stored["paired_turn_hash"] or "")
+            or not str(stored["paired_assistant_content"] or "").strip()
+        ):
+            raise CanonicalSourceConflict(
+                "attested source lacks an immutable exact assistant pair"
+            )
+        return _row_to_canonical_turn(rows[0])
+
+    def attest_canonical_user_source(
+        self,
+        row: "CanonicalTurnRow",
+        *,
+        observed_at: str,
+        assistant_row: "CanonicalTurnRow | None" = None,
+    ) -> None:
+        """Atomically bind a live adapter source to one physical user row."""
+        with self.pool.connection() as conn, conn.transaction():
+            self._attest_canonical_user_source_on_connection(
+                conn, row, observed_at=observed_at,
+                assistant_row=assistant_row,
+            )
+        return
+
+    def _attest_canonical_user_source_on_connection(
+        self,
+        conn,
+        row: "CanonicalTurnRow",
+        *,
+        observed_at: str,
+        assistant_row: "CanonicalTurnRow | None" = None,
+    ) -> None:
+        """Connection-local source insert used by canonical write transaction."""
+
+        claim = self._validated_source_claim(row)
+        canonical_id = (row.canonical_turn_id or "").strip()
+        owner = (row.conversation_id or "").strip()
+        audience = (row.audience_conversation_id or "").strip()
+        actor_id = (row.sender_actor_id or "").strip()
+        content = row.user_content or ""
+        if not all((canonical_id, owner, audience, actor_id)):
+            raise CanonicalSourceConflict(
+                "attested user source is missing canonical or audience identity"
+            )
+        seen = (observed_at or utcnow_iso()).strip()
+        try:
+            stored = conn.execute(
+                    """SELECT ct.*, c.tenant_id
+                         FROM canonical_turns ct
+                         JOIN conversations c
+                           ON c.conversation_id = ct.conversation_id
+                        WHERE ct.conversation_id = %s
+                          AND ct.canonical_turn_id = %s
+                        FOR UPDATE""",
+                    (owner, canonical_id),
+                ).fetchone()
+            if stored is None:
+                raise CanonicalSourceConflict(
+                    "attested canonical user row does not exist"
+                )
+            exact = (
+                    str(stored["user_content"] or "") == content
+                    and not str(stored["assistant_content"] or "").strip()
+                    and str(stored["turn_hash"] or "") == (row.turn_hash or "")
+                    and str(stored["source_message_id"] or "")
+                    == claim["message_id"]
+                    and str(stored["audience_conversation_id"] or "") == audience
+                    and str(stored["origin_channel_id"] or "")
+                    == claim["channel_id"]
+                    and str(stored["sender_actor_id"] or "") == actor_id
+            )
+            if not exact:
+                raise CanonicalSourceConflict(
+                    "canonical row disagrees with attested source body or identity"
+                )
+            tenant_id = str(stored["tenant_id"] or "")
+            if assistant_row is None:
+                raise CanonicalSourceConflict(
+                    "attested source requires an immutable exact assistant pair"
+                )
+            assistant_id = (assistant_row.canonical_turn_id or "").strip()
+            paired = conn.execute(
+                """SELECT * FROM canonical_turns
+                     WHERE conversation_id = %s
+                       AND canonical_turn_id = %s
+                     FOR UPDATE""",
+                (owner, assistant_id),
+            ).fetchone()
+            if (
+                paired is None
+                or str(paired["user_content"] or "").strip()
+                or not str(paired["assistant_content"] or "").strip()
+                or str(paired["assistant_content"] or "")
+                != (assistant_row.assistant_content or "")
+                or str(paired["turn_hash"] or "")
+                != (assistant_row.turn_hash or "")
+                or int(paired["turn_group_number"])
+                != int(stored["turn_group_number"])
+            ):
+                raise CanonicalSourceConflict(
+                    "assistant row disagrees with attested exact pair"
+                )
+            assistant_hash = assistant_row.turn_hash or ""
+            pair_version = 1
+            key = (
+                tenant_id, claim["agent_scope_id"], claim["platform"],
+                claim["account_id"], claim["message_id"],
+            )
+            existing = conn.execute(
+                    """SELECT * FROM canonical_message_sources
+                        WHERE tenant_id = %s
+                          AND agent_scope_id = %s
+                          AND platform = %s
+                          AND account_id = %s
+                          AND message_id = %s
+                        FOR UPDATE""",
+                    key,
+                ).fetchone()
+            expected = {
+                "canonical_turn_id": canonical_id,
+                "assistant_canonical_turn_id": assistant_id,
+                "assistant_turn_hash": assistant_hash,
+                "pair_version": pair_version,
+                "audience_conversation_id": audience,
+                "channel_id": claim["channel_id"],
+                "guild_id": claim["guild_id"],
+                "author_id": claim["author_id"],
+                "source_actor_id": actor_id,
+                "transport_body_sha256": claim["transport_body_sha256"],
+                "canonical_body_sha256": claim["canonical_body_sha256"],
+                "projection_version": claim["projection_version"],
+                "canonical_turn_hash": row.turn_hash or "",
+                "reply_target_message_id": claim["reply_target_message_id"],
+            }
+            if existing is not None:
+                if any(
+                        str(existing[name] if existing[name] is not None else "")
+                        != str(value)
+                        for name, value in expected.items()
+                ):
+                    raise CanonicalSourceConflict(
+                        "source message already belongs to another canonical "
+                        "body, route, or identity"
+                    )
+                conn.execute(
+                        """UPDATE canonical_message_sources
+                              SET observed_at = %s
+                            WHERE tenant_id = %s
+                              AND agent_scope_id = %s
+                              AND platform = %s
+                              AND account_id = %s
+                              AND message_id = %s""",
+                        (seen, *key),
+                )
+                return
+            conn.execute(
+                    """INSERT INTO canonical_message_sources
+                       (tenant_id, agent_scope_id, platform, account_id,
+                        message_id, canonical_turn_id,
+                        assistant_canonical_turn_id, assistant_turn_hash,
+                        turn_group_number, pair_version,
+                        audience_conversation_id, channel_id, guild_id,
+                        author_id, source_actor_id, transport_body_sha256,
+                        canonical_body_sha256, projection_version,
+                        canonical_turn_hash, reply_target_message_id,
+                        observed_at, created_at)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                               %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                               %s, %s)""",
+                    (
+                        *key, canonical_id,
+                        assistant_id or None, assistant_hash,
+                        -1, pair_version,
+                        audience, claim["channel_id"],
+                        claim["guild_id"], claim["author_id"], actor_id,
+                        claim["transport_body_sha256"],
+                        claim["canonical_body_sha256"],
+                        claim["projection_version"], row.turn_hash or "",
+                        claim["reply_target_message_id"], seen, seen,
+                    ),
+            )
+        except CanonicalSourceConflict:
+            raise
+        except psycopg.errors.UniqueViolation as exc:
+            raise CanonicalSourceConflict(
+                "canonical source uniqueness conflict"
+            ) from exc
+
     def find_actor_ids_by_display_label(
         self,
         conversation_id: str,
@@ -9933,7 +11310,15 @@ class PostgresStore(ContextStore):
         protected_recent_turns: int = 0,
     ) -> list[CanonicalTurnRow]:
         merged_rows = list(_merge_canonical_turn_rows(self._load_canonical_turn_rows(conversation_id)).values())
-        uncompacted = [row for row in merged_rows if not row.compacted_at]
+        # Only a verified user/assistant logical pair is compactable.  A
+        # terminal singleton remains queryable canonical evidence but cannot
+        # synthesize an empty half or advance the pair watermark.
+        uncompacted = [
+            row for row in merged_rows
+            if not row.compacted_at
+            and (row.user_content or "").strip()
+            and (row.assistant_content or "").strip()
+        ]
         if protected_recent_turns > 0 and len(uncompacted) > protected_recent_turns:
             uncompacted = uncompacted[:-protected_recent_turns]
         elif protected_recent_turns > 0:
@@ -10084,6 +11469,101 @@ class PostgresStore(ContextStore):
             ).fetchall()
             return [_row_to_canonical_turn(row) for row in rows]
 
+    def iter_complete_untagged_canonical_groups(
+        self,
+        *,
+        conversation_id: str,
+        expected_lifecycle_epoch: int,
+        batch_size: int = 32,
+    ) -> list[list[CanonicalTurnRow]]:
+        """Return complete groups plus earlier terminal one-sided groups."""
+        with self.pool.connection() as conn:
+            rows = conn.execute(
+                """
+                WITH eligible AS (
+                    SELECT ct.turn_group_number, MIN(ct.sort_key) AS first_sort
+                      FROM canonical_turns AS ct
+                      JOIN conversations AS c
+                        ON c.conversation_id = ct.conversation_id
+                     WHERE ct.conversation_id = %s
+                       AND c.lifecycle_epoch = %s
+                       AND c.deleted_at IS NULL
+                       AND c.phase NOT IN ('deleted', 'merged')
+                       AND ct.turn_group_number >= 0
+                     GROUP BY ct.turn_group_number
+                    HAVING SUM(CASE WHEN ct.tagged_at IS NULL THEN 1 ELSE 0 END) > 0
+                       AND (
+                           (COUNT(*) = 1
+                            AND SUM(CASE WHEN btrim(COALESCE(ct.user_content, '')) <> ''
+                                         THEN 1 ELSE 0 END) = 1
+                            AND SUM(CASE WHEN btrim(COALESCE(ct.assistant_content, '')) <> ''
+                                         THEN 1 ELSE 0 END) = 1)
+                           OR
+                           (COUNT(*) = 2
+                            AND SUM(CASE WHEN btrim(COALESCE(ct.user_content, '')) <> ''
+                                         THEN 1 ELSE 0 END) = 1
+                            AND SUM(CASE WHEN btrim(COALESCE(ct.assistant_content, '')) <> ''
+                                         THEN 1 ELSE 0 END) = 1
+                            AND SUM(CASE WHEN btrim(COALESCE(ct.user_content, '')) <> ''
+                                               AND btrim(COALESCE(ct.assistant_content, '')) <> ''
+                                         THEN 1 ELSE 0 END) = 0)
+                           OR
+                           (COUNT(*) = 1
+                            AND MAX(ct.sort_key) < (
+                                SELECT MAX(ct_later.sort_key)
+                                  FROM canonical_turns ct_later
+                                 WHERE ct_later.conversation_id = %s
+                            )
+                            AND (
+                                SUM(CASE WHEN btrim(COALESCE(ct.user_content, '')) <> ''
+                                         THEN 1 ELSE 0 END)
+                                + SUM(CASE WHEN btrim(COALESCE(ct.assistant_content, '')) <> ''
+                                          THEN 1 ELSE 0 END)
+                            ) = 1)
+                       )
+                     ORDER BY first_sort ASC
+                     LIMIT %s
+                )
+                SELECT ct.canonical_turn_id, ct.conversation_id, ct.turn_group_number,
+                       ct.sort_key, ct.turn_hash, ct.hash_version,
+                       ct.normalized_user_text, ct.normalized_assistant_text,
+                       ct.user_content, ct.assistant_content,
+                       ct.user_raw_content, ct.assistant_raw_content,
+                       ct.primary_tag, ct.tags_json, ct.session_date, ct.sender,
+                       ct.origin_channel_id, ct.origin_channel_label, ct.sender_actor_id,
+                       ct.source_message_id, ct.reply_target_message_id, ct.reply_subject_actor_id,
+                       ct.reply_subject_label, ct.reply_target_body, ct.reply_attribution_version,
+                       ct.audience_conversation_id, ct.audience_attribution_version,
+                       ct.fact_signals_json, ct.code_refs_json,
+                       ct.covered_ingestible_entries,
+                       ct.tagged_at, ct.compacted_at,
+                       ct.first_seen_at, ct.last_seen_at,
+                       ct.source_batch_id, ct.created_at, ct.updated_at
+                  FROM canonical_turns AS ct
+                  JOIN eligible AS e
+                    ON e.turn_group_number = ct.turn_group_number
+                 WHERE ct.conversation_id = %s
+                 ORDER BY e.first_sort ASC, ct.sort_key ASC, ct.canonical_turn_id ASC
+                """,
+                (
+                    conversation_id,
+                    expected_lifecycle_epoch,
+                    conversation_id,
+                    max(1, int(batch_size)),
+                    conversation_id,
+                ),
+            ).fetchall()
+        groups: list[list[CanonicalTurnRow]] = []
+        by_group: dict[int, list[CanonicalTurnRow]] = {}
+        for raw in rows:
+            row = _row_to_canonical_turn(raw)
+            group_number = int(row.turn_group_number)
+            if group_number not in by_group:
+                by_group[group_number] = []
+                groups.append(by_group[group_number])
+            by_group[group_number].append(row)
+        return groups
+
     def mark_canonical_row_tagged(
         self,
         *,
@@ -10199,6 +11679,123 @@ class PostgresStore(ContextStore):
                 ),
             )
             return int(cur.rowcount or 0) == 1
+
+    def update_canonical_group_tagging_if_unchanged(
+        self,
+        *,
+        conversation_id: str,
+        turn_group_number: int,
+        canonical_turn_ids: list[str],
+        expected_turn_hashes: list[str],
+        expected_lifecycle_epoch: int,
+        primary_tag: str,
+        tags: list[str],
+        session_date: str,
+        fact_signals: list[FactSignal],
+        code_refs: list[dict],
+        tagged_at: str | None = None,
+    ) -> bool:
+        if (
+            int(turn_group_number) < 0
+            or len(canonical_turn_ids) not in (1, 2)
+            or len(canonical_turn_ids) != len(expected_turn_hashes)
+            or len(set(canonical_turn_ids)) != len(canonical_turn_ids)
+            or not all(canonical_turn_ids)
+            or not all(expected_turn_hashes)
+        ):
+            return False
+        expected = dict(zip(canonical_turn_ids, expected_turn_hashes, strict=True))
+        fact_payload = [
+            {
+                "subject": fs.subject,
+                "verb": fs.verb,
+                "object": fs.object,
+                "status": fs.status,
+                "fact_type": getattr(fs, "fact_type", ""),
+                "what": getattr(fs, "what", ""),
+            }
+            for fs in (fact_signals or [])
+        ]
+        now = _dt_to_str(datetime.now(timezone.utc))
+        tagged = tagged_at or now
+        with self.pool.connection() as conn:
+            with conn.transaction():
+                rows = conn.execute(
+                    """
+                    SELECT ct.canonical_turn_id, ct.turn_hash,
+                           ct.user_content, ct.assistant_content, ct.tagged_at
+                      FROM canonical_turns AS ct
+                      JOIN conversations AS c
+                        ON c.conversation_id = ct.conversation_id
+                     WHERE ct.conversation_id = %s
+                       AND ct.turn_group_number = %s
+                       AND c.lifecycle_epoch = %s
+                       AND c.deleted_at IS NULL
+                       AND c.phase NOT IN ('deleted', 'merged')
+                     ORDER BY ct.sort_key, ct.canonical_turn_id
+                       FOR UPDATE OF ct
+                    """,
+                    (
+                        conversation_id,
+                        int(turn_group_number),
+                        expected_lifecycle_epoch,
+                    ),
+                ).fetchall()
+                observed = {
+                    str(row["canonical_turn_id"]): str(row["turn_hash"] or "")
+                    for row in rows
+                }
+                user_count = sum(
+                    bool(str(row["user_content"] or "").strip()) for row in rows
+                )
+                assistant_count = sum(
+                    bool(str(row["assistant_content"] or "").strip()) for row in rows
+                )
+                combined_count = sum(
+                    bool(str(row["user_content"] or "").strip())
+                    and bool(str(row["assistant_content"] or "").strip())
+                    for row in rows
+                )
+                valid_shape = (
+                    len(rows) == 1
+                    and user_count == 1
+                    and assistant_count == 1
+                ) or (
+                    len(rows) == 2
+                    and user_count == 1
+                    and assistant_count == 1
+                    and combined_count == 0
+                )
+                if (
+                    not valid_shape
+                    or observed != expected
+                    or not any(row["tagged_at"] is None for row in rows)
+                ):
+                    return False
+                cur = conn.execute(
+                    """
+                    UPDATE canonical_turns
+                       SET primary_tag = %s, tags_json = %s, session_date = %s,
+                           fact_signals_json = %s, code_refs_json = %s,
+                           tagged_at = %s, updated_at = %s
+                     WHERE conversation_id = %s
+                       AND turn_group_number = %s
+                       AND canonical_turn_id = ANY(%s)
+                    """,
+                    (
+                        primary_tag or "_general",
+                        json.dumps(list(tags or [])),
+                        session_date or "",
+                        json.dumps(fact_payload),
+                        json.dumps(list(code_refs or [])),
+                        tagged,
+                        now,
+                        conversation_id,
+                        int(turn_group_number),
+                        canonical_turn_ids,
+                    ),
+                )
+                return int(cur.rowcount or 0) == len(rows)
 
     def backfill_canonical_row_hash_if_empty(
         self,

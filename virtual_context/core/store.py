@@ -349,8 +349,17 @@ class ContextStore(ABC):
         """
         return []
 
-    def conversation_reconcile(self, conversation_id: str):
+    def conversation_reconcile(
+        self,
+        conversation_id: str,
+        *,
+        expected_generation: int | None = None,
+    ):
         """Optional per-conversation write lock for merge-style ingest paths."""
+        if expected_generation is not None:
+            raise NotImplementedError(
+                "store cannot generation-fence exact source admission"
+            )
         return nullcontext()
 
     @abstractmethod
@@ -518,6 +527,7 @@ class ContextStore(ABC):
         reply_attribution_version: int = 0,
         audience_conversation_id: str = "",
         audience_attribution_version: int = 0,
+        source_claim: dict | None = None,
     ) -> None:
         """Upsert a canonical turn, using ``turn_number`` only as an ordinal hint."""
 
@@ -626,6 +636,22 @@ class ContextStore(ABC):
         """
         raise NotImplementedError
 
+    def iter_complete_untagged_canonical_groups(
+        self,
+        *,
+        conversation_id: str,
+        expected_lifecycle_epoch: int,
+        batch_size: int = 32,
+    ) -> list[list[CanonicalTurnRow]]:
+        """Return complete logical groups with at least one untagged row.
+
+        A complete group is exactly one legacy combined row, or exactly two
+        split rows containing one user-only and one assistant-only half.
+        Incomplete and ambiguous groups are never returned.  Implementations
+        must lifecycle-fence and order groups by their minimum ``sort_key``.
+        """
+        raise NotImplementedError
+
     def mark_canonical_row_tagged(
         self,
         *,
@@ -668,6 +694,29 @@ class ContextStore(ABC):
         lifecycle epoch in the same statement that updates tag fields.  They
         must not update content, sender, source ids, channel/audience data,
         reply attribution, ordering, or any other canonical provenance.
+        """
+        raise NotImplementedError
+
+    def update_canonical_group_tagging_if_unchanged(
+        self,
+        *,
+        conversation_id: str,
+        turn_group_number: int,
+        canonical_turn_ids: list[str],
+        expected_turn_hashes: list[str],
+        expected_lifecycle_epoch: int,
+        primary_tag: str,
+        tags: list[str],
+        session_date: str,
+        fact_signals: list[FactSignal],
+        code_refs: list[dict],
+        tagged_at: str | None = None,
+    ) -> bool:
+        """Atomically apply one generated enrichment to every backing row.
+
+        Concrete stores must lock/re-read the whole logical group, prove the
+        exact supported shape, ids, hashes, lifecycle and at-least-one-
+        untagged precondition, then update all rows in one transaction.
         """
         raise NotImplementedError
 
@@ -1054,6 +1103,29 @@ class ContextStore(ABC):
         """
         return None
 
+    def find_attested_canonical_user_source(
+        self,
+        row: "CanonicalTurnRow",
+    ) -> "CanonicalTurnRow | None":
+        """Return one immutable source membership, or ``None``.
+
+        This surface never falls back to ``canonical_turns.source_message_id``:
+        that legacy column may predate source attestation and therefore cannot
+        prove a body-to-message binding.
+        """
+        return None
+
+    def attest_canonical_user_source(
+        self,
+        row: "CanonicalTurnRow",
+        *,
+        observed_at: str,
+    ) -> None:
+        """Persist a verified current-user source membership or raise."""
+        raise NotImplementedError(
+            "this storage backend cannot attest canonical message sources"
+        )
+
     def find_actor_ids_by_display_label(
         self,
         conversation_id: str,
@@ -1190,6 +1262,35 @@ class ContextStore(ABC):
         """
         raise NotImplementedError
 
+    def claim_or_verify_conversation(
+        self, *, tenant_id: str, conversation_id: str,
+    ) -> None:
+        """Atomically create a conversation owner or verify the existing one.
+
+        A backend with globally shared conversation ids must never turn an
+        upsert into a tenant reassignment. Implementations raise
+        ``PermissionError`` when the id already belongs to another tenant.
+        """
+        raise NotImplementedError
+
+    def resolve_or_claim_conversation_for_tenant(
+        self, *, tenant_id: str, conversation_id: str,
+    ) -> str:
+        """Atomically resolve an alias, or claim an unaliased id.
+
+        The alias-existence check and the decision to create a conversation
+        owner must share the same storage lock.  Otherwise a rowless alias can
+        be mistaken for a new conversation and permanently claimed by the
+        requesting tenant before its real target is inspected.
+        """
+        raise NotImplementedError
+
+    def conversation_belongs_to_tenant(
+        self, *, tenant_id: str, conversation_id: str,
+    ) -> bool:
+        """Return whether the durable conversation owner is exactly tenant."""
+        raise NotImplementedError
+
     def get_lifecycle_epoch(self, conversation_id: str) -> int:
         """Return the current lifecycle_epoch. Raises KeyError if no row exists."""
         raise NotImplementedError
@@ -1245,6 +1346,39 @@ class ContextStore(ABC):
         (filtered by ``tagged_at IS NOT NULL`` for the numerator) so they
         can never drift from canonical truth.  Raises ``KeyError`` if the
         conversation row doesn't exist.
+        """
+        raise NotImplementedError
+
+    def has_complete_untagged_canonical_group(
+        self,
+        *,
+        conversation_id: str,
+        expected_lifecycle_epoch: int,
+    ) -> bool:
+        """Whether an exact two-row user/assistant group has untagged work.
+
+        The lifecycle check and physical-pair proof must happen in storage so
+        a prepare request cannot claim an ingestion lease for a user-only
+        half.  Concrete durable backends implement this as one indexed,
+        epoch-fenced existence query.
+        """
+        raise NotImplementedError
+
+    def claim_ingestion_for_complete_group(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        worker_id: str,
+        raw_payload_entries: int,
+        lease_ttl_s: float,
+    ) -> str:
+        """Atomically recheck work, open the episode and claim its lease.
+
+        Returns ``claimed``/``busy`` (optionally suffixed ``-transitioned``),
+        ``no-work`` or ``stale``. The complete-group predicate, phase
+        transition, episode upsert and ownership decision share one storage
+        transaction.
         """
         raise NotImplementedError
 
