@@ -206,3 +206,28 @@ class InvalidationFailedError(RuntimeError):
         self.event = dict(event)
         if cause is not None:
             self.__cause__ = cause
+
+
+class SessionStateRepairFailedError(RuntimeError):
+    """A VCATTACH alias committed but target marker repair did not.
+
+    ``execute_attach`` raises this only after it has still published the
+    mandatory cross-worker invalidation and evicted local runtime state. The
+    caller must surface a retryable response: repeating VCATTACH is idempotent
+    and retries the exact-preimage repair without hiding an incomplete target.
+    """
+
+    def __init__(
+        self,
+        *,
+        source_id: str,
+        target_id: str,
+        cause: BaseException,
+    ) -> None:
+        super().__init__(
+            "VCATTACH session-state repair incomplete "
+            f"(source={source_id[:12]}, target={target_id[:12]})"
+        )
+        self.source_id = source_id
+        self.target_id = target_id
+        self.__cause__ = cause

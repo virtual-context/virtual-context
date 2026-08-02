@@ -21,6 +21,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from virtual_context.core.exceptions import SessionStateRepairFailedError
 from virtual_context.core.state_recovery import derive_session_state_markers
 from virtual_context.proxy.session_state import SessionState
 from virtual_context.proxy.vcattach import (
@@ -196,6 +197,37 @@ def test_derive_session_state_markers_carries_existing_non_derivable_fields():
     assert state.version == 99
 
 
+def test_derive_session_state_markers_uses_explicit_durable_generation():
+    rows = [_row(0, tagged=True, compacted=True)]
+    store = _store_with_rows(rows)
+    existing = SessionState(conversation_generation=0, version=3)
+
+    state = derive_session_state_markers(
+        store,
+        "conv-existing",
+        existing_state=existing,
+        authoritative_conversation_generation=7,
+    )
+
+    assert state is not None
+    assert state.conversation_generation == 7
+    assert state.version == 3
+
+
+@pytest.mark.parametrize("invalid_generation", [-1, True, "7", 1.0])
+def test_derive_session_state_markers_rejects_invalid_durable_generation(
+    invalid_generation,
+):
+    store = _store_with_rows([_row(0, tagged=True, compacted=True)])
+
+    with pytest.raises(ValueError, match="non-negative int"):
+        derive_session_state_markers(
+            store,
+            "conv-invalid-generation",
+            authoritative_conversation_generation=invalid_generation,
+        )
+
+
 # ---------------------------------------------------------------------------
 # execute_attach — marker write + T2-before-T1 ordering
 # ---------------------------------------------------------------------------
@@ -221,9 +253,43 @@ def _execute_attach_test_store():
         save_conversation_alias=_save_alias,
         delete_conversation_alias=_delete_alias,
         get_all_canonical_turns=_get_all_canonical_turns,
+        get_conversation_generation=lambda _conv_id: 3,
+        is_conversation_deleted=lambda _conv_id: False,
     )
     store._aliases_view = aliases
     return store
+
+
+def _marker_provider(*, repair_error=None, call_order=None):
+    """Provider double that models the exact-CAS repair and read-back."""
+    provider = MagicMock()
+    committed: dict[str, SessionState] = {}
+
+    def _load(_conversation_id):
+        state = committed.get("state")
+        return (b"committed", state) if state is not None else (None, None)
+
+    def _repair(
+        _conversation_id,
+        *,
+        expected_raw,
+        markers,
+        durable_generation,
+    ):
+        if call_order is not None:
+            call_order.append("provider.repair")
+        if repair_error is not None:
+            raise repair_error
+        assert expected_raw is None
+        assert durable_generation == 3
+        state = SessionState.from_json(markers.to_json())
+        state.version = int(markers.version or 0) + 1
+        committed["state"] = state
+        return state.version
+
+    provider.load_authoritative_snapshot.side_effect = _load
+    provider.repair_session_state_markers.side_effect = _repair
+    return provider
 
 
 def test_execute_attach_writes_session_state_when_provider_supplied():
@@ -231,8 +297,7 @@ def test_execute_attach_writes_session_state_when_provider_supplied():
     fires after alias commit and before cross-worker publish. Provider
     receives the derived SessionState."""
     store = _execute_attach_test_store()
-    provider = MagicMock()
-    provider.load.return_value = None  # no existing state
+    provider = _marker_provider()
 
     execute_attach(
         old_id="src",
@@ -241,8 +306,8 @@ def test_execute_attach_writes_session_state_when_provider_supplied():
         session_state_provider=provider,
     )
 
-    assert provider.save.call_count == 1
-    saved_state = provider.save.call_args.args[1]
+    assert provider.repair_session_state_markers.call_count == 1
+    saved_state = provider.repair_session_state_markers.call_args.kwargs["markers"]
     assert isinstance(saved_state, SessionState)
     assert saved_state.compacted_prefix_messages == 2
     assert saved_state.last_completed_turn == 1
@@ -264,37 +329,34 @@ def test_execute_attach_skips_session_state_write_when_provider_none():
     assert store._aliases_view == {"src": "tgt"}
 
 
-def test_execute_attach_swallows_provider_save_exception():
-    """Provider.save raising must NOT propagate. Alias is committed;
-    sibling workers will apply hydrate-time defensive recovery."""
+def test_execute_attach_surfaces_provider_repair_after_invalidation():
+    """A committed alias with incomplete repair is explicitly retryable."""
     store = _execute_attach_test_store()
-    provider = MagicMock()
-    provider.load.return_value = None
-    provider.save.side_effect = RuntimeError("redis transport blip")
-
-    # Should not raise.
-    execute_attach(
-        old_id="src",
-        target_id="tgt",
-        store=store,
-        session_state_provider=provider,
+    provider = _marker_provider(
+        repair_error=RuntimeError("redis transport blip"),
     )
+
+    with pytest.raises(SessionStateRepairFailedError):
+        execute_attach(
+            old_id="src",
+            target_id="tgt",
+            store=store,
+            session_state_provider=provider,
+        )
 
     # Alias still landed.
     assert store._aliases_view == {"src": "tgt"}
     # Provider was attempted.
-    assert provider.save.call_count == 1
+    assert provider.repair_session_state_markers.call_count == 1
 
 
 def test_execute_attach_marker_write_commits_before_cross_worker_publish():
     """Codex finding 3: strict T2-before-T1 ordering pinned by call-order
-    inspection. Records the invocation index of provider.save versus
+    inspection. Records the invocation index of marker repair versus
     each cross_worker_invalidate call; asserts the save happens FIRST."""
     store = _execute_attach_test_store()
-    provider = MagicMock()
-    provider.load.return_value = None
     call_order: list[str] = []
-    provider.save.side_effect = lambda conv, state: call_order.append("provider.save")
+    provider = _marker_provider(call_order=call_order)
 
     def _xworker(event):
         call_order.append(f"cross_worker.{event.get('type', '?')}")
@@ -307,14 +369,14 @@ def test_execute_attach_marker_write_commits_before_cross_worker_publish():
         session_state_provider=provider,
     )
 
-    # provider.save must precede every cross_worker.* call.
-    save_idx = call_order.index("provider.save")
+    # Exact marker repair must precede every cross_worker.* call.
+    save_idx = call_order.index("provider.repair")
     xworker_indices = [
         i for i, e in enumerate(call_order) if e.startswith("cross_worker.")
     ]
     assert xworker_indices, "cross_worker_invalidate should have fired at least once"
     assert all(i > save_idx for i in xworker_indices), (
-        f"cross_worker_invalidate must fire AFTER provider.save; "
+        f"cross_worker_invalidate must fire AFTER marker repair; "
         f"call_order = {call_order}"
     )
 
@@ -325,22 +387,24 @@ def test_execute_attach_cross_worker_fires_when_marker_write_fails():
     and sibling workers must learn about it. They'll apply hydrate-time
     defensive recovery to patch missing markers from canonical_turns."""
     store = _execute_attach_test_store()
-    provider = MagicMock()
-    provider.load.return_value = None
-    provider.save.side_effect = RuntimeError("redis down")
+    provider = _marker_provider(repair_error=RuntimeError("redis down"))
     received_events: list[dict] = []
+    locally_invalidated: list[str] = []
 
-    execute_attach(
-        old_id="src",
-        target_id="tgt",
-        store=store,
-        cross_worker_invalidate=lambda e: received_events.append(dict(e)),
-        session_state_provider=provider,
-    )
+    with pytest.raises(SessionStateRepairFailedError):
+        execute_attach(
+            old_id="src",
+            target_id="tgt",
+            store=store,
+            cross_worker_invalidate=lambda e: received_events.append(dict(e)),
+            registry_invalidate=locally_invalidated.append,
+            session_state_provider=provider,
+        )
 
     types = [e["type"] for e in received_events]
     assert "alias_deleted" in types
     assert "alias_created" in types
+    assert locally_invalidated == ["src", "tgt"]
 
 
 def test_execute_attach_local_registry_invalidate_fires_for_both_ids():
@@ -348,10 +412,8 @@ def test_execute_attach_local_registry_invalidate_fires_for_both_ids():
     registry. Order: registry_invalidate runs AFTER provider.save AND
     after cross_worker_invalidate."""
     store = _execute_attach_test_store()
-    provider = MagicMock()
-    provider.load.return_value = None
     call_order: list[str] = []
-    provider.save.side_effect = lambda *_: call_order.append("provider.save")
+    provider = _marker_provider(call_order=call_order)
 
     def _registry(cid):
         call_order.append(f"registry.{cid}")
@@ -367,7 +429,7 @@ def test_execute_attach_local_registry_invalidate_fires_for_both_ids():
 
     assert "registry.src" in call_order
     assert "registry.tgt" in call_order
-    save_idx = call_order.index("provider.save")
+    save_idx = call_order.index("provider.repair")
     last_registry_idx = max(
         i for i, e in enumerate(call_order) if e.startswith("registry.")
     )
@@ -379,8 +441,7 @@ def test_execute_attach_self_target_still_writes_markers():
     success, including the self-VCATTACH path (resolver maps source to
     same id). Cheap idempotent repair."""
     store = _execute_attach_test_store()
-    provider = MagicMock()
-    provider.load.return_value = None
+    provider = _marker_provider()
 
     execute_attach(
         old_id="X",
@@ -389,8 +450,8 @@ def test_execute_attach_self_target_still_writes_markers():
         session_state_provider=provider,
     )
 
-    assert provider.save.call_count == 1
-    saved_state = provider.save.call_args.args[1]
+    assert provider.repair_session_state_markers.call_count == 1
+    saved_state = provider.repair_session_state_markers.call_args.kwargs["markers"]
     assert saved_state.compacted_prefix_messages == 2
 
 

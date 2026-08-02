@@ -135,6 +135,7 @@ def derive_session_state_markers(
     conversation_id: str,
     *,
     existing_state: SessionState | None = None,
+    authoritative_conversation_generation: int | None = None,
 ) -> SessionState | None:
     """Derive SessionState markers from canonical_turns for ``conversation_id``.
 
@@ -153,6 +154,10 @@ def derive_session_state_markers(
             ``split_processed_tags``, ``trailing_fingerprint``,
             ``provider``, ``version``) are carried forward when supplied
             so the marker write doesn't clobber unrelated state.
+        authoritative_conversation_generation: optional generation read from
+            the durable conversation lifecycle store. When supplied, this
+            authoritative value replaces the carried/default generation.
+            Callers must not infer or promote a generation from Redis alone.
 
     Returns:
         A ``SessionState`` with all derivable fields populated. Returns
@@ -184,6 +189,17 @@ def derive_session_state_markers(
       inbound).
     """
     from ..engine import VirtualContextEngine
+
+    if (
+        authoritative_conversation_generation is not None
+        and (
+            type(authoritative_conversation_generation) is not int
+            or authoritative_conversation_generation < 0
+        )
+    ):
+        raise ValueError(
+            "authoritative_conversation_generation must be a non-negative int"
+        )
 
     try:
         rows = list(store.get_all_canonical_turns(conversation_id))
@@ -226,7 +242,9 @@ def derive_session_state_markers(
     if existing_state is not None:
         last_request_time = float(getattr(existing_state, "last_request_time", 0.0) or 0.0)
         checkpoint_version = int(getattr(existing_state, "checkpoint_version", 0) or 0) + 1
-        conversation_generation = int(getattr(existing_state, "conversation_generation", 0) or 0)
+        carried_conversation_generation = int(
+            getattr(existing_state, "conversation_generation", 0) or 0
+        )
         tool_tag_counter = int(getattr(existing_state, "tool_tag_counter", 0) or 0)
         split_processed_tags = set(getattr(existing_state, "split_processed_tags", set()) or set())
         trailing_fingerprint = str(getattr(existing_state, "trailing_fingerprint", "") or "")
@@ -248,7 +266,7 @@ def derive_session_state_markers(
     else:
         last_request_time = 0.0
         checkpoint_version = 1
-        conversation_generation = 0
+        carried_conversation_generation = 0
         tool_tag_counter = 0
         split_processed_tags = set()
         trailing_fingerprint = ""
@@ -303,7 +321,11 @@ def derive_session_state_markers(
         last_completed_turn=int(last_completed_turn),
         last_indexed_turn=int(last_indexed_turn),
         checkpoint_version=checkpoint_version,
-        conversation_generation=conversation_generation,
+        conversation_generation=(
+            int(authoritative_conversation_generation)
+            if authoritative_conversation_generation is not None
+            else carried_conversation_generation
+        ),
         tool_tag_counter=tool_tag_counter,
         split_processed_tags=split_processed_tags,
         trailing_fingerprint=trailing_fingerprint,

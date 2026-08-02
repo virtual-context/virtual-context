@@ -2331,7 +2331,10 @@ def cmd_admin_backfill_session_state_markers(args):
     provider = None
     if not dry_run:
         try:
-            provider = SessionStateProvider(redis_url=redis_url)
+            provider = SessionStateProvider(
+                redis_url=redis_url,
+                store=raw_store,
+            )
         except Exception as exc:  # noqa: BLE001
             print(json.dumps({
                 "status": "error",
@@ -2380,14 +2383,56 @@ def cmd_admin_backfill_session_state_markers(args):
             "saved": False,
         }
         try:
+            get_generation = getattr(
+                raw_store, "get_conversation_generation", None,
+            )
+            is_deleted = getattr(raw_store, "is_conversation_deleted", None)
+            if not callable(get_generation) or not callable(is_deleted):
+                raise RuntimeError(
+                    "durable conversation lifecycle API is unavailable"
+                )
+            durable_generation = get_generation(cid)
+            if type(durable_generation) is not int or durable_generation < 0:
+                raise RuntimeError(
+                    "durable conversation generation is invalid"
+                )
+            durable_deleted = is_deleted(cid)
+            if durable_deleted is True:
+                raise RuntimeError(
+                    "refusing marker repair for deleted conversation"
+                )
+            if durable_deleted is not False:
+                raise RuntimeError(
+                    "durable conversation lifecycle state is invalid"
+                )
             existing = None
+            expected_raw = None
             if provider is not None:
-                try:
-                    existing = provider.load(cid)
-                except Exception:
-                    existing = None
+                expected_raw, existing = provider.load_authoritative_snapshot(
+                    cid
+                )
+                if existing is not None and existing.deleted:
+                    raise RuntimeError(
+                        "refusing to replace authoritative Redis tombstone"
+                    )
+                if existing is not None:
+                    existing_generation = existing.conversation_generation
+                    if (
+                        type(existing_generation) is not int
+                        or existing_generation < 0
+                    ):
+                        raise RuntimeError(
+                            "authoritative Redis generation is invalid"
+                        )
+                    if existing_generation > durable_generation:
+                        raise RuntimeError(
+                            "refusing authoritative Redis generation downgrade"
+                        )
             derived = derive_session_state_markers(
-                raw_store, cid, existing_state=existing,
+                raw_store,
+                cid,
+                existing_state=existing,
+                authoritative_conversation_generation=durable_generation,
             )
         except Exception as exc:  # noqa: BLE001
             failed_count += 1
@@ -2406,6 +2451,7 @@ def cmd_admin_backfill_session_state_markers(args):
             "flushed_prefix_messages": derived.flushed_prefix_messages,
             "last_completed_turn": derived.last_completed_turn,
             "last_indexed_turn": derived.last_indexed_turn,
+            "conversation_generation": derived.conversation_generation,
             "turn_tag_entries": len(derived.turn_tag_entries),
         })
         if dry_run:
@@ -2413,10 +2459,38 @@ def cmd_admin_backfill_session_state_markers(args):
             print(json.dumps(result))
             continue
         try:
-            provider.save(cid, derived)
+            saved_version = provider.repair_session_state_markers(
+                cid,
+                expected_raw=expected_raw,
+                markers=derived,
+                durable_generation=durable_generation,
+                allow_generation_promotion=True,
+            )
+            verified_raw, verified = provider.load_authoritative_snapshot(cid)
+            if verified_raw is None or verified is None:
+                raise RuntimeError("session-state marker repair disappeared")
+            expected_markers = {
+                "compacted_prefix_messages": derived.compacted_prefix_messages,
+                "flushed_prefix_messages": derived.flushed_prefix_messages,
+                "last_compacted_turn": derived.last_compacted_turn,
+                "last_completed_turn": derived.last_completed_turn,
+                "last_indexed_turn": derived.last_indexed_turn,
+                "conversation_generation": durable_generation,
+                "version": saved_version,
+            }
+            for field, expected_value in expected_markers.items():
+                if getattr(verified, field) != expected_value:
+                    raise RuntimeError(
+                        f"session-state marker verification failed: {field}"
+                    )
+            if verified.turn_tag_entries != derived.turn_tag_entries:
+                raise RuntimeError(
+                    "session-state marker verification failed: turn_tag_entries"
+                )
             saved_count += 1
             result["status"] = "ok"
             result["saved"] = True
+            result["version"] = saved_version
         except Exception as exc:  # noqa: BLE001
             failed_count += 1
             result["status"] = "error"
@@ -2424,7 +2498,7 @@ def cmd_admin_backfill_session_state_markers(args):
         print(json.dumps(result))
 
     summary = {
-        "status": "complete",
+        "status": "complete" if failed_count == 0 else "failed",
         "tenant_id": tenant_id,
         "all_convs_for_tenant": all_convs,
         "dry_run": dry_run,
@@ -2438,6 +2512,8 @@ def cmd_admin_backfill_session_state_markers(args):
         engine.close()
     except Exception:
         pass
+    if failed_count:
+        sys.exit(1)
 
 
 def main():

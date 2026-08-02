@@ -4,7 +4,9 @@ import os
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 import json
+import fakeredis
 import pytest
+import redis
 from unittest.mock import MagicMock, patch
 from virtual_context.proxy.session_state import SessionState, SessionStateProvider
 from virtual_context.proxy.formats import PayloadTokenCache
@@ -160,6 +162,321 @@ def test_save_rejects_checkpoint_from_previous_conversation_generation(
     assert loaded.conversation_generation == 2
     assert loaded.last_completed_turn == -1
 
+
+class _LifecycleStore:
+    def __init__(self, *, generation=1, deleted=False):
+        self.generation = generation
+        self.deleted = deleted
+        self.saved = []
+
+    def get_conversation_generation(self, _conversation_id):
+        return self.generation
+
+    def is_conversation_deleted(self, _conversation_id):
+        return self.deleted
+
+    def save_engine_state(self, snapshot):
+        self.saved.append(snapshot)
+
+
+def _repair_provider(*, generation=1, deleted=False):
+    redis_client = fakeredis.FakeRedis(decode_responses=False)
+    store = _LifecycleStore(generation=generation, deleted=deleted)
+    return SessionStateProvider(redis_client=redis_client, store=store), redis_client, store
+
+
+def test_marker_repair_exact_cas_advances_generation_and_preserves_payload():
+    repair_provider, redis_client, store = _repair_provider(generation=1)
+    key = "vc:session:conv-repair"
+    original = json.loads(SessionState(
+        conversation_generation=0,
+        checkpoint_version=3,
+        version=7,
+        provider="keep-provider",
+        working_set=[{"tag": "keep-me"}],
+    ).to_json())
+    original["future_unknown_field"] = {"nested": [1, 2, 3]}
+    original_raw = json.dumps(original, separators=(",", ":")).encode()
+    redis_client.set(key, original_raw)
+
+    expected_raw, existing = repair_provider.load_authoritative_snapshot(
+        "conv-repair"
+    )
+    markers = SessionState(
+        compacted_prefix_messages=12,
+        flushed_prefix_messages=10,
+        last_compacted_turn=8,
+        last_completed_turn=11,
+        last_indexed_turn=11,
+        turn_tag_entries=[{"turn_number": 11, "tags": ["topic"]}],
+        conversation_generation=1,
+    )
+    saved_version = repair_provider.repair_session_state_markers(
+        "conv-repair",
+        expected_raw=expected_raw,
+        markers=markers,
+        durable_generation=1,
+        allow_generation_promotion=True,
+    )
+
+    committed = json.loads(redis_client.get(key))
+    assert existing is not None
+    assert saved_version == 8
+    assert committed["version"] == 8
+    assert committed["checkpoint_version"] == 4
+    assert committed["conversation_generation"] == 1
+    assert committed["compacted_prefix_messages"] == 12
+    assert committed["flushed_prefix_messages"] == 10
+    assert committed["last_completed_turn"] == 11
+    assert committed["turn_tag_entries"] == markers.turn_tag_entries
+    assert committed["provider"] == "keep-provider"
+    assert committed["working_set"] == [{"tag": "keep-me"}]
+    assert committed["future_unknown_field"] == {"nested": [1, 2, 3]}
+    assert len(store.saved) == 1
+    assert store.saved[0].conversation_generation == 1
+
+
+def test_marker_repair_creates_first_checkpoint_from_missing_key():
+    repair_provider, _redis_client, _store = _repair_provider(generation=1)
+
+    saved_version = repair_provider.repair_session_state_markers(
+        "conv-missing",
+        expected_raw=None,
+        markers=SessionState(
+            conversation_generation=1,
+            checkpoint_version=1,
+            last_completed_turn=2,
+        ),
+        durable_generation=1,
+    )
+
+    committed = repair_provider.load_authoritative("conv-missing")
+    assert committed is not None
+    assert saved_version == 1
+    assert committed.version == 1
+    assert committed.checkpoint_version == 1
+    assert committed.conversation_generation == 1
+    assert committed.last_completed_turn == 2
+
+
+def test_marker_repair_requires_explicit_admin_generation_promotion():
+    repair_provider, redis_client, _store = _repair_provider(generation=1)
+    key = "vc:session:conv-promotion-policy"
+    raw = SessionState(conversation_generation=0, version=2).to_json()
+    redis_client.set(key, raw)
+
+    with pytest.raises(RuntimeError, match="non-administrative"):
+        repair_provider.repair_session_state_markers(
+            "conv-promotion-policy",
+            expected_raw=raw,
+            markers=SessionState(conversation_generation=1),
+            durable_generation=1,
+        )
+
+    assert redis_client.get(key) == raw
+
+
+@pytest.mark.parametrize(
+    ("redis_state", "store_deleted", "error"),
+    [
+        (SessionState(deleted=True, version=2**53), False, "tombstone"),
+        (SessionState(conversation_generation=2), False, "downgrade"),
+        (SessionState(conversation_generation=-1), False, "invalid"),
+        (SessionState(conversation_generation=0), True, "deleted conversation"),
+    ],
+)
+def test_marker_repair_rejects_unsafe_lifecycle_state(
+    redis_state,
+    store_deleted,
+    error,
+):
+    repair_provider, redis_client, _store = _repair_provider(
+        generation=1,
+        deleted=store_deleted,
+    )
+    key = "vc:session:conv-unsafe"
+    raw = redis_state.to_json()
+    redis_client.set(key, raw)
+    markers = SessionState(conversation_generation=1)
+
+    with pytest.raises(RuntimeError, match=error):
+        repair_provider.repair_session_state_markers(
+            "conv-unsafe",
+            expected_raw=raw,
+            markers=markers,
+            durable_generation=1,
+        )
+
+    assert redis_client.get(key) == raw
+
+
+def test_marker_repair_rejects_changed_exact_preimage_and_busy_lease():
+    repair_provider, redis_client, _store = _repair_provider(generation=1)
+    key = "vc:session:conv-race"
+    expected = SessionState(conversation_generation=0, version=1).to_json()
+    changed = SessionState(conversation_generation=0, version=2).to_json()
+    redis_client.set(key, changed)
+    markers = SessionState(conversation_generation=1)
+
+    with pytest.raises(RuntimeError, match="changed before marker repair"):
+        repair_provider.repair_session_state_markers(
+            "conv-race",
+            expected_raw=expected,
+            markers=markers,
+            durable_generation=1,
+        )
+    assert redis_client.get(key) == changed
+
+    redis_client.set("vc:lifecycle_lease:conv-race", "other-owner")
+    with pytest.raises(RuntimeError, match="lifecycle lease is busy"):
+        repair_provider.repair_session_state_markers(
+            "conv-race",
+            expected_raw=changed,
+            markers=markers,
+            durable_generation=1,
+        )
+    assert redis_client.get(key) == changed
+
+
+def test_marker_repair_retries_benign_watched_lease_renewal():
+    backing = fakeredis.FakeRedis(decode_responses=False)
+
+    class OneWatchRaceRedis:
+        inject_race = True
+
+        def pipeline(self, *args, **kwargs):
+            pipe = backing.pipeline(*args, **kwargs)
+            if self.inject_race:
+                self.inject_race = False
+
+                def _raise_watch_error(*_args, **_kwargs):
+                    raise redis.WatchError("simulated lease renewal")
+
+                pipe.execute = _raise_watch_error
+            return pipe
+
+        def __getattr__(self, name):
+            return getattr(backing, name)
+
+    store = _LifecycleStore(generation=1, deleted=False)
+    repair_provider = SessionStateProvider(
+        redis_client=OneWatchRaceRedis(),
+        store=store,
+    )
+    conversation_id = "conv-renewal-race"
+    key = f"vc:session:{conversation_id}"
+    raw = SessionState(conversation_generation=1, version=4).to_json()
+    backing.set(key, raw)
+
+    saved_version = repair_provider.repair_session_state_markers(
+        conversation_id,
+        expected_raw=raw,
+        markers=SessionState(
+            conversation_generation=1,
+            last_completed_turn=9,
+        ),
+        durable_generation=1,
+    )
+
+    committed = repair_provider.load_authoritative(conversation_id)
+    assert saved_version == 5
+    assert committed is not None
+    assert committed.last_completed_turn == 9
+
+@pytest.mark.parametrize(
+    ("payload_update", "error"),
+    [
+        ({"conversation_generation": "0"}, "generation is invalid"),
+        ({"version": "1"}, "version is invalid"),
+        ({"checkpoint_version": True}, "checkpoint version is invalid"),
+        ({"deleted": "false"}, "deletion marker is invalid"),
+    ],
+)
+def test_marker_repair_rejects_malformed_security_fields(
+    payload_update,
+    error,
+):
+    repair_provider, redis_client, _store = _repair_provider(generation=1)
+    key = "vc:session:conv-malformed"
+    payload = json.loads(SessionState(conversation_generation=1).to_json())
+    payload.update(payload_update)
+    raw = json.dumps(payload).encode()
+    redis_client.set(key, raw)
+
+    with pytest.raises(RuntimeError, match=error):
+        repair_provider.repair_session_state_markers(
+            "conv-malformed",
+            expected_raw=raw,
+            markers=SessionState(conversation_generation=1),
+            durable_generation=1,
+        )
+
+    assert redis_client.get(key) == raw
+
+
+def test_sqlite_redis_generation_drift_repair_then_normal_save(tmp_path):
+    """Reproduce DB=1/Redis=0 with real lifecycle and checkpoint storage."""
+    from virtual_context.storage.sqlite import SQLiteStore
+
+    conversation_id = "sqlite-generation-drift"
+    store = SQLiteStore(db_path=str(tmp_path / "generation-drift.db"))
+    try:
+        conn = store._get_conn()
+        conn.execute(
+            """INSERT INTO conversation_lifecycle
+               (conversation_id, generation, deleted, updated_at)
+               VALUES (?, 1, 0, datetime('now'))""",
+            (conversation_id,),
+        )
+        conn.commit()
+        redis_client = fakeredis.FakeRedis(decode_responses=False)
+        provider = SessionStateProvider(
+            redis_client=redis_client,
+            store=store,
+        )
+        redis_client.set(
+            f"vc:session:{conversation_id}",
+            SessionState(
+                conversation_generation=0,
+                checkpoint_version=2,
+                version=4,
+                provider="preserved",
+            ).to_json(),
+        )
+        expected_raw, _existing = provider.load_authoritative_snapshot(
+            conversation_id
+        )
+
+        repaired_version = provider.repair_session_state_markers(
+            conversation_id,
+            expected_raw=expected_raw,
+            markers=SessionState(
+                conversation_generation=1,
+                last_completed_turn=6,
+                last_indexed_turn=6,
+            ),
+            durable_generation=1,
+            allow_generation_promotion=True,
+        )
+        repaired = provider.load_authoritative(conversation_id)
+        assert repaired is not None
+        assert repaired_version == 5
+        assert repaired.conversation_generation == 1
+        assert repaired.provider == "preserved"
+
+        repaired.last_completed_turn = 7
+        assert provider.save(conversation_id, repaired) == 6
+        committed = provider.load_authoritative(conversation_id)
+        assert committed is not None
+        assert committed.conversation_generation == 1
+        assert committed.version == 6
+        assert committed.last_completed_turn == 7
+        durable = store.load_engine_state(conversation_id)
+        assert durable is not None
+        assert durable.conversation_generation == 1
+        assert durable.last_completed_turn == 7
+    finally:
+        store.close()
 
 def test_delete_sets_tombstone(provider, mock_redis):
     provider.delete("conv-123")

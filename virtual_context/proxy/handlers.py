@@ -1964,9 +1964,17 @@ async def _handle_vcattach(
                 session_state_provider=session_state_provider,
             )
     except Exception as exc:
-        from ..core.exceptions import InvalidationFailedError
-        if not isinstance(exc, InvalidationFailedError):
+        from ..core.exceptions import (
+            InvalidationFailedError,
+            SessionStateRepairFailedError,
+        )
+        if not isinstance(
+            exc,
+            (InvalidationFailedError, SessionStateRepairFailedError),
+        ):
             raise
+
+        repair_incomplete = isinstance(exc, SessionStateRepairFailedError)
 
         # The alias DML may already be committed when Redis publication
         # fails.  Preserve the REST-mode at-least-once contract in proxy
@@ -1975,9 +1983,17 @@ async def _handle_vcattach(
         # an SSE-formatted error with the same HTTP 503 + Retry-After
         # semantics as JSON callers.
         logger.warning(
-            "vcattach invalidation failed",
+            (
+                "vcattach session-state repair incomplete"
+                if repair_incomplete
+                else "vcattach invalidation failed"
+            ),
             extra={
-                "metric": "vcattach_invalidation_failed",
+                "metric": (
+                    "vcattach_session_state_repair_failed"
+                    if repair_incomplete
+                    else "vcattach_invalidation_failed"
+                ),
                 "tenant_id": tenant_id or "",
                 "source": result.conversation_id[:12],
                 "target": target_id[:12],
@@ -1985,11 +2001,23 @@ async def _handle_vcattach(
             },
         )
         retry_message = (
-            "alias eviction transport unavailable; retry the VCATTACH"
+            "target session repair incomplete; retry the VCATTACH"
+            if repair_incomplete
+            else "alias eviction transport unavailable; retry the VCATTACH"
+        )
+        retry_error = (
+            "target session repair incomplete; retry"
+            if repair_incomplete
+            else "alias eviction transport unavailable; retry"
+        )
+        retry_code = (
+            "vcattach_session_state_repair_failed"
+            if repair_incomplete
+            else "vcattach_invalidation_failed"
         )
         retry_headers = {"Retry-After": "1"}
         if result.is_streaming:
-            streamed = f"[vcattach_invalidation_failed] {retry_message}"
+            streamed = f"[{retry_code}] {retry_message}"
             return StreamingResponse(
                 iter([fmt.emit_fake_response_sse(streamed, target_id)]),
                 media_type="text/event-stream",
@@ -2000,7 +2028,7 @@ async def _handle_vcattach(
             {
                 "conversation_id": target_id,
                 "vc_command": "attach",
-                "error": "alias eviction transport unavailable; retry",
+                "error": retry_error,
                 "message": retry_message,
                 "retryable": True,
             },
@@ -2700,8 +2728,18 @@ def _handle_vc_command_rest(
                     session_state_provider=_session_state_provider,
                 )
         except Exception as exc:
-            from ..core.exceptions import InvalidationFailedError
-            if isinstance(exc, InvalidationFailedError):
+            from ..core.exceptions import (
+                InvalidationFailedError,
+                SessionStateRepairFailedError,
+            )
+            if isinstance(
+                exc,
+                (InvalidationFailedError, SessionStateRepairFailedError),
+            ):
+                repair_incomplete = isinstance(
+                    exc,
+                    SessionStateRepairFailedError,
+                )
                 # At-least-once contract per spec S9: alias row already
                 # committed; surface as retryable 503 so the user
                 # retries (which fires the callback again until it
@@ -2710,24 +2748,39 @@ def _handle_vc_command_rest(
                 # ``vcattach_invalidation_failed`` metric for ops
                 # symmetry with ``vcmerge_invalidation_failed``.
                 logger.warning(
-                    "vcattach invalidation failed",
+                    (
+                        "vcattach session-state repair incomplete"
+                        if repair_incomplete
+                        else "vcattach invalidation failed"
+                    ),
                     extra={
-                        "metric": "vcattach_invalidation_failed",
+                        "metric": (
+                            "vcattach_session_state_repair_failed"
+                            if repair_incomplete
+                            else "vcattach_invalidation_failed"
+                        ),
                         "tenant_id": tenant_id or "",
                         "source": conv_id[:12],
                         "target": target_id[:12],
                         "callback_error": repr(exc.__cause__),
                     },
                 )
+                retry_error = (
+                    "target session repair incomplete; retry"
+                    if repair_incomplete
+                    else "alias eviction transport unavailable; retry"
+                )
+                retry_message = (
+                    "target session repair incomplete; retry the VCATTACH"
+                    if repair_incomplete
+                    else "alias eviction transport unavailable; retry the VCATTACH"
+                )
                 return JSONResponse(
                     {
                         "conversation_id": target_id,
                         "vc_command": "attach",
-                        "error": "alias eviction transport unavailable; retry",
-                        "message": (
-                            "alias eviction transport unavailable; "
-                            "retry the VCATTACH"
-                        ),
+                        "error": retry_error,
+                        "message": retry_message,
                         "retryable": True,
                     },
                     status_code=503,

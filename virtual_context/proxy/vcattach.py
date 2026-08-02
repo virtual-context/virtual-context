@@ -428,63 +428,129 @@ def execute_attach(
     # at hydrate-time, here fixed at the write-time entry point so
     # future hydrations have correct data on disk too).
     #
-    # Failures here are best-effort — alias row is already committed
-    # at T0b, and T1 below still fires to invalidate sibling caches.
-    # The hydrate-time defensive recovery (Step C in spec) catches any
-    # workers that read stale Redis between T0b and a successful T2.
+    # Alias DML is already committed at T0b, so a repair failure is deferred
+    # until after mandatory cross-worker and local invalidation. It is then
+    # surfaced as retryable; reporting success would leave the cloud
+    # generation gate correctly refusing the stale target.
+    marker_repair_error: BaseException | None = None
     if session_state_provider is not None:
         try:
             from ..core.state_recovery import derive_session_state_markers
-            existing = None
-            try:
-                existing = session_state_provider.load(target_id)
-            except Exception:
-                logger.warning(
-                    "VCATTACH: failed to load existing SessionState for "
-                    "%s; deriving from canonical_turns without "
-                    "carrying forward non-derivable fields",
-                    target_id[:12], exc_info=True,
+            get_generation = getattr(
+                store, "get_conversation_generation", None,
+            )
+            is_deleted = getattr(store, "is_conversation_deleted", None)
+            if not callable(get_generation) or not callable(is_deleted):
+                raise RuntimeError(
+                    "durable conversation lifecycle API is unavailable"
                 )
+            durable_generation = get_generation(target_id)
+            if type(durable_generation) is not int or durable_generation < 0:
+                raise RuntimeError(
+                    "durable conversation generation is invalid"
+                )
+            durable_deleted = is_deleted(target_id)
+            if durable_deleted is True:
+                raise RuntimeError(
+                    "refusing marker repair for deleted VCATTACH target"
+                )
+            if durable_deleted is not False:
+                raise RuntimeError(
+                    "durable conversation lifecycle state is invalid"
+                )
+            expected_raw, existing = (
+                session_state_provider.load_authoritative_snapshot(target_id)
+            )
+            if existing is not None and existing.deleted:
+                raise RuntimeError(
+                    "refusing to replace authoritative Redis tombstone"
+                )
+            if existing is not None:
+                existing_generation = existing.conversation_generation
+                if (
+                    type(existing_generation) is not int
+                    or existing_generation < 0
+                ):
+                    raise RuntimeError(
+                        "authoritative Redis generation is invalid"
+                    )
+                if existing_generation > durable_generation:
+                    raise RuntimeError(
+                        "refusing authoritative Redis generation downgrade"
+                    )
             derived = derive_session_state_markers(
-                store, target_id, existing_state=existing,
+                store,
+                target_id,
+                existing_state=existing,
+                authoritative_conversation_generation=durable_generation,
             )
             if derived is not None:
-                saved_version = session_state_provider.save(target_id, derived)
-                if saved_version is None:
-                    logger.warning(
-                        "VCATTACH: SessionStateProvider.save did not persist "
-                        "derived markers for target %s; alias is committed and "
-                        "cross-worker invalidation will still fire",
-                        target_id[:12],
+                saved_version = (
+                    session_state_provider.repair_session_state_markers(
+                        target_id,
+                        expected_raw=expected_raw,
+                        markers=derived,
+                        durable_generation=durable_generation,
                     )
-                else:
-                    logger.info(
-                        "VCATTACH: persisted derived SessionState markers for "
-                        "target %s (compacted=%d, flushed=%d, "
-                        "last_completed_turn=%d, last_indexed_turn=%d, "
-                        "turn_tag_entries=%d)",
-                        target_id[:12],
-                        derived.compacted_prefix_messages,
-                        derived.flushed_prefix_messages,
-                        derived.last_completed_turn,
-                        derived.last_indexed_turn,
-                        len(derived.turn_tag_entries),
+                )
+                verified_raw, verified = (
+                    session_state_provider.load_authoritative_snapshot(
+                        target_id
                     )
-        except Exception:
+                )
+                if verified_raw is None or verified is None:
+                    raise RuntimeError(
+                        "VCATTACH marker repair disappeared after commit"
+                    )
+                expected_markers = {
+                    "compacted_prefix_messages": (
+                        derived.compacted_prefix_messages
+                    ),
+                    "flushed_prefix_messages": derived.flushed_prefix_messages,
+                    "last_compacted_turn": derived.last_compacted_turn,
+                    "last_completed_turn": derived.last_completed_turn,
+                    "last_indexed_turn": derived.last_indexed_turn,
+                    "conversation_generation": durable_generation,
+                    "version": saved_version,
+                }
+                for field, expected_value in expected_markers.items():
+                    if getattr(verified, field) != expected_value:
+                        raise RuntimeError(
+                            "VCATTACH marker verification failed: " + field
+                        )
+                if verified.turn_tag_entries != derived.turn_tag_entries:
+                    raise RuntimeError(
+                        "VCATTACH marker verification failed: turn_tag_entries"
+                    )
+                logger.info(
+                    "VCATTACH: persisted derived SessionState markers for "
+                    "target %s (generation=%d, version=%d, compacted=%d, "
+                    "flushed=%d, last_completed_turn=%d, "
+                    "last_indexed_turn=%d, turn_tag_entries=%d)",
+                    target_id[:12],
+                    durable_generation,
+                    saved_version,
+                    derived.compacted_prefix_messages,
+                    derived.flushed_prefix_messages,
+                    derived.last_completed_turn,
+                    derived.last_indexed_turn,
+                    len(derived.turn_tag_entries),
+                )
+        except Exception as exc:
+            marker_repair_error = exc
             logger.warning(
                 "VCATTACH: SessionState marker write failed for target %s; "
                 "alias is committed and cross-worker invalidation will "
-                "still fire — sibling workers will apply hydrate-time "
-                "defensive recovery from canonical_turns",
+                "still fire; the caller must retry the incomplete repair",
                 target_id[:12], exc_info=True,
             )
 
     # T1. Cross-worker invalidation — fires whether T2 succeeded or
     # not. The alias row IS committed at this point and sibling
     # workers MUST learn about it regardless of marker-write outcome.
-    # When T2 succeeded: siblings re-hydrate from corrected Redis on
-    # next request. When T2 failed: siblings re-hydrate from stale
-    # Redis and apply hydrate-time defensive recovery.
+    # When T2 succeeded, siblings re-hydrate from corrected Redis on the next
+    # request. When it failed, invalidation still runs before a retryable error
+    # is raised below.
     if callable(cross_worker_invalidate):
         from ..core.exceptions import InvalidationFailedError
         for event in (
@@ -526,3 +592,12 @@ def execute_attach(
                 registry_invalidate(cid)
             except Exception:
                 logger.warning("VCATTACH: failed to invalidate session %s", cid[:12])
+
+    if marker_repair_error is not None:
+        from ..core.exceptions import SessionStateRepairFailedError
+
+        raise SessionStateRepairFailedError(
+            source_id=old_id,
+            target_id=target_id,
+            cause=marker_repair_error,
+        ) from marker_repair_error

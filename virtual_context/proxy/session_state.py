@@ -329,14 +329,29 @@ class SessionStateProvider:
         can clear that shared flag while the failed call is still completing
         its fallback.
         """
+        _raw, state = self.load_authoritative_snapshot(conversation_id)
+        return state
+
+    def load_authoritative_snapshot(
+        self,
+        conversation_id: str,
+    ) -> tuple[bytes | None, SessionState | None]:
+        """Return the exact Redis preimage and its decoded state.
+
+        This is intentionally separate from :meth:`load`: administrative
+        repair code must never mistake a durable fallback for the Redis value
+        it is about to compare-and-swap.
+        """
         try:
             raw = self._redis.get(self._key(conversation_id))
             if raw is None:
                 self._degraded = False
-                return None
+                return None, None
+            if isinstance(raw, str):
+                raw = raw.encode("utf-8")
             state = SessionState.from_json(raw)
             self._degraded = False
-            return state
+            return raw, state
         except Exception:
             self._degraded = True
             logger.warning(
@@ -345,6 +360,223 @@ class SessionStateProvider:
                 exc_info=True,
             )
             raise
+
+    def repair_session_state_markers(
+        self,
+        conversation_id: str,
+        *,
+        expected_raw: bytes | None,
+        markers: SessionState,
+        durable_generation: int,
+        allow_generation_promotion: bool = False,
+    ) -> int:
+        """Repair derivable markers using an exact-preimage lifecycle CAS.
+
+        Ordinary :meth:`save` remains generation-strict. A populated older-
+        generation checkpoint may advance only when the explicit admin caller
+        sets ``allow_generation_promotion=True``; normal VCATTACH repair is
+        equal-generation only. The
+        method acquires the same Redis lifecycle lease used by cloud
+        delete/recreate operations, requires the exact authoritative Redis
+        preimage, rejects tombstones and generation downgrades, preserves all
+        unrelated and unknown JSON fields, and changes only database-derived
+        markers plus checkpoint/version counters and generation.
+        """
+        import redis
+        import uuid
+
+        if type(durable_generation) is not int or durable_generation < 0:
+            raise RuntimeError("durable conversation generation is invalid")
+        if type(allow_generation_promotion) is not bool:
+            raise RuntimeError("generation-promotion policy is invalid")
+        if (
+            type(markers.conversation_generation) is not int
+            or markers.conversation_generation != durable_generation
+        ):
+            raise RuntimeError("marker state generation is not durable-current")
+
+        store = self._store
+        get_generation = getattr(store, "get_conversation_generation", None)
+        is_deleted = getattr(store, "is_conversation_deleted", None)
+        if not callable(get_generation) or not callable(is_deleted):
+            raise RuntimeError("durable conversation lifecycle API is unavailable")
+
+        def require_active_generation() -> None:
+            deleted = is_deleted(conversation_id)
+            if deleted is True:
+                raise RuntimeError("refusing marker repair for deleted conversation")
+            if deleted is not False:
+                raise RuntimeError("durable conversation lifecycle state is invalid")
+            observed = get_generation(conversation_id)
+            if type(observed) is not int or observed < 0:
+                raise RuntimeError("durable conversation generation is invalid")
+            if observed != durable_generation:
+                raise RuntimeError(
+                    "durable conversation generation changed during marker repair"
+                )
+
+        expected = expected_raw
+        if isinstance(expected, str):
+            expected = expected.encode("utf-8")
+        key = self._key(conversation_id)
+        lease_key = f"vc:lifecycle_lease:{conversation_id}"
+
+        def attempt_commit_under_lease(token: str) -> int:
+            committed: SessionState | None = None
+            with self._redis.pipeline() as pipe:
+                pipe.watch(lease_key, key)
+                owner = pipe.get(lease_key)
+                if isinstance(owner, bytes):
+                    owner = owner.decode("utf-8")
+                if owner != token:
+                    pipe.unwatch()
+                    raise RuntimeError("conversation lifecycle lease was lost")
+
+                current_raw = pipe.get(key)
+                if isinstance(current_raw, str):
+                    current_raw = current_raw.encode("utf-8")
+                if current_raw != expected:
+                    pipe.unwatch()
+                    raise RuntimeError(
+                        "authoritative Redis state changed before marker repair"
+                    )
+
+                if current_raw is None:
+                    payload = json.loads(markers.to_json())
+                    current_version = 0
+                    current_checkpoint = 0
+                else:
+                    payload = json.loads(current_raw)
+                    if not isinstance(payload, dict):
+                        pipe.unwatch()
+                        raise RuntimeError("authoritative Redis state is not an object")
+                    deleted = payload.get("deleted", False)
+                    if type(deleted) is not bool:
+                        pipe.unwatch()
+                        raise RuntimeError(
+                            "authoritative Redis deletion marker is invalid"
+                        )
+                    if deleted:
+                        pipe.unwatch()
+                        raise RuntimeError(
+                            "refusing to replace authoritative Redis tombstone"
+                        )
+                    redis_generation = payload.get("conversation_generation", 0)
+                    if type(redis_generation) is not int or redis_generation < 0:
+                        pipe.unwatch()
+                        raise RuntimeError(
+                            "authoritative Redis generation is invalid"
+                        )
+                    if redis_generation > durable_generation:
+                        pipe.unwatch()
+                        raise RuntimeError(
+                            "refusing session-state generation downgrade"
+                        )
+                    if (
+                        redis_generation < durable_generation
+                        and not allow_generation_promotion
+                    ):
+                        pipe.unwatch()
+                        raise RuntimeError(
+                            "refusing non-administrative session-state "
+                            "generation promotion"
+                        )
+                    current_version = payload.get("version", 0)
+                    current_checkpoint = payload.get("checkpoint_version", 0)
+                if type(current_version) is not int or current_version < 0:
+                    pipe.unwatch()
+                    raise RuntimeError("authoritative Redis version is invalid")
+                if (
+                    type(current_checkpoint) is not int
+                    or current_checkpoint < 0
+                ):
+                    pipe.unwatch()
+                    raise RuntimeError(
+                        "authoritative Redis checkpoint version is invalid"
+                    )
+                payload.update({
+                    "compacted_prefix_messages": int(
+                        markers.compacted_prefix_messages
+                    ),
+                    "flushed_prefix_messages": int(
+                        markers.flushed_prefix_messages
+                    ),
+                    "last_compacted_turn": int(markers.last_compacted_turn),
+                    "last_completed_turn": int(markers.last_completed_turn),
+                    "last_indexed_turn": int(markers.last_indexed_turn),
+                    "turn_tag_entries": list(markers.turn_tag_entries),
+                    "conversation_generation": durable_generation,
+                    "checkpoint_version": current_checkpoint + 1,
+                    "version": current_version + 1,
+                    "deleted": False,
+                })
+                encoded = json.dumps(
+                    payload,
+                    default=str,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                require_active_generation()
+                pipe.multi()
+                pipe.set(key, encoded)
+                pipe.execute()
+                committed = SessionState.from_json(encoded)
+
+            require_active_generation()
+            self._degraded = False
+            assert committed is not None
+            self._save_to_store(conversation_id, committed)
+            return int(committed.version)
+
+        def commit_under_lease(token: str) -> int:
+            for _attempt in range(3):
+                try:
+                    return attempt_commit_under_lease(token)
+                except redis.WatchError:
+                    # Cloud renews the watched lifecycle key periodically.
+                    # Retry only while the next attempt still proves the same
+                    # lease owner and exact session preimage.
+                    continue
+            raise RuntimeError(
+                "session-state marker repair lost repeated Redis races"
+            )
+
+        # Cloud's provider exposes a renewable, thread-reentrant lifecycle
+        # lease. Use it when available so VCATTACH can safely call this method
+        # while already holding the same conversation lease. The standalone
+        # core provider has no such helper, so administrative CLI repair takes
+        # the exact same Redis lease key directly for this bounded CAS.
+        lifecycle_lease = getattr(self, "lifecycle_lease", None)
+        if callable(lifecycle_lease):
+            with lifecycle_lease(conversation_id) as token:
+                require_active_generation()
+                return commit_under_lease(token)
+
+        require_active_generation()
+        token = uuid.uuid4().hex
+        acquired = self._redis.set(lease_key, token, nx=True, px=30_000)
+        if not acquired:
+            raise RuntimeError("conversation lifecycle lease is busy")
+        try:
+            return commit_under_lease(token)
+        finally:
+            try:
+                with self._redis.pipeline() as pipe:
+                    pipe.watch(lease_key)
+                    owner = pipe.get(lease_key)
+                    if isinstance(owner, bytes):
+                        owner = owner.decode("utf-8")
+                    if owner == token:
+                        pipe.multi()
+                        pipe.delete(lease_key)
+                        pipe.execute()
+                    else:
+                        pipe.unwatch()
+            except Exception:
+                logger.warning(
+                    "Failed to release marker-repair lease for %s",
+                    conversation_id[:12],
+                    exc_info=True,
+                )
 
     def save(self, conversation_id: str, state: SessionState) -> int | None:
         """Save session state to Redis with optimistic version check.

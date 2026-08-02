@@ -12,10 +12,72 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import pytest
 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 from types import SimpleNamespace
+
+
+def test_cmd_admin_backfill_session_state_markers_fails_closed_on_redis_load(
+    monkeypatch,
+    capsys,
+):
+    import virtual_context.cli.main as cli_main
+    import virtual_context.engine as engine_module
+    import virtual_context.proxy.session_state as session_state
+
+    class RawStore:
+        def get_conversation_generation(self, _conversation_id):
+            return 1
+
+        def is_conversation_deleted(self, _conversation_id):
+            return False
+
+    raw_store = RawStore()
+
+    class StubEngine:
+        def __init__(self, config):
+            self._store = SimpleNamespace(_store=raw_store)
+
+        def close(self):
+            pass
+
+    class FailingProvider:
+        def __init__(self, redis_url, store):
+            assert redis_url == "redis://localhost:6379/0"
+            assert store is raw_store
+
+        def load_authoritative_snapshot(self, _conversation_id):
+            raise RuntimeError("redis authority unavailable")
+
+    monkeypatch.setattr(cli_main, "load_config", lambda path: SimpleNamespace())
+    monkeypatch.setattr(cli_main, "_apply_storage_overrides", lambda config, args: None)
+    monkeypatch.setattr(engine_module, "VirtualContextEngine", StubEngine)
+    monkeypatch.setattr(session_state, "SessionStateProvider", FailingProvider)
+
+    args = SimpleNamespace(
+        config=None,
+        conversation_id="conv-fail",
+        tenant_id="",
+        all_convs_for_tenant=False,
+        dry_run=False,
+        limit=None,
+        redis_url="redis://localhost:6379/0",
+    )
+
+    with pytest.raises(SystemExit) as exited:
+        cli_main.cmd_admin_backfill_session_state_markers(args)
+
+    assert exited.value.code == 1
+    lines = [
+        json.loads(line)
+        for line in capsys.readouterr().out.strip().splitlines()
+    ]
+    assert lines[0]["status"] == "error"
+    assert lines[1]["status"] == "failed"
+    assert lines[1]["saved"] == 0
+    assert lines[1]["failed"] == 1
 
 
 def test_cli_parser_accepts_session_state_markers_subcommand():
@@ -77,9 +139,18 @@ def test_cmd_admin_backfill_session_state_markers_dry_run_skips_provider(
     import virtual_context.engine as engine_module
     import virtual_context.proxy.session_state as session_state
 
-    raw_store = object()
+    class RawStore:
+        def get_conversation_generation(self, conversation_id):
+            assert conversation_id == "conv-dry"
+            return 4
+
+        def is_conversation_deleted(self, conversation_id):
+            assert conversation_id == "conv-dry"
+            return False
+
+    raw_store = RawStore()
     closed: list[bool] = []
-    derive_calls: list[tuple[object, str, object]] = []
+    derive_calls: list[tuple[object, str, object, int]] = []
 
     class StubEngine:
         def __init__(self, config):
@@ -92,13 +163,27 @@ def test_cmd_admin_backfill_session_state_markers_dry_run_skips_provider(
         def __init__(self, *args, **kwargs):
             raise AssertionError("dry-run must not construct provider")
 
-    def fake_derive(store, conversation_id, *, existing_state=None):
-        derive_calls.append((store, conversation_id, existing_state))
+    def fake_derive(
+        store,
+        conversation_id,
+        *,
+        existing_state=None,
+        authoritative_conversation_generation=None,
+    ):
+        derive_calls.append(
+            (
+                store,
+                conversation_id,
+                existing_state,
+                authoritative_conversation_generation,
+            )
+        )
         return SimpleNamespace(
             compacted_prefix_messages=4,
             flushed_prefix_messages=4,
             last_completed_turn=3,
             last_indexed_turn=3,
+            conversation_generation=authoritative_conversation_generation,
             turn_tag_entries=[{"turn_number": 0}],
         )
 
@@ -130,7 +215,7 @@ def test_cmd_admin_backfill_session_state_markers_dry_run_skips_provider(
     assert lines[1]["status"] == "complete"
     assert lines[1]["processed"] == 1
     assert lines[1]["saved"] == 0
-    assert derive_calls == [(raw_store, "conv-dry", None)]
+    assert derive_calls == [(raw_store, "conv-dry", None, 4)]
     assert closed == [True]
 
 
@@ -156,6 +241,14 @@ def test_cmd_admin_backfill_session_state_markers_batch_filters_tenant(
         def is_attachable_target(self, *, conversation_id, tenant_id=None):
             return tenant_id == "tenant-1" and conversation_id in {"conv-a", "conv-c"}
 
+        def get_conversation_generation(self, conversation_id):
+            assert conversation_id in {"conv-a", "conv-c"}
+            return 5
+
+        def is_conversation_deleted(self, conversation_id):
+            assert conversation_id in {"conv-a", "conv-c"}
+            return False
+
     raw_store = RawStore()
     constructed_configs: list[SimpleNamespace] = []
 
@@ -170,30 +263,67 @@ def test_cmd_admin_backfill_session_state_markers_batch_filters_tenant(
     provider_instances: list[object] = []
 
     class StubProvider:
-        def __init__(self, redis_url):
+        def __init__(self, redis_url, store):
             self.redis_url = redis_url
+            self.store = store
             self.loaded: list[str] = []
             self.saved: list[tuple[str, object]] = []
+            self.committed: dict[str, object] = {}
             provider_instances.append(self)
 
-        def load(self, conversation_id):
+        def load_authoritative_snapshot(self, conversation_id):
             self.loaded.append(conversation_id)
-            return SimpleNamespace(version=5, checkpoint_version=9)
+            if conversation_id in self.committed:
+                return b"committed", self.committed[conversation_id]
+            return b"preimage", SimpleNamespace(
+                version=5,
+                checkpoint_version=9,
+                conversation_generation=5,
+                deleted=False,
+            )
 
-        def save(self, conversation_id, state):
-            self.saved.append((conversation_id, state))
+        def repair_session_state_markers(
+            self,
+            conversation_id,
+            *,
+            expected_raw,
+            markers,
+            durable_generation,
+            allow_generation_promotion,
+        ):
+            assert expected_raw == b"preimage"
+            assert durable_generation == 5
+            assert allow_generation_promotion is True
+            committed = SimpleNamespace(**vars(markers))
+            committed.version = 6
+            self.committed[conversation_id] = committed
+            self.saved.append((conversation_id, committed))
             return 6
 
-    derived_for: list[tuple[str, object]] = []
+    derived_for: list[tuple[str, object, int]] = []
 
-    def fake_derive(store, conversation_id, *, existing_state=None):
+    def fake_derive(
+        store,
+        conversation_id,
+        *,
+        existing_state=None,
+        authoritative_conversation_generation=None,
+    ):
         assert store is raw_store
-        derived_for.append((conversation_id, existing_state))
+        derived_for.append(
+            (
+                conversation_id,
+                existing_state,
+                authoritative_conversation_generation,
+            )
+        )
         return SimpleNamespace(
             compacted_prefix_messages=2,
             flushed_prefix_messages=2,
+            last_compacted_turn=1,
             last_completed_turn=1,
             last_indexed_turn=1,
+            conversation_generation=authoritative_conversation_generation,
             turn_tag_entries=[{"turn_number": 0}],
         )
 
@@ -217,9 +347,11 @@ def test_cmd_admin_backfill_session_state_markers_batch_filters_tenant(
 
     provider = provider_instances[0]
     assert provider.redis_url == "redis://localhost:6379/0"
-    assert provider.loaded == ["conv-a", "conv-c"]
+    assert provider.store is raw_store
+    assert provider.loaded == ["conv-a", "conv-a", "conv-c", "conv-c"]
     assert [cid for cid, _ in provider.saved] == ["conv-a", "conv-c"]
-    assert [cid for cid, _ in derived_for] == ["conv-a", "conv-c"]
+    assert [cid for cid, _, _ in derived_for] == ["conv-a", "conv-c"]
+    assert [generation for _, _, generation in derived_for] == [5, 5]
     assert constructed_configs[0].tenant_id == "tenant-1"
 
     lines = [
@@ -257,6 +389,14 @@ def test_cmd_admin_backfill_session_state_markers_batch_all_convs_single_tenant(
             self.attachable_calls.append((conversation_id, tenant_id))
             return tenant_id is None and conversation_id == "conv-live"
 
+        def get_conversation_generation(self, conversation_id):
+            assert conversation_id == "conv-live"
+            return 2
+
+        def is_conversation_deleted(self, conversation_id):
+            assert conversation_id == "conv-live"
+            return False
+
     raw_store = RawStore()
 
     class StubEngine:
@@ -268,15 +408,23 @@ def test_cmd_admin_backfill_session_state_markers_batch_all_convs_single_tenant(
 
     derived_for: list[str] = []
 
-    def fake_derive(store, conversation_id, *, existing_state=None):
+    def fake_derive(
+        store,
+        conversation_id,
+        *,
+        existing_state=None,
+        authoritative_conversation_generation=None,
+    ):
         assert store is raw_store
         assert existing_state is None
+        assert authoritative_conversation_generation == 2
         derived_for.append(conversation_id)
         return SimpleNamespace(
             compacted_prefix_messages=2,
             flushed_prefix_messages=2,
             last_completed_turn=1,
             last_indexed_turn=1,
+            conversation_generation=authoritative_conversation_generation,
             turn_tag_entries=[{"turn_number": 0}],
         )
 
