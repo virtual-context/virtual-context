@@ -47,6 +47,24 @@ class DryRunReport:
     skip_stage: str = ""
     ladder: list = field(default_factory=list)
 
+    def apply_outcome(self, outcome) -> "DryRunReport":
+        """Take kind, reason, stage AND the selector's own rejections.
+
+        The selector can discover a reason of its own — the fallback being
+        unconfigured, for instance — and that reason has to be counted like
+        every other or it exists only in a sentence. Setting the outcome
+        fields by hand leaves the merge to whoever remembers; doing both
+        here means a caller that reports the outcome at all cannot lose the
+        rejections that came with it.
+        """
+        self.outcome_kind = getattr(outcome, "kind", self.outcome_kind)
+        self.skip_reason = getattr(outcome, "reason", "") or ""
+        self.skip_stage = getattr(outcome, "skip_stage", "") or ""
+        added = list(getattr(outcome, "added_rejections", ()) or ())
+        if added:
+            self.rejections = list(self.rejections) + added
+        return self
+
     def render(self) -> str:
         lines: list[str] = []
         add = lines.append

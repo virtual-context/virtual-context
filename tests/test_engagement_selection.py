@@ -748,3 +748,57 @@ class TestFallbackUnavailabilityIsNamed:
         )
         assert outcome.kind == "broader"
         assert outcome.added_rejections == ()
+
+
+class TestOutcomeRejectionsReachTheLadder:
+    """A reason that only a caller can surface is a reason that gets lost."""
+
+    def test_apply_outcome_counts_the_selectors_own_rejection(self):
+        from virtual_context.core.engagement import (
+            REASON_BROADER_POOL_NOT_CONFIGURED, DryRunReport, select_question,
+        )
+
+        outcome = select_question(
+            verified=[], rejections=[], channel_id=P3, broader_questions=None,
+        )
+        report = DryRunReport(
+            generated_at=NOW, conversation_id="c", channel_id=P3,
+        ).apply_outcome(outcome)
+
+        assert report.outcome_kind == "skip"
+        assert report.skip_stage == "broader"
+        rendered = report.render()
+        # Counted as a row, not only mentioned in the skip sentence.
+        assert f"[broader] {REASON_BROADER_POOL_NOT_CONFIGURED}: 1" in rendered
+
+    def test_apply_outcome_preserves_existing_rejections(self):
+        from virtual_context.core.engagement import (
+            DryRunReport, Rejection, select_question,
+        )
+
+        outcome = select_question(
+            verified=[], channel_id=P3, broader_questions=None,
+            rejections=[Rejection("a", "history", "member_recently_tagged")],
+        )
+        report = DryRunReport(
+            generated_at=NOW, conversation_id="c", channel_id=P3,
+            rejections=[Rejection("a", "history", "member_recently_tagged")],
+        ).apply_outcome(outcome)
+
+        rendered = report.render()
+        assert "[history] member_recently_tagged: 1" in rendered
+        assert "[broader] broader_pool_not_configured: 1" in rendered
+        assert "(2 total)" in rendered
+
+    def test_a_successful_selection_adds_nothing(self):
+        from virtual_context.core.engagement import DryRunReport, select_question
+
+        outcome = select_question(
+            verified=[], rejections=[], channel_id=P3,
+            broader_questions={P3: ["What still argues for secretagogues?"]},
+        )
+        report = DryRunReport(
+            generated_at=NOW, conversation_id="c", channel_id=P3,
+        ).apply_outcome(outcome)
+        assert report.outcome_kind == "broader"
+        assert report.rejections == []
