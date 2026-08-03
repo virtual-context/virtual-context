@@ -90,8 +90,10 @@ def compose_draft(
     stance = str(getattr(candidate, "stance", "") or "")
     if composer is None:
         raise DraftComposerNotConfigured(
-            "no draft composer model is configured; configure "
-            "engagement.fidelity_judge_model's composition counterpart or "
+            "no draft composer model is configured. No such setting exists "
+            "yet — the judge is assembly.engagement_fidelity_judge_model and "
+            "its composition counterpart has not been decided. Until it is, "
+            "the caller must inject a composer explicitly, or "
             "disable the pipeline. Composing without a model would mean "
             "posting text nobody generated from the verified quote."
         )

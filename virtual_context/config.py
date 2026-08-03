@@ -250,6 +250,22 @@ def _build_config(raw: dict[str, Any], *, validate: bool = True) -> VirtualConte
 
     # Assembly
     _asm_defaults = AssemblerConfig()
+    # Both engagement settings live under `assembly`, and for a while the
+    # error text and the type comment told operators to write them under a
+    # top-level `engagement:` instead. A config written that way loads
+    # cleanly, reads nothing, leaves engagement_enabled False, and never
+    # trips validation — so the operator believes the fidelity gate is
+    # running when the pipeline is simply off. Refusing is the only outcome
+    # that cannot be mistaken for success; silently discarding a block
+    # someone deliberately wrote is what made this invisible.
+    for _block, _home in _MISLEADING_TOP_LEVEL_BLOCKS.items():
+        if _block in raw:
+            raise ValueError(
+                f"top-level '{_block}:' is not a configuration section; "
+                f"those settings live under '{_home}:'. Left in place this "
+                "block loads cleanly, is read by nothing, and leaves the "
+                "operator believing it took effect."
+            )
     assembly_raw = raw.get("assembly", {})
     assembler_config = AssemblerConfig(
         core_context_max_tokens=assembly_raw.get("core_context_max_tokens", _asm_defaults.core_context_max_tokens),
@@ -638,23 +654,23 @@ def validate_config(config: VirtualContextConfig) -> list[str]:
             or not config.assembler.engagement_fidelity_judge_model.strip()
         ):
             errors.append(
-                "engagement.fidelity_judge_model is required as a non-empty "
-                "string when the engagement pipeline is enabled"
+                "assembly.engagement_fidelity_judge_model is required as a "
+                "non-empty string when the engagement pipeline is enabled"
             )
 
     if not (0.0 <= config.segmenter.tag_overlap_threshold <= 1.0):
         errors.append(
-            f"segmenter.tag_overlap_threshold must be in [0.0, 1.0], "
+            f"compaction.tag_overlap_threshold must be in [0.0, 1.0], "
             f"got {config.segmenter.tag_overlap_threshold}"
         )
     if config.segmenter.max_segment_turns < 0:
         errors.append(
-            f"segmenter.max_segment_turns must be >= 0, "
+            f"compaction.max_segment_turns must be >= 0, "
             f"got {config.segmenter.max_segment_turns}"
         )
     if config.segmenter.tool_result_segment_threshold < 0:
         errors.append(
-            f"segmenter.tool_result_segment_threshold must be >= 0, "
+            f"compaction.tool_result_segment_threshold must be >= 0, "
             f"got {config.segmenter.tool_result_segment_threshold}"
         )
 
@@ -713,6 +729,23 @@ def validate_config(config: VirtualContextConfig) -> list[str]:
         )
 
     return errors
+
+
+# Section names an operator can reasonably be led to write, mapped to where
+# the settings actually live. Each was named by a validation message or a type
+# comment that did not match the key the loader reads, so a config written to
+# follow the message loads cleanly and is read by nothing. These are refused
+# rather than ignored: silently discarding a block someone deliberately wrote
+# is what made the mismatch invisible in the first place.
+#
+# This is deliberately a short list rather than a check for any unrecognised
+# top-level key. The shipped production config carries a `telemetry:` block
+# that nothing in this loader reads, so a blanket rule would refuse a config
+# that works today.
+_MISLEADING_TOP_LEVEL_BLOCKS = {
+    "engagement": "assembly",
+    "segmenter": "compaction",
+}
 
 
 def load_config(

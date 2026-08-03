@@ -2392,7 +2392,9 @@ class AssemblerConfig:
     # unset it is a configuration ERROR, never a fallback to a cheaper model.
     # A draft that no judge checked must not be postable, and silently
     # skipping the check is the defect this pipeline exists to prevent.
-    # YAML key: engagement.fidelity_judge_model.
+    # YAML keys: assembly.engagement_enabled and
+    # assembly.engagement_fidelity_judge_model. Both live under
+    # `assembly`; there is no top-level `engagement:` section.
     engagement_enabled: bool = False
     engagement_fidelity_judge_model: str = ""
     # Speaker roster. Independent of the actor card and SHIPS DARK: with the
