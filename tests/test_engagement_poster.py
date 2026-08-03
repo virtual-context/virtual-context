@@ -1,0 +1,229 @@
+"""The only write path in the package.
+
+Every guard is a refusal rather than a check, because a returned value can
+be ignored by a caller that forgets to look at it, and there is no safe
+default for sending anyway. No test here performs a real send; the sender is
+always a mock, and a test asserts the module cannot open a socket at all.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+import pytest
+
+from virtual_context.core.engagement import (
+    POST_CHANNEL_IDS,
+    POSTING_ENABLED_BY_DEFAULT,
+    SOURCE_CHANNEL_IDS,
+    Candidate,
+    InMemoryPostHistory,
+    LiveVerification,
+    PostRefused,
+    already_posted_today,
+    post_question,
+)
+
+EASTERN = ZoneInfo("America/New_York")
+NOW = datetime(2026, 8, 3, 14, 0, tzinfo=EASTERN)
+VASTTEST = "1524946242499514418"
+MSG = "1532400954878595094"
+
+
+def _cand():
+    return Candidate(
+        canonical_turn_id="ct-1", source_message_id=MSG,
+        actor_id="actor:discord:1327457861143494767", channel_id=VASTTEST,
+        text="Adding ss31 (5mg) for 4 weeks.", sent_at=NOW - timedelta(days=4),
+        sender="BigTex", question_type="timed",
+    )
+
+
+def _verified():
+    return LiveVerification(True, "", "", MSG)
+
+
+def _send(**kw):
+    return "9990001"
+
+
+def _post(**over):
+    kw = dict(
+        candidate=_cand(), question="Did you start the SS-31?",
+        channel_id=VASTTEST, verification=_verified(),
+        history=InMemoryPostHistory(), sender=_send, now=NOW,
+        question_type="timed", enabled=True,
+    )
+    kw.update(over)
+    return post_question(**kw)
+
+
+class TestPostingShipsDisabled:
+    def test_the_shipped_default_is_off(self):
+        assert POSTING_ENABLED_BY_DEFAULT is False
+
+    def test_posting_without_asking_refuses(self):
+        with pytest.raises(PostRefused, match="not enabled"):
+            _post(enabled=POSTING_ENABLED_BY_DEFAULT)
+
+
+class TestChannelRefusal:
+    def test_the_rehearsal_channel_is_the_only_destination(self):
+        assert POST_CHANNEL_IDS == (VASTTEST,)
+
+    @pytest.mark.parametrize("community", SOURCE_CHANNEL_IDS)
+    def test_every_source_channel_is_refused_by_id(self, community):
+        """Refused, not merely checked — by id, against the shipped tuple."""
+        with pytest.raises(PostRefused, match="not a permitted destination"):
+            _post(channel_id=community)
+
+    def test_an_unknown_channel_is_refused(self):
+        with pytest.raises(PostRefused):
+            _post(channel_id="999999999999999999")
+
+    def test_nothing_is_sent_when_the_channel_is_refused(self):
+        calls = {"n": 0}
+
+        def _counting(**kw):
+            calls["n"] += 1
+            return "x"
+
+        with pytest.raises(PostRefused):
+            _post(channel_id=SOURCE_CHANNEL_IDS[0], sender=_counting)
+        assert calls["n"] == 0
+
+
+class TestVerificationGate:
+    def test_no_verification_refuses(self):
+        with pytest.raises(PostRefused, match="not confirmed live"):
+            _post(verification=None)
+
+    def test_a_failed_verification_refuses(self):
+        with pytest.raises(PostRefused, match="not confirmed live"):
+            _post(verification=LiveVerification(False, "source_message_deleted"))
+
+    def test_a_verification_for_another_message_refuses(self):
+        """A pass is not transferable between candidates or runs."""
+        with pytest.raises(PostRefused, match="different message"):
+            _post(verification=LiveVerification(True, "", "", "111111111111"))
+
+    def test_a_verification_with_no_message_id_refuses(self):
+        """Guards against a stale verdict shape carrying an implicit pass."""
+        with pytest.raises(PostRefused, match="different message"):
+            _post(verification=LiveVerification(True))
+
+
+class TestIdempotentPerEasternDay:
+    def test_a_second_post_the_same_day_refuses(self):
+        history = InMemoryPostHistory()
+        _post(history=history)
+        with pytest.raises(PostRefused, match="already gone out"):
+            _post(history=history)
+
+    def test_the_next_eastern_day_is_allowed(self):
+        history = InMemoryPostHistory()
+        _post(history=history)
+        result = _post(history=history, now=NOW + timedelta(days=1))
+        assert result.day == "2026-08-04"
+
+    def test_the_key_is_the_civil_day_not_an_elapsed_interval(self):
+        """23:30 and 00:30 Eastern are different days, 1 hour apart."""
+        history = InMemoryPostHistory()
+        late = datetime(2026, 8, 3, 23, 30, tzinfo=EASTERN)
+        _post(history=history, now=late)
+        result = _post(history=history, now=late + timedelta(hours=1))
+        assert result.day == "2026-08-04"
+
+    def test_a_utc_timestamped_record_still_matches_its_eastern_day(self):
+        history = InMemoryPostHistory()
+        _post(history=history, now=NOW)
+        # Same instant expressed in UTC must not read as a different day.
+        assert already_posted_today(
+            history, now=NOW.astimezone(timezone.utc),
+        ) is True
+
+
+class TestTheSendItself:
+    def test_an_empty_question_is_refused(self):
+        with pytest.raises(PostRefused, match="empty question"):
+            _post(question="   ")
+
+    def test_a_send_returning_no_id_is_treated_as_failed(self):
+        with pytest.raises(PostRefused, match="no message id"):
+            _post(sender=lambda **kw: "")
+
+    def test_a_successful_post_is_recorded_in_history(self):
+        history = InMemoryPostHistory()
+        result = _post(history=history)
+        assert result.message_id == "9990001"
+        record = history.all()[0]
+        assert record.discord_message_id == "9990001"
+        assert record.channel_id == VASTTEST
+        assert record.source_message_ids == (MSG,)
+        assert record.question_type == "timed"
+        assert record.topic_fingerprint != 0
+
+    def test_the_history_record_carries_no_member_content(self):
+        history = InMemoryPostHistory()
+        _post(history=history)
+        record = history.all()[0]
+        assert "Adding ss31" not in record.question_text
+
+
+class TestTheModuleHoldsNoCredential:
+    def test_it_imports_no_http_client_and_opens_no_socket(self):
+        import ast
+        import inspect
+
+        from virtual_context.core.engagement import poster
+
+        tree = ast.parse(inspect.getsource(poster))
+        imported = {
+            alias.name.split(".")[0]
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.Import, ast.ImportFrom))
+            for alias in node.names
+        } | {
+            node.module.split(".")[0]
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom) and node.module
+        }
+        for forbidden in ("httpx", "requests", "urllib", "socket", "http"):
+            assert forbidden not in imported, forbidden
+
+    def test_no_credential_is_bound_or_embedded(self):
+        """Inspects the code, not the prose.
+
+        A word sweep flagged the docstring sentence explaining that this
+        module does NOT hold a token — measuring the file's text rather than
+        what it does, which is the same error as a test carrying its own
+        ruler. This checks bindings and literals instead.
+        """
+        import ast
+        import inspect
+
+        from virtual_context.core.engagement import poster
+
+        tree = ast.parse(inspect.getsource(poster))
+        bound = {
+            t.id.lower()
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            for t in node.targets
+            if isinstance(t, ast.Name)
+        }
+        for forbidden in ("token", "secret", "authorization", "bearer"):
+            assert not any(forbidden in name for name in bound), forbidden
+
+        docstrings = {
+            ast.get_docstring(n)
+            for n in ast.walk(tree)
+            if isinstance(n, (ast.Module, ast.FunctionDef, ast.ClassDef))
+        }
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                if node.value in docstrings:
+                    continue
+                # No literal long enough to be a credential.
+                assert len(node.value) < 60 or " " in node.value, node.value[:40]

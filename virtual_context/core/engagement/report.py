@@ -108,7 +108,7 @@ class DryRunReport:
         add(f"considered   : {self.considered} candidate(s)")
         add("")
 
-        if self.outcome_kind == "personal":
+        if self.outcome_kind not in ("skip", "broader"):
             add("VERIFIED QUOTE")
             add("-" * 72)
             add(f"  {self.quote}")
@@ -139,7 +139,7 @@ class DryRunReport:
                     add(f"  reason               {self.fidelity['reason']}")
                 add("")
 
-        if self.outcome_kind in ("personal", "broader"):
+        if self.outcome_kind != "skip":
             add("PROPOSED QUESTION")
             add("-" * 72)
             add(f"  {self.question}")

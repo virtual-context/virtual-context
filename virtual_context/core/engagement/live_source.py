@@ -70,6 +70,10 @@ class LiveVerification:
     ok: bool
     reason: str = ""
     detail: str = ""
+    # Which message this verdict is about. A poster requires it to match the
+    # candidate it is about to quote, so a pass cannot be carried over from
+    # an earlier run or a different candidate.
+    verified_message_id: str = ""
 
 
 def _actor_tail(actor_id: str) -> str:
@@ -122,7 +126,7 @@ def verify_source_live(
         return LiveVerification(
             False, LIVE_CHANNEL_MISMATCH, f"stored {channel_id} live {live_channel}",
         )
-    return LiveVerification(True, LIVE_OK)
+    return LiveVerification(True, LIVE_OK, "", message_id)
 
 
 def select_live_verified(
