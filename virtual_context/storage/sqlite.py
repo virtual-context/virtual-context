@@ -1272,7 +1272,7 @@ class SQLiteStore(ContextStore):
             DROP TRIGGER IF EXISTS trg_merge_post_commit_pending_tenant_consistency_insert
         """)
         conn.execute("""
-            CREATE TRIGGER trg_merge_post_commit_pending_tenant_consistency_insert
+            CREATE TRIGGER IF NOT EXISTS trg_merge_post_commit_pending_tenant_consistency_insert
                 BEFORE INSERT ON merge_post_commit_pending
                 FOR EACH ROW
                 WHEN (NEW.tenant_id IS NOT (SELECT tenant_id FROM merge_audit WHERE merge_id = NEW.merge_id))
@@ -1285,7 +1285,7 @@ class SQLiteStore(ContextStore):
             DROP TRIGGER IF EXISTS trg_merge_post_commit_pending_tenant_consistency_update
         """)
         conn.execute("""
-            CREATE TRIGGER trg_merge_post_commit_pending_tenant_consistency_update
+            CREATE TRIGGER IF NOT EXISTS trg_merge_post_commit_pending_tenant_consistency_update
                 BEFORE UPDATE OF tenant_id ON merge_post_commit_pending
                 FOR EACH ROW
                 WHEN (NEW.tenant_id IS NOT OLD.tenant_id
@@ -1317,6 +1317,13 @@ class SQLiteStore(ContextStore):
                     # Old CHECK detected; rewrite the table.
                     logger.info("E-D4: rewriting conversations to add 'merged' to CHECK")
                     conn.execute("PRAGMA foreign_keys = OFF")
+                    # Drop rather than IF NOT EXISTS: a crash between this
+                    # CREATE and the RENAME below leaves a half-populated
+                    # scratch table, and reusing it would silently migrate
+                    # onto partial data. The sibling rewrites all drop first.
+                    conn.execute(
+                        "DROP TABLE IF EXISTS conversations_ed4_new"
+                    )
                     conn.execute("""
                         CREATE TABLE conversations_ed4_new (
                             conversation_id TEXT PRIMARY KEY,
@@ -2290,7 +2297,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
 
             DROP TRIGGER IF EXISTS
                 trg_dirty_actor_card_on_canonical_insert;
-            CREATE TRIGGER trg_dirty_actor_card_on_canonical_insert
+            CREATE TRIGGER IF NOT EXISTS trg_dirty_actor_card_on_canonical_insert
             AFTER INSERT ON canonical_turns
             FOR EACH ROW
             WHEN NEW.sender_actor_id <> '' AND NEW.user_content <> ''
@@ -2308,7 +2315,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
 
             DROP TRIGGER IF EXISTS
                 trg_invalidate_actor_card_turn_source_delete;
-            CREATE TRIGGER trg_invalidate_actor_card_turn_source_delete
+            CREATE TRIGGER IF NOT EXISTS trg_invalidate_actor_card_turn_source_delete
             BEFORE DELETE ON canonical_turns
             FOR EACH ROW
             BEGIN
@@ -2345,7 +2352,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
 
             DROP TRIGGER IF EXISTS
                 trg_invalidate_actor_card_turn_source_update;
-            CREATE TRIGGER trg_invalidate_actor_card_turn_source_update
+            CREATE TRIGGER IF NOT EXISTS trg_invalidate_actor_card_turn_source_update
             BEFORE UPDATE OF
                 conversation_id, user_content, sender_actor_id,
                 audience_conversation_id, audience_attribution_version,
@@ -2520,7 +2527,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
     def _ensure_canonical_turn_views(self, conn: sqlite3.Connection) -> None:
         conn.execute("DROP VIEW IF EXISTS canonical_turns_ordinal")
         conn.execute(
-            """CREATE VIEW canonical_turns_ordinal AS
+            """CREATE VIEW IF NOT EXISTS canonical_turns_ordinal AS
                SELECT
                    ct.*,
                    ROW_NUMBER() OVER (
@@ -2748,7 +2755,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
             conn.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
         conn.executescript(
             """
-            CREATE TRIGGER trg_guard_attested_canonical_turn_update
+            CREATE TRIGGER IF NOT EXISTS trg_guard_attested_canonical_turn_update
             BEFORE UPDATE ON canonical_turns
             FOR EACH ROW
             WHEN (
@@ -2794,7 +2801,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
                     'attested canonical source fields are immutable'
                 );
             END;
-            CREATE TRIGGER trg_validate_canonical_message_source_pair_insert
+            CREATE TRIGGER IF NOT EXISTS trg_validate_canonical_message_source_pair_insert
             BEFORE INSERT ON canonical_message_sources
             FOR EACH ROW
             WHEN NOT (
@@ -2805,7 +2812,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
             BEGIN
                 SELECT RAISE(ABORT, 'invalid canonical source pair shape');
             END;
-            CREATE TRIGGER trg_validate_canonical_message_source_pair_update
+            CREATE TRIGGER IF NOT EXISTS trg_validate_canonical_message_source_pair_update
             BEFORE UPDATE ON canonical_message_sources
             FOR EACH ROW
             WHEN NOT (
@@ -2816,7 +2823,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
             BEGIN
                 SELECT RAISE(ABORT, 'invalid canonical source pair shape');
             END;
-            CREATE TRIGGER trg_guard_canonical_message_source_update
+            CREATE TRIGGER IF NOT EXISTS trg_guard_canonical_message_source_update
             BEFORE UPDATE ON canonical_message_sources
             FOR EACH ROW
             WHEN
