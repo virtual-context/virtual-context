@@ -38,6 +38,10 @@ class Candidate:
     text: str
     sent_at: datetime
     sender: str = ""      # displayed handle only; never a real name
+    # Which of the spec's question types this candidate supports. Set by the
+    # stage that qualified it, never assumed by the selector.
+    question_type: str = ""
+    hook_kind: str = ""   # the verified item a personal continuation rests on
 
 
 @dataclass(frozen=True)

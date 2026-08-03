@@ -98,8 +98,12 @@ def select_question(
     considered = len(verified) + len(rejections)
     if verified:
         best = verified[0]
+        # The label comes from the candidate, never from this function. A
+        # hardcoded "personal" here described a timed follow-up for the whole
+        # life of the pipeline and hid the fact that type 1 did not exist.
         return SelectionOutcome(
-            kind="personal", candidate=best, considered=considered,
+            kind=getattr(best, "question_type", "") or "timed",
+            candidate=best, considered=considered,
         )
 
     # Why the broader fallback could not produce a question. Naming this

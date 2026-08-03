@@ -33,6 +33,13 @@ from .broader import (
     generate_broader_question,
     validate_broader_question,
 )
+from .continuation import (
+    CONTINUATION_HOOK_KINDS,
+    HOOK_DETECTOR_SYSTEM_PROMPT,
+    ContinuationHook,
+    HookDetectorNotConfigured,
+    find_continuation_hook,
+)
 from .candidates import Candidate, Rejection, collect_candidates
 from .compose import (
     TONE_CONSTRAINTS,
@@ -87,6 +94,11 @@ __all__ = [
     "BroaderQuestion",
     "generate_broader_question",
     "validate_broader_question",
+    "CONTINUATION_HOOK_KINDS",
+    "HOOK_DETECTOR_SYSTEM_PROMPT",
+    "ContinuationHook",
+    "HookDetectorNotConfigured",
+    "find_continuation_hook",
     "Candidate",
     "rehearsal_allowlist",
     "strip_speaker_prefix",
