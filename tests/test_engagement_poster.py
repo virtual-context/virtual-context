@@ -429,3 +429,107 @@ class TestAFailedConfirmationStillHoldsTheDay:
         record = history.all()[0]
         assert record.status == "pending"
         assert record.discord_message_id == ""
+
+
+class TestTheFingerprintKeysOnTheQuestion:
+    """Presentation must not decide whether a question counts as a repeat.
+
+    Fingerprinting the delivery body inverts the rule in both directions.
+    Measured against the shipped threshold: the same question bare vs wrapped
+    scored 30, so a real repeat was missed; two different questions about one
+    original scored 5, so a good question was rejected. Both while naming
+    question_recently_asked in the ladder.
+    """
+
+    QUESTION = "Did you end up starting the SS-31?"
+    OTHER = "What made you pick the morning dose over the evening one?"
+    # Realistic length matters: a short quote does not dominate the token
+    # set and the false-repeat direction does not reproduce. With this one
+    # the defect scores 29 and 5 against a threshold of 12 — the same shape
+    # cloud measured in production (30 and 5). A shorter fixture passes the
+    # negative control while proving only half the property.
+    ORIGINAL = (
+        "Adding ss31 (5mg) for 4 weeks. Adding in MotsC after SS31. Labs "
+        "pending, should have them back next week sometime. Been running the "
+        "enclo at 25mg MWF alongside, sleep has been rough since I moved the "
+        "modafinil earlier in the day, and the KPV 500mcg in the morning "
+        "seems to be helping the gut stuff more than I expected honestly."
+    )
+
+    def _wrap(self, question):
+        return (
+            f"> {self.ORIGINAL}\n"
+            f"— Rob in #p3ptides, 9 days ago\n\n"
+            f"<@1338726888809697364> {question}"
+        )
+
+    def _recorded(self, posting_permitted, **over):
+        history = InMemoryPostHistory()
+        _post(history=history, **over)
+        return history.all()[0]
+
+    def test_wrapping_does_not_change_the_fingerprint(self, posting_permitted):
+        bare = self._recorded(posting_permitted, question=self.QUESTION)
+        wrapped = self._recorded(
+            posting_permitted, question=self.QUESTION,
+            delivery_body=self._wrap(self.QUESTION),
+        )
+        assert wrapped.topic_fingerprint == bare.topic_fingerprint
+
+    def test_two_questions_about_one_original_stay_distinct(
+        self, posting_permitted,
+    ):
+        """The quoted original must not dominate the token set."""
+        from virtual_context.core.engagement import fingerprint_distance
+        from virtual_context.core.engagement.history import SIMILARITY_DISTANCE
+
+        one = self._recorded(
+            posting_permitted, question=self.QUESTION,
+            delivery_body=self._wrap(self.QUESTION),
+        )
+        two = self._recorded(
+            posting_permitted, question=self.OTHER,
+            delivery_body=self._wrap(self.OTHER),
+        )
+        distance = fingerprint_distance(
+            one.topic_fingerprint, two.topic_fingerprint,
+        )
+        assert distance > SIMILARITY_DISTANCE, (
+            f"distinct questions collapsed to distance {distance}"
+        )
+
+    def test_the_ledger_records_the_question_not_the_delivery(
+        self, posting_permitted,
+    ):
+        """question_text is for near-duplicate review; the wrapper is noise."""
+        row = self._recorded(
+            posting_permitted, question=self.QUESTION,
+            delivery_body=self._wrap(self.QUESTION),
+        )
+        assert row.question_text == self.QUESTION
+        assert "— Rob in #p3ptides" not in row.question_text
+
+    def test_the_delivery_body_is_what_actually_gets_sent(
+        self, posting_permitted,
+    ):
+        seen = {}
+
+        def _sender(**kw):
+            seen.update(kw)
+            return "9990001"
+
+        wrapped = self._wrap(self.QUESTION)
+        _post(question=self.QUESTION, delivery_body=wrapped, sender=_sender)
+        assert seen["content"] == wrapped
+
+    def test_without_a_delivery_body_the_question_is_sent(
+        self, posting_permitted,
+    ):
+        seen = {}
+
+        def _sender(**kw):
+            seen.update(kw)
+            return "9990001"
+
+        _post(question=self.QUESTION, sender=_sender)
+        assert seen["content"] == self.QUESTION

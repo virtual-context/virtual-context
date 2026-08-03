@@ -213,6 +213,7 @@ def run_once(
     try:
         sent = post_question(
             candidate=chosen, question=draft.text,
+            delivery_body=getattr(draft, "delivery_body", "") or "",
             channel_id=_post_target(allowlist, chosen),
             verification=_verification_for(chosen, live_rejections),
             history=history, sender=message_sender, now=now,

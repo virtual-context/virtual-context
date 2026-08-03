@@ -105,6 +105,7 @@ def post_question(
     *,
     candidate,
     question: str,
+    delivery_body: str = "",
     channel_id: str,
     verification,
     history,
@@ -139,9 +140,22 @@ def post_question(
         raise PostRefused(
             "a question has already gone out for this Eastern day"
         )
+    # The question and the thing that gets sent are different values and must
+    # not be conflated. Presentation — a quoted original, a mention, review
+    # framing — belongs to delivery. The repetition rule keys on the QUESTION,
+    # because that is what must not repeat.
+    #
+    # Fingerprinting the delivery body inverts the rule in both directions:
+    # the quoted original dominates the token set, so every question about one
+    # member's message looks identical and the same question about two
+    # messages looks unrelated. Measured against the shipped threshold of 12,
+    # the same question bare vs wrapped scored 30 — a real repeat missed —
+    # while two different questions about one original scored 5 and were
+    # falsely rejected. Both while reporting question_recently_asked.
     body = (question or "").strip()
     if not body:
         raise PostRefused("refusing to send an empty question")
+    sent_body = (delivery_body or "").strip() or body
 
     # Claim the day BEFORE sending, and address the confirmation by the
     # handle this claim returned. "The last row" is not an address: a second
@@ -182,7 +196,7 @@ def post_question(
     source_channel = str(getattr(candidate, "channel_id", "") or "")
     message_id = str(sender(
         channel_id=channel_id,
-        content=body,
+        content=sent_body,
         reply_to_message_id=expected,
         reply_to_channel_id=source_channel,
         reply_to_guild_id=_guild_id(),

@@ -27,6 +27,12 @@ class DraftComposerNotConfigured(RuntimeError):
 class Draft:
     text: str = ""
     reason: str = ""
+    # What actually gets sent, when presentation differs from the question —
+    # review framing, a quoted original, a mention. Empty means the question
+    # is sent as-is. The repetition fingerprint always keys on ``text``, never
+    # on this, so how a question is presented cannot change whether it counts
+    # as a repeat.
+    delivery_body: str = ""
 
     @property
     def usable(self) -> bool:
