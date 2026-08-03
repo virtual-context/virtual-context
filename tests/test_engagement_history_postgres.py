@@ -62,25 +62,53 @@ def _record(**kw) -> PostRecord:
 
 
 class _Pool:
-    """A pool shape matching what the storage backends expose."""
+    """A pool shape matching what the storage backends expose.
 
-    def __init__(self, dsn):
+    ``row_factory`` is a constructor argument because it is exactly what this
+    test got wrong. Production builds its pool with ``dict_row``; this pool
+    defaulted to psycopg's tuple rows, so every assertion passed against a
+    connection configured differently from the one production hands the
+    class — and the class could not read a single row in production.
+    """
+
+    def __init__(self, dsn, row_factory=None):
         self._dsn = dsn
+        self._row_factory = row_factory
 
     def connection(self):
         import psycopg
 
-        return psycopg.connect(self._dsn, autocommit=True)
+        kwargs = {"autocommit": True}
+        if self._row_factory is not None:
+            kwargs["row_factory"] = self._row_factory
+        return psycopg.connect(self._dsn, **kwargs)
 
 
 class _Store:
-    def __init__(self, dsn):
-        self.pool = _Pool(dsn)
+    def __init__(self, dsn, row_factory=None):
+        self.pool = _Pool(dsn, row_factory)
 
 
-@pytest.fixture(scope="module")
-def pg_store():
-    store = _Store(PG_URL)
+def _row_factories():
+    """Both shapes a driver can hand back. Production uses dict_row."""
+    from psycopg.rows import dict_row, tuple_row
+
+    return [("dict_row", dict_row), ("tuple_row", tuple_row)]
+
+
+@pytest.fixture(
+    scope="module",
+    params=_row_factories() if PG_URL else [],
+    ids=lambda p: p[0],
+)
+def pg_store(request):
+    """Every durable test runs under BOTH row factories.
+
+    Parameterised rather than fixed, because a fix verified on the wrong
+    factory passes and changes nothing — which is how the positional access
+    survived a green suite.
+    """
+    store = _Store(PG_URL, request.param[1])
     apply_engagement_history_schema(store)
     return store
 
@@ -369,7 +397,11 @@ class TestTheDayClaimIsEnforcedByTheDatabase:
                         WHERE tenant_id = %s AND question_text = %s""",
                     (durable._tenant_id, f"h{hour}"),
                 ).fetchone()
-            assert row[0] == row[1], f"disagreed at {hour}:30 UTC"
+            stored, sql_day = (
+                (row["eastern_day"], row["sql_day"])
+                if isinstance(row, dict) else (row[0], row[1])
+            )
+            assert stored == sql_day, f"disagreed at {hour}:30 UTC"
             with pg_store.pool.connection() as conn:
                 conn.execute(
                     "DELETE FROM engagement_post_history WHERE tenant_id = %s",
@@ -386,3 +418,77 @@ class TestTheDayClaimIsEnforcedByTheDatabase:
         )
         other.record(_record(posted_at=now))
         assert len(other.all()) == 1
+
+
+class TestAnEmptyResultIsNotEvidence:
+    """`[]` from an empty table looks exactly like a working reader.
+
+    Every read here returned `[]` in production and the suite was green,
+    because the table had no rows and the tests used a connection whose row
+    factory did not match production's. These assert a row goes in, comes
+    back, and carries its values — so an empty list can never again be
+    mistaken for a working read.
+    """
+
+    def test_all_returns_the_record_with_its_fields(self, durable):
+        durable.record(_record(
+            question_text="How did the ss31 run go?",
+            tagged_actor_id=ACTOR,
+            source_message_ids=("1524917968440524991",),
+            topic_fingerprint=2**64 - 1,
+            status="posted",
+        ))
+        rows = durable.all()
+        assert len(rows) == 1, "a written row did not come back"
+        row = rows[0]
+        assert row.question_text == "How did the ss31 run go?"
+        assert row.tagged_actor_id == ACTOR
+        assert row.source_message_ids == ("1524917968440524991",)
+        assert row.topic_fingerprint == 2**64 - 1
+        assert row.status == "posted"
+        assert row.posted_at.tzinfo is not None, "timestamp lost its zone"
+
+    def test_pending_claims_returns_the_record_not_an_empty_list(self, durable):
+        durable.record(_record(status="pending", question_text="stuck"))
+        claims = pending_claims(durable)
+        assert len(claims) == 1, "a pending claim was invisible"
+        assert claims[0].question_text == "stuck"
+        assert claims[0].status == "pending"
+
+    def test_day_is_claimed_answers_true_for_a_written_row(self, durable):
+        """The read that was raising KeyError on every single run."""
+        now = datetime(2026, 8, 2, 16, 0, tzinfo=timezone.utc)
+        assert durable.day_is_claimed(now.astimezone(EASTERN).date()) is False
+        durable.record(_record(posted_at=now))
+        assert durable.day_is_claimed(now.astimezone(EASTERN).date()) is True
+
+    def test_the_guard_actually_blocks_a_second_post_end_to_end(
+        self, durable, monkeypatch,
+    ):
+        """The property the whole ledger exists for.
+
+        This is the assertion that would have failed in production: the
+        duplicate guard was not degraded, it was inoperative, and only the
+        ordering of the checks kept it from posting twice.
+        """
+        import virtual_context.core.engagement.poster as poster_module
+
+        monkeypatch.setattr(poster_module, "POSTING_ENABLED", True)
+        now = datetime(2026, 8, 2, 16, 0, tzinfo=timezone.utc)
+        candidate = SimpleNamespace(
+            actor_id=ACTOR, source_message_id="1524917968440524991",
+            channel_id=CHANNEL,
+        )
+        verification = SimpleNamespace(
+            ok=True, verified_message_id="1524917968440524991",
+        )
+        kwargs = dict(
+            candidate=candidate, question="Did the ss31 run go well?",
+            channel_id=CHANNEL, verification=verification, history=durable,
+            sender=lambda **kw: "9001", now=now, question_type="timed",
+        )
+        first = poster_module.post_question(**kwargs)
+        assert first.message_id == "9001"
+        with pytest.raises(poster_module.PostRefused):
+            poster_module.post_question(**kwargs)
+        assert len(durable.all()) == 1, "the day was claimed twice"

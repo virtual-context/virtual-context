@@ -38,6 +38,7 @@ except Exception:  # pragma: no cover - psycopg absent
     class _UNIQUE_VIOLATION(Exception):
         pass
 from dataclasses import dataclass, field
+from collections.abc import Mapping
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -457,10 +458,12 @@ class PostgresPostHistory:
                 """SELECT EXISTS (
                        SELECT 1 FROM engagement_post_history
                         WHERE tenant_id = %s AND eastern_day = %s
-                   )""",
+                   ) AS claimed""",
                 (self._tenant_id, day),
             ).fetchone()
-        return bool(row[0])
+        if row is None:
+            return False
+        return bool(_row_value(row, "claimed", ("claimed",)))
 
     def pending(self) -> list[PostRecord]:
         return self._select("AND status = 'pending'")
@@ -473,11 +476,18 @@ class PostgresPostHistory:
 
     # -- internals ------------------------------------------------------
 
-    _COLUMNS = (
-        "id, posted_at, channel_id, question_type, tagged_actor_id, "
-        "source_message_ids, topic_fingerprint, question_text, "
-        "discord_message_id, resolution, status"
+    # Named so the row can be read without depending on the connection's
+    # row factory. Production builds its pool with dict_row and returns
+    # mappings; a bare psycopg connection returns tuples. Code that indexes
+    # positionally works against one and raises KeyError against the other,
+    # and a test using the wrong factory passes while the class cannot read
+    # a row in production.
+    _COLUMN_NAMES = (
+        "id", "posted_at", "channel_id", "question_type", "tagged_actor_id",
+        "source_message_ids", "topic_fingerprint", "question_text",
+        "discord_message_id", "resolution", "status",
     )
+    _COLUMNS = ", ".join(_COLUMN_NAMES)
 
     def _select(self, extra: str) -> list[PostRecord]:
         with self._connect() as conn:
@@ -486,7 +496,7 @@ class PostgresPostHistory:
                 f"WHERE tenant_id = %s {extra} ORDER BY posted_at, id",
                 (self._tenant_id,),
             ).fetchall()
-        return [_row_to_record(r) for r in rows]
+        return [_row_to_record(r, self._COLUMN_NAMES) for r in rows]
 
     def _one(self, handle: str) -> PostRecord:
         with self._connect() as conn:
@@ -497,7 +507,7 @@ class PostgresPostHistory:
             ).fetchone()
         if row is None:
             raise KeyError(f"no post history record for handle {handle!r}")
-        return _row_to_record(row)
+        return _row_to_record(row, self._COLUMN_NAMES)
 
 
 def _join_ids(ids) -> str:
@@ -508,22 +518,33 @@ def _split_ids(blob: str) -> tuple[str, ...]:
     return tuple(p for p in (blob or "").split(",") if p)
 
 
-def _row_to_record(row) -> PostRecord:
-    (
-        _id, posted_at, channel_id, question_type, tagged_actor_id,
-        source_message_ids, topic_fingerprint, question_text,
-        discord_message_id, resolution, status,
-    ) = row
+def _row_value(row, name: str, columns):
+    """One column, whether the driver returned a mapping or a sequence.
+
+    Unpacking a dict yields its KEYS, so positional access does not merely
+    fail here — it silently produces column names where values belong, which
+    is how ``posted_at`` reached ``datetime.fromisoformat`` as a string
+    literal. Reading by name is correct under either factory.
+    """
+    if isinstance(row, Mapping):
+        return row[name]
+    return row[tuple(columns).index(name)]
+
+
+def _row_to_record(row, columns) -> PostRecord:
+    def field(name):
+        return _row_value(row, name, columns)
+
     return PostRecord(
-        posted_at=datetime.fromisoformat(posted_at),
-        channel_id=channel_id,
-        question_type=question_type,
-        tagged_actor_id=tagged_actor_id,
-        source_message_ids=_split_ids(source_message_ids),
+        posted_at=datetime.fromisoformat(field("posted_at")),
+        channel_id=field("channel_id"),
+        question_type=field("question_type"),
+        tagged_actor_id=field("tagged_actor_id"),
+        source_message_ids=_split_ids(field("source_message_ids")),
         # NUMERIC comes back as Decimal; the fingerprint is compared bitwise.
-        topic_fingerprint=int(topic_fingerprint or 0),
-        question_text=question_text,
-        discord_message_id=discord_message_id,
-        resolution=resolution,
-        status=status,
+        topic_fingerprint=int(field("topic_fingerprint") or 0),
+        question_text=field("question_text"),
+        discord_message_id=field("discord_message_id"),
+        resolution=field("resolution"),
+        status=field("status"),
     )
