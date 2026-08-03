@@ -492,3 +492,79 @@ class TestAnEmptyResultIsNotEvidence:
         with pytest.raises(poster_module.PostRefused):
             poster_module.post_question(**kwargs)
         assert len(durable.all()) == 1, "the day was claimed twice"
+
+
+class TestThroughARealStore:
+    """Not a double. An actual PostgresStore, built the way production builds it.
+
+    The parameterised fixtures above cover both row factories, but they still
+    use a hand-written pool. That is the same class of thing that hid the
+    defect: a double configured by the person who also wrote the assertions.
+    This constructs the real store, so the pool, its row factory and its
+    connection kwargs are whatever PostgresStore chooses — not what a test
+    chose on its behalf.
+    """
+
+    @pytest.fixture
+    def real_store(self):
+        from virtual_context.storage.postgres import PostgresStore
+
+        store = PostgresStore(PG_URL)
+        apply_engagement_history_schema(store)
+        return store
+
+    def test_the_pool_really_does_return_mappings(self, real_store):
+        """Pins the production fact the fix depends on.
+
+        If this ever returns tuples, the by-name reads still work — but the
+        premise in the fix's comment would be stale, and a stale premise is
+        how the next person justifies going back to positional access.
+        """
+        with real_store.pool.connection() as conn:
+            row = conn.execute("SELECT 1 AS n").fetchone()
+        assert isinstance(row, dict), (
+            f"production pool returned {type(row).__name__}, not a mapping"
+        )
+
+    def test_day_is_claimed_answers_both_ways_through_the_real_store(
+        self, real_store,
+    ):
+        """Cloud's post-fix ask, and the exact line that raised KeyError."""
+        tenant = f"t-{uuid.uuid4().hex[:12]}"
+        history = PostgresPostHistory(
+            real_store, tenant_id=tenant,
+            conversation_id="sk:agent:vast:discord",
+        )
+        now = datetime(2026, 8, 2, 16, 0, tzinfo=timezone.utc)
+        day = now.astimezone(EASTERN).date()
+        try:
+            assert history.day_is_claimed(day) is False, "unclaimed day"
+            history.record(_record(posted_at=now))
+            assert history.day_is_claimed(day) is True, "claimed day"
+            assert already_posted_today(history, now=now) is True
+        finally:
+            with real_store.pool.connection() as conn:
+                conn.execute(
+                    "DELETE FROM engagement_post_history WHERE tenant_id = %s",
+                    (tenant,),
+                )
+
+    def test_a_written_row_reads_back_through_the_real_store(self, real_store):
+        """all() and pending_claims() against the real pool, not [] from empty."""
+        tenant = f"t-{uuid.uuid4().hex[:12]}"
+        history = PostgresPostHistory(
+            real_store, tenant_id=tenant,
+            conversation_id="sk:agent:vast:discord",
+        )
+        try:
+            history.record(_record(question_text="real", status="pending"))
+            rows = history.all()
+            assert len(rows) == 1
+            assert rows[0].question_text == "real"
+            assert [r.question_text for r in pending_claims(history)] == ["real"]
+        finally:
+            with real_store.pool.connection() as conn:
+                conn.execute(
+                    "DELETE FROM engagement_post_history WHERE tenant_id = %s",
+                    (tenant,),
+                )
