@@ -510,3 +510,120 @@ class TestShippedAllowlist:
         from virtual_context.core.engagement import rehearsal_allowlist
 
         assert rehearsal_allowlist().may_source("1524946242499514418") is False
+
+
+class TestAttributionStandard:
+    """The gate judges attribution, not entailment.
+
+    A question that assumes an answer attributes nothing and must pass; a
+    draft that states something the quote does not support must fail. Every
+    assertion here is made against the SHIPPED prompt and the SHIPPED
+    fixtures, never a copy declared in this file.
+    """
+
+    def test_the_shipped_prompt_asks_for_two_separate_judgements(self):
+        from virtual_context.core.engagement import (
+            FIDELITY_JUDGE_SYSTEM_PROMPT as PROMPT,
+        )
+
+        assert "ASSERTS" in PROMPT and "PRESUPPOSES" in PROMPT
+        assert "separate judgements" in PROMPT
+        assert '"asserts"' in PROMPT and '"presupposes"' in PROMPT
+
+    def test_an_assertion_fails(self):
+        from virtual_context.core.engagement import run_fidelity_gate
+
+        verdict = run_fidelity_gate(
+            quote="Sleep has been rough since I moved the modafinil earlier.",
+            draft="Moving the modafinil earlier wrecked your sleep.",
+            judge=lambda **kw: {
+                "asserts": True, "presupposes": False,
+                "reason": "states a cause the quote does not give",
+            },
+        )
+        assert verdict.faithful is False
+        assert "cause" in verdict.reason
+
+    def test_a_presupposition_passes(self):
+        """The owner's ruling, encoded as a mechanism rather than a case."""
+        from virtual_context.core.engagement import run_fidelity_gate
+
+        verdict = run_fidelity_gate(
+            quote="Adding ss31 (5mg) for 4 weeks.",
+            draft="How's the four weeks going?",
+            judge=lambda **kw: {"asserts": False, "presupposes": True},
+        )
+        assert verdict.faithful is True
+
+    def test_an_unreadable_split_verdict_still_fails_closed(self):
+        from virtual_context.core.engagement import run_fidelity_gate
+
+        verdict = run_fidelity_gate(
+            quote="q", draft="d",
+            judge=lambda **kw: {"asserts": "maybe", "presupposes": False},
+        )
+        assert verdict.faithful is False
+        assert verdict.reason == "unreadable_verdict"
+
+    def test_the_reclassified_followups_are_pass_fixtures(self):
+        from virtual_context.core.engagement import (
+            ADVERSARIAL_FIDELITY_FIXTURES as FIXTURES,
+        )
+
+        by_name = {f.name: f for f in FIXTURES}
+        for name in (
+            "presumptive_followup_four_weeks",
+            "presumptive_followup_motsc",
+            "presumptive_followup_contemplated_change",
+        ):
+            assert by_name[name].expected_faithful is True, name
+
+    def test_the_assertion_fixtures_must_still_fail(self):
+        from virtual_context.core.engagement import (
+            ADVERSARIAL_FIDELITY_FIXTURES as FIXTURES,
+        )
+
+        by_name = {f.name: f for f in FIXTURES}
+        for name in (
+            "asserts_a_cause_he_never_gave",
+            "asserts_an_action_he_never_took",
+            "asserts_a_causal_claim",
+            "asserts_he_said_something_he_did_not",
+        ):
+            assert by_name[name].expected_faithful is False, name
+
+    def test_a_clause_is_pinned_in_its_draft_not_as_a_fragment(self):
+        """Judging the second clause alone produced a wrong verdict twice.
+
+        The gate sees whole drafts, so the fixture is the whole draft. A
+        fixture holding only the trailing clause would measure a unit the
+        runtime never evaluates.
+        """
+        from virtual_context.core.engagement import (
+            ADVERSARIAL_FIDELITY_FIXTURES as FIXTURES,
+        )
+
+        fixture = next(
+            f for f in FIXTURES if f.name == "clause_in_context_not_fragment"
+        )
+        assert fixture.draft.count("?") == 2, "the fixture lost its antecedent"
+        assert fixture.draft.startswith("Did you end up starting")
+        assert "How's the four weeks going?" in fixture.draft
+        assert fixture.expected_faithful is True
+
+    def test_both_production_drafts_are_pass_regressions(self):
+        from virtual_context.core.engagement import (
+            ADVERSARIAL_FIDELITY_FIXTURES as FIXTURES,
+        )
+
+        names = {f.name for f in FIXTURES if f.expected_faithful}
+        assert "clause_in_context_not_fragment" in names
+        assert "production_draft_dadscientist" in names
+
+    def test_the_suite_cannot_be_passed_by_rejecting_everything(self):
+        from virtual_context.core.engagement import (
+            ADVERSARIAL_FIDELITY_FIXTURES as FIXTURES,
+        )
+
+        assert sum(1 for f in FIXTURES if f.expected_faithful) >= 5
+        assert sum(1 for f in FIXTURES if not f.expected_faithful) >= 5

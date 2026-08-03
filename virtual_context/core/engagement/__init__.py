@@ -36,6 +36,7 @@ from .compose import (
 from .channels import ChannelAllowlist, load_channel_allowlist
 from .fidelity import (
     ADVERSARIAL_FIDELITY_FIXTURES,
+    FIDELITY_JUDGE_SYSTEM_PROMPT,
     FidelityFixture,
     FidelityGateNotConfigured,
     FidelityVerdict,
@@ -53,6 +54,7 @@ from .verify import MessageSourceRecord, verify_candidates
 
 __all__ = [
     "ADVERSARIAL_FIDELITY_FIXTURES",
+    "FIDELITY_JUDGE_SYSTEM_PROMPT",
     "POST_CHANNEL_IDS",
     "REHEARSAL_CONFIG",
     "SOURCE_CHANNEL_IDS",
