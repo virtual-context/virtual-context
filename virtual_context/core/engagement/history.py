@@ -104,6 +104,11 @@ class PostRecord:
     # The review post in the staging channel, distinct from the published
     # reply. Both exist for a staged row that was approved.
     staged_message_id: str = ""
+    # The channel the quoted message lives in. channel_id records where the
+    # post went, which under staging is the staging channel — publishing
+    # needs the source, and deriving it later from the message id would mean
+    # a lookup that can fail at the moment it is needed.
+    source_channel_id: str = ""
     # The row's own handle, so a record read back can be addressed.
     #
     # Without it the operator surface was unusable: pending_claims() reported
@@ -355,6 +360,9 @@ ALTER TABLE engagement_post_history
 ALTER TABLE engagement_post_history
     ADD COLUMN IF NOT EXISTS staged_message_id TEXT NOT NULL DEFAULT '';
 
+ALTER TABLE engagement_post_history
+    ADD COLUMN IF NOT EXISTS source_channel_id TEXT NOT NULL DEFAULT '';
+
 UPDATE engagement_post_history
    SET eastern_day = (posted_at::timestamptz AT TIME ZONE 'America/New_York')::date
  WHERE eastern_day IS NULL;
@@ -482,9 +490,10 @@ class PostgresPostHistory:
                        id, tenant_id, conversation_id, posted_at, channel_id,
                        question_type, tagged_actor_id, source_message_ids,
                        topic_fingerprint, question_text, discord_message_id,
-                       resolution, status, eastern_day, staged_message_id
+                       resolution, status, eastern_day, staged_message_id,
+                       source_channel_id
                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                             %s, %s, %s)""",
+                             %s, %s, %s, %s)""",
                 (
                     handle, self._tenant_id, self._conversation_id,
                     entry.posted_at.isoformat(), entry.channel_id,
@@ -493,6 +502,7 @@ class PostgresPostHistory:
                     int(entry.topic_fingerprint or 0), entry.question_text,
                     entry.discord_message_id, entry.resolution, entry.status,
                     _eastern_day(entry.posted_at), entry.staged_message_id,
+                    entry.source_channel_id,
                 ),
             )
 
@@ -614,6 +624,7 @@ class PostgresPostHistory:
         "id", "posted_at", "channel_id", "question_type", "tagged_actor_id",
         "source_message_ids", "topic_fingerprint", "question_text",
         "discord_message_id", "resolution", "status", "staged_message_id",
+        "source_channel_id",
     )
     _COLUMNS = ", ".join(_COLUMN_NAMES)
 
@@ -677,4 +688,5 @@ def _row_to_record(row, columns) -> PostRecord:
         resolution=field("resolution"),
         status=field("status"),
         staged_message_id=str(field("staged_message_id") or ""),
+        source_channel_id=str(field("source_channel_id") or ""),
     )

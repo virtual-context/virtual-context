@@ -468,12 +468,12 @@ class TestTheSendCarriesTheReplyContext:
             seen.update(kw)
             return "9001"
 
-        original = poster_module.POST_CHANNEL_IDS
-        poster_module.POST_CHANNEL_IDS = (P3,)
+        original = poster_module.STAGING_CHANNEL_IDS
+        poster_module.STAGING_CHANNEL_IDS = (P3,)
         try:
             _run(post=True, allowlist=widened, message_sender=_sender)
         finally:
-            poster_module.POST_CHANNEL_IDS = original
+            poster_module.STAGING_CHANNEL_IDS = original
 
         assert seen["channel_id"] == P3, "the post did not follow the source"
         assert seen["can_reply_in_place"] is True
@@ -525,13 +525,13 @@ class TestTheChannelCapIsScopedToCommunityChannels:
         widened = load_channel_allowlist({
             "source_channel_ids": [P3], "post_channel_ids": [P3],
         })
-        original = poster_module.POST_CHANNEL_IDS
-        poster_module.POST_CHANNEL_IDS = (P3,)
+        original = poster_module.STAGING_CHANNEL_IDS
+        poster_module.STAGING_CHANNEL_IDS = (P3,)
         try:
             result = _run(post=True, history=history, allowlist=widened,
                           message_sender=lambda **kw: "4")
         finally:
-            poster_module.POST_CHANNEL_IDS = original
+            poster_module.STAGING_CHANNEL_IDS = original
         assert result.posted_message_id == ""
         reasons = {r.reason for r in result.rejections if r.stage == "history"}
         assert "channel_recently_overused" in reasons, reasons
@@ -547,13 +547,13 @@ class TestTheChannelCapIsScopedToCommunityChannels:
             widened = load_channel_allowlist({
                 "source_channel_ids": [P3], "post_channel_ids": post_channels,
             })
-            original = poster_module.POST_CHANNEL_IDS
-            poster_module.POST_CHANNEL_IDS = tuple(post_channels)
+            original = poster_module.STAGING_CHANNEL_IDS
+            poster_module.STAGING_CHANNEL_IDS = tuple(post_channels)
             try:
                 return _run(post=True, history=history, allowlist=widened,
                             message_sender=lambda **kw: "x")
             finally:
-                poster_module.POST_CHANNEL_IDS = original
+                poster_module.STAGING_CHANNEL_IDS = original
 
         assert _attempt([VASTTEST], self._history_with(3, VASTTEST)) \
             .posted_message_id == "x", "the rehearsal exemption did not apply"

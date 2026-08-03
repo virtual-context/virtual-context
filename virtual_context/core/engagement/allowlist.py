@@ -45,7 +45,28 @@ SOURCE_CHANNEL_IDS = (
 # Rehearsal only. Widening this is the change that enables posting into a
 # live community channel, so it is deliberately a one-line, reviewable edit
 # rather than something a caller can arrive at by assembling its own config.
-POST_CHANNEL_IDS = (VASTTEST,)
+# Two lists, deliberately not one.
+#
+# Compose reaches STAGING only; the approval path reaches PUBLISH only. With
+# a single widened list, a bug anywhere in compose could put a question into
+# a community channel with no approval at all — the owner's approval would be
+# a convention rather than a route. Two lists make his approval the only way
+# into a community channel by construction.
+#
+# Widening STAGING_CHANNEL_IDS therefore cannot publish anything, and
+# PUBLISH_CHANNEL_IDS is unreachable from the compose path by name: nothing
+# in the staging code path imports it.
+STAGING_CHANNEL_IDS = (VASTTEST,)
+PUBLISH_CHANNEL_IDS = SOURCE_CHANNEL_IDS
+
+# The compose path's destination list. Kept as the staging list so a caller
+# that has not been updated cannot acquire publish reach by accident.
+POST_CHANNEL_IDS = STAGING_CHANNEL_IDS
+
+assert not set(STAGING_CHANNEL_IDS) & set(PUBLISH_CHANNEL_IDS), (
+    "a channel cannot be both a staging and a publish destination: staging "
+    "is reachable without approval and publishing must not be"
+)
 
 REHEARSAL_CONFIG = {
     "source_channel_ids": list(SOURCE_CHANNEL_IDS),

@@ -136,7 +136,7 @@ class TestChannelRefusal:
     @pytest.mark.parametrize("community", SOURCE_CHANNEL_IDS)
     def test_every_source_channel_is_refused_by_id(self, posting_permitted, community):
         """Refused, not merely checked — by id, against the shipped tuple."""
-        with pytest.raises(PostRefused, match="not a permitted destination"):
+        with pytest.raises(PostRefused, match="not a permitted staging destination"):
             _post(channel_id=community)
 
     def test_an_unknown_channel_is_refused(self, posting_permitted):

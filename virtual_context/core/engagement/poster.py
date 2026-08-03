@@ -23,7 +23,7 @@ from datetime import datetime
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
-from .allowlist import GUILD_CONVERSATION_ID, POST_CHANNEL_IDS
+from .allowlist import GUILD_CONVERSATION_ID, STAGING_CHANNEL_IDS
 from .history import DayAlreadyClaimed, PostRecord, topic_fingerprint
 
 # LIVE, and deliberately NOT a parameter.
@@ -119,10 +119,12 @@ def post_question(
             "posting is disabled in this build; it is shipped configuration "
             "and cannot be enabled by a caller"
         )
-    if channel_id not in POST_CHANNEL_IDS:
+    if channel_id not in STAGING_CHANNEL_IDS:
         raise PostRefused(
-            f"channel {channel_id} is not a permitted destination; posting "
-            "is restricted to the shipped post list"
+            f"channel {channel_id} is not a permitted staging destination. "
+            "This path cannot reach a publish channel at all: publishing to "
+            "a community channel goes through the approval path, which is "
+            "the only code that knows PUBLISH_CHANNEL_IDS."
         )
     if verification is None or not getattr(verification, "ok", False):
         raise PostRefused(
@@ -167,6 +169,7 @@ def post_question(
     # first means it costs the record, and the next run then sees an unclaimed
     # day and posts again. Skipping a day is recoverable; posting twice into a
     # community channel is not.
+    source_channel = str(getattr(candidate, "channel_id", "") or "")
     try:
         handle = history.record(PostRecord(
             posted_at=now,
@@ -176,6 +179,7 @@ def post_question(
             source_message_ids=(expected,) if expected else (),
             topic_fingerprint=topic_fingerprint(body),
             question_text=body,
+            source_channel_id=source_channel,
             discord_message_id="",
             status="pending",
         ))
@@ -193,7 +197,6 @@ def post_question(
     #
     # The engine decides WHAT is true about the post; the caller owns the
     # transport and the credential and decides how to express it.
-    source_channel = str(getattr(candidate, "channel_id", "") or "")
     message_id = str(sender(
         channel_id=channel_id,
         content=sent_body,
