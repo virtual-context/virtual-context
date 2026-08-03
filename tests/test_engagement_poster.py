@@ -313,3 +313,58 @@ class TestTheDayIsClaimedBeforeTheSend:
         with pytest.raises(PostRefused, match="already gone out"):
             _post(history=history)
         assert len(pending_claims(history)) == 1
+
+
+class TestAFailedConfirmationStillHoldsTheDay:
+    """The message is out and the confirming write failed.
+
+    This is the case the ordering exists for. The send succeeded, so the
+    question is public; only the record of its id is missing. The day must
+    stay claimed, because the alternative — treating a lost confirmation as
+    "nothing happened" — posts the same question twice.
+    """
+
+    class _FailsOnUpdate(InMemoryPostHistory):
+        def update(self, index, **changes):
+            raise OSError("connection reset while confirming")
+
+    def test_the_day_stays_claimed_when_the_confirmation_fails(self):
+        from virtual_context.core.engagement import pending_claims
+
+        history = self._FailsOnUpdate()
+        sent = {"n": 0}
+
+        def _sender(**kw):
+            sent["n"] += 1
+            return "9990001"
+
+        with pytest.raises(OSError):
+            _post(history=history, sender=_sender)
+
+        assert sent["n"] == 1, "the message did go out"
+        assert already_posted_today(history, now=NOW) is True
+        assert len(pending_claims(history)) == 1
+
+    def test_it_never_re_sends_after_a_failed_confirmation(self):
+        history = self._FailsOnUpdate()
+        sent = {"n": 0}
+
+        def _sender(**kw):
+            sent["n"] += 1
+            return "9990001"
+
+        with pytest.raises(OSError):
+            _post(history=history, sender=_sender)
+        with pytest.raises(PostRefused, match="already gone out"):
+            _post(history=history, sender=_sender)
+
+        assert sent["n"] == 1, "re-sent a question that had already gone out"
+
+    def test_the_unconfirmed_claim_has_no_message_id(self):
+        """So an operator can tell it apart from a completed post."""
+        history = self._FailsOnUpdate()
+        with pytest.raises(OSError):
+            _post(history=history, sender=lambda **kw: "9990001")
+        record = history.all()[0]
+        assert record.status == "pending"
+        assert record.discord_message_id == ""
