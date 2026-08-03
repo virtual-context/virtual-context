@@ -97,6 +97,7 @@ from .select import (
     select_question,
 )
 from .timing import ThreadState, assess_thread, timed_followup_eligibility
+from .sources import load_message_sources
 from .verify import MessageSourceRecord, verify_candidates
 
 __all__ = [
@@ -165,6 +166,7 @@ __all__ = [
     "FidelityGateNotConfigured",
     "FidelityVerdict",
     "MessageSourceRecord",
+    "load_message_sources",
     "Rejection",
     "REASON_BROADER_POOL_EMPTY",
     "REASON_BROADER_POOL_NOT_CONFIGURED",

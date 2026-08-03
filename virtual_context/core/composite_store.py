@@ -1481,6 +1481,18 @@ class CompositeStore:
             )
         return None
 
+    def list_attested_message_sources(
+        self,
+        *,
+        tenant_id: str,
+        canonical_turn_ids,
+    ) -> list[dict]:
+        """Attestation rows for these turns. Empty when unsupported."""
+        fn = getattr(self._segments, "list_attested_message_sources", None)
+        if not callable(fn):
+            return []
+        return fn(tenant_id=tenant_id, canonical_turn_ids=canonical_turn_ids)
+
     def find_attested_canonical_user_source(
         self,
         row: "CanonicalTurnRow",

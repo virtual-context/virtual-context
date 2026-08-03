@@ -10828,6 +10828,39 @@ class PostgresStore(ContextStore):
             )
         return values
 
+    def list_attested_message_sources(
+        self,
+        *,
+        tenant_id: str,
+        canonical_turn_ids,
+    ) -> list[dict]:
+        """The attestation rows for these turns, for two-source verification.
+
+        The engagement pipeline must compare a canonical row against the
+        independently written source record before quoting anyone publicly.
+        Without this, that comparison has to be reassembled by whoever is
+        calling — which puts the integrity check outside the module that owns
+        the invariant, and lets it drift from this backend's own guards the
+        first time either changes.
+
+        Read-only, tenant-scoped, and bounded to the ids asked for. Returns
+        plain rows; the caller maps them to its own record type, so storage
+        stays free of engagement types.
+        """
+        ids = [str(i) for i in (canonical_turn_ids or []) if str(i)]
+        if not ids:
+            return []
+        with self.pool.connection() as conn:
+            rows = conn.execute(
+                """SELECT canonical_turn_id, message_id, channel_id, guild_id,
+                          author_id, source_actor_id
+                     FROM canonical_message_sources
+                    WHERE tenant_id = %s
+                      AND canonical_turn_id = ANY(%s::uuid[])""",
+                (str(tenant_id), ids),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
     def find_attested_canonical_user_source(
         self,
         row: "CanonicalTurnRow",
