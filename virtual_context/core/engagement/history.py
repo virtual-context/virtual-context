@@ -64,6 +64,11 @@ class PostRecord:
     question_text: str = ""            # Vast's own words, for near-dup review
     discord_message_id: str = ""
     resolution: str = ""               # "" | "answered" | "ignored"
+    # "pending" means the day was claimed and the send may or may not have
+    # happened; "posted" means the message id came back. A day is taken in
+    # either state, because the only irreversible mistake here is sending
+    # twice.
+    status: str = "posted"
 
 
 class InMemoryPostHistory:
@@ -74,6 +79,15 @@ class InMemoryPostHistory:
 
     def record(self, entry: PostRecord) -> None:
         self._records.append(entry)
+
+    def update(self, index: int, **changes) -> PostRecord:
+        """Replace a record in place, for the claim-then-confirm sequence."""
+        import dataclasses
+
+        self._records[index] = dataclasses.replace(
+            self._records[index], **changes,
+        )
+        return self._records[index]
 
     def since(self, moment: datetime) -> list[PostRecord]:
         return [r for r in self._records if r.posted_at >= moment]
@@ -187,7 +201,12 @@ CREATE TABLE IF NOT EXISTS engagement_post_history (
     topic_fingerprint   NUMERIC(20,0) NOT NULL DEFAULT 0,
     question_text       TEXT NOT NULL DEFAULT '',
     discord_message_id  TEXT NOT NULL DEFAULT '',
-    resolution          TEXT NOT NULL DEFAULT ''
+    resolution          TEXT NOT NULL DEFAULT '',
+    -- The day is claimed here BEFORE the message is sent, because a send and
+    -- a write cannot be made atomic. 'pending' means claimed and possibly
+    -- sent; 'posted' means the message id came back. Both hold the day, so a
+    -- crash between the two can only cost a post, never duplicate one.
+    status              TEXT NOT NULL DEFAULT 'posted'
 );
 CREATE INDEX IF NOT EXISTS engagement_post_history_actor
     ON engagement_post_history (tenant_id, tagged_actor_id, posted_at);

@@ -44,8 +44,23 @@ class PostResult:
     day: str
 
 
+def pending_claims(history) -> list:
+    """Days claimed whose send was never confirmed.
+
+    A pending row means we sent, or possibly did not, and cannot tell. It is
+    deliberately NOT retried: retrying is exactly how the one irreversible
+    mistake happens. It stays claimed and is surfaced here for a person to
+    resolve.
+    """
+    return [r for r in history.all() if getattr(r, "status", "") == "pending"]
+
+
 def already_posted_today(history, *, now: datetime) -> bool:
-    """Whether a question has gone out for this Eastern calendar day.
+    """Whether this Eastern calendar day is already claimed.
+
+    A claim counts whether or not the send was confirmed. An unconfirmed
+    claim is the case where we cannot tell what happened, and the safe
+    reading of "cannot tell" is that the day is spent.
 
     Keyed on the civil day rather than an elapsed interval, so a restart, a
     manual re-run or a duplicate wake-up all resolve to the same day and
@@ -104,10 +119,12 @@ def post_question(
     if not body:
         raise PostRefused("refusing to send an empty question")
 
-    message_id = str(sender(channel_id=channel_id, content=body) or "")
-    if not message_id:
-        raise PostRefused("the send returned no message id; treating as failed")
-
+    # Claim the day BEFORE sending. A Discord send and a Postgres write
+    # cannot be made atomic, so the ordering decides which way a failure
+    # between them breaks. Claiming first means a crash costs a post; sending
+    # first means it costs the record, and the next run then sees an unclaimed
+    # day and posts again. Skipping a day is recoverable; posting twice into a
+    # community channel is not.
     history.record(PostRecord(
         posted_at=now,
         channel_id=channel_id,
@@ -116,7 +133,17 @@ def post_question(
         source_message_ids=(expected,) if expected else (),
         topic_fingerprint=topic_fingerprint(body),
         question_text=body,
-        discord_message_id=message_id,
+        discord_message_id="",
+        status="pending",
     ))
+    claim_index = len(history.all()) - 1
+
+    message_id = str(sender(channel_id=channel_id, content=body) or "")
+    if not message_id:
+        # The claim stands. The send may or may not have landed, and the day
+        # stays taken precisely because we cannot tell.
+        raise PostRefused("the send returned no message id; treating as failed")
+
+    history.update(claim_index, discord_message_id=message_id, status="posted")
     day = now.astimezone(ZoneInfo(POSTING_ZONE)).date().isoformat()
     return PostResult(message_id=message_id, channel_id=channel_id, day=day)

@@ -59,6 +59,7 @@ from .poster import (
     PostRefused,
     PostResult,
     already_posted_today,
+    pending_claims,
     post_question,
 )
 from .runner import RunResult, run_once
@@ -139,6 +140,7 @@ __all__ = [
     "PostRefused",
     "PostResult",
     "already_posted_today",
+    "pending_claims",
     "post_question",
     "RunResult",
     "run_once",

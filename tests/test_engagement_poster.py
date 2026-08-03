@@ -227,3 +227,89 @@ class TestTheModuleHoldsNoCredential:
                     continue
                 # No literal long enough to be a credential.
                 assert len(node.value) < 60 or " " in node.value, node.value[:40]
+
+
+class TestTheDayIsClaimedBeforeTheSend:
+    """A send and a write cannot be atomic, so the ordering picks the failure.
+
+    Claiming first means a crash costs a post. Sending first means it costs
+    the record, and the next run then sees an unclaimed day and posts again.
+    Skipping is recoverable; a duplicate in a community channel is not.
+    """
+
+    def test_a_send_that_raises_leaves_the_day_claimed(self):
+        from virtual_context.core.engagement import pending_claims
+
+        history = InMemoryPostHistory()
+
+        def _explodes(**kw):
+            raise OSError("connection reset")
+
+        with pytest.raises(OSError):
+            _post(history=history, sender=_explodes)
+
+        assert already_posted_today(history, now=NOW) is True
+        assert len(pending_claims(history)) == 1
+        assert history.all()[0].status == "pending"
+        assert history.all()[0].discord_message_id == ""
+
+    def test_a_claimed_day_refuses_a_second_attempt(self):
+        """The whole point: a crash must not licence a retry."""
+        history = InMemoryPostHistory()
+
+        def _explodes(**kw):
+            raise OSError("connection reset")
+
+        with pytest.raises(OSError):
+            _post(history=history, sender=_explodes)
+        with pytest.raises(PostRefused, match="already gone out"):
+            _post(history=history)
+
+    def test_a_send_returning_no_id_still_holds_the_day(self):
+        """We cannot tell whether it landed, so the day stays spent."""
+        from virtual_context.core.engagement import pending_claims
+
+        history = InMemoryPostHistory()
+        with pytest.raises(PostRefused, match="no message id"):
+            _post(history=history, sender=lambda **kw: "")
+        assert already_posted_today(history, now=NOW) is True
+        assert len(pending_claims(history)) == 1
+
+    def test_a_successful_send_confirms_the_claim(self):
+        from virtual_context.core.engagement import pending_claims
+
+        history = InMemoryPostHistory()
+        _post(history=history)
+        record = history.all()[0]
+        assert record.status == "posted"
+        assert record.discord_message_id == "9990001"
+        assert pending_claims(history) == []
+
+    def test_the_claim_exists_before_the_sender_is_called(self):
+        """Proves the order directly rather than inferring it from outcomes."""
+        history = InMemoryPostHistory()
+        seen = {}
+
+        def _observing(**kw):
+            seen["claimed_at_send_time"] = already_posted_today(
+                history, now=NOW,
+            )
+            seen["status"] = history.all()[0].status
+            return "9990001"
+
+        _post(history=history, sender=_observing)
+        assert seen["claimed_at_send_time"] is True
+        assert seen["status"] == "pending"
+
+    def test_a_pending_claim_is_never_auto_retried(self):
+        """Retrying an unconfirmed send is how a duplicate happens."""
+        from virtual_context.core.engagement import pending_claims
+
+        history = InMemoryPostHistory()
+        with pytest.raises(PostRefused):
+            _post(history=history, sender=lambda **kw: "")
+        assert len(pending_claims(history)) == 1
+        # Any later attempt that day refuses rather than resending.
+        with pytest.raises(PostRefused, match="already gone out"):
+            _post(history=history)
+        assert len(pending_claims(history)) == 1
