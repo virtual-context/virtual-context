@@ -238,9 +238,10 @@ class TestOnePoolNotTwoTiers:
 
 
 class TestContinuationComposition:
-    def _cand_with_hook(self):
+    def _cand_with_hook(self, evidence="Adding ss31 (5mg) for 4 weeks."):
         return _cand(question_type="personal",
-                     hook_kind="dose_or_compound_change")
+                     hook_kind="dose_or_compound_change",
+                     hook_evidence=evidence)
 
     def test_no_composer_configured_raises(self):
         from virtual_context.core.engagement import (
@@ -249,9 +250,7 @@ class TestContinuationComposition:
 
         with pytest.raises(DraftComposerNotConfigured):
             compose_continuation_draft(
-                candidate=self._cand_with_hook(),
-                hook_kind="dose_or_compound_change",
-                evidence="Adding ss31 (5mg) for 4 weeks.", composer=None,
+                candidate=self._cand_with_hook(), composer=None,
             )
 
     def test_evidence_must_appear_in_the_quote(self):
@@ -259,9 +258,7 @@ class TestContinuationComposition:
         from virtual_context.core.engagement import compose_continuation_draft
 
         draft = compose_continuation_draft(
-            candidate=self._cand_with_hook(),
-            hook_kind="dose_or_compound_change",
-            evidence="he doubled his dose",
+            candidate=self._cand_with_hook(evidence="words he never wrote"),
             composer=lambda **kw: "anything",
         )
         assert draft.usable is False
@@ -273,8 +270,6 @@ class TestContinuationComposition:
         seen = {}
         compose_continuation_draft(
             candidate=self._cand_with_hook(),
-            hook_kind="dose_or_compound_change",
-            evidence="Adding ss31 (5mg) for 4 weeks.",
             composer=lambda **kw: seen.update(kw) or "q?",
             sender="BigTex",
         )
@@ -333,3 +328,106 @@ class TestTheArtifactNamesTheType:
             generated_at=NOW, conversation_id="c", channel_id=P3,
         ).apply_outcome(SelectionOutcome(kind="broader", question="q?"))
         assert "question type: broader" in report.render()
+
+
+class TestTheHookCannotBeRecomputed:
+    """The draft must rest on the hook that passed the gate, not a new one.
+
+    Qualification computes the hook and its evidence, and that computation is
+    what admitted the candidate. If the drafter recomputes, a detector that
+    answers differently the second time produces a draft grounded in evidence
+    no gate ever saw — and the divergence is invisible afterwards, because
+    both hooks look equally plausible in a report.
+    """
+
+    def _drifting_detector(self, calls):
+        """Answers one way first, then differently. A real model can do this."""
+        answers = [
+            {"kind": "dose_or_compound_change",
+             "evidence": "Adding ss31 (5mg) for 4 weeks."},
+            {"kind": "prior_result_unclear", "evidence": "something else"},
+        ]
+
+        def _detector(**kw):
+            calls.append(kw)
+            return answers[min(len(calls) - 1, len(answers) - 1)]
+
+        return _detector
+
+    def test_the_drafter_never_calls_the_detector(self):
+        """The strongest form: there is no second computation to disagree."""
+        from virtual_context.core.engagement import (
+            compose_continuation_draft, qualify_candidates,
+        )
+
+        calls: list = []
+        candidate = _cand(sent_at=NOW - timedelta(days=90))
+        qualified, _ = qualify_candidates(
+            [candidate], now=NOW, detector=self._drifting_detector(calls),
+        )
+        assert len(calls) == 1, "qualification should compute the hook once"
+
+        compose_continuation_draft(
+            candidate=qualified[0], composer=lambda **kw: "q?", sender="BigTex",
+        )
+        assert len(calls) == 1, "the drafter recomputed the hook"
+
+    def test_the_draft_uses_the_hook_that_qualified_it(self):
+        from virtual_context.core.engagement import (
+            compose_continuation_draft, qualify_candidates,
+        )
+
+        calls: list = []
+        qualified, _ = qualify_candidates(
+            [_cand(sent_at=NOW - timedelta(days=90))], now=NOW,
+            detector=self._drifting_detector(calls),
+        )
+        seen = {}
+        compose_continuation_draft(
+            candidate=qualified[0],
+            composer=lambda **kw: seen.update(kw) or "q?", sender="BigTex",
+        )
+        # The second detector answer must not appear anywhere in the draft.
+        assert seen["hook_kind"] == "dose_or_compound_change"
+        assert seen["evidence"] == "Adding ss31 (5mg) for 4 weeks."
+
+    def test_the_carried_hook_survives_the_whole_pipeline(self):
+        from virtual_context.core.engagement import qualify_candidates
+
+        qualified, _ = qualify_candidates(
+            [_cand(sent_at=NOW - timedelta(days=90))], now=NOW,
+            detector=self._drifting_detector([]),
+        )
+        assert qualified[0].hook_evidence == "Adding ss31 (5mg) for 4 weeks."
+        assert qualified[0].hook_kind == "dose_or_compound_change"
+
+    def test_a_candidate_with_no_hook_cannot_be_drafted(self):
+        """Reading from the candidate must not silently draft on a blank."""
+        from virtual_context.core.engagement import compose_continuation_draft
+
+        draft = compose_continuation_draft(
+            candidate=_cand(), composer=lambda **kw: "q?",
+        )
+        assert draft.usable is False
+        assert draft.reason == "no_qualified_hook"
+
+    def test_no_argument_can_inject_a_hook(self):
+        """Same shape as the posting flag: it isn't a parameter at all."""
+        import inspect
+
+        from virtual_context.core.engagement import compose_continuation_draft
+
+        params = set(inspect.signature(compose_continuation_draft).parameters)
+        assert not params & {"hook_kind", "evidence", "hook_evidence"}
+
+    def test_the_stance_is_carried_not_recomputed(self):
+        import inspect
+
+        from virtual_context.core.engagement import compose_draft, qualify_candidates
+
+        assert "stance" not in inspect.signature(compose_draft).parameters
+        qualified, _ = qualify_candidates(
+            [_cand(sent_at=NOW - timedelta(days=3))], now=NOW,
+            detector=lambda **kw: {"kind": "x", "evidence": "y"},
+        )
+        assert qualified[0].stance in {"anticipatory", "outcome"}

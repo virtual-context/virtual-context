@@ -42,6 +42,14 @@ class Candidate:
     # stage that qualified it, never assumed by the selector.
     question_type: str = ""
     hook_kind: str = ""   # the verified item a personal continuation rests on
+    # The hook's own words, and the stance the thread assessment reached.
+    # Both are computed during qualification and carried rather than left to
+    # be recomputed: a second computation can disagree with the first, and
+    # then the draft rests on a hook that never passed the gate. The
+    # disagreement would be invisible downstream, because both values look
+    # equally plausible in a report.
+    hook_evidence: str = ""
+    stance: str = ""
 
 
 @dataclass(frozen=True)

@@ -77,12 +77,17 @@ def strip_speaker_prefix(body: str, sender: str) -> str:
 def compose_draft(
     *,
     candidate,
-    stance: str,
     composer: Callable[..., Any] | None,
     sender: str = "",
     channel_label: str = "",
 ) -> Draft:
-    """Ask the configured model for one question about *candidate*."""
+    """Ask the configured model for one question about *candidate*.
+
+    The stance is read from the candidate rather than passed in. Thread
+    assessment during qualification already decided it, and recomputing it
+    here would be a second ruler for the same measurement.
+    """
+    stance = str(getattr(candidate, "stance", "") or "")
     if composer is None:
         raise DraftComposerNotConfigured(
             "no draft composer model is configured; configure "
@@ -144,13 +149,19 @@ _HOOK_FRAMING = {
 def compose_continuation_draft(
     *,
     candidate,
-    hook_kind: str,
-    evidence: str,
     composer: Callable[..., Any] | None,
     sender: str = "",
     channel_label: str = "",
 ) -> Draft:
-    """Draft a continuation from the hook and the member's verbatim words."""
+    """Draft a continuation from the hook the candidate already carries.
+
+    The hook and its evidence are read from the candidate, not accepted as
+    arguments. They were computed during qualification, and that computation
+    is what let this candidate through the gate; taking them as parameters
+    would let a caller supply a freshly recomputed hook that never passed it.
+    A recomputation can disagree with the original, and the disagreement is
+    invisible afterwards because both values look equally plausible.
+    """
     if composer is None:
         raise DraftComposerNotConfigured(
             "no draft composer model is configured; a continuation cannot be "
@@ -160,7 +171,10 @@ def compose_continuation_draft(
     quote = strip_speaker_prefix(
         getattr(candidate, "text", ""), sender or getattr(candidate, "sender", ""),
     )
-    verbatim = (evidence or "").strip()
+    hook_kind = str(getattr(candidate, "hook_kind", "") or "")
+    verbatim = str(getattr(candidate, "hook_evidence", "") or "").strip()
+    if not hook_kind:
+        return Draft("", "no_qualified_hook")
     if not verbatim or verbatim.lower() not in quote.lower():
         return Draft("", "evidence_not_in_quote")
     try:

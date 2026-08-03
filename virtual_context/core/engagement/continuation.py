@@ -134,6 +134,7 @@ def qualify_candidates(
         timed_ok, _why = timed_followup_eligibility(candidate, now=now)
         question_type = "timed"
         hook_kind = ""
+        hook_evidence = ""
         if not timed_ok:
             # Outside the clock window it can still qualify on evidence, and
             # that is the only thing separating the two types.
@@ -144,6 +145,7 @@ def qualify_candidates(
                 rejections.append(Rejection(turn_id, "continuation", reason))
                 continue
             question_type, hook_kind = "personal", hook.kind
+            hook_evidence = hook.evidence
 
         later = (later_texts_for or (lambda c: []))(candidate)
         terms = (subject_terms_for or (lambda c: []))(candidate)
@@ -158,6 +160,7 @@ def qualify_candidates(
         qualified.append(
             dataclasses.replace(
                 candidate, question_type=question_type, hook_kind=hook_kind,
+                hook_evidence=hook_evidence, stance=state.stance,
             )
         )
     return qualified, rejections

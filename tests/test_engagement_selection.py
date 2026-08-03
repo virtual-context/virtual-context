@@ -51,11 +51,13 @@ def _mid(moment):
     return str(datetime_to_snowflake_floor(moment) + 7)
 
 
-def _cand(days_ago: float, text="Adding ss31 (5mg) for 4 weeks.", turn="ct-1"):
+def _cand(days_ago: float, text="Adding ss31 (5mg) for 4 weeks.", turn="ct-1",
+          stance="anticipatory"):
     sent = NOW - timedelta(days=days_ago)
     return Candidate(
         canonical_turn_id=turn, source_message_id=_mid(sent),
         actor_id=BIGTEX, channel_id=P3, text=text, sent_at=sent,
+        stance=stance,
     )
 
 
@@ -320,7 +322,7 @@ class TestDraftComposition:
         )
 
         with pytest.raises(DraftComposerNotConfigured):
-            compose_draft(candidate=_cand(3), stance="anticipatory", composer=None)
+            compose_draft(candidate=_cand(3), composer=None)
 
     def test_the_composer_never_receives_the_speaker_label_in_the_body(self):
         from virtual_context.core.engagement import compose_draft
@@ -333,8 +335,7 @@ class TestDraftComposition:
 
         candidate = _cand(3, text="Adding ss31 (5mg) for 4 weeks.")
         compose_draft(
-            candidate=candidate, stance="anticipatory", composer=_composer,
-            sender="BigTex",
+            candidate=candidate, composer=_composer, sender="BigTex",
         )
         assert "BigTex:" not in seen["quote"]
         assert seen["quote"] == "Adding ss31 (5mg) for 4 weeks."
@@ -348,7 +349,7 @@ class TestDraftComposition:
             raise RuntimeError("provider down")
 
         draft = compose_draft(
-            candidate=_cand(3), stance="anticipatory", composer=_boom,
+            candidate=_cand(3), composer=_boom,
         )
         assert draft.text == ""
         assert draft.reason == "composer_error"
@@ -357,8 +358,7 @@ class TestDraftComposition:
         from virtual_context.core.engagement import compose_draft
 
         draft = compose_draft(
-            candidate=_cand(3), stance="anticipatory",
-            composer=lambda **kw: "   ",
+            candidate=_cand(3), composer=lambda **kw: "   ",
         )
         assert draft.usable is False
         assert draft.reason == "empty_draft"
@@ -368,7 +368,7 @@ class TestDraftComposition:
 
         seen = {}
         compose_draft(
-            candidate=_cand(5), stance="outcome",
+            candidate=_cand(5, stance="outcome"),
             composer=lambda **kw: seen.update(kw) or "how did it go?",
         )
         assert seen["stance"] == "outcome"
