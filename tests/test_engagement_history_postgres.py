@@ -25,6 +25,8 @@ import pytest
 from tests.pg_helpers import pg_dsn
 from virtual_context.core.engagement import (
     DayAlreadyClaimed,
+    check_repetition,
+    topic_fingerprint,
     InMemoryPostHistory,
     PostgresPostHistory,
     PostRecord,
@@ -568,3 +570,92 @@ class TestThroughARealStore:
                     "DELETE FROM engagement_post_history WHERE tenant_id = %s",
                     (tenant,),
                 )
+
+
+class TestRepetitionIsEnforcedAgainstTheDurableLedger:
+    """The rules exist, are tested, and were never invoked by the runner.
+
+    `check_repetition` was defined, exported, and absent from the run path.
+    Every Phase 3 rule was therefore unenforced, and `topic_fingerprint` was
+    computed and stored on every post and compared to nothing. A second run
+    reproduced a posted question word for word.
+
+    These run against the durable ledger with a real posted row, because the
+    in-memory store proved nothing about what the live job would read.
+    """
+
+    @pytest.fixture
+    def durable_with_a_post(self, durable):
+        """One posted question, as production has today."""
+        durable.record(_record(
+            posted_at=datetime(2026, 8, 3, 18, 4, tzinfo=timezone.utc),
+            tagged_actor_id=ACTOR,
+            source_message_ids=("1533835931390443521",),
+            question_text="Can you paste the rest of the label? It cuts off "
+                          "at vitamin B6.",
+            topic_fingerprint=topic_fingerprint(
+                "Can you paste the rest of the label? It cuts off at "
+                "vitamin B6."
+            ),
+            status="posted",
+        ))
+        return durable
+
+    def test_the_same_thread_cannot_be_mined_twice(self, durable_with_a_post):
+        rejection = check_repetition(
+            history=durable_with_a_post,
+            now=datetime(2026, 8, 4, 18, 4, tzinfo=timezone.utc),
+            actor_id="actor:discord:0000", channel_id="9999",
+            source_message_ids=("1533835931390443521",),
+            question_text="Something completely different?",
+        )
+        assert rejection is not None
+        assert rejection.reason == "thread_already_used"
+
+    def test_the_same_member_is_not_tagged_again_inside_the_cooldown(
+        self, durable_with_a_post,
+    ):
+        rejection = check_repetition(
+            history=durable_with_a_post,
+            now=datetime(2026, 8, 4, 18, 4, tzinfo=timezone.utc),
+            actor_id=ACTOR, channel_id="9999",
+            source_message_ids=("a-different-message",),
+            question_text="Something completely different?",
+        )
+        assert rejection is not None
+        assert rejection.reason == "member_recently_tagged"
+
+    def test_the_posted_question_cannot_be_asked_again(
+        self, durable_with_a_post,
+    ):
+        """The exact incident: same question, word for word, next day."""
+        rejection = check_repetition(
+            history=durable_with_a_post,
+            now=datetime(2026, 8, 4, 18, 4, tzinfo=timezone.utc),
+            actor_id="actor:discord:0000", channel_id="9999",
+            source_message_ids=("a-different-message",),
+            question_text="Can you paste the rest of the label? It cuts off "
+                          "at vitamin B6.",
+        )
+        assert rejection is not None
+        assert rejection.reason == "question_recently_asked"
+
+    def test_an_unrelated_question_from_a_new_member_passes(
+        self, durable_with_a_post,
+    ):
+        """The rules must not reject everything — that would also 'work'."""
+        assert check_repetition(
+            history=durable_with_a_post,
+            now=datetime(2026, 8, 4, 18, 4, tzinfo=timezone.utc),
+            actor_id="actor:discord:0000", channel_id="9999",
+            source_message_ids=("a-different-message",),
+            question_text="How did the sleep protocol end up going?",
+        ) is None
+
+    def test_the_fingerprint_stored_on_a_post_is_what_similarity_reads(
+        self, durable_with_a_post,
+    ):
+        """It was written on every post and compared to nothing."""
+        row = durable_with_a_post.all()[0]
+        assert row.topic_fingerprint == topic_fingerprint(row.question_text)
+        assert row.topic_fingerprint != 0

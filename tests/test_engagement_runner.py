@@ -123,12 +123,75 @@ class TestPostingWhenAskedAndEnabled:
         assert seen["channel_id"] == VASTTEST
         assert seen["content"] == "Did you end up starting the SS-31?"
 
-    def test_the_post_is_recorded_and_blocks_a_second_that_day(self, posting_permitted):
+    def test_a_second_run_cannot_repeat_the_first(self, posting_permitted):
+        """Two guards stand between the runs; this asserts the outer one.
+
+        Repetition now rejects the candidate before ranking, so the second
+        run never reaches the day claim. That ordering is deliberate — a
+        repeat should not cost a live source request or a model call — but it
+        means the day claim needs its own test, below, rather than being
+        proved incidentally by this one.
+        """
         history = InMemoryPostHistory()
         first = _run(post=True, history=history,
                      message_sender=lambda **kw: "1")
         assert first.posted_message_id == "1"
         second = _run(post=True, history=history,
+                      message_sender=lambda **kw: "2")
+        assert second.posted_message_id == ""
+        reasons = {r.reason for r in second.rejections if r.stage == "history"}
+        assert reasons, "the repeat was not counted as a history rejection"
+        assert reasons <= {
+            "thread_already_used", "member_recently_tagged",
+            "question_recently_asked", "channel_recently_overused",
+            "thread_previously_ignored",
+        }, reasons
+
+    def test_the_day_claim_still_blocks_an_unrelated_candidate(
+        self, posting_permitted,
+    ):
+        """The inner guard, proved without the repetition rules firing.
+
+        A different member, a different thread, the same Eastern day. Nothing
+        repetition-based applies, so if a second post is refused it is the
+        day claim doing it.
+        """
+        import dataclasses
+
+        history = InMemoryPostHistory()
+        first = _run(post=True, history=history,
+                     message_sender=lambda **kw: "1")
+        assert first.posted_message_id == "1"
+
+        other = _result()
+        other = dataclasses.replace(other, provenance=dataclasses.replace(
+            other.provenance, canonical_turn_id="ct-other",
+            actor_id="actor:discord:9999999999999999",
+            source_message_id=str(int(MSG) + 5000),
+        ))
+        sources = {"ct-other": MessageSourceRecord(
+            canonical_turn_id="ct-other", message_id=str(int(MSG) + 5000),
+            channel_id=P3, guild_id="1524917037191925871",
+            author_id="9999999999999999",
+            source_actor_id="actor:discord:9999999999999999",
+        )}
+        def _fetch_other(**kw):
+            # The live check compares the attested author to the stored
+            # actor, so this must answer for the new member, not the default.
+            return 200, {"channel_id": P3,
+                         "author": {"id": "9999999999999999"},
+                         "edited_timestamp": None}
+
+        def _other_drafter(candidate):
+            # A different question as well as a different member, so the
+            # similarity rule has nothing to catch either. Everything
+            # repetition-based is now silent by construction.
+            return (Draft("What made you pick the morning dose?", ""),
+                    FidelityVerdict(True))
+
+        second = _run(post=True, history=history, results=[other],
+                      sources=sources, senders={"ct-other": "Someone"},
+                      source_fetcher=_fetch_other, drafter=_other_drafter,
                       message_sender=lambda **kw: "2")
         assert second.posted_message_id == ""
         assert "already gone out" in second.refused

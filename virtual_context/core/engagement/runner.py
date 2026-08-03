@@ -23,6 +23,7 @@ from datetime import datetime
 from typing import Any, Callable
 
 from .candidates import Rejection, collect_candidates
+from .history import check_repetition
 from .live_source import select_live_verified
 from .poster import PostRefused, post_question
 from .report import DryRunReport
@@ -76,7 +77,37 @@ def run_once(
     qualified, qualify_rejections = qualifier(verified, now=now)
     rejections += list(qualify_rejections)
 
-    ranked = rank_candidates(qualified)
+    # Repetition is checked BEFORE ranking so a repeat never costs a rank
+    # slot, a live source request or a model call. These three rules need
+    # only the candidate: who was tagged recently, which threads have been
+    # mined, how busy the channel has been.
+    #
+    # The fourth rule — question similarity — cannot run here. It fingerprints
+    # the DRAFT, which does not exist yet, and check_repetition skips that
+    # rule when the text is empty. Calling once here would ship
+    # question_recently_asked as a rule that can never fire, so it is checked
+    # again after each draft below.
+    fresh: list = []
+    for candidate in qualified:
+        repeat = check_repetition(
+            history=history, now=now,
+            actor_id=getattr(candidate, "actor_id", ""),
+            channel_id=getattr(candidate, "channel_id", ""),
+            source_message_ids=(
+                (candidate.source_message_id,)
+                if getattr(candidate, "source_message_id", "") else ()
+            ),
+            question_text="",
+        )
+        if repeat is not None:
+            rejections.append(Rejection(
+                getattr(candidate, "canonical_turn_id", ""),
+                "history", repeat.reason, repeat.detail,
+            ))
+            continue
+        fresh.append(candidate)
+
+    ranked = rank_candidates(fresh)
 
     # A failed draft costs a candidate, not the day. One flaky model call
     # against a pool of qualified candidates should not decide that there was
@@ -105,6 +136,24 @@ def run_once(
         attempts += 1
 
         attempt_draft, attempt_verdict = drafter(candidate)
+
+        # Now the draft exists, so the question-similarity rule can run. A
+        # near-duplicate of something already asked is rejected here and the
+        # walk moves to the next candidate rather than losing the day.
+        repeat = check_repetition(
+            history=history, now=now,
+            actor_id=getattr(candidate, "actor_id", ""),
+            channel_id=getattr(candidate, "channel_id", ""),
+            source_message_ids=(),
+            question_text=attempt_draft.text or "",
+        )
+        if repeat is not None:
+            rejections.append(Rejection(
+                getattr(candidate, "canonical_turn_id", ""),
+                "history", repeat.reason, repeat.detail,
+            ))
+            continue
+
         attempt_outcome = apply_fidelity_outcome(
             select_question(verified=[candidate], rejections=rejections,
                             channel_id=candidate.channel_id),
