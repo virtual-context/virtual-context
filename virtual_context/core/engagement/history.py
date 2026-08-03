@@ -179,7 +179,12 @@ CREATE TABLE IF NOT EXISTS engagement_post_history (
     question_type       TEXT NOT NULL,
     tagged_actor_id     TEXT NOT NULL DEFAULT '',
     source_message_ids  TEXT NOT NULL DEFAULT '',
-    topic_fingerprint   BIGINT NOT NULL DEFAULT 0,
+    -- NUMERIC(20,0), not BIGINT. The fingerprint is an unsigned 64-bit
+    -- simhash spanning 0..2^64-1, and Postgres BIGINT is signed with a
+    -- ceiling of 2^63-1, so about half of all values would fail to insert.
+    -- SQLite accepts them either way, which is why a test on SQLite alone
+    -- would not have caught it.
+    topic_fingerprint   NUMERIC(20,0) NOT NULL DEFAULT 0,
     question_text       TEXT NOT NULL DEFAULT '',
     discord_message_id  TEXT NOT NULL DEFAULT '',
     resolution          TEXT NOT NULL DEFAULT ''

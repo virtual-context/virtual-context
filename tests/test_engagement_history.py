@@ -258,3 +258,45 @@ class TestThresholdsHaveMargin:
     def test_the_channel_window_and_limit_are_consistent(self):
         assert CHANNEL_MAX_IN_WINDOW >= 1
         assert CHANNEL_WINDOW.days >= 1
+
+
+class TestTheFingerprintColumnHoldsTheWholeRange:
+    """The simhash is unsigned 64-bit; a signed column loses half of it."""
+
+    def test_fingerprints_exceed_signed_64_bit(self):
+        """Non-vacuous: prove the range actually goes above the ceiling."""
+        over = [
+            s for s in (
+                "have you started the SS-31 yet",
+                "did you add the KPV to the pm dose",
+                "how did the four weeks go",
+                "which marker changed your protocol",
+                "what tells you that you are recovered",
+                "rate my stack question",
+                "is the am dose still 500mcg",
+                "what would make you drop the dose",
+            ) if topic_fingerprint(s) > 2**63 - 1
+        ]
+        assert over, "no sample exceeded the signed ceiling; sample is unfit"
+
+    def test_every_fingerprint_fits_the_declared_column(self):
+        from virtual_context.core.engagement import ENGAGEMENT_HISTORY_DDL
+
+        assert "NUMERIC(20,0)" in ENGAGEMENT_HISTORY_DDL
+        assert "topic_fingerprint   BIGINT" not in ENGAGEMENT_HISTORY_DDL
+        # NUMERIC(20,0) spans 20 digits; 2^64-1 has 20.
+        assert len(str(2**64 - 1)) == 20
+
+    def test_the_ddl_says_why_the_type_is_what_it_is(self):
+        from virtual_context.core.engagement import ENGAGEMENT_HISTORY_DDL
+
+        assert "unsigned 64-bit" in ENGAGEMENT_HISTORY_DDL
+        assert "2^63-1" in ENGAGEMENT_HISTORY_DDL
+
+    def test_distance_still_works_across_the_boundary(self):
+        from virtual_context.core.engagement import fingerprint_distance
+
+        low = topic_fingerprint("which marker changed your protocol")
+        high = topic_fingerprint("have you started the SS-31 yet")
+        assert high > 2**63 - 1 > low
+        assert 0 <= fingerprint_distance(low, high) <= 64
