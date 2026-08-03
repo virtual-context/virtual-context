@@ -19,6 +19,14 @@ from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
 
+_LIVE_VERIFIED_NOTE = (
+    "SOURCE RE-FETCHED LIVE: the selected message was confirmed against its "
+    "source at selection time — still present, unedited, same author, same "
+    "channel. Content is deliberately not compared; the edited marker and "
+    "the HTTP status carry that question without a normalisation step that "
+    "would report drift on nearly every row."
+)
+
 _EDIT_DELETE_LIMITATION = (
     "LIMITATION: attribution is proved by cross-checking the canonical row "
     "against the independently attested source record captured at ingest. "
@@ -52,6 +60,10 @@ class DryRunReport:
     skip_reason: str = ""
     skip_stage: str = ""
     ladder: list = field(default_factory=list)
+    # Whether the selected message was re-fetched from its source. The
+    # limitation below is true only when it was not, and printing it anyway
+    # would tell a reviewer a check did not happen when it did.
+    live_verified: bool = False
 
     def apply_outcome(self, outcome) -> "DryRunReport":
         """Take kind, reason, stage AND the selector's own rejections.
@@ -175,7 +187,10 @@ class DryRunReport:
                 if len(items) > 2:
                     add(f"      … and {len(items) - 2} more")
         add("")
-        add(_EDIT_DELETE_LIMITATION)
+        add(
+            _LIVE_VERIFIED_NOTE if self.live_verified
+            else _EDIT_DELETE_LIMITATION
+        )
         add("=" * 72)
         add("NO MESSAGES WERE SENT. NO STATE WAS WRITTEN.")
         add("=" * 72)

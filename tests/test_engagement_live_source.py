@@ -196,3 +196,30 @@ class TestSelectionWalksTheRanking:
         )
         assert rejections[0].stage == "live_source"
         assert rejections[0].reason in BLOCKING_REASONS
+
+
+class TestTheArtifactTellsTheTruthAboutTheCheck:
+    def test_the_limitation_prints_when_no_refetch_happened(self):
+        report = DryRunReport(
+            generated_at=NOW, conversation_id="c", channel_id=CHAN,
+        )
+        rendered = report.render()
+        assert "CANNOT detect a message edited or deleted" in rendered
+        assert "SOURCE RE-FETCHED LIVE" not in rendered
+
+    def test_the_limitation_is_replaced_once_the_refetch_ran(self):
+        """Printing it anyway says a check did not happen when it did."""
+        report = DryRunReport(
+            generated_at=NOW, conversation_id="c", channel_id=CHAN,
+            live_verified=True,
+        )
+        rendered = report.render()
+        assert "SOURCE RE-FETCHED LIVE" in rendered
+        assert "CANNOT detect a message edited or deleted" not in rendered
+
+    def test_the_live_note_still_says_content_is_not_compared(self):
+        report = DryRunReport(
+            generated_at=NOW, conversation_id="c", channel_id=CHAN,
+            live_verified=True,
+        )
+        assert "not compared" in report.render()
