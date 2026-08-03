@@ -41,6 +41,19 @@ from .continuation import (
     find_continuation_hook,
     qualify_candidates,
 )
+from .live_source import (
+    BLOCKING_REASONS,
+    LIVE_AUTHOR_MISMATCH,
+    LIVE_CHANNEL_MISMATCH,
+    LIVE_DELETED,
+    LIVE_EDITED,
+    LIVE_FORBIDDEN,
+    LIVE_RATE_LIMITED,
+    LIVE_UNREACHABLE,
+    LiveVerification,
+    select_live_verified,
+    verify_source_live,
+)
 from .candidates import Candidate, Rejection, collect_candidates
 from .compose import (
     CONTINUATION_GUIDANCE,
@@ -103,6 +116,17 @@ __all__ = [
     "HookDetectorNotConfigured",
     "find_continuation_hook",
     "qualify_candidates",
+    "BLOCKING_REASONS",
+    "LIVE_AUTHOR_MISMATCH",
+    "LIVE_CHANNEL_MISMATCH",
+    "LIVE_DELETED",
+    "LIVE_EDITED",
+    "LIVE_FORBIDDEN",
+    "LIVE_RATE_LIMITED",
+    "LIVE_UNREACHABLE",
+    "LiveVerification",
+    "select_live_verified",
+    "verify_source_live",
     "Candidate",
     "rehearsal_allowlist",
     "strip_speaker_prefix",
