@@ -96,6 +96,13 @@ class PostRecord:
     # either state, because the only irreversible mistake here is sending
     # twice.
     status: str = "posted"
+    # The row's own handle, so a record read back can be addressed.
+    #
+    # Without it the operator surface was unusable: pending_claims() reported
+    # rows for a person to resolve and update() takes a handle, so the only
+    # method that could fix them could not be told which one. Empty on a
+    # record being written; populated on every record read back.
+    id: str = ""
 
 
 class InMemoryPostHistory:
@@ -122,8 +129,10 @@ class InMemoryPostHistory:
             raise DayAlreadyClaimed(
                 f"{_eastern_day(entry.posted_at)} is already claimed"
             )
+        import dataclasses
+
         handle = uuid.uuid4().hex
-        self._records[handle] = entry
+        self._records[handle] = dataclasses.replace(entry, id=handle)
         self._order.append(handle)
         return handle
 
@@ -549,6 +558,7 @@ def _row_to_record(row, columns) -> PostRecord:
         return _row_value(row, name, columns)
 
     return PostRecord(
+        id=str(field("id") or ""),
         posted_at=datetime.fromisoformat(field("posted_at")),
         channel_id=field("channel_id"),
         question_type=field("question_type"),

@@ -787,3 +787,50 @@ class TestTheGuardRejectsOneAndLetsAnotherThrough:
             f"the surviving candidate was not drafted: {drafted}"
         )
         assert result.report.question == "How are the mornings treating you?"
+
+
+class TestARecordCanBeAddressed:
+    """A record read back must be usable with update().
+
+    Filed as cosmetic and it wasn't: pending_claims() reported rows "for a
+    person to resolve" while update() took a handle the record didn't carry,
+    so the only method that could fix them could not be told which one. The
+    approval loop needs the same round trip — read a staged row, update it.
+    """
+
+    def test_the_record_carries_the_handle_record_returned(self, history):
+        handle = history.record(_record(status="pending"))
+        assert history.all()[0].id == handle
+
+    def test_a_record_read_back_can_be_updated_by_its_own_id(self, history):
+        """The exact round trip the approval loop performs."""
+        history.record(_record(status="pending", question_text="staged"))
+        row = history.all()[0]
+        history.update(row.id, status="posted", discord_message_id="123")
+        after = history.all()[0]
+        assert after.status == "posted"
+        assert after.discord_message_id == "123"
+        assert after.id == row.id
+
+    def test_pending_claims_returns_addressable_rows(self, history):
+        """The operator surface, now actually operable."""
+        history.record(_record(status="pending"))
+        claims = pending_claims(history)
+        assert claims and claims[0].id
+        history.update(claims[0].id, status="posted")
+        assert pending_claims(history) == []
+
+    def test_ids_are_distinct_per_row(self, history):
+        first = history.record(_record(question_text="one"))
+        second = history.record(_record(
+            question_text="two",
+            posted_at=datetime(2026, 8, 3, 16, 0, tzinfo=timezone.utc),
+        ))
+        ids = {r.id for r in history.all()}
+        assert ids == {first, second}
+        assert len(ids) == 2
+
+    def test_both_backends_agree_on_the_field(self, history):
+        """Neither backend may leave it empty on a row read back."""
+        history.record(_record())
+        assert history.all()[0].id != ""
