@@ -44,6 +44,10 @@ from .fidelity import (
 )
 from .report import DryRunReport
 from .select import (
+    REASON_BROADER_POOL_EMPTY,
+    REASON_BROADER_POOL_NOT_CONFIGURED,
+    REASON_BROADER_QUESTIONS_RECENT,
+    REASON_NO_CANDIDATES,
     SelectionOutcome,
     apply_fidelity_outcome,
     rank_candidates,
@@ -83,6 +87,10 @@ __all__ = [
     "FidelityVerdict",
     "MessageSourceRecord",
     "Rejection",
+    "REASON_BROADER_POOL_EMPTY",
+    "REASON_BROADER_POOL_NOT_CONFIGURED",
+    "REASON_BROADER_QUESTIONS_RECENT",
+    "REASON_NO_CANDIDATES",
     "SelectionOutcome",
     "ThreadState",
     "apply_fidelity_outcome",

@@ -15,7 +15,17 @@ from __future__ import annotations
 
 import random
 from collections import Counter
+
+from .candidates import Rejection
 from dataclasses import dataclass, field
+
+
+# Named reasons, shipped. Tests assert against these symbols so a reason
+# string cannot drift away from what the runtime actually emits.
+REASON_NO_CANDIDATES = "no_candidates"
+REASON_BROADER_POOL_NOT_CONFIGURED = "broader_pool_not_configured"
+REASON_BROADER_POOL_EMPTY = "broader_pool_empty"
+REASON_BROADER_QUESTIONS_RECENT = "all_broader_questions_recent"
 
 
 @dataclass(frozen=True)
@@ -26,6 +36,9 @@ class SelectionOutcome:
     reason: str = ""
     skip_stage: str = ""
     considered: int = 0
+    # Rejections the selector itself produced, for the caller to merge into
+    # the report so the fallback's own failure is counted like any other.
+    added_rejections: tuple = ()
 
 
 def _specificity(text: str) -> float:
@@ -89,7 +102,21 @@ def select_question(
             kind="personal", candidate=best, considered=considered,
         )
 
-    pool = list((broader_questions or {}).get(channel_id, []))
+    # Why the broader fallback could not produce a question. Naming this
+    # separately matters: "no pool is configured" and "the corpus was empty"
+    # are different faults with different fixes, and reporting the second
+    # when the first is true sends a reader hunting for data that is not
+    # missing.
+    configured = broader_questions or {}
+    if channel_id not in configured:
+        fallback_reason = REASON_BROADER_POOL_NOT_CONFIGURED
+        pool: list[str] = []
+    else:
+        pool = list(configured.get(channel_id) or [])
+        fallback_reason = (
+            REASON_BROADER_POOL_EMPTY if not pool else ""
+        )
+
     already = set(recent_questions or [])
     fresh = [q for q in pool if q not in already]
     if fresh:
@@ -99,18 +126,25 @@ def select_question(
             question=chooser.choice(sorted(fresh)),
             considered=considered,
         )
+    if pool and not fresh:
+        fallback_reason = REASON_BROADER_QUESTIONS_RECENT
+
+    fallback_rejection = Rejection("", "broader", fallback_reason)
 
     stage, reason = _dominant_rejection(rejections)
     if not stage:
-        stage = "collect" if not pool else "broader"
-        reason = "no_candidates" if not pool else "all_broader_questions_recent"
+        # No candidate ever failed, so the only thing that failed is the
+        # fallback itself. Report that, not an empty corpus.
+        stage, reason = "broader", fallback_reason
     return SelectionOutcome(
         kind="skip",
         reason=(
-            f"nothing survived; dominant rejection at '{stage}': {reason}"
+            f"nothing survived; dominant rejection at '{stage}': {reason}; "
+            f"fallback unavailable: {fallback_reason}"
         ),
         skip_stage=stage,
         considered=considered,
+        added_rejections=(fallback_rejection,),
     )
 
 

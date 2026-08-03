@@ -657,3 +657,94 @@ class TestFixtureSuiteCoversTheMeasuredPopulation:
 
         source = inspect.getsource(fidelity)
         assert "contemplated vs stated" in source.lower()
+
+
+class TestFallbackUnavailabilityIsNamed:
+    """A counter that names the wrong cause invites the wrong conclusion.
+
+    Reporting 'no_candidates' when the truth is 'no pool is configured'
+    sends a reader hunting for missing data that is not missing. Every
+    assertion here is against the SHIPPED reason constants.
+    """
+
+    def test_an_unconfigured_pool_is_not_reported_as_an_empty_corpus(self):
+        from virtual_context.core.engagement import (
+            REASON_BROADER_POOL_NOT_CONFIGURED,
+            REASON_NO_CANDIDATES,
+            select_question,
+        )
+
+        outcome = select_question(
+            verified=[], rejections=[], channel_id=P3, broader_questions=None,
+        )
+        assert outcome.kind == "skip"
+        assert outcome.skip_stage == "broader"
+        assert REASON_BROADER_POOL_NOT_CONFIGURED in outcome.reason
+        assert REASON_NO_CANDIDATES not in outcome.reason
+
+    def test_an_empty_pool_is_distinguishable_from_an_absent_one(self):
+        from virtual_context.core.engagement import (
+            REASON_BROADER_POOL_EMPTY,
+            REASON_BROADER_POOL_NOT_CONFIGURED,
+            select_question,
+        )
+
+        outcome = select_question(
+            verified=[], rejections=[], channel_id=P3,
+            broader_questions={P3: []},
+        )
+        assert REASON_BROADER_POOL_EMPTY in outcome.reason
+        assert REASON_BROADER_POOL_NOT_CONFIGURED not in outcome.reason
+
+    def test_an_exhausted_pool_keeps_its_existing_reason(self):
+        from virtual_context.core.engagement import (
+            REASON_BROADER_QUESTIONS_RECENT, select_question,
+        )
+
+        outcome = select_question(
+            verified=[], rejections=[], channel_id=P3,
+            broader_questions={P3: ["Q1"]}, recent_questions=["Q1"],
+        )
+        assert outcome.skip_stage == "broader"
+        assert REASON_BROADER_QUESTIONS_RECENT in outcome.reason
+
+    def test_the_fallback_failure_is_a_counted_row(self):
+        """It must appear in the ladder like every other named reason."""
+        from virtual_context.core.engagement import (
+            REASON_BROADER_POOL_NOT_CONFIGURED, select_question,
+        )
+
+        outcome = select_question(
+            verified=[], rejections=[], channel_id=P3, broader_questions=None,
+        )
+        assert len(outcome.added_rejections) == 1
+        rejection = outcome.added_rejections[0]
+        assert rejection.stage == "broader"
+        assert rejection.reason == REASON_BROADER_POOL_NOT_CONFIGURED
+
+    def test_candidate_rejections_still_name_their_own_stage(self):
+        """The fallback reason is additional, never a replacement."""
+        from virtual_context.core.engagement import (
+            REASON_BROADER_POOL_NOT_CONFIGURED, Rejection, select_question,
+        )
+
+        outcome = select_question(
+            verified=[], channel_id=P3, broader_questions=None,
+            rejections=[Rejection("a", "history", "member_recently_tagged")],
+        )
+        assert outcome.skip_stage == "history"
+        assert "member_recently_tagged" in outcome.reason
+        assert REASON_BROADER_POOL_NOT_CONFIGURED in outcome.reason
+        assert outcome.added_rejections[0].reason == (
+            REASON_BROADER_POOL_NOT_CONFIGURED
+        )
+
+    def test_a_configured_pool_still_produces_a_broader_question(self):
+        from virtual_context.core.engagement import select_question
+
+        outcome = select_question(
+            verified=[], rejections=[], channel_id=P3,
+            broader_questions={P3: ["What still argues for secretagogues?"]},
+        )
+        assert outcome.kind == "broader"
+        assert outcome.added_rejections == ()
