@@ -50,6 +50,13 @@ FIDELITY_JUDGE_SYSTEM_PROMPT = (
     "wrecked your sleep', 'you added the MotsC', 'since you started', 'now "
     "that the labs are back', 'you said X', a dose, compound, duration, "
     "cause or outcome the quote never gives.\n\n"
+    "Elapsed time is the one exception, and it turns on SOURCE rather than "
+    "kind. The message's timestamp is verified metadata, so a claim about "
+    "WHEN he wrote it is not an assertion: 'you posted this nine days ago' "
+    "asserts nothing about him. A claim about what he did during that time "
+    "is still an assertion: 'you've been running it nine days' states a "
+    "duration of use the quote never gives. The first is about the message, "
+    "the second is about the member.\n\n"
     "2. PRESUPPOSES: does the draft merely ASSUME something while asking? A "
     "presupposition dissolves if the member answers no. Examples: 'how's the "
     "four weeks going', 'how's the MotsC going'.\n\n"
@@ -278,6 +285,18 @@ ADVERSARIAL_FIDELITY_FIXTURES: tuple[FidelityFixture, ...] = (
         "asserts_a_resolved_outcome",
         "Sleep has been rough since I moved the modafinil earlier.",
         "Since your sleep is fixed now, what did it?", False,
+    ),
+    # --- elapsed time: metadata passes, conduct does not ---
+    FidelityFixture(
+        "refers_to_when_he_posted",
+        "Adding ss31 (5mg) for 4 weeks. Adding in MotsC after SS31.",
+        "You mentioned this nine days ago - did the SS-31 start?",
+        True, must_reject=False,
+    ),
+    FidelityFixture(
+        "asserts_a_duration_of_conduct_from_the_same_gap",
+        "Adding ss31 (5mg) for 4 weeks. Adding in MotsC after SS31.",
+        "You've been on the SS-31 nine days now - how is it sitting?", False,
     ),
     FidelityFixture(
         "asserts_a_doubled_dose",

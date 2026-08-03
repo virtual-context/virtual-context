@@ -40,8 +40,16 @@ TONE_CONSTRAINTS = (
     "'Question of the day'. Never explain that the post was scheduled or "
     "generated. Never mention tools, memory, routing, models, prompts, or "
     "infrastructure. Light wit is welcome; do not force it. Ask only about "
-    "what the quoted words actually say — add no claim, timing, intention, "
-    "causality, action, outcome, or degree of certainty that is not in them."
+    "what the quoted words actually say — add no claim, intention, "
+    "causality, action, outcome, or degree of certainty that is not in "
+    "them.\n\n"
+    "WHEN he wrote it is an exception, and the only one. The message's own "
+    "timestamp is verified metadata, re-checked against the live source "
+    "before anything is sent, so referring to it puts nothing in his mouth: "
+    "'you mentioned this last week' is a claim about when he spoke. A claim "
+    "about what he DID in that time is not — 'you've been running it a "
+    "week' says something about him the message never said. The permission "
+    "is about the SOURCE of the fact, not the kind of fact."
 )
 
 _STANCE_GUIDANCE = {

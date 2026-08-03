@@ -114,8 +114,8 @@ class TestPostingWhenAskedAndEnabled:
     def test_it_posts_to_the_rehearsal_channel_only(self, posting_permitted):
         seen = {}
 
-        def _sender(*, channel_id, content):
-            seen.update(channel_id=channel_id, content=content)
+        def _sender(**kw):
+            seen.update(kw)
             return "9990001"
 
         result = _run(post=True, message_sender=_sender)
@@ -416,3 +416,65 @@ class TestAFailedDraftCostsACandidateNotTheDay:
         assert result.posted_message_id == "9001"
         assert len(history.all()) == 1, "a rejected attempt claimed the day"
         assert history.all()[0].status == "posted"
+
+
+class TestTheSendCarriesTheReplyContext:
+    """Everything needed to reply was in scope at the send and unused."""
+
+    def _sent(self, **over):
+        seen = {}
+
+        def _sender(**kw):
+            seen.update(kw)
+            return "9001"
+
+        _run(post=True, message_sender=_sender, **over)
+        return seen
+
+    def test_the_source_message_and_channel_are_passed(self, posting_permitted):
+        sent = self._sent()
+        assert sent["reply_to_message_id"] == MSG
+        assert sent["reply_to_channel_id"] == P3
+
+    def test_the_tagged_member_is_passed(self, posting_permitted):
+        """Written to the ledger on the line above, never given to the sender."""
+        assert self._sent()["mention_actor_id"] == ACTOR
+
+    def test_the_guild_id_is_the_numeric_tail(self, posting_permitted):
+        assert self._sent()["reply_to_guild_id"] == "1524917037191925871"
+
+    def test_a_cross_channel_post_cannot_reply_in_place(self, posting_permitted):
+        """Source is #p3ptides, destination is the rehearsal channel."""
+        assert self._sent()["can_reply_in_place"] is False
+
+    def test_widening_the_allowlist_alone_makes_it_a_real_reply(
+        self, posting_permitted,
+    ):
+        """The requirement: flip the destination, get a reply, no code change.
+
+        Nothing here changes but the shipped post list. The destination
+        follows the source channel and the send becomes reply-capable.
+        """
+        import virtual_context.core.engagement.poster as poster_module
+        from virtual_context.core.engagement import load_channel_allowlist
+
+        widened = load_channel_allowlist({
+            "source_channel_ids": [P3],
+            "post_channel_ids": [P3],
+        })
+        seen = {}
+
+        def _sender(**kw):
+            seen.update(kw)
+            return "9001"
+
+        original = poster_module.POST_CHANNEL_IDS
+        poster_module.POST_CHANNEL_IDS = (P3,)
+        try:
+            _run(post=True, allowlist=widened, message_sender=_sender)
+        finally:
+            poster_module.POST_CHANNEL_IDS = original
+
+        assert seen["channel_id"] == P3, "the post did not follow the source"
+        assert seen["can_reply_in_place"] is True
+        assert seen["reply_to_message_id"] == MSG

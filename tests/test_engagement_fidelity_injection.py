@@ -181,3 +181,58 @@ class TestTheScorecard:
         text = score_fidelity_fixtures(lambda **kw: {"asserts": False}).summary()
         for word in ("correct", "false negative", "false positive", "injection"):
             assert word in text
+
+
+class TestElapsedTimeTurnsOnSourceNotKind:
+    """Metadata about the message is permitted; conduct claims are not.
+
+    The judge guards attribution, not entailment. A message's timestamp is
+    verified metadata — re-checked against the live source before anything
+    sends — so saying when he wrote something puts nothing in his mouth.
+    Saying what he did during that interval still does.
+
+    The pair below is deliberately the SAME nine-day gap and the same quote,
+    so the only difference under test is whether the claim is about the
+    message or about the member.
+    """
+
+    def _fixture(self, name):
+        from virtual_context.core.engagement import (
+            ADVERSARIAL_FIDELITY_FIXTURES,
+        )
+
+        found = [f for f in ADVERSARIAL_FIDELITY_FIXTURES if f.name == name]
+        assert found, f"{name} is missing from the shipped set"
+        return found[0]
+
+    def test_referring_to_when_he_posted_is_allowed(self):
+        fixture = self._fixture("refers_to_when_he_posted")
+        assert fixture.expected_faithful is True
+        assert fixture.must_reject is False
+
+    def test_a_duration_of_conduct_is_still_rejected(self):
+        fixture = self._fixture("asserts_a_duration_of_conduct_from_the_same_gap")
+        assert fixture.expected_faithful is False
+        assert fixture.must_reject is True
+
+    def test_the_pair_differs_only_in_what_the_claim_is_about(self):
+        """Same quote, same interval — so the verdict cannot turn on those."""
+        allowed = self._fixture("refers_to_when_he_posted")
+        refused = self._fixture("asserts_a_duration_of_conduct_from_the_same_gap")
+        assert allowed.quote == refused.quote
+        assert "nine days" in allowed.draft and "nine days" in refused.draft
+        assert allowed.expected_faithful != refused.expected_faithful
+
+    def test_the_judge_prompt_states_the_distinction(self):
+        from virtual_context.core.engagement import FIDELITY_JUDGE_SYSTEM_PROMPT
+
+        low = FIDELITY_JUDGE_SYSTEM_PROMPT.lower()
+        assert "about the message" in low and "about the member" in low
+
+    def test_the_composer_is_no_longer_told_to_avoid_all_timing(self):
+        """It was handed sent_at and instructed not to use it."""
+        from virtual_context.core.engagement.compose import TONE_CONSTRAINTS
+
+        assert "add no claim, intention" in TONE_CONSTRAINTS
+        assert "when he spoke" in TONE_CONSTRAINTS
+        assert "source of the fact" in TONE_CONSTRAINTS.lower()

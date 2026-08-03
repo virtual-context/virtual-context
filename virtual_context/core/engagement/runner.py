@@ -213,7 +213,7 @@ def run_once(
     try:
         sent = post_question(
             candidate=chosen, question=draft.text,
-            channel_id=_post_target(allowlist),
+            channel_id=_post_target(allowlist, chosen),
             verification=_verification_for(chosen, live_rejections),
             history=history, sender=message_sender, now=now,
             question_type=outcome.kind,
@@ -225,9 +225,25 @@ def run_once(
                      rejections=rejections)
 
 
-def _post_target(allowlist) -> str:
-    """The single permitted destination, taken from the shipped list."""
-    targets = sorted(getattr(allowlist, "post_channel_ids", ()) or ())
+def _post_target(allowlist, candidate=None) -> str:
+    """Where this question goes: the source channel if that is permitted.
+
+    A follow-up belongs under the message it follows up on. When the source
+    channel is on the shipped post list, that is the destination and the
+    send can carry a real reply reference. Otherwise it falls back to the
+    single rehearsal destination, which is a testing artifact and must not
+    decide what the feature is.
+
+    So widening POST_CHANNEL_IDS to include the community channels is
+    sufficient on its own to turn every post into a true in-channel reply,
+    with no further code change. An ambiguous list still resolves to "",
+    which the poster refuses.
+    """
+    permitted = tuple(getattr(allowlist, "post_channel_ids", ()) or ())
+    source = str(getattr(candidate, "channel_id", "") or "")
+    if source and source in permitted:
+        return source
+    targets = sorted(permitted)
     return targets[0] if len(targets) == 1 else ""
 
 

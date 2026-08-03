@@ -23,7 +23,7 @@ from datetime import datetime
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
-from .allowlist import POST_CHANNEL_IDS
+from .allowlist import GUILD_CONVERSATION_ID, POST_CHANNEL_IDS
 from .history import DayAlreadyClaimed, PostRecord, topic_fingerprint
 
 # LIVE, and deliberately NOT a parameter.
@@ -172,7 +172,27 @@ def post_question(
         # other precondition failure rather than raising out of the runner.
         raise PostRefused(f"the day is already claimed: {exc}") from exc
 
-    message_id = str(sender(channel_id=channel_id, content=body) or "")
+    # Everything the transport needs to render a followed-up-with reply, all
+    # of it already in scope here and none of it previously passed.
+    # ``mention_actor_id`` is the sharpest case: it is written to the ledger
+    # on the line above and was never given to the thing that sends.
+    #
+    # The engine decides WHAT is true about the post; the caller owns the
+    # transport and the credential and decides how to express it.
+    source_channel = str(getattr(candidate, "channel_id", "") or "")
+    message_id = str(sender(
+        channel_id=channel_id,
+        content=body,
+        reply_to_message_id=expected,
+        reply_to_channel_id=source_channel,
+        reply_to_guild_id=_guild_id(),
+        mention_actor_id=str(getattr(candidate, "actor_id", "") or ""),
+        # True only when the destination IS the source channel, which is the
+        # only case where a reply reference can attach. Widening
+        # POST_CHANNEL_IDS to include the source channels turns this True on
+        # its own, with no other change — which is the point.
+        can_reply_in_place=(channel_id == source_channel),
+    ) or "")
     if not message_id:
         # The claim stands. The send may or may not have landed, and the day
         # stays taken precisely because we cannot tell.
@@ -181,3 +201,8 @@ def post_question(
     history.update(handle, discord_message_id=message_id, status="posted")
     day = now.astimezone(ZoneInfo(POSTING_ZONE)).date().isoformat()
     return PostResult(message_id=message_id, channel_id=channel_id, day=day)
+
+
+def _guild_id() -> str:
+    """The numeric guild id carried inside the shipped conversation id."""
+    return GUILD_CONVERSATION_ID.rsplit(":", 1)[-1]
