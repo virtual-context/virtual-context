@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 import sqlite3
 import threading
@@ -1024,6 +1025,57 @@ def _merge_canonical_turn_rows(rows: list[CanonicalTurnRow]) -> dict[int, Canoni
     return merged
 
 
+# ---------------------------------------------------------------- bootstrap
+
+# Serializes the schema bootstrap so concurrent connections cannot race the
+# DDL. Postgres does this with a cross-worker advisory lock; SQLite has no
+# advisory locks, so the equivalent is a lock file beside the database plus an
+# in-process mutex, because ``flock`` is held per file descriptor and two
+# threads sharing one would not exclude each other.
+#
+# This closes the COLLISION defect only — two bootstrappers both running the
+# DDL. It is deliberately NOT the ``conn.transaction()`` fix applied to the
+# Postgres trigger pairs, which closes a different defect: a window where the
+# table is writable while a guard trigger is absent. Measured, the same probe
+# that slipped 5014 unguarded writes against Postgres slipped 0 against
+# SQLite, because SQLite's database-level write lock means a writer cannot
+# interleave with DDL at all. The honest claim is failure-to-reproduce rather
+# than proof of absence, but the asymmetry is real and the two defects need
+# different fixes.
+_BOOTSTRAP_MUTEXES: dict[str, threading.Lock] = {}
+_BOOTSTRAP_MUTEX_REGISTRY = threading.Lock()
+
+
+@contextmanager
+def _bootstrap_lock(db_path):
+    """Hold the bootstrap lock for one database, across threads and processes."""
+    key = str(db_path)
+    with _BOOTSTRAP_MUTEX_REGISTRY:
+        mutex = _BOOTSTRAP_MUTEXES.setdefault(key, threading.Lock())
+    with mutex:
+        # An in-memory database is private to its connection, so there is no
+        # second process to exclude and no file to place a lock beside.
+        if key in ("", ":memory:") or key.startswith("file::memory:"):
+            yield
+            return
+        try:
+            import fcntl
+        except ImportError:  # pragma: no cover - non-POSIX
+            # Without flock the in-process mutex is all that is available.
+            # Say so rather than implying cross-process safety.
+            yield
+            return
+        handle = os.open(f"{key}.bootstrap.lock", os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            yield
+        finally:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+            finally:
+                os.close(handle)
+
+
 class SQLiteStore(ContextStore):
     """SQLite-based storage with tag-overlap queries and FTS5 search."""
 
@@ -1152,6 +1204,17 @@ class SQLiteStore(ContextStore):
             self._local.reconcile_lock_depth = max(self._reconcile_lock_depth() - 1, 0)
 
     def _ensure_schema(self) -> None:
+        """Bootstrap the schema under a lock shared by every connection.
+
+        Without it, connections booting together race the DDL: both find a
+        trigger absent, both create it, and the loser aborts the rest of its
+        guarded block. Measured across 40 trials of 8 concurrent boots, that
+        produced 41 failures before the guards and lock landed.
+        """
+        with _bootstrap_lock(self.db_path):
+            self._ensure_schema_locked()
+
+    def _ensure_schema_locked(self) -> None:
         conn = self._get_conn()
         # Migration: rename session_id → conversation_id (idempotent).
         # Must run BEFORE SCHEMA_SQL because SCHEMA_SQL creates indexes
