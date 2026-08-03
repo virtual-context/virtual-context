@@ -35,6 +35,14 @@ WINDOW_HOURS = 6
 # "total" is per posted question, of which there is one per day.
 MAX_REPLIES_PER_QUESTION = 2
 
+# A separate daily ceiling rather than an inference from "one post a day".
+# The two are equal today only because the scheduler posts once; a missed-day
+# catch-up, a manual run, or any later change to that cadence would leave the
+# per-question cap intact while the daily total quietly doubled. Making it a
+# constant means the bound survives a change to something else. Its failure
+# mode is already handled: exceeding it refuses like any other bound.
+MAX_REPLIES_PER_DAY = 2
+
 # Spec priorities, in the order given. A response matching none of these is
 # not replied to, which is how "Vast should not answer everyone" is enforced
 # rather than hoped for.
@@ -66,6 +74,7 @@ class WindowState:
 
     posted_at: datetime
     replies_sent: int = 0
+    replies_sent_today: int = 0
     peers_talking: bool = False
 
 
@@ -109,6 +118,8 @@ def should_reply(
         return ReplyDecision(False, "peers_talking_among_themselves")
     if state.replies_sent >= MAX_REPLIES_PER_QUESTION:
         return ReplyDecision(False, "reply_budget_spent")
+    if state.replies_sent_today >= MAX_REPLIES_PER_DAY:
+        return ReplyDecision(False, "daily_reply_budget_spent")
     if now > window_closes_at(state.posted_at):
         return ReplyDecision(False, "window_closed")
     if now.astimezone(active_hours_end.tzinfo).hour >= active_hours_end.hour:

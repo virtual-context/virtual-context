@@ -259,3 +259,33 @@ class TestTheTwoHalvesAreJoined:
         )
         assert text == ""
         assert reason.startswith("attribution:")
+
+
+class TestTheDailyCapIsItsOwnBound:
+    """Equal to the per-question cap today, but not derived from it."""
+
+    def test_the_daily_cap_is_a_shipped_constant(self):
+        from virtual_context.core.engagement import MAX_REPLIES_PER_DAY
+
+        assert MAX_REPLIES_PER_DAY == 2
+
+    def test_the_daily_budget_refuses_even_with_a_fresh_question(self):
+        """A second post in one day must not reset the daily total."""
+        from virtual_context.core.engagement import MAX_REPLIES_PER_DAY
+
+        decision = _reply(
+            state=_state(replies_sent=0,
+                         replies_sent_today=MAX_REPLIES_PER_DAY),
+        )
+        assert decision.reply is False
+        assert decision.reason == "daily_reply_budget_spent"
+
+    def test_the_two_bounds_are_independent(self):
+        """Neither is computed from the other, so changing one is visible."""
+        import inspect
+
+        from virtual_context.core.engagement import response_window
+
+        source = inspect.getsource(response_window)
+        assert "MAX_REPLIES_PER_DAY = 2" in source
+        assert "MAX_REPLIES_PER_DAY = MAX_REPLIES_PER_QUESTION" not in source
