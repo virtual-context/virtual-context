@@ -113,7 +113,13 @@ def post_question(
     now: datetime,
     question_type: str,
 ) -> PostResult:
-    """Send one question, or refuse and say which precondition failed."""
+    """Stage one question for approval, or refuse and say what failed.
+
+    Named for the action it used to perform. It can no longer post to a
+    community channel — the destination guard admits only staging channels —
+    so every successful call ends in a staged row awaiting the owner. The
+    publish is a separate path that owns PUBLISH_CHANNEL_IDS.
+    """
     if not POSTING_ENABLED:
         raise PostRefused(
             "posting is disabled in this build; it is shipped configuration "
@@ -215,7 +221,16 @@ def post_question(
         # stays taken precisely because we cannot tell.
         raise PostRefused("the send returned no message id; treating as failed")
 
-    history.update(handle, discord_message_id=message_id, status="posted")
+    # This path can only reach a staging channel — the destination guard
+    # above refuses anything else — so its terminal state is a STAGE, not a
+    # post. Recording "posted" here made the ledger claim a question had gone
+    # to a community channel when it was sitting in the staging channel
+    # awaiting approval, and put the staging message id in the field meant
+    # for the published one.
+    #
+    # discord_message_id stays empty until something actually publishes, so
+    # "posted" keeps one meaning: a real message in a community channel.
+    history.update(handle, staged_message_id=message_id, status="staged")
     day = now.astimezone(ZoneInfo(POSTING_ZONE)).date().isoformat()
     return PostResult(message_id=message_id, channel_id=channel_id, day=day)
 

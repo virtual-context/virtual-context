@@ -415,7 +415,8 @@ class TestAFailedDraftCostsACandidateNotTheDay:
                                  message_sender=lambda **kw: "9001")
         assert result.posted_message_id == "9001"
         assert len(history.all()) == 1, "a rejected attempt claimed the day"
-        assert history.all()[0].status == "posted"
+        # Staged, not posted: this path can only reach the staging channel.
+        assert history.all()[0].status == "staged"
 
 
 class TestTheSendCarriesTheReplyContext:

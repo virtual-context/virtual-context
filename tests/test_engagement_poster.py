@@ -219,7 +219,12 @@ class TestTheSendItself:
         result = _post(history=history)
         assert result.message_id == "9990001"
         record = history.all()[0]
-        assert record.discord_message_id == "9990001"
+        # The staging channel's message id belongs in staged_message_id.
+        # discord_message_id is reserved for a published reply, so an
+        # operator can tell what actually reached a community channel.
+        assert record.staged_message_id == "9990001"
+        assert record.discord_message_id == ""
+        assert record.status == "staged"
         assert record.channel_id == VASTTEST
         assert record.source_message_ids == (MSG,)
         assert record.question_type == "timed"
@@ -337,13 +342,20 @@ class TestTheDayIsClaimedBeforeTheSend:
         assert len(pending_claims(history)) == 1
 
     def test_a_successful_send_confirms_the_claim(self, posting_permitted):
+        """The claim resolves to `staged`, and stops being pending.
+
+        `posted` is reserved for a message in a community channel, so a
+        successful stage must not claim it — otherwise the ledger says a
+        question reached members when it is sitting awaiting approval.
+        """
         from virtual_context.core.engagement import pending_claims
 
         history = InMemoryPostHistory()
         _post(history=history)
         record = history.all()[0]
-        assert record.status == "posted"
-        assert record.discord_message_id == "9990001"
+        assert record.status == "staged"
+        assert record.staged_message_id == "9990001"
+        assert record.discord_message_id == ""
         assert pending_claims(history) == []
 
     def test_the_claim_exists_before_the_sender_is_called(self, posting_permitted):
@@ -533,3 +545,57 @@ class TestTheFingerprintKeysOnTheQuestion:
 
         _post(question=self.QUESTION, sender=_sender)
         assert seen["content"] == self.QUESTION
+
+
+class TestStagingProducesTheStateTheApprovalPathConsumes:
+    """The producer for `staged`, which did not exist.
+
+    The columns, the statuses and both consumers shipped before anything
+    wrote the state they consume: claim_for_publish and decline both match
+    `WHERE status = 'staged'`, and nothing ever set it. The approval loop
+    could never fire, and a staged question was recorded as posted.
+    """
+
+    def test_a_staged_row_is_what_the_approval_path_looks_for(
+        self, posting_permitted,
+    ):
+        history = InMemoryPostHistory()
+        _post(history=history)
+        staged = [r for r in history.all() if r.status == "staged"]
+        assert len(staged) == 1, "the poller's query would find nothing"
+
+    def test_the_claim_can_actually_be_won_on_a_real_staged_row(
+        self, posting_permitted,
+    ):
+        """claim_for_publish could never return True before this."""
+        history = InMemoryPostHistory()
+        _post(history=history)
+        row = history.all()[0]
+        assert history.claim_for_publish(row.id) is True
+
+    def test_a_real_staged_row_can_be_declined(self, posting_permitted):
+        history = InMemoryPostHistory()
+        _post(history=history)
+        row = history.all()[0]
+        assert history.decline(row.id) is True
+        assert already_posted_today(history, now=NOW) is False
+
+    def test_posted_still_means_a_published_message(self, posting_permitted):
+        """The publish path sets it; staging must not."""
+        history = InMemoryPostHistory()
+        _post(history=history)
+        row = history.all()[0]
+        history.claim_for_publish(row.id)
+        history.update(row.id, status="posted",
+                       discord_message_id="1533900000000000000")
+        after = history.all()[0]
+        assert after.status == "posted"
+        assert after.discord_message_id == "1533900000000000000"
+        assert after.staged_message_id == "9990001", "the stage id was lost"
+
+    def test_the_two_ids_are_never_the_same_field(self, posting_permitted):
+        """An operator must be able to tell what reached a community channel."""
+        history = InMemoryPostHistory()
+        _post(history=history)
+        row = history.all()[0]
+        assert row.staged_message_id and not row.discord_message_id
