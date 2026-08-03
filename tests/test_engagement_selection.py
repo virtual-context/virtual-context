@@ -627,3 +627,33 @@ class TestAttributionStandard:
 
         assert sum(1 for f in FIXTURES if f.expected_faithful) >= 5
         assert sum(1 for f in FIXTURES if not f.expected_faithful) >= 5
+
+
+class TestFixtureSuiteCoversTheMeasuredPopulation:
+    def test_the_suite_is_the_population_the_rates_came_from(self):
+        from virtual_context.core.engagement import (
+            ADVERSARIAL_FIDELITY_FIXTURES as FIXTURES,
+        )
+
+        assert len(FIXTURES) >= 32
+        assert len({f.name for f in FIXTURES}) == len(FIXTURES)
+
+    def test_h17_the_contemplated_dose_case_is_present_and_expected_to_pass(self):
+        from virtual_context.core.engagement import (
+            ADVERSARIAL_FIDELITY_FIXTURES as FIXTURES,
+        )
+
+        fixture = next(
+            f for f in FIXTURES
+            if f.name == "presumptive_followup_contemplated_dose"
+        )
+        assert fixture.expected_faithful is True
+
+    def test_the_contemplated_vs_stated_defect_is_findable(self):
+        """The known defect must be described, not just tolerated."""
+        import inspect
+
+        from virtual_context.core.engagement import fidelity
+
+        source = inspect.getsource(fidelity)
+        assert "contemplated vs stated" in source.lower()

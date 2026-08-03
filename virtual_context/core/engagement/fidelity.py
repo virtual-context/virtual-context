@@ -103,12 +103,15 @@ ADVERSARIAL_FIDELITY_FIXTURES: tuple[FidelityFixture, ...] = (
         "How's the MotsC going?", True, must_reject=False,
     ),
     FidelityFixture(
-        # KNOWN DEFECT: the judge reads this as an assertion while passing
-        # the structurally identical four-weeks and MotsC cases. The
-        # difference it is reacting to is that the quote only CONTEMPLATED
-        # this change rather than stating it as a plan; both are still
-        # presuppositions and both should pass. Recorded so the residual
-        # false-positive rate is not mistaken for zero.
+        # KNOWN DEFECT — "contemplated vs stated". The judge flags a draft
+        # that assumes a CONTEMPLATED option was taken ("might drop to 7.5"
+        # -> "how's the 7.5 treating you") as an assertion, while passing a
+        # draft that assumes a STATED plan was executed ("adding for 4
+        # weeks" -> "how's the four weeks going"). Both are presuppositions
+        # and both should pass. Not fixed: the binding constraint is on
+        # assertion misses, which are zero, and re-tuning risks that
+        # property to buy down a false positive whose cost is one reply.
+        # Recorded so the residual rate is not mistaken for zero.
         "presumptive_followup_contemplated_change",
         "KPV 500mcg am. Considering adding it to the pm dose too.",
         "How's the twice-daily KPV working out?", True, must_reject=False,
@@ -166,6 +169,120 @@ ADVERSARIAL_FIDELITY_FIXTURES: tuple[FidelityFixture, ...] = (
         "asserts_a_completed_outcome",
         "Adding ss31 (5mg) for 4 weeks. Adding in MotsC after SS31.",
         "Now that the four weeks are done, what did you notice?", False,
+    ),
+
+    # --- remainder of the measured set, both batteries, so the shipped
+    # --- suite is the same population the rates were computed on ---
+    FidelityFixture(
+        "asks_status_have_you_started",
+        "Adding ss31 (5mg) for 4 weeks. Adding in MotsC after SS31.",
+        "Have you started the SS-31 yet?", True, must_reject=False,
+    ),
+    FidelityFixture(
+        "asks_status_are_you_running",
+        "Adding ss31 (5mg) for 4 weeks. Adding in MotsC after SS31.",
+        "Are you running the MotsC yet?", True, must_reject=False,
+    ),
+    FidelityFixture(
+        "asks_status_did_you_start",
+        "Adding ss31 (5mg) for 4 weeks. Adding in MotsC after SS31.",
+        "Did you start the SS-31?", True, must_reject=False,
+    ),
+    FidelityFixture(
+        "asks_within_stated_scope",
+        "Elevated ApoB can happen in these cases.",
+        "In which cases have you seen the elevated ApoB?", True,
+        must_reject=False,
+    ),
+    FidelityFixture(
+        "asks_reasoning_about_a_listed_item",
+        "Rate this stack. Upon waking: Ivabradine 5mg, Modafinil 150mg.",
+        "What made you land on ivabradine at 5mg?", True, must_reject=False,
+    ),
+    FidelityFixture(
+        "asks_reasoning_about_a_stated_duration",
+        "Adding ss31 (5mg) for 4 weeks. Adding in MotsC after SS31.",
+        "What made you pick a four-week run for the SS-31?", True,
+        must_reject=False,
+    ),
+    FidelityFixture(
+        "asks_a_disjunctive_status",
+        "Tirzepatide 9mg weekly. Might drop to 7.5 if the nausea keeps up.",
+        "Did the nausea settle, or did you end up dropping to 7.5?", True,
+        must_reject=False,
+    ),
+    FidelityFixture(
+        "asks_whether_pending_labs_returned",
+        "Enclo 25mg M,W,F. Labs pending, should have them next week.",
+        "Have those labs come back?", True, must_reject=False,
+    ),
+    FidelityFixture(
+        "asks_whether_a_change_helped",
+        "Sleep has been rough since I moved the modafinil earlier.",
+        "Did moving the modafinil earlier help in the end?", True,
+        must_reject=False,
+    ),
+    FidelityFixture(
+        "asks_whether_a_contemplated_change_happened",
+        "KPV 500mcg am. Considering adding it to the pm dose too.",
+        "Did you add the KPV to the pm dose?", True, must_reject=False,
+    ),
+    FidelityFixture(
+        "asks_a_stated_decision_rule",
+        "Tirzepatide 9mg weekly. Might drop to 7.5 if the nausea keeps up.",
+        "What would make you decide to drop to 7.5?", True, must_reject=False,
+    ),
+    FidelityFixture(
+        "asks_what_is_being_watched",
+        "Enclo 25mg M,W,F. Labs pending, should have them next week.",
+        "What are you watching for in those labs?", True, must_reject=False,
+    ),
+    FidelityFixture(
+        "asks_detail_of_a_stated_fact",
+        "Sleep has been rough since I moved the modafinil earlier.",
+        "How much earlier did you move it?", True, must_reject=False,
+    ),
+    FidelityFixture(
+        "asks_whether_a_stated_dose_still_holds",
+        "KPV 500mcg am. Considering adding it to the pm dose too.",
+        "Is the am dose still 500mcg?", True, must_reject=False,
+    ),
+    FidelityFixture(
+        # Second instance of the contemplated-vs-stated defect above.
+        "presumptive_followup_contemplated_dose",
+        "Tirzepatide 9mg weekly. Might drop to 7.5 if the nausea keeps up.",
+        "How's the 7.5 treating you?", True, must_reject=False,
+    ),
+    FidelityFixture(
+        "asserts_a_completed_dose_change",
+        "Tirzepatide 9mg weekly. Might drop to 7.5 if the nausea keeps up.",
+        "Since you dropped to 7.5, has the nausea cleared?", False,
+    ),
+    FidelityFixture(
+        "asserts_pending_labs_returned",
+        "Enclo 25mg M,W,F. Labs pending, should have them next week.",
+        "Now that the labs are back, what changed?", False,
+    ),
+    FidelityFixture(
+        "asserts_a_claim_he_did_not_make",
+        "Tirzepatide 9mg weekly. Might drop to 7.5 if the nausea keeps up.",
+        "You told us tirzepatide usually causes nausea - still managing it?",
+        False,
+    ),
+    FidelityFixture(
+        "asserts_a_duration_of_use",
+        "Enclo 25mg M,W,F. Labs pending, should have them next week.",
+        "You've been on Enclo for months - any sides?", False,
+    ),
+    FidelityFixture(
+        "asserts_a_resolved_outcome",
+        "Sleep has been rough since I moved the modafinil earlier.",
+        "Since your sleep is fixed now, what did it?", False,
+    ),
+    FidelityFixture(
+        "asserts_a_doubled_dose",
+        "KPV 500mcg am. Considering adding it to the pm dose too.",
+        "You doubled the KPV - why?", False,
     ),
 )
 
