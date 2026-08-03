@@ -478,3 +478,104 @@ class TestTheSendCarriesTheReplyContext:
         assert seen["channel_id"] == P3, "the post did not follow the source"
         assert seen["can_reply_in_place"] is True
         assert seen["reply_to_message_id"] == MSG
+
+
+class TestTheChannelCapIsScopedToCommunityChannels:
+    """The cap protects a community from being over-posted into.
+
+    The rehearsal destination is private, has one deliberate watcher, and
+    exists only because we cannot yet post where we mean to. Applying a
+    community-protection rule there is the rule aimed at the wrong target.
+
+    Separately: the cap counts what has LANDED in a channel, so it must be
+    given the destination. It was being given the candidate's source channel
+    and compared against the ledger's destination, so it never matched at all.
+    """
+
+    def _history_with(self, n, channel):
+        from virtual_context.core.engagement import PostRecord, topic_fingerprint
+
+        history = InMemoryPostHistory()
+        for i in range(n):
+            history.record(PostRecord(
+                posted_at=NOW - timedelta(days=i + 1),
+                channel_id=channel, question_type="timed",
+                tagged_actor_id=f"actor:discord:{9000 + i}",
+                source_message_ids=(f"seed-{i}",),
+                topic_fingerprint=topic_fingerprint(f"unrelated question {i}"),
+                question_text=f"unrelated question {i}", status="posted",
+            ))
+        return history
+
+    def test_three_rehearsal_posts_do_not_block_a_fourth(self, posting_permitted):
+        """Exactly the state that stopped cloud re-arming."""
+        history = self._history_with(3, VASTTEST)
+        result = _run(post=True, history=history,
+                      message_sender=lambda **kw: "4")
+        assert result.posted_message_id == "4", [
+            (r.reason, r.detail) for r in result.rejections
+        ]
+
+    def test_three_community_posts_do_block_a_fourth(self, posting_permitted):
+        """Widened allowlist: the destination is the source channel."""
+        import virtual_context.core.engagement.poster as poster_module
+        from virtual_context.core.engagement import load_channel_allowlist
+
+        history = self._history_with(3, P3)
+        widened = load_channel_allowlist({
+            "source_channel_ids": [P3], "post_channel_ids": [P3],
+        })
+        original = poster_module.POST_CHANNEL_IDS
+        poster_module.POST_CHANNEL_IDS = (P3,)
+        try:
+            result = _run(post=True, history=history, allowlist=widened,
+                          message_sender=lambda **kw: "4")
+        finally:
+            poster_module.POST_CHANNEL_IDS = original
+        assert result.posted_message_id == ""
+        reasons = {r.reason for r in result.rejections if r.stage == "history"}
+        assert "channel_recently_overused" in reasons, reasons
+
+    def test_widening_the_allowlist_re_arms_the_cap_with_no_code_change(
+        self, posting_permitted,
+    ):
+        """Same ledger, same candidate — only the shipped post list differs."""
+        import virtual_context.core.engagement.poster as poster_module
+        from virtual_context.core.engagement import load_channel_allowlist
+
+        def _attempt(post_channels, history):
+            widened = load_channel_allowlist({
+                "source_channel_ids": [P3], "post_channel_ids": post_channels,
+            })
+            original = poster_module.POST_CHANNEL_IDS
+            poster_module.POST_CHANNEL_IDS = tuple(post_channels)
+            try:
+                return _run(post=True, history=history, allowlist=widened,
+                            message_sender=lambda **kw: "x")
+            finally:
+                poster_module.POST_CHANNEL_IDS = original
+
+        assert _attempt([VASTTEST], self._history_with(3, VASTTEST)) \
+            .posted_message_id == "x", "the rehearsal exemption did not apply"
+        assert _attempt([P3], self._history_with(3, P3)) \
+            .posted_message_id == "", "the cap did not re-arm when widened"
+
+    def test_the_other_rules_still_apply_in_the_rehearsal_channel(
+        self, posting_permitted,
+    ):
+        """Only the volume rule is scoped. Thread reuse is not."""
+        from virtual_context.core.engagement import PostRecord, topic_fingerprint
+
+        history = InMemoryPostHistory()
+        history.record(PostRecord(
+            posted_at=NOW - timedelta(days=1), channel_id=VASTTEST,
+            question_type="timed", tagged_actor_id=ACTOR,
+            source_message_ids=(MSG,),
+            topic_fingerprint=topic_fingerprint("something else entirely"),
+            question_text="something else entirely", status="posted",
+        ))
+        result = _run(post=True, history=history,
+                      message_sender=lambda **kw: "nope")
+        assert result.posted_message_id == ""
+        reasons = {r.reason for r in result.rejections if r.stage == "history"}
+        assert reasons & {"thread_already_used", "member_recently_tagged"}, reasons

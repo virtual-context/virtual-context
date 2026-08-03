@@ -190,8 +190,21 @@ def check_repetition(
     channel_id: str,
     source_message_ids: tuple[str, ...] | list[str],
     question_text: str,
+    apply_channel_cap: bool = True,
 ) -> Rejection | None:
-    """The first repetition rule this candidate breaks, or ``None``."""
+    """The first repetition rule this candidate breaks, or ``None``.
+
+    ``channel_id`` is the channel a question would be POSTED to, because the
+    cap counts how much has landed in a channel. The ledger records the
+    destination, so passing a source channel here compares two different
+    things and the rule silently never matches.
+
+    ``apply_channel_cap`` exists because the cap protects a community from
+    being over-posted into. A private rehearsal destination has nothing to
+    protect and one deliberate watcher, so the rule is aimed at the wrong
+    target there — not relaxed, scoped. The other four rules apply
+    everywhere and are unaffected.
+    """
     incoming = {str(m) for m in (source_message_ids or []) if str(m)}
     fingerprint = topic_fingerprint(question_text)
     records = history.all()
@@ -233,7 +246,7 @@ def check_repetition(
         r for r in records
         if r.channel_id == channel_id and now - r.posted_at <= CHANNEL_WINDOW
     ]
-    if len(recent_in_channel) >= CHANNEL_MAX_IN_WINDOW:
+    if apply_channel_cap and len(recent_in_channel) >= CHANNEL_MAX_IN_WINDOW:
         return Rejection(
             "", "history", "channel_recently_overused",
             f"{len(recent_in_channel)} posts in {CHANNEL_WINDOW.days}d",

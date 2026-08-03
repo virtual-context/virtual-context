@@ -89,15 +89,29 @@ def run_once(
     # again after each draft below.
     fresh: list = []
     for candidate in qualified:
+        # The cap counts what has landed in a channel, so it must be given
+        # the DESTINATION. Passing the source channel compared a candidate's
+        # origin against the ledger's destination and the rule never matched.
+        #
+        # A destination that is not the source channel is the rehearsal
+        # fallback: private, one watcher, nothing to protect. The cap is
+        # scoped out there and re-arms by itself the moment the allowlist
+        # widens, because then the destination IS the source channel and the
+        # condition below is false. No second list, nothing to remember.
+        destination = _post_target(allowlist, candidate)
+        posting_to_community = bool(destination) and destination == getattr(
+            candidate, "channel_id", "",
+        )
         repeat = check_repetition(
             history=history, now=now,
             actor_id=getattr(candidate, "actor_id", ""),
-            channel_id=getattr(candidate, "channel_id", ""),
+            channel_id=destination,
             source_message_ids=(
                 (candidate.source_message_id,)
                 if getattr(candidate, "source_message_id", "") else ()
             ),
             question_text="",
+            apply_channel_cap=posting_to_community,
         )
         if repeat is not None:
             rejections.append(Rejection(
@@ -143,9 +157,11 @@ def run_once(
         repeat = check_repetition(
             history=history, now=now,
             actor_id=getattr(candidate, "actor_id", ""),
-            channel_id=getattr(candidate, "channel_id", ""),
+            channel_id=_post_target(allowlist, candidate),
             source_message_ids=(),
             question_text=attempt_draft.text or "",
+            # Already decided before ranking; this pass is for similarity.
+            apply_channel_cap=False,
         )
         if repeat is not None:
             rejections.append(Rejection(
