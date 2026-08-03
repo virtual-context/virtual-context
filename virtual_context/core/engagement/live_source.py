@@ -19,6 +19,22 @@ answer both harms exactly.
 The credential never reaches this module. The caller supplies a fetcher and
 owns the transport, the token and the egress; this code owns only the
 question being asked and what each answer means.
+
+What is measured, and what is not, because the two should not blur together
+just by sitting in the same file:
+
+MEASURED against the live source — a present message returns 200 with a null
+edited marker and an author id matching the stored actor; an absent one
+returns 404; a selection run costs one request.
+
+NOT MEASURED, assumed from documentation — that this read requires View
+Channel and Read Message History and no privileged intent, and that the
+per-route budget comfortably absorbs a handful of daily requests. The
+successful reads show the bot can read the channels it is pointed at; they
+do not establish which permission bits are required in general, nor where
+the rate ceiling sits. Neither assumption is load-bearing for correctness:
+a permission that turns out to be missing surfaces as 403 and a budget that
+turns out to be tighter surfaces as 429, and both already block.
 """
 
 from __future__ import annotations

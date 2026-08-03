@@ -223,3 +223,25 @@ class TestTheArtifactTellsTheTruthAboutTheCheck:
             live_verified=True,
         )
         assert "not compared" in report.render()
+
+
+class TestUnmeasuredClaimsStayLabelled:
+    """Assumptions should not harden into facts by sitting near measurements."""
+
+    def test_the_module_separates_measured_from_assumed(self):
+        import inspect
+
+        from virtual_context.core.engagement import live_source
+
+        source = inspect.getsource(live_source)
+        assert "MEASURED against the live source" in source
+        assert "NOT MEASURED, assumed from documentation" in source
+
+    def test_both_assumptions_degrade_into_blocking_reasons(self):
+        """Neither assumption is load-bearing: each has a blocking fallback."""
+        from virtual_context.core.engagement import (
+            LIVE_FORBIDDEN, LIVE_RATE_LIMITED,
+        )
+
+        assert LIVE_FORBIDDEN in BLOCKING_REASONS
+        assert LIVE_RATE_LIMITED in BLOCKING_REASONS
