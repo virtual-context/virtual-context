@@ -24,7 +24,7 @@ from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from .allowlist import POST_CHANNEL_IDS
-from .history import PostRecord, topic_fingerprint
+from .history import DayAlreadyClaimed, PostRecord, topic_fingerprint
 
 # Ships dark, and deliberately NOT as a parameter.
 #
@@ -147,17 +147,24 @@ def post_question(
     # first means it costs the record, and the next run then sees an unclaimed
     # day and posts again. Skipping a day is recoverable; posting twice into a
     # community channel is not.
-    handle = history.record(PostRecord(
-        posted_at=now,
-        channel_id=channel_id,
-        question_type=question_type,
-        tagged_actor_id=str(getattr(candidate, "actor_id", "") or ""),
-        source_message_ids=(expected,) if expected else (),
-        topic_fingerprint=topic_fingerprint(body),
-        question_text=body,
-        discord_message_id="",
-        status="pending",
-    ))
+    try:
+        handle = history.record(PostRecord(
+            posted_at=now,
+            channel_id=channel_id,
+            question_type=question_type,
+            tagged_actor_id=str(getattr(candidate, "actor_id", "") or ""),
+            source_message_ids=(expected,) if expected else (),
+            topic_fingerprint=topic_fingerprint(body),
+            question_text=body,
+            discord_message_id="",
+            status="pending",
+        ))
+    except DayAlreadyClaimed as exc:
+        # The read-then-write above can lose a race the database will not:
+        # two processes both find the day free, both claim it, and only one
+        # can win. Refusing here keeps the loser on the same path as every
+        # other precondition failure rather than raising out of the runner.
+        raise PostRefused(f"the day is already claimed: {exc}") from exc
 
     message_id = str(sender(channel_id=channel_id, content=body) or "")
     if not message_id:

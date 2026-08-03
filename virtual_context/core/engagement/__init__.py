@@ -13,6 +13,7 @@ from .allowlist import (
 from .history import (
     ENGAGEMENT_HISTORY_DDL,
     apply_engagement_history_schema,
+    DayAlreadyClaimed,
     InMemoryPostHistory,
     PostgresPostHistory,
     PostRecord,
@@ -106,6 +107,7 @@ __all__ = [
     "SOURCE_CHANNEL_IDS",
     "ENGAGEMENT_HISTORY_DDL",
     "apply_engagement_history_schema",
+    "DayAlreadyClaimed",
     "InMemoryPostHistory",
     "PostgresPostHistory",
     "PostRecord",

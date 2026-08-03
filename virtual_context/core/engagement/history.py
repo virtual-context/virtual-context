@@ -31,6 +31,12 @@ from __future__ import annotations
 import hashlib
 import re
 import uuid
+
+try:  # the driver's exception type must not leak past this module
+    from psycopg.errors import UniqueViolation as _UNIQUE_VIOLATION
+except Exception:  # pragma: no cover - psycopg absent
+    class _UNIQUE_VIOLATION(Exception):
+        pass
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -60,6 +66,15 @@ _STOPWORDS = frozenset({
     "for", "from", "have", "how", "in", "is", "it", "of", "on", "or", "the",
     "to", "was", "were", "what", "when", "which", "with", "you", "your",
 })
+
+
+class DayAlreadyClaimed(RuntimeError):
+    """Raised when a second row tries to take a civil day already held.
+
+    Both backends raise this, so behaviour does not depend on which one is
+    installed. In Postgres it is a unique-index violation translated at the
+    boundary; the driver's exception type never leaves this module.
+    """
 
 
 @dataclass(frozen=True)
@@ -100,6 +115,12 @@ class InMemoryPostHistory:
         self._order: list[str] = []
 
     def record(self, entry: PostRecord) -> str:
+        if entry.posted_at is not None and self.day_is_claimed(
+            _eastern_day(entry.posted_at),
+        ):
+            raise DayAlreadyClaimed(
+                f"{_eastern_day(entry.posted_at)} is already claimed"
+            )
         handle = uuid.uuid4().hex
         self._records[handle] = entry
         self._order.append(handle)
@@ -244,8 +265,29 @@ CREATE TABLE IF NOT EXISTS engagement_post_history (
     -- a write cannot be made atomic. 'pending' means claimed and possibly
     -- sent; 'posted' means the message id came back. Both hold the day, so a
     -- crash between the two can only cost a post, never duplicate one.
-    status              TEXT NOT NULL DEFAULT 'posted'
+    status              TEXT NOT NULL DEFAULT 'posted',
+    -- The civil day this row claims, stored rather than computed. Postgres
+    -- will not index an expression it cannot prove immutable, and converting
+    -- a timestamp to an Eastern date is not immutable, so the unique
+    -- constraint below needs a real column to sit on.
+    eastern_day         DATE
 );
+
+-- Present separately as well as in the CREATE TABLE above, so one script
+-- serves a fresh install and a database where the table already exists.
+ALTER TABLE engagement_post_history
+    ADD COLUMN IF NOT EXISTS eastern_day DATE;
+
+UPDATE engagement_post_history
+   SET eastern_day = (posted_at::timestamptz AT TIME ZONE 'America/New_York')::date
+ WHERE eastern_day IS NULL;
+
+-- The day claim, enforced by the database rather than by a read-then-write in
+-- application code. Checking first and inserting second is exactly the shape
+-- that fails under two processes, and the day claim is the only thing standing
+-- between a crash and a duplicate post into a community channel.
+CREATE UNIQUE INDEX IF NOT EXISTS engagement_post_history_one_per_day
+    ON engagement_post_history (tenant_id, eastern_day);
 CREATE INDEX IF NOT EXISTS engagement_post_history_actor
     ON engagement_post_history (tenant_id, tagged_actor_id, posted_at);
 CREATE INDEX IF NOT EXISTS engagement_post_history_channel
@@ -346,14 +388,25 @@ class PostgresPostHistory:
         row", which is what a second process would also compute.
         """
         handle = uuid.uuid4().hex
+        try:
+            self._insert(handle, entry)
+        except _UNIQUE_VIOLATION as exc:
+            # The database refused a second claim on the same day. That is
+            # the constraint doing its job, not an error to surface raw.
+            raise DayAlreadyClaimed(
+                f"{_eastern_day(entry.posted_at)} is already claimed"
+            ) from exc
+        return handle
+
+    def _insert(self, handle: str, entry: PostRecord) -> None:
         with self._connect() as conn:
             conn.execute(
                 """INSERT INTO engagement_post_history (
                        id, tenant_id, conversation_id, posted_at, channel_id,
                        question_type, tagged_actor_id, source_message_ids,
                        topic_fingerprint, question_text, discord_message_id,
-                       resolution, status
-                   ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                       resolution, status, eastern_day
+                   ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
                 (
                     handle, self._tenant_id, self._conversation_id,
                     entry.posted_at.isoformat(), entry.channel_id,
@@ -361,9 +414,9 @@ class PostgresPostHistory:
                     _join_ids(entry.source_message_ids),
                     int(entry.topic_fingerprint or 0), entry.question_text,
                     entry.discord_message_id, entry.resolution, entry.status,
+                    _eastern_day(entry.posted_at),
                 ),
             )
-        return handle
 
     def update(self, handle: str, **changes) -> PostRecord:
         """Confirm or amend one row, addressed by handle."""
@@ -403,10 +456,9 @@ class PostgresPostHistory:
             row = conn.execute(
                 """SELECT EXISTS (
                        SELECT 1 FROM engagement_post_history
-                        WHERE tenant_id = %s
-                          AND (posted_at::timestamptz AT TIME ZONE %s)::date = %s
+                        WHERE tenant_id = %s AND eastern_day = %s
                    )""",
-                (self._tenant_id, POSTING_ZONE, day),
+                (self._tenant_id, day),
             ).fetchone()
         return bool(row[0])
 

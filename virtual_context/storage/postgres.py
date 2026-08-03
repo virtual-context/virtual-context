@@ -1649,33 +1649,45 @@ class PostgresStore(ContextStore):
                 """)
                 # INSERT trigger: always fires; OLD is unavailable on INSERT,
                 # so no WHEN clause needed.
-                conn.execute("""
-                    DROP TRIGGER IF EXISTS trg_merge_post_commit_pending_tenant_consistency_insert
-                        ON merge_post_commit_pending
-                """)
-                conn.execute("""
-                    CREATE TRIGGER trg_merge_post_commit_pending_tenant_consistency_insert
-                        BEFORE INSERT ON merge_post_commit_pending
-                        FOR EACH ROW
-                        EXECUTE FUNCTION enforce_merge_post_commit_pending_tenant_consistency()
-                """)
+                # One transaction: DROP TRIGGER takes ACCESS EXCLUSIVE and the pool
+                # is autocommit, so as separate statements the table is writable and
+                # untriggered between them. The schema advisory lock does not close
+                # this — it excludes bootstrappers, not writers.
+                with conn.transaction():
+                    conn.execute("""
+                        DROP TRIGGER IF EXISTS trg_merge_post_commit_pending_tenant_consistency_insert
+                            ON merge_post_commit_pending
+                    """)
+                    conn.execute("""
+                        CREATE TRIGGER trg_merge_post_commit_pending_tenant_consistency_insert
+                            BEFORE INSERT ON merge_post_commit_pending
+                            FOR EACH ROW
+                            EXECUTE FUNCTION enforce_merge_post_commit_pending_tenant_consistency()
+                    """)
+
                 # UPDATE trigger: fires only when an UPDATE statement touches
                 # tenant_id AND the new value differs from old. Phase B
                 # consumer's status-only UPDATEs short-circuit because the
                 # BEFORE UPDATE OF tenant_id clause filters by the SET
                 # column list; the WHEN clause adds a second filter for
                 # actual value change.
-                conn.execute("""
-                    DROP TRIGGER IF EXISTS trg_merge_post_commit_pending_tenant_consistency_update
-                        ON merge_post_commit_pending
-                """)
-                conn.execute("""
-                    CREATE TRIGGER trg_merge_post_commit_pending_tenant_consistency_update
-                        BEFORE UPDATE OF tenant_id ON merge_post_commit_pending
-                        FOR EACH ROW
-                        WHEN (NEW.tenant_id IS DISTINCT FROM OLD.tenant_id)
-                        EXECUTE FUNCTION enforce_merge_post_commit_pending_tenant_consistency()
-                """)
+                # One transaction: DROP TRIGGER takes ACCESS EXCLUSIVE and the pool
+                # is autocommit, so as separate statements the table is writable and
+                # untriggered between them. The schema advisory lock does not close
+                # this — it excludes bootstrappers, not writers.
+                with conn.transaction():
+                    conn.execute("""
+                        DROP TRIGGER IF EXISTS trg_merge_post_commit_pending_tenant_consistency_update
+                            ON merge_post_commit_pending
+                    """)
+                    conn.execute("""
+                        CREATE TRIGGER trg_merge_post_commit_pending_tenant_consistency_update
+                            BEFORE UPDATE OF tenant_id ON merge_post_commit_pending
+                            FOR EACH ROW
+                            WHEN (NEW.tenant_id IS DISTINCT FROM OLD.tenant_id)
+                            EXECUTE FUNCTION enforce_merge_post_commit_pending_tenant_consistency()
+                    """)
+
             except Exception:
                 logger.warning("merge_post_commit_pending bootstrap failed", exc_info=True)
             #: origin_conversation_id
@@ -2224,17 +2236,29 @@ class PostgresStore(ContextStore):
                    END;
                    $$ LANGUAGE plpgsql"""
             )
-            conn.execute(
-                """DROP TRIGGER IF EXISTS
-                       trg_guard_attested_canonical_turn_update
-                   ON canonical_turns"""
-            )
-            conn.execute(
-                """CREATE TRIGGER trg_guard_attested_canonical_turn_update
-                   BEFORE UPDATE ON canonical_turns
-                   FOR EACH ROW EXECUTE FUNCTION
-                       vc_guard_attested_canonical_turn_update()"""
-            )
+            # One transaction, not two statements. DROP TRIGGER takes an
+            # ACCESS EXCLUSIVE lock and the pool is autocommit, so as
+            # separate statements the lock is released the moment the DROP
+            # commits and the table is writable, unguarded, until the
+            # CREATE lands. Holding both in one transaction keeps that
+            # lock to the commit.
+            #
+            # The schema advisory lock does NOT close this. It excludes
+            # other bootstrappers, not ordinary writers, and by
+            # serializing workers it guarantees an already-booted one is
+            # serving traffic while a later worker is inside this gap.
+            with conn.transaction():
+                conn.execute(
+                    """DROP TRIGGER IF EXISTS
+                           trg_guard_attested_canonical_turn_update
+                       ON canonical_turns"""
+                )
+                conn.execute(
+                    """CREATE TRIGGER trg_guard_attested_canonical_turn_update
+                                   BEFORE UPDATE ON canonical_turns
+                                   FOR EACH ROW EXECUTE FUNCTION
+                                       vc_guard_attested_canonical_turn_update()"""
+                )
             conn.execute(
                 """CREATE OR REPLACE FUNCTION
                        vc_guard_canonical_message_source_update()
@@ -2270,19 +2294,30 @@ class PostgresStore(ContextStore):
                    END;
                    $$ LANGUAGE plpgsql"""
             )
-            conn.execute(
-                """DROP TRIGGER IF EXISTS
-                       trg_guard_canonical_message_source_update
-                   ON canonical_message_sources"""
-            )
-            conn.execute(
-                """CREATE TRIGGER
-                       trg_guard_canonical_message_source_update
-                   BEFORE UPDATE ON canonical_message_sources
-                   FOR EACH ROW EXECUTE FUNCTION
-                       vc_guard_canonical_message_source_update()"""
-            )
-
+            # One transaction, not two statements. DROP TRIGGER takes an
+            # ACCESS EXCLUSIVE lock and the pool is autocommit, so as
+            # separate statements the lock is released the moment the DROP
+            # commits and the table is writable, unguarded, until the
+            # CREATE lands. Holding both in one transaction keeps that
+            # lock to the commit.
+            #
+            # The schema advisory lock does NOT close this. It excludes
+            # other bootstrappers, not ordinary writers, and by
+            # serializing workers it guarantees an already-booted one is
+            # serving traffic while a later worker is inside this gap.
+            with conn.transaction():
+                conn.execute(
+                    """DROP TRIGGER IF EXISTS
+                           trg_guard_canonical_message_source_update
+                       ON canonical_message_sources"""
+                )
+                conn.execute(
+                    """CREATE TRIGGER
+                                       trg_guard_canonical_message_source_update
+                                   BEFORE UPDATE ON canonical_message_sources
+                                   FOR EACH ROW EXECUTE FUNCTION
+                                       vc_guard_canonical_message_source_update()"""
+                )
     def _assert_canonical_message_source_schema(self) -> None:
         """Fail startup if the source fence could not be installed."""
         with self.pool.connection() as conn:
@@ -2804,17 +2839,23 @@ class PostgresStore(ContextStore):
                 END;
                 $$
             """)
-            conn.execute(
-                """DROP TRIGGER IF EXISTS
-                       trg_dirty_actor_card_on_canonical_insert
-                   ON canonical_turns"""
-            )
-            conn.execute("""
-                CREATE TRIGGER trg_dirty_actor_card_on_canonical_insert
-                AFTER INSERT ON canonical_turns
-                FOR EACH ROW
-                EXECUTE FUNCTION vc_dirty_actor_card_on_canonical_insert()
-            """)
+            # One transaction: DROP TRIGGER takes ACCESS EXCLUSIVE and the pool
+            # is autocommit, so as separate statements the table is writable and
+            # untriggered between them. The schema advisory lock does not close
+            # this — it excludes bootstrappers, not writers.
+            with conn.transaction():
+                conn.execute(
+                    """DROP TRIGGER IF EXISTS
+                           trg_dirty_actor_card_on_canonical_insert
+                       ON canonical_turns"""
+                )
+                conn.execute("""
+                    CREATE TRIGGER trg_dirty_actor_card_on_canonical_insert
+                    AFTER INSERT ON canonical_turns
+                    FOR EACH ROW
+                    EXECUTE FUNCTION vc_dirty_actor_card_on_canonical_insert()
+                """)
+
             conn.execute("""
                 CREATE OR REPLACE FUNCTION
                     vc_invalidate_actor_card_turn_source()
@@ -2894,21 +2935,27 @@ class PostgresStore(ContextStore):
                 END;
                 $$
             """)
-            conn.execute(
-                """DROP TRIGGER IF EXISTS
-                       trg_invalidate_actor_card_turn_source
-                   ON canonical_turns"""
-            )
-            conn.execute("""
-                CREATE TRIGGER trg_invalidate_actor_card_turn_source
-                BEFORE DELETE OR UPDATE OF
-                    conversation_id, user_content, sender_actor_id,
-                    audience_conversation_id, audience_attribution_version,
-                    origin_channel_id, created_at, first_seen_at
-                ON canonical_turns
-                FOR EACH ROW
-                EXECUTE FUNCTION vc_invalidate_actor_card_turn_source()
-            """)
+            # One transaction: DROP TRIGGER takes ACCESS EXCLUSIVE and the pool
+            # is autocommit, so as separate statements the table is writable and
+            # untriggered between them. The schema advisory lock does not close
+            # this — it excludes bootstrappers, not writers.
+            with conn.transaction():
+                conn.execute(
+                    """DROP TRIGGER IF EXISTS
+                           trg_invalidate_actor_card_turn_source
+                       ON canonical_turns"""
+                )
+                conn.execute("""
+                    CREATE TRIGGER trg_invalidate_actor_card_turn_source
+                    BEFORE DELETE OR UPDATE OF
+                        conversation_id, user_content, sender_actor_id,
+                        audience_conversation_id, audience_attribution_version,
+                        origin_channel_id, created_at, first_seen_at
+                    ON canonical_turns
+                    FOR EACH ROW
+                    EXECUTE FUNCTION vc_invalidate_actor_card_turn_source()
+                """)
+
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS actor_card_rebuild_status (
                     tenant_id TEXT NOT NULL,

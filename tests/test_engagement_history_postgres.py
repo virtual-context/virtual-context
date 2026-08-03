@@ -17,12 +17,14 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pytest
 
 from tests.pg_helpers import pg_dsn
 from virtual_context.core.engagement import (
+    DayAlreadyClaimed,
     InMemoryPostHistory,
     PostgresPostHistory,
     PostRecord,
@@ -110,7 +112,10 @@ def history(request, durable):
 class TestBothBackendsAgree:
     def test_record_returns_a_handle_that_addresses_that_row(self, history):
         first = history.record(_record(question_text="one"))
-        second = history.record(_record(question_text="two"))
+        second = history.record(_record(
+            question_text="two",
+            posted_at=datetime(2026, 8, 3, 16, 0, tzinfo=timezone.utc),
+        ))
         assert first != second
         history.update(first, resolution="answered")
         by_text = {r.question_text: r.resolution for r in history.all()}
@@ -124,7 +129,10 @@ class TestBothBackendsAgree:
         claim silently confirmed someone else's.
         """
         first = history.record(_record(question_text="mine", status="pending"))
-        history.record(_record(question_text="theirs", status="pending"))
+        history.record(_record(
+            question_text="theirs", status="pending",
+            posted_at=datetime(2026, 8, 3, 16, 0, tzinfo=timezone.utc),
+        ))
         history.update(first, status="posted", discord_message_id="111")
         states = {r.question_text: (r.status, r.discord_message_id)
                   for r in history.all()}
@@ -153,7 +161,10 @@ class TestBothBackendsAgree:
 
     def test_pending_claims_sees_the_unconfirmed_row(self, history):
         history.record(_record(question_text="done", status="posted"))
-        history.record(_record(question_text="stuck", status="pending"))
+        history.record(_record(
+            question_text="stuck", status="pending",
+            posted_at=datetime(2026, 8, 3, 16, 0, tzinfo=timezone.utc),
+        ))
         assert [r.question_text for r in pending_claims(history)] == ["stuck"]
 
     def test_a_confirmed_claim_leaves_pending(self, history):
@@ -268,3 +279,110 @@ class TestOnlyTheDurableBackendCanBeAskedThis:
     def test_a_store_without_a_pool_refuses(self):
         with pytest.raises(RuntimeError, match="no connection pool"):
             PostgresPostHistory(object(), tenant_id="t", conversation_id="c")
+
+
+# ------------------------------------------------- the day is a constraint
+
+
+class TestTheDayClaimIsEnforcedByTheDatabase:
+    """A read-then-write cannot hold a claim under two processes.
+
+    ``already_posted_today`` checks, then ``record`` writes. Between those
+    two, another process can do the same. The unique index is what makes the
+    second one impossible rather than unlikely.
+    """
+
+    def test_a_second_claim_on_the_same_day_is_refused(self, history):
+        now = datetime(2026, 8, 2, 16, 0, tzinfo=timezone.utc)
+        history.record(_record(posted_at=now))
+        with pytest.raises(DayAlreadyClaimed):
+            history.record(_record(posted_at=now, question_text="second"))
+
+    def test_the_refusal_does_not_depend_on_the_backend(self, history):
+        """Both raise the same domain error, not a driver exception."""
+        now = datetime(2026, 8, 2, 16, 0, tzinfo=timezone.utc)
+        history.record(_record(posted_at=now))
+        try:
+            history.record(_record(posted_at=now))
+        except DayAlreadyClaimed as exc:
+            assert "2026-08-02" in str(exc)
+        else:
+            pytest.fail("expected DayAlreadyClaimed")
+
+    def test_a_claim_that_loses_the_race_becomes_a_refusal_not_a_crash(
+        self, history, monkeypatch,
+    ):
+        """The reason the constraint and the handler ship together.
+
+        A constraint whose violation escapes as a database error turns a
+        cleanly skipped day into a failed unit — the state that invites
+        someone to fix it by restarting, which is how a double post happens.
+        """
+        import virtual_context.core.engagement.poster as poster_module
+
+        monkeypatch.setattr(poster_module, "POSTING_ENABLED", True)
+        now = datetime(2026, 8, 2, 16, 0, tzinfo=timezone.utc)
+        history.record(_record(posted_at=now))
+
+        candidate = SimpleNamespace(
+            actor_id=ACTOR, source_message_id="1524917968440524991",
+            channel_id=CHANNEL,
+        )
+        verification = SimpleNamespace(
+            ok=True, verified_message_id="1524917968440524991",
+        )
+        # Bypass the read-then-write check so the constraint is what refuses.
+        monkeypatch.setattr(poster_module, "already_posted_today",
+                            lambda *a, **k: False)
+        with pytest.raises(poster_module.PostRefused, match="already claimed"):
+            poster_module.post_question(
+                candidate=candidate, question="Did the ss31 run go well?",
+                channel_id=CHANNEL, verification=verification,
+                history=history, sender=lambda **kw: "999", now=now,
+                question_type="timed",
+            )
+
+    def test_the_next_day_is_still_claimable(self, history):
+        now = datetime(2026, 8, 2, 16, 0, tzinfo=timezone.utc)
+        history.record(_record(posted_at=now))
+        history.record(_record(posted_at=now + timedelta(days=1)))
+        assert len(history.all()) == 2
+
+    def test_the_stored_day_matches_the_sql_backfill_expression(
+        self, durable, pg_store,
+    ):
+        """Python writes the column; SQL backfills it. They must agree.
+
+        A disagreement would put a row's claim on one day and the migration's
+        recomputation on another, so the constraint would guard a different
+        day than the one the code checks.
+        """
+        for hour in (0, 3, 4, 5, 12, 23):
+            moment = datetime(2026, 8, 3, hour, 30, tzinfo=timezone.utc)
+            durable.record(_record(posted_at=moment, question_text=f"h{hour}"))
+            with pg_store.pool.connection() as conn:
+                row = conn.execute(
+                    """SELECT eastern_day,
+                              (posted_at::timestamptz
+                               AT TIME ZONE 'America/New_York')::date AS sql_day
+                         FROM engagement_post_history
+                        WHERE tenant_id = %s AND question_text = %s""",
+                    (durable._tenant_id, f"h{hour}"),
+                ).fetchone()
+            assert row[0] == row[1], f"disagreed at {hour}:30 UTC"
+            with pg_store.pool.connection() as conn:
+                conn.execute(
+                    "DELETE FROM engagement_post_history WHERE tenant_id = %s",
+                    (durable._tenant_id,),
+                )
+
+    def test_one_tenants_claim_does_not_block_another(self, pg_store, durable):
+        """The index is on (tenant_id, eastern_day), not the day alone."""
+        now = datetime(2026, 8, 2, 16, 0, tzinfo=timezone.utc)
+        durable.record(_record(posted_at=now))
+        other = PostgresPostHistory(
+            pg_store, tenant_id=f"t-{uuid.uuid4().hex[:12]}",
+            conversation_id="sk:agent:vast:discord",
+        )
+        other.record(_record(posted_at=now))
+        assert len(other.all()) == 1
