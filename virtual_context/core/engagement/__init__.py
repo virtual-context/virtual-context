@@ -25,6 +25,14 @@ from .schedule import (
     plan_day,
     preview_schedule,
 )
+from .broader import (
+    BROADER_GENERATOR_GUIDANCE,
+    CLAIM_CHECKER_SYSTEM_PROMPT,
+    BroaderGeneratorNotConfigured,
+    BroaderQuestion,
+    generate_broader_question,
+    validate_broader_question,
+)
 from .candidates import Candidate, Rejection, collect_candidates
 from .compose import (
     TONE_CONSTRAINTS,
@@ -73,6 +81,12 @@ __all__ = [
     "may_run_now",
     "plan_day",
     "preview_schedule",
+    "BROADER_GENERATOR_GUIDANCE",
+    "CLAIM_CHECKER_SYSTEM_PROMPT",
+    "BroaderGeneratorNotConfigured",
+    "BroaderQuestion",
+    "generate_broader_question",
+    "validate_broader_question",
     "Candidate",
     "rehearsal_allowlist",
     "strip_speaker_prefix",
