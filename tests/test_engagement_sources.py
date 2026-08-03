@@ -8,7 +8,11 @@ yields nothing forever. These tests exist so that gap cannot reopen silently.
 
 from __future__ import annotations
 
+import uuid
+
 import pytest
+
+from tests.pg_helpers import pg_dsn
 
 from virtual_context.core.engagement import (
     MessageSourceRecord, load_message_sources,
@@ -124,3 +128,120 @@ class TestItFeedsTheVerifierEndToEnd:
         verified, rejected = verify_candidates([candidate], {})
         assert verified == []
         assert [r.reason for r in rejected] == ["no_attested_source"]
+
+
+# ------------------------------------------------- against real backends
+
+
+class TestAgainstRealBackends:
+    """The fixture tests above cannot catch a wrong column name or cast.
+
+    This gap existed precisely because every test built the mapping by hand,
+    so a fixture-only test here would reproduce the exact blindness that hid
+    it. These execute the shipped SQL against a real database.
+    """
+
+    TEN = "tenant-a"
+
+    def _seed(self, store, execute, *, tenant=None, ordinal=100):
+        """One attested user turn. Returns its canonical turn id.
+
+        Every identity is unique per call. An earlier version pinned the
+        conversation id and sort key, which passed once and then collided on
+        the next run against the same database — the test assumed a fresh
+        database without saying so, which is the same class of hidden ruler
+        this file exists to catch.
+
+        The ledger's pair-shape constraint requires an assistant turn and a
+        non-empty assistant hash, so a lone user row cannot be inserted —
+        worth knowing before anyone writes a repair script against it.
+        """
+        conv = f"conv-{uuid.uuid4().hex[:12]}"
+        account = f"acct-{uuid.uuid4().hex[:12]}"
+        user_turn, asst_turn = str(uuid.uuid4()), str(uuid.uuid4())
+        for offset, turn in enumerate((user_turn, asst_turn)):
+            execute(
+                """INSERT INTO canonical_turns
+                   (canonical_turn_id, conversation_id, turn_group_number,
+                    sort_key, turn_hash, hash_version, normalized_user_text,
+                    normalized_assistant_text, user_content, assistant_content,
+                    primary_tag, tags_json)
+                   VALUES (?,?,1,?,?,1,'u','a','u','a','t','[]')""",
+                (turn, conv, ordinal + offset, uuid.uuid4().hex),
+            )
+        execute(
+            """INSERT INTO canonical_message_sources
+               (tenant_id, agent_scope_id, platform, account_id, message_id,
+                canonical_turn_id, assistant_canonical_turn_id,
+                assistant_turn_hash, turn_group_number, pair_version,
+                audience_conversation_id, channel_id, guild_id, author_id,
+                source_actor_id, transport_body_sha256, canonical_body_sha256,
+                projection_version, canonical_turn_hash,
+                reply_target_message_id, observed_at, created_at)
+               VALUES (?,'vast','discord',?,'1524917968440524991',?,?,
+                       'ah',-1,1,?,'1524917968440524990',
+                       '1524917037191925871','1338726888809697364',
+                       'actor:discord:1338726888809697364','a','b','v1','h',
+                       '','2026-08-02','2026-08-02')""",
+            (tenant or self.TEN, account, user_turn, asst_turn, conv),
+        )
+        return user_turn
+
+    @pytest.mark.skipif(not pg_dsn(), reason="no Postgres DSN")
+    def test_postgres_round_trip(self):
+        from virtual_context.storage.postgres import PostgresStore
+
+        store = PostgresStore(pg_dsn())
+
+        def execute(sql, params):
+            with store.pool.connection() as conn:
+                conn.execute(sql.replace("?", "%s"), params)
+
+        turn = self._seed(store, execute, ordinal=200)
+        out = load_message_sources(
+            store, tenant_id=self.TEN, canonical_turn_ids=[turn],
+        )
+        assert out[turn].author_id == "1338726888809697364"
+        assert out[turn].message_id == "1524917968440524991"
+        assert out[turn].channel_id == "1524917968440524990"
+
+    @pytest.mark.skipif(not pg_dsn(), reason="no Postgres DSN")
+    def test_postgres_will_not_cross_tenants(self):
+        from virtual_context.storage.postgres import PostgresStore
+
+        store = PostgresStore(pg_dsn())
+
+        def execute(sql, params):
+            with store.pool.connection() as conn:
+                conn.execute(sql.replace("?", "%s"), params)
+
+        turn = self._seed(store, execute, ordinal=300)
+        assert load_message_sources(
+            store, tenant_id="somebody-else", canonical_turn_ids=[turn],
+        ) == {}
+
+    @pytest.mark.skipif(not pg_dsn(), reason="no Postgres DSN")
+    def test_postgres_unknown_id_is_absent(self):
+        from virtual_context.storage.postgres import PostgresStore
+
+        store = PostgresStore(pg_dsn())
+        assert load_message_sources(
+            store, tenant_id=self.TEN, canonical_turn_ids=[str(uuid.uuid4())],
+        ) == {}
+
+    def test_sqlite_round_trip(self, tmp_path):
+        from virtual_context.storage.sqlite import SQLiteStore
+
+        store = SQLiteStore(str(tmp_path / "s.db"))
+        conn = store._get_conn()
+
+        def execute(sql, params):
+            conn.execute(sql, params)
+            conn.commit()
+
+        turn = self._seed(store, execute, ordinal=400)
+        out = load_message_sources(
+            store, tenant_id=self.TEN, canonical_turn_ids=[turn],
+        )
+        assert out[turn].author_id == "1338726888809697364"
+        assert out[turn].message_id == "1524917968440524991"
