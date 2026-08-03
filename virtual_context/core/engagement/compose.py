@@ -109,3 +109,76 @@ def compose_draft(
     if not text:
         return Draft("", "empty_draft")
     return Draft(text, "")
+
+
+# A continuation's own guidance. The timed path's prompt is deliberately
+# untouched: that one asks about the status of something recent, while this
+# one reopens a specific thing the member said at any distance, and the two
+# need different framing. The hook is passed as structure, and the evidence
+# is his verbatim words, so the draft is built from what he actually wrote
+# rather than from a summary of it.
+CONTINUATION_GUIDANCE = (
+    "This is not a recent-status check. The member said something specific, "
+    "possibly a while ago, that was never resolved or never explained. Ask "
+    "about THAT. Quote or closely echo his own words so he recognises what "
+    "you are referring to, then ask the one thing a curious reader would "
+    "still want to know: what happened, what he decided, or what he meant. "
+    "Do not state that anything happened, changed, or was caused - ask. If "
+    "the question you are about to write could be asked of any member, it is "
+    "the wrong question; the tag is earned by his specific words or not at all."
+)
+
+_HOOK_FRAMING = {
+    "unresolved_experiment_or_protocol": "an experiment he never reported back on",
+    "symptom_or_side_effect_tracked": "a symptom he was tracking",
+    "pending_or_surprising_labs": "lab work that was pending or surprised him",
+    "dose_or_compound_change": "a dose or compound he was changing",
+    "stated_decision_rule": "a rule he gave for how he would decide",
+    "personal_preference_or_tradeoff": "a preference or tradeoff he stated",
+    "contradiction_or_change_of_view": "a view he appeared to change",
+    "specific_practical_concern": "a specific practical concern he raised",
+    "prior_result_unclear": "a result whose meaning he left unclear",
+}
+
+
+def compose_continuation_draft(
+    *,
+    candidate,
+    hook_kind: str,
+    evidence: str,
+    composer: Callable[..., Any] | None,
+    sender: str = "",
+    channel_label: str = "",
+) -> Draft:
+    """Draft a continuation from the hook and the member's verbatim words."""
+    if composer is None:
+        raise DraftComposerNotConfigured(
+            "no draft composer model is configured; a continuation cannot be "
+            "written without one, and posting an unwritten question is not an "
+            "available outcome."
+        )
+    quote = strip_speaker_prefix(
+        getattr(candidate, "text", ""), sender or getattr(candidate, "sender", ""),
+    )
+    verbatim = (evidence or "").strip()
+    if not verbatim or verbatim.lower() not in quote.lower():
+        return Draft("", "evidence_not_in_quote")
+    try:
+        raw = composer(
+            quote=quote,
+            evidence=verbatim,
+            hook_kind=hook_kind,
+            hook_framing=_HOOK_FRAMING.get(hook_kind, "something he said"),
+            handle=sender or getattr(candidate, "sender", ""),
+            stance="continuation",
+            stance_guidance=CONTINUATION_GUIDANCE,
+            channel_label=channel_label,
+            sent_at=getattr(candidate, "sent_at", None),
+            tone=TONE_CONSTRAINTS,
+        )
+    except Exception:
+        return Draft("", "composer_error")
+    text = str(raw or "").strip()
+    if not text:
+        return Draft("", "empty_draft")
+    return Draft(text, "")

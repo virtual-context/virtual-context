@@ -235,3 +235,58 @@ class TestOnePoolNotTwoTiers:
         )
         assert qualified == []
         assert rejections[0].stage == "resolution"
+
+
+class TestContinuationComposition:
+    def _cand_with_hook(self):
+        return _cand(question_type="personal",
+                     hook_kind="dose_or_compound_change")
+
+    def test_no_composer_configured_raises(self):
+        from virtual_context.core.engagement import (
+            DraftComposerNotConfigured, compose_continuation_draft,
+        )
+
+        with pytest.raises(DraftComposerNotConfigured):
+            compose_continuation_draft(
+                candidate=self._cand_with_hook(),
+                hook_kind="dose_or_compound_change",
+                evidence="Adding ss31 (5mg) for 4 weeks.", composer=None,
+            )
+
+    def test_evidence_must_appear_in_the_quote(self):
+        """A hook whose evidence is not his words cannot ground a draft."""
+        from virtual_context.core.engagement import compose_continuation_draft
+
+        draft = compose_continuation_draft(
+            candidate=self._cand_with_hook(),
+            hook_kind="dose_or_compound_change",
+            evidence="he doubled his dose",
+            composer=lambda **kw: "anything",
+        )
+        assert draft.usable is False
+        assert draft.reason == "evidence_not_in_quote"
+
+    def test_the_composer_receives_the_hook_and_verbatim_evidence(self):
+        from virtual_context.core.engagement import compose_continuation_draft
+
+        seen = {}
+        compose_continuation_draft(
+            candidate=self._cand_with_hook(),
+            hook_kind="dose_or_compound_change",
+            evidence="Adding ss31 (5mg) for 4 weeks.",
+            composer=lambda **kw: seen.update(kw) or "q?",
+            sender="BigTex",
+        )
+        assert seen["evidence"] == "Adding ss31 (5mg) for 4 weeks."
+        assert seen["hook_kind"] == "dose_or_compound_change"
+        assert "dose or compound" in seen["hook_framing"]
+        assert seen["stance"] == "continuation"
+        assert "BigTex:" not in seen["quote"]
+
+    def test_the_timed_prompt_is_not_reused(self):
+        """Continuation has its own guidance; the timed path is untouched."""
+        from virtual_context.core.engagement import CONTINUATION_GUIDANCE
+
+        assert "not a recent-status check" in CONTINUATION_GUIDANCE
+        assert "could be asked of any member" in CONTINUATION_GUIDANCE

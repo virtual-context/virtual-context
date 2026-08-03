@@ -43,9 +43,11 @@ from .continuation import (
 )
 from .candidates import Candidate, Rejection, collect_candidates
 from .compose import (
+    CONTINUATION_GUIDANCE,
     TONE_CONSTRAINTS,
     Draft,
     DraftComposerNotConfigured,
+    compose_continuation_draft,
     compose_draft,
     strip_speaker_prefix,
 )
@@ -104,7 +106,9 @@ __all__ = [
     "Candidate",
     "rehearsal_allowlist",
     "strip_speaker_prefix",
+    "compose_continuation_draft",
     "compose_draft",
+    "CONTINUATION_GUIDANCE",
     "TONE_CONSTRAINTS",
     "DraftComposerNotConfigured",
     "Draft",
