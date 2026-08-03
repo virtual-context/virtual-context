@@ -18,6 +18,13 @@ from .history import (
     fingerprint_distance,
     topic_fingerprint,
 )
+from .schedule import (
+    SCHEDULE_ENABLED_BY_DEFAULT,
+    ScheduleWindow,
+    may_run_now,
+    plan_day,
+    preview_schedule,
+)
 from .candidates import Candidate, Rejection, collect_candidates
 from .compose import (
     TONE_CONSTRAINTS,
@@ -55,6 +62,11 @@ __all__ = [
     "check_repetition",
     "fingerprint_distance",
     "topic_fingerprint",
+    "SCHEDULE_ENABLED_BY_DEFAULT",
+    "ScheduleWindow",
+    "may_run_now",
+    "plan_day",
+    "preview_schedule",
     "Candidate",
     "rehearsal_allowlist",
     "strip_speaker_prefix",
