@@ -26,7 +26,7 @@ from zoneinfo import ZoneInfo
 from .allowlist import POST_CHANNEL_IDS
 from .history import DayAlreadyClaimed, PostRecord, topic_fingerprint
 
-# Ships dark, and deliberately NOT as a parameter.
+# LIVE, and deliberately NOT a parameter.
 #
 # Permission and intent are different things. A caller says whether it wants
 # to post today (``post=`` on the runner); it does not get to say whether
@@ -38,7 +38,13 @@ from .history import DayAlreadyClaimed, PostRecord, topic_fingerprint
 #
 # This is the same shape as POST_CHANNEL_IDS below, which is imported rather
 # than injected and is why a caller cannot post to a community channel.
-POSTING_ENABLED = False
+#
+# Now that this is True, it is global to the build and says nothing about
+# WHERE. The only thing keeping posts to one private channel is
+# POST_CHANNEL_IDS, checked immediately below and currently a single id. That
+# tuple is now the load-bearing guard: widening it widens what this flag
+# already permits, with no second switch to stop it.
+POSTING_ENABLED = True
 
 POSTING_ZONE = "America/New_York"
 

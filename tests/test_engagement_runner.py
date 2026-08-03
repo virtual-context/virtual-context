@@ -97,8 +97,14 @@ class TestDryRunIsTheDefault:
         assert "Did you end up starting the SS-31?" in rendered
         assert "SOURCE RE-FETCHED LIVE" in rendered
 
-    def test_asking_to_post_in_the_shipped_build_refuses(self):
-        """Two separate switches: intent, and permission."""
+    def test_asking_to_post_with_permission_withdrawn_refuses(self, monkeypatch):
+        """Two separate switches: intent, and permission.
+
+        Permission is now granted in this build, so the refusal is exercised
+        by withdrawing it rather than by relying on the shipped default. The
+        runner must surface it as a refusal, not raise.
+        """
+        monkeypatch.setattr(poster_module, "POSTING_ENABLED", False)
         result = _run(post=True, message_sender=lambda **kw: "1")
         assert result.posted_message_id == ""
         assert "disabled in this build" in result.refused

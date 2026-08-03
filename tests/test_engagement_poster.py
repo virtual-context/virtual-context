@@ -75,11 +75,38 @@ def posting_permitted(monkeypatch):
     monkeypatch.setattr(poster_module, "POSTING_ENABLED", True)
 
 
-class TestPostingShipsDisabled:
-    def test_the_shipped_value_is_off(self):
-        assert POSTING_ENABLED is False
+@pytest.fixture
+def posting_disabled(monkeypatch):
+    monkeypatch.setattr(poster_module, "POSTING_ENABLED", False)
 
-    def test_posting_refuses_in_the_shipped_build(self):
+
+class TestPostingIsLiveAndWhatNowConstrainsIt:
+    """Posting is enabled. These pin what is left holding it.
+
+    While this shipped False, "nothing can post" was the guarantee and the
+    channel list was a second line. That is no longer true: the flag is
+    global to the build and says nothing about WHERE. POST_CHANNEL_IDS is now
+    the only thing keeping posts to one private channel, so it is asserted
+    here rather than left to the channel-refusal class alone.
+    """
+
+    def test_the_shipped_value_is_on(self):
+        assert POSTING_ENABLED is True
+
+    def test_the_only_destination_is_the_rehearsal_channel(self):
+        """The load-bearing guard, now that permission is granted."""
+        assert POST_CHANNEL_IDS == (VASTTEST,)
+
+    def test_no_community_channel_is_a_destination(self):
+        assert not set(POST_CHANNEL_IDS) & set(SOURCE_CHANNEL_IDS)
+
+    def test_the_refusal_path_still_works_when_disabled(self, posting_disabled):
+        """The mechanism must survive the flip, not just the default.
+
+        If this build is ever turned back off, the guard has to still refuse
+        — a switch that only worked while it was already closed would be
+        discovered at exactly the wrong moment.
+        """
         with pytest.raises(PostRefused, match="disabled in this build"):
             _post()
 
