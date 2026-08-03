@@ -5,6 +5,13 @@ nothing. Scheduling and delivery live outside the engine.
 """
 
 from .candidates import Candidate, Rejection, collect_candidates
+from .compose import (
+    TONE_CONSTRAINTS,
+    Draft,
+    DraftComposerNotConfigured,
+    compose_draft,
+    strip_speaker_prefix,
+)
 from .channels import ChannelAllowlist, load_channel_allowlist
 from .fidelity import (
     ADVERSARIAL_FIDELITY_FIXTURES,
@@ -21,6 +28,11 @@ from .verify import MessageSourceRecord, verify_candidates
 __all__ = [
     "ADVERSARIAL_FIDELITY_FIXTURES",
     "Candidate",
+    "strip_speaker_prefix",
+    "compose_draft",
+    "TONE_CONSTRAINTS",
+    "DraftComposerNotConfigured",
+    "Draft",
     "ChannelAllowlist",
     "DryRunReport",
     "FidelityFixture",

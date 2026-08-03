@@ -2387,6 +2387,14 @@ class AssemblerConfig:
     # Optional independent fallback for provider-level empty/refused responses.
     # It is never used for a valid semantic rejection.
     actor_card_admission_fallback_model: str = ""
+    # Community-engagement fidelity judge. Same fail-closed contract as the
+    # card admission model: with the engagement pipeline enabled and this
+    # unset it is a configuration ERROR, never a fallback to a cheaper model.
+    # A draft that no judge checked must not be postable, and silently
+    # skipping the check is the defect this pipeline exists to prevent.
+    # YAML key: engagement.fidelity_judge_model.
+    engagement_enabled: bool = False
+    engagement_fidelity_judge_model: str = ""
     # Speaker roster. Independent of the actor card and SHIPS DARK: with the
     # gate off, no roster or handle-assignment read is performed, no budget
     # key is added, and rendered output and tool schemas are byte-identical.

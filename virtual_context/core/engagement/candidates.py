@@ -24,6 +24,7 @@ from datetime import datetime
 
 from ..discord_snowflake import snowflake_to_datetime
 from .channels import ChannelAllowlist
+from .compose import strip_speaker_prefix
 
 
 @dataclass(frozen=True)
@@ -36,6 +37,7 @@ class Candidate:
     channel_id: str
     text: str
     sent_at: datetime
+    sender: str = ""      # displayed handle only; never a real name
 
 
 @dataclass(frozen=True)
@@ -52,6 +54,7 @@ def collect_candidates(
     results,
     *,
     allowlist: ChannelAllowlist,
+    senders: dict[str, str] | None = None,
     dedupe: bool = True,
 ) -> tuple[list[Candidate], list[Rejection]]:
     """Filter retrieval results down to authored, timeable, sourceable rows.
@@ -93,12 +96,18 @@ def collect_candidates(
             _reject("duplicate_source_message_id", f"message_id={message_id}")
             continue
         seen.add(message_id)
+        sender = (senders or {}).get(turn_id, "")
         kept.append(Candidate(
             canonical_turn_id=turn_id,
             source_message_id=message_id,
             actor_id=str(getattr(provenance, "actor_id", "") or ""),
             channel_id=channel_id,
-            text=str(getattr(result, "text", "") or ""),
+            # The member's words alone: the ingest-written speaker prefix
+            # is attribution, not part of what he said.
+            text=strip_speaker_prefix(
+                str(getattr(result, "text", "") or ""), sender,
+            ),
             sent_at=sent_at,
+            sender=sender,
         ))
     return kept, rejected

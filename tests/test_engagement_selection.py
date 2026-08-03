@@ -229,3 +229,134 @@ class TestRankingAndSelection:
         assert outcome.kind == "skip"
         assert outcome.skip_stage == "verify"
         assert "author_mismatch" in outcome.reason
+
+
+# ------------------------------------------------- speaker-prefix stripping
+
+
+class TestSpeakerPrefix:
+    """Stored guild bodies carry a "<sender>: " prefix from ingest.
+
+    387 of 400 sampled production rows begin with it. It is durable data,
+    not a rendering artifact, so a composer fed the raw body would receive
+    the speaker label as part of the member's words and could reproduce it
+    or reason about it as content.
+    """
+
+    def test_the_rows_own_sender_prefix_is_removed(self):
+        from virtual_context.core.engagement import strip_speaker_prefix
+
+        assert strip_speaker_prefix(
+            "Cashew King: @Vast Pinned my 80mg Test this morning",
+            "Cashew King",
+        ) == "@Vast Pinned my 80mg Test this morning"
+
+    def test_a_body_without_the_prefix_is_untouched(self):
+        from virtual_context.core.engagement import strip_speaker_prefix
+
+        body = "@Vast Pinned my 80mg Test this morning"
+        assert strip_speaker_prefix(body, "Cashew King") == body
+
+    def test_only_the_rows_own_sender_is_stripped(self):
+        """Never a generic strip-to-first-colon; that mangles real text."""
+        from virtual_context.core.engagement import strip_speaker_prefix
+
+        assert strip_speaker_prefix(
+            "Note: I stopped the SS-31", "Cashew King",
+        ) == "Note: I stopped the SS-31"
+        assert strip_speaker_prefix(
+            "Roo: something", "Cashew King",
+        ) == "Roo: something"
+
+    def test_an_empty_sender_strips_nothing(self):
+        from virtual_context.core.engagement import strip_speaker_prefix
+
+        assert strip_speaker_prefix("Roo: hi", "") == "Roo: hi"
+
+    def test_the_collector_stores_the_members_words_alone(self):
+        from virtual_context.core.engagement import collect_candidates, load_channel_allowlist
+        from virtual_context.types import QuoteResult, SourceProvenance
+
+        result = QuoteResult(
+            text="Cashew King: Adding ss31 (5mg) for 4 weeks.",
+            tag="", segment_ref="ct-1", source_scope="turn",
+            matched_side="user",
+            provenance=SourceProvenance(
+                conversation_id="c", canonical_turn_id="ct-1",
+                source_role="requester", actor_id=BIGTEX,
+                audience_conversation_id="c", audience_attribution_version=1,
+                origin_channel_id=P3, source_message_id=_mid(NOW),
+            ),
+        )
+        allow = load_channel_allowlist(
+            {"source_channel_ids": [P3], "post_channel_ids": [P3]},
+        )
+        kept, _ = collect_candidates(
+            [result], allowlist=allow, senders={"ct-1": "Cashew King"},
+        )
+        assert kept[0].text == "Adding ss31 (5mg) for 4 weeks."
+        assert kept[0].sender == "Cashew King"
+
+
+# ----------------------------------------------------- draft composition
+
+
+class TestDraftComposition:
+    def test_a_composer_with_no_model_refuses_to_run(self):
+        from virtual_context.core.engagement import (
+            DraftComposerNotConfigured, compose_draft,
+        )
+
+        with pytest.raises(DraftComposerNotConfigured):
+            compose_draft(candidate=_cand(3), stance="anticipatory", composer=None)
+
+    def test_the_composer_never_receives_the_speaker_label_in_the_body(self):
+        from virtual_context.core.engagement import compose_draft
+
+        seen = {}
+
+        def _composer(**kw):
+            seen.update(kw)
+            return "@BigTex have you started the SS-31 yet?"
+
+        candidate = _cand(3, text="Adding ss31 (5mg) for 4 weeks.")
+        compose_draft(
+            candidate=candidate, stance="anticipatory", composer=_composer,
+            sender="BigTex",
+        )
+        assert "BigTex:" not in seen["quote"]
+        assert seen["quote"] == "Adding ss31 (5mg) for 4 weeks."
+        # Attribution travels separately, as structure, never inside the body.
+        assert seen["handle"] == "BigTex"
+
+    def test_a_composer_that_raises_yields_no_draft(self):
+        from virtual_context.core.engagement import compose_draft
+
+        def _boom(**kw):
+            raise RuntimeError("provider down")
+
+        draft = compose_draft(
+            candidate=_cand(3), stance="anticipatory", composer=_boom,
+        )
+        assert draft.text == ""
+        assert draft.reason == "composer_error"
+
+    def test_an_empty_draft_is_not_usable(self):
+        from virtual_context.core.engagement import compose_draft
+
+        draft = compose_draft(
+            candidate=_cand(3), stance="anticipatory",
+            composer=lambda **kw: "   ",
+        )
+        assert draft.usable is False
+        assert draft.reason == "empty_draft"
+
+    def test_the_stance_reaches_the_composer(self):
+        from virtual_context.core.engagement import compose_draft
+
+        seen = {}
+        compose_draft(
+            candidate=_cand(5), stance="outcome",
+            composer=lambda **kw: seen.update(kw) or "how did it go?",
+        )
+        assert seen["stance"] == "outcome"

@@ -291,6 +291,13 @@ def _build_config(raw: dict[str, Any], *, validate: bool = True) -> VirtualConte
             "actor_card_curation_fallback_model",
             _asm_defaults.actor_card_curation_fallback_model,
         ) or "",
+        engagement_enabled=bool(assembly_raw.get(
+            "engagement_enabled", _asm_defaults.engagement_enabled,
+        )),
+        engagement_fidelity_judge_model=assembly_raw.get(
+            "engagement_fidelity_judge_model",
+            _asm_defaults.engagement_fidelity_judge_model,
+        ),
         actor_card_admission_model=assembly_raw.get(
             "actor_card_admission_model",
             _asm_defaults.actor_card_admission_model,
@@ -617,6 +624,24 @@ def validate_config(config: VirtualContextConfig) -> list[str]:
             )
 
     # Segmenter config
+
+    # The engagement pipeline's fidelity judge fails configuration closed for
+    # the same reason the card admission model does: a gate that silently
+    # does not run is worse than one that is absent, because callers believe
+    # the check happened.
+    if getattr(config.assembler, "engagement_enabled", False):
+        if (
+            not isinstance(
+                getattr(config.assembler, "engagement_fidelity_judge_model", ""),
+                str,
+            )
+            or not config.assembler.engagement_fidelity_judge_model.strip()
+        ):
+            errors.append(
+                "engagement.fidelity_judge_model is required as a non-empty "
+                "string when the engagement pipeline is enabled"
+            )
+
     if not (0.0 <= config.segmenter.tag_overlap_threshold <= 1.0):
         errors.append(
             f"segmenter.tag_overlap_threshold must be in [0.0, 1.0], "
