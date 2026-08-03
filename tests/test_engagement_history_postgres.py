@@ -659,3 +659,131 @@ class TestRepetitionIsEnforcedAgainstTheDurableLedger:
         row = durable_with_a_post.all()[0]
         assert row.topic_fingerprint == topic_fingerprint(row.question_text)
         assert row.topic_fingerprint != 0
+
+
+class TestTheGuardRejectsOneAndLetsAnotherThrough:
+    """A guard that rejects the whole pool is indistinguishable from one that
+    works: the artifact reads no_question_selected either way.
+
+    This is the re-arm gate. It runs the real runner against the durable
+    ledger, with the member who was already posted about and a second member
+    who was not, and asserts BOTH halves in a single run — the repeat is
+    rejected by name, and the other candidate is the one that gets drafted.
+    """
+
+    OTHER_ACTOR = "actor:discord:1485681229608259666"
+    OTHER_AUTHOR = "1485681229608259666"
+    GUILD = "sk:agent:vast:discord:guild:1524917037191925871"
+    P3 = "1524917968440524990"
+
+    def _row(self, *, turn, actor, message_id, text):
+        from virtual_context.types import QuoteResult, SourceProvenance
+
+        return QuoteResult(
+            text=text, tag="", segment_ref=turn, source_scope="turn",
+            matched_side="user",
+            provenance=SourceProvenance(
+                conversation_id=self.GUILD, canonical_turn_id=turn,
+                source_role="requester", actor_id=actor,
+                audience_conversation_id=self.GUILD,
+                audience_attribution_version=1,
+                origin_channel_id=self.P3, source_message_id=message_id,
+            ),
+        )
+
+    def test_the_repeat_is_rejected_and_the_other_candidate_survives(
+        self, durable,
+    ):
+        import dataclasses
+
+        from virtual_context.core.discord_snowflake import (
+            datetime_to_snowflake_floor,
+        )
+        from virtual_context.core.engagement import (
+            Draft, FidelityVerdict, MessageSourceRecord, load_channel_allowlist,
+            run_once,
+        )
+
+        now = datetime(2026, 8, 4, 18, 4, tzinfo=timezone.utc)
+        posted_message = "1533835931390443521"
+        # The row production already has: Rob, posted about yesterday.
+        durable.record(_record(
+            posted_at=now - timedelta(days=1),
+            channel_id=self.P3, tagged_actor_id=ACTOR,
+            source_message_ids=(posted_message,),
+            question_text="Can you paste the rest of the label?",
+            topic_fingerprint=topic_fingerprint(
+                "Can you paste the rest of the label?"
+            ),
+            status="posted",
+        ))
+
+        sent = now - timedelta(days=4)
+        repeat = self._row(turn="ct-rob", actor=ACTOR,
+                           message_id=posted_message,
+                           text="Rob: Maximus Building Blocks label.")
+        other_message = str(datetime_to_snowflake_floor(sent) + 11)
+        fresh = self._row(turn="ct-other", actor=self.OTHER_ACTOR,
+                          message_id=other_message,
+                          text="Roo: Started KPV 500mcg in the mornings.")
+        sources = {
+            "ct-rob": MessageSourceRecord(
+                canonical_turn_id="ct-rob", message_id=posted_message,
+                channel_id=self.P3, guild_id="1524917037191925871",
+                author_id="1338726888809697364", source_actor_id=ACTOR,
+            ),
+            "ct-other": MessageSourceRecord(
+                canonical_turn_id="ct-other", message_id=other_message,
+                channel_id=self.P3, guild_id="1524917037191925871",
+                author_id=self.OTHER_AUTHOR,
+                source_actor_id=self.OTHER_ACTOR,
+            ),
+        }
+        authors = {posted_message: "1338726888809697364",
+                   other_message: self.OTHER_AUTHOR}
+
+        def _fetcher(*, channel_id, message_id):
+            return 200, {"channel_id": channel_id, "edited_timestamp": None,
+                         "author": {"id": authors[message_id]}}
+
+        def _qualifier(verified, *, now):
+            return [dataclasses.replace(c, question_type="timed",
+                                        stance="anticipatory")
+                    for c in verified], []
+
+        drafted: list = []
+
+        def _drafter(candidate):
+            drafted.append(candidate.canonical_turn_id)
+            return Draft("How are the mornings treating you?", ""), \
+                FidelityVerdict(True)
+
+        result = run_once(
+            results=[repeat, fresh], sources=sources,
+            senders={"ct-rob": "Rob", "ct-other": "Roo"},
+            allowlist=load_channel_allowlist({
+                "source_channel_ids": [self.P3],
+                "post_channel_ids": [CHANNEL],
+            }),
+            history=durable, now=now, conversation_id=self.GUILD,
+            qualifier=_qualifier, drafter=_drafter, source_fetcher=_fetcher,
+        )
+
+        # Half one: the repeat is rejected, by name, against the real ledger.
+        history_rejections = {
+            r.canonical_turn_id: r.reason
+            for r in result.rejections if r.stage == "history"
+        }
+        assert "ct-rob" in history_rejections, (
+            f"the already-posted thread was not rejected: {result.rejections}"
+        )
+        assert history_rejections["ct-rob"] in {
+            "thread_already_used", "member_recently_tagged",
+        }, history_rejections
+
+        # Half two: something else still got through. Without this, a guard
+        # that rejects everything passes half one and looks correct.
+        assert drafted == ["ct-other"], (
+            f"the surviving candidate was not drafted: {drafted}"
+        )
+        assert result.report.question == "How are the mornings treating you?"
