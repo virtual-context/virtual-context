@@ -4,6 +4,12 @@ Read-only. Selects and proves candidates; posts nothing and schedules
 nothing. Scheduling and delivery live outside the engine.
 """
 
+from .allowlist import (
+    POST_CHANNEL_IDS,
+    SOURCE_CHANNEL_IDS,
+    REHEARSAL_CONFIG,
+    rehearsal_allowlist,
+)
 from .candidates import Candidate, Rejection, collect_candidates
 from .compose import (
     TONE_CONSTRAINTS,
@@ -32,7 +38,11 @@ from .verify import MessageSourceRecord, verify_candidates
 
 __all__ = [
     "ADVERSARIAL_FIDELITY_FIXTURES",
+    "POST_CHANNEL_IDS",
+    "REHEARSAL_CONFIG",
+    "SOURCE_CHANNEL_IDS",
     "Candidate",
+    "rehearsal_allowlist",
     "strip_speaker_prefix",
     "compose_draft",
     "TONE_CONSTRAINTS",

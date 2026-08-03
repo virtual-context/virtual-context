@@ -479,3 +479,34 @@ class TestPostChannelRestriction:
         for community in (P3, "1524917037787250834", "1530567788949798963"):
             assert allow.may_post(community) is False
             assert allow.may_source(community) is True
+
+
+class TestShippedAllowlist:
+    """The boundary must be a shipped artifact, not each caller's argument."""
+
+    def test_the_shipped_allowlist_posts_only_to_the_rehearsal_channel(self):
+        from virtual_context.core.engagement import (
+            POST_CHANNEL_IDS, rehearsal_allowlist,
+        )
+
+        allow = rehearsal_allowlist()
+        assert POST_CHANNEL_IDS == ("1524946242499514418",)
+        assert allow.may_post("1524946242499514418") is True
+
+    def test_no_community_channel_is_postable_in_the_shipped_config(self):
+        from virtual_context.core.engagement import (
+            SOURCE_CHANNEL_IDS, rehearsal_allowlist,
+        )
+
+        allow = rehearsal_allowlist()
+        for channel_id in SOURCE_CHANNEL_IDS:
+            assert allow.may_source(channel_id) is True
+            assert allow.may_post(channel_id) is False, (
+                f"{channel_id} is postable in the shipped config; widening "
+                "this must be a deliberate, reviewed edit"
+            )
+
+    def test_the_rehearsal_channel_is_never_a_source(self):
+        from virtual_context.core.engagement import rehearsal_allowlist
+
+        assert rehearsal_allowlist().may_source("1524946242499514418") is False
