@@ -39,6 +39,7 @@ from .continuation import (
     ContinuationHook,
     HookDetectorNotConfigured,
     find_continuation_hook,
+    qualify_candidates,
 )
 from .candidates import Candidate, Rejection, collect_candidates
 from .compose import (
@@ -99,6 +100,7 @@ __all__ = [
     "ContinuationHook",
     "HookDetectorNotConfigured",
     "find_continuation_hook",
+    "qualify_candidates",
     "Candidate",
     "rehearsal_allowlist",
     "strip_speaker_prefix",

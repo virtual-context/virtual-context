@@ -24,6 +24,7 @@ scale.
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -101,3 +102,62 @@ def find_continuation_hook(
     if evidence.lower() not in body.lower():
         return None, "evidence_not_verbatim"
     return ContinuationHook(kind, evidence), ""
+
+
+def qualify_candidates(
+    verified: list,
+    *,
+    now,
+    detector: Callable[..., Any] | None,
+    later_texts_for=None,
+    subject_terms_for=None,
+) -> tuple[list, list]:
+    """Label every verified candidate with the type it can actually carry.
+
+    One pool, not two tiers. A timed follow-up and a continuation compete on
+    the same ranking because the specification orders selection by verified
+    personal relevance; only the generated channel question sits beneath
+    them. Splitting them into separate pools would have made the older,
+    larger set a fallback by construction.
+
+    Both types get the same later-context treatment, because a thread the
+    member has already carried forward is equally stale whether it is three
+    days old or three months. Returns ``(qualified, rejections)``.
+    """
+    from .candidates import Rejection
+    from .timing import assess_thread, timed_followup_eligibility
+
+    qualified: list = []
+    rejections: list[Rejection] = []
+    for candidate in verified or []:
+        turn_id = getattr(candidate, "canonical_turn_id", "")
+        timed_ok, _why = timed_followup_eligibility(candidate, now=now)
+        question_type = "timed"
+        hook_kind = ""
+        if not timed_ok:
+            # Outside the clock window it can still qualify on evidence, and
+            # that is the only thing separating the two types.
+            hook, reason = find_continuation_hook(
+                quote=getattr(candidate, "text", ""), detector=detector,
+            )
+            if hook is None:
+                rejections.append(Rejection(turn_id, "continuation", reason))
+                continue
+            question_type, hook_kind = "personal", hook.kind
+
+        later = (later_texts_for or (lambda c: []))(candidate)
+        terms = (subject_terms_for or (lambda c: []))(candidate)
+        state = assess_thread(
+            candidate, later_texts=later, now=now, subject_terms=terms,
+        )
+        if state.blocks_candidate:
+            rejections.append(
+                Rejection(turn_id, "resolution", state.reason or "blocked"),
+            )
+            continue
+        qualified.append(
+            dataclasses.replace(
+                candidate, question_type=question_type, hook_kind=hook_kind,
+            )
+        )
+    return qualified, rejections

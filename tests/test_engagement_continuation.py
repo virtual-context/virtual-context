@@ -161,3 +161,77 @@ class TestLabelsAreTruthful:
         )
         assert outcome.kind != "personal"
         assert outcome.kind == "timed"
+
+
+class TestOnePoolNotTwoTiers:
+    def _detector(self, kind="dose_or_compound_change"):
+        return lambda **kw: {
+            "kind": kind, "evidence": "Adding ss31 (5mg) for 4 weeks.",
+        }
+
+    def test_both_types_land_in_one_pool(self):
+        from virtual_context.core.engagement import qualify_candidates
+
+        recent = _cand(canonical_turn_id="ct-recent",
+                       sent_at=NOW - timedelta(days=3))
+        old = _cand(canonical_turn_id="ct-old",
+                    sent_at=NOW - timedelta(days=90))
+        qualified, _ = qualify_candidates(
+            [recent, old], now=NOW, detector=self._detector(),
+        )
+        types = {c.canonical_turn_id: c.question_type for c in qualified}
+        assert types == {"ct-recent": "timed", "ct-old": "personal"}
+
+    def test_a_continuation_can_outrank_a_timed_followup(self):
+        """Not a fallback tier: they compete on the same ranking."""
+        from virtual_context.core.engagement import (
+            qualify_candidates, rank_candidates,
+        )
+
+        thin_timed = _cand(canonical_turn_id="ct-timed", text="ok",
+                           sent_at=NOW - timedelta(days=3))
+        rich_old = _cand(canonical_turn_id="ct-old",
+                         text="Adding ss31 (5mg) for 4 weeks. Labs pending.",
+                         sent_at=NOW - timedelta(days=90))
+        qualified, _ = qualify_candidates(
+            [thin_timed, rich_old], now=NOW, detector=self._detector(),
+        )
+        assert rank_candidates(qualified)[0].canonical_turn_id == "ct-old"
+
+    def test_a_continuation_without_a_hook_is_rejected_by_name(self):
+        from virtual_context.core.engagement import qualify_candidates
+
+        old = _cand(sent_at=NOW - timedelta(days=90))
+        qualified, rejections = qualify_candidates(
+            [old], now=NOW,
+            detector=lambda **kw: {"kind": "", "evidence": ""},
+        )
+        assert qualified == []
+        assert rejections[0].stage == "continuation"
+        assert rejections[0].reason == "no_specific_hook"
+
+    def test_the_resolution_check_applies_to_continuations_too(self):
+        """A thread he is talking about today is stale at any age."""
+        from virtual_context.core.engagement import qualify_candidates
+
+        old = _cand(sent_at=NOW - timedelta(days=90))
+        qualified, rejections = qualify_candidates(
+            [old], now=NOW, detector=self._detector(),
+            later_texts_for=lambda c: [("ss31 update", NOW - timedelta(hours=2))],
+            subject_terms_for=lambda c: ["ss31"],
+        )
+        assert qualified == []
+        assert rejections[0].stage == "resolution"
+        assert rejections[0].reason == "member_posted_today"
+
+    def test_the_resolution_check_applies_to_timed_too(self):
+        from virtual_context.core.engagement import qualify_candidates
+
+        recent = _cand(sent_at=NOW - timedelta(days=3))
+        qualified, rejections = qualify_candidates(
+            [recent], now=NOW, detector=self._detector(),
+            later_texts_for=lambda c: [("ss31 update", NOW - timedelta(hours=1))],
+            subject_terms_for=lambda c: ["ss31"],
+        )
+        assert qualified == []
+        assert rejections[0].stage == "resolution"
