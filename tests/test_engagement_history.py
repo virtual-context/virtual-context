@@ -26,6 +26,16 @@ from virtual_context.core.engagement import (
     topic_fingerprint,
 )
 
+# Assert against the SHIPPED thresholds, never a number retyped here. A test
+# carrying its own ruler stays green while the rule it claims to pin moves
+# out from under it.
+from virtual_context.core.engagement.history import (
+    CHANNEL_MAX_IN_WINDOW,
+    CHANNEL_WINDOW,
+    MEMBER_COOLDOWN,
+    SIMILARITY_DISTANCE,
+)
+
 NOW = datetime(2026, 8, 2, 12, 0, 0, tzinfo=timezone.utc)
 P3 = "1524917968440524990"
 RMS = "1530567788949798963"
@@ -55,19 +65,30 @@ class TestTopicFingerprint:
             topic_fingerprint("how did the four weeks go")
         )
 
-    def test_wording_changes_stay_close(self):
+    def test_a_reworded_question_is_similar_by_the_shipped_rule(self):
         from virtual_context.core.engagement import fingerprint_distance
 
         a = topic_fingerprint("have you started the SS-31 yet")
         b = topic_fingerprint("did you start the SS-31 yet")
-        assert fingerprint_distance(a, b) <= 16
+        distance = fingerprint_distance(a, b)
+        # The bound is the shipped threshold, so tightening it below this
+        # pair's distance fails here instead of silently letting a reworded
+        # repeat through.
+        assert distance <= SIMILARITY_DISTANCE, (
+            f"reworded question at distance {distance} is no longer caught "
+            f"by SIMILARITY_DISTANCE={SIMILARITY_DISTANCE}"
+        )
 
-    def test_different_topics_are_far_apart(self):
+    def test_a_different_topic_is_not_similar_by_the_shipped_rule(self):
         from virtual_context.core.engagement import fingerprint_distance
 
         a = topic_fingerprint("have you started the SS-31 yet")
         b = topic_fingerprint("which marker changed your entire protocol")
-        assert fingerprint_distance(a, b) > 16
+        distance = fingerprint_distance(a, b)
+        assert distance > SIMILARITY_DISTANCE, (
+            f"unrelated topics at distance {distance} would be suppressed as "
+            f"duplicates by SIMILARITY_DISTANCE={SIMILARITY_DISTANCE}"
+        )
 
     def test_it_keeps_no_recoverable_text(self):
         """A fingerprint answers similarity without storing what was said."""
@@ -132,7 +153,7 @@ class TestRepetitionChecks:
 
     def test_the_same_member_is_available_again_after_the_cooldown(self):
         history = self._history(
-            _record(posted_at=NOW - timedelta(days=30),
+            _record(posted_at=NOW - MEMBER_COOLDOWN - timedelta(days=1),
                     source_message_ids=("other",)),
         )
         rejection = check_repetition(
@@ -155,12 +176,14 @@ class TestRepetitionChecks:
         assert rejection.reason == "question_recently_asked"
 
     def test_an_over_used_channel_is_rejected(self):
+        # Exactly the shipped limit, derived rather than retyped.
         history = self._history(*[
-            _record(posted_at=NOW - timedelta(days=d), channel_id=P3,
+            _record(posted_at=NOW - timedelta(hours=6 * (d + 1)),
+                    channel_id=P3,
                     tagged_actor_id=f"actor:discord:{d}",
                     source_message_ids=(f"m{d}",),
-                    topic_fingerprint=topic_fingerprint(f"topic number {d}"))
-            for d in (1, 2, 3)
+                    topic_fingerprint=topic_fingerprint(f"unrelated topic {d}"))
+            for d in range(CHANNEL_MAX_IN_WINDOW)
         ])
         rejection = check_repetition(
             history=history, now=NOW, actor_id=BIGTEX, channel_id=P3,
@@ -214,3 +237,24 @@ class TestSchemaIsDesignedNotMigrated:
         ddl = ENGAGEMENT_HISTORY_DDL.lower()
         for forbidden in ("member_text", "quote", "handle", "display_name"):
             assert forbidden not in ddl
+
+
+class TestThresholdsHaveMargin:
+    """A rule that only just holds is one wording change from not holding."""
+
+    def test_the_reworded_pair_sits_at_the_shipped_boundary(self):
+        from virtual_context.core.engagement import fingerprint_distance
+
+        distance = fingerprint_distance(
+            topic_fingerprint("have you started the SS-31 yet"),
+            topic_fingerprint("did you start the SS-31 yet"),
+        )
+        # Recorded, not asserted as good: the only worked example we have
+        # sits exactly ON the threshold, so the near-duplicate rule has zero
+        # margin here. Documented so a future tuning pass starts from a
+        # measurement rather than from the constant's round number.
+        assert distance == SIMILARITY_DISTANCE
+
+    def test_the_channel_window_and_limit_are_consistent(self):
+        assert CHANNEL_MAX_IN_WINDOW >= 1
+        assert CHANNEL_WINDOW.days >= 1
