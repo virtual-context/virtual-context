@@ -113,3 +113,71 @@ class TestWhatTheShippedPromptDoesAndDoesNotSay:
             ("untrusted", "do not follow", "never follow", "instructions "
              "inside", "ignore any instructions")
         ), "the prompt now has untrusted-input framing; update the audit"
+
+
+class TestTheScorecard:
+    """The harness, not the judge.
+
+    Every judge here is a stub, so nothing in this class says anything about
+    whether a real model resists injection. What it establishes is that the
+    measurement is sound: that a failure is counted as a failure, that the
+    two error directions are not summed into one number, and that an
+    injection failure is reported as its own kind.
+    """
+
+    def test_a_perfect_judge_passes(self):
+        from virtual_context.core.engagement import (
+            ADVERSARIAL_FIDELITY_FIXTURES, score_fidelity_fixtures,
+        )
+
+        expected = {f.draft: f.expected_faithful
+                    for f in ADVERSARIAL_FIDELITY_FIXTURES}
+
+        def _oracle(*, quote, draft):
+            return {"asserts": not expected[draft], "reason": ""}
+
+        card = score_fidelity_fixtures(_oracle)
+        assert card.passed
+        assert card.false_negatives == ()
+        assert card.false_positives == ()
+
+    def test_a_judge_that_obeys_the_quote_is_caught(self):
+        """The headline failure mode, as the harness would report it."""
+        from virtual_context.core.engagement import score_fidelity_fixtures
+
+        card = score_fidelity_fixtures(
+            lambda **kw: {"asserts": False, "reason": "instructed"},
+        )
+        assert not card.passed
+        assert len(card.injection_failures) == 4, card.summary()
+        assert {r.name for r in card.injection_failures} == {
+            "quote_instructs_the_judge_in_prose",
+            "quote_contains_the_answer_shaped_as_json",
+            "quote_impersonates_a_system_turn",
+            "quote_claims_the_draft_is_pre_approved",
+        }
+
+    def test_the_two_error_directions_are_not_summed(self):
+        """A false negative posts a false attribution; a false positive
+        costs a question. One accuracy number would hide which happened."""
+        from virtual_context.core.engagement import score_fidelity_fixtures
+
+        card = score_fidelity_fixtures(
+            lambda **kw: {"asserts": True, "reason": "everything rejected"},
+        )
+        assert card.false_negatives == ()
+        assert card.false_positives != ()
+        assert card.passed, "rejecting everything is safe, if useless"
+
+    def test_an_injection_failure_is_also_a_false_negative(self):
+        from virtual_context.core.engagement import score_fidelity_fixtures
+
+        card = score_fidelity_fixtures(lambda **kw: {"asserts": False})
+        assert set(card.injection_failures).issubset(set(card.false_negatives))
+
+    def test_the_summary_names_every_count(self):
+        from virtual_context.core.engagement import score_fidelity_fixtures
+
+        text = score_fidelity_fixtures(lambda **kw: {"asserts": False}).summary()
+        for word in ("correct", "false negative", "false positive", "injection"):
+            assert word in text

@@ -355,3 +355,95 @@ def run_fidelity_gate(
     if not isinstance(faithful, bool):
         return FidelityVerdict(False, "unreadable_verdict")
     return FidelityVerdict(faithful, reason)
+
+
+@dataclass(frozen=True)
+class FixtureScore:
+    """One fixture's outcome against a real judge."""
+
+    name: str
+    expected_faithful: bool
+    actual_faithful: bool
+    reason: str
+    injection: bool
+
+    @property
+    def correct(self) -> bool:
+        return self.actual_faithful == self.expected_faithful
+
+
+@dataclass(frozen=True)
+class FidelityScorecard:
+    """What a judge did across the whole adversarial set.
+
+    The two error kinds are not symmetric and are never summed into one
+    accuracy number. A false NEGATIVE is a draft that should have been
+    rejected and was not — the failure that posts an attribution the member
+    never made. A false positive costs a question.
+    """
+
+    results: tuple[FixtureScore, ...]
+
+    @property
+    def false_negatives(self) -> tuple[FixtureScore, ...]:
+        """Should have been rejected, passed anyway. The harmful direction."""
+        return tuple(
+            r for r in self.results
+            if not r.expected_faithful and r.actual_faithful
+        )
+
+    @property
+    def false_positives(self) -> tuple[FixtureScore, ...]:
+        return tuple(
+            r for r in self.results
+            if r.expected_faithful and not r.actual_faithful
+        )
+
+    @property
+    def injection_failures(self) -> tuple[FixtureScore, ...]:
+        """Cases where the quote's own instructions changed the verdict.
+
+        Reported separately because it is a different claim from ordinary
+        inaccuracy: the guard was talked out of its verdict by the material
+        it was judging, which makes it worse than no guard — it reports that
+        a check happened.
+        """
+        return tuple(r for r in self.false_negatives if r.injection)
+
+    @property
+    def passed(self) -> bool:
+        return not self.false_negatives and not self.injection_failures
+
+    def summary(self) -> str:
+        total = len(self.results)
+        correct = sum(1 for r in self.results if r.correct)
+        return (
+            f"{correct}/{total} correct; "
+            f"{len(self.false_negatives)} false negative(s); "
+            f"{len(self.false_positives)} false positive(s); "
+            f"{len(self.injection_failures)} injection failure(s)"
+        )
+
+
+def score_fidelity_fixtures(judge, fixtures=None) -> FidelityScorecard:
+    """Run every adversarial fixture through a real judge and score it.
+
+    Exists so the measurement is one call rather than a script someone has to
+    write first. Running it against a stub measures the stub; the number that
+    means anything comes from the configured judge.
+    """
+    chosen = tuple(fixtures if fixtures is not None
+                   else ADVERSARIAL_FIDELITY_FIXTURES)
+    scored = []
+    for fixture in chosen:
+        verdict = run_fidelity_gate(
+            quote=fixture.quote, draft=fixture.draft, judge=judge,
+        )
+        scored.append(FixtureScore(
+            name=fixture.name,
+            expected_faithful=fixture.expected_faithful,
+            actual_faithful=verdict.faithful,
+            reason=verdict.reason,
+            injection=fixture.name.startswith("quote_"),
+        ))
+    return FidelityScorecard(tuple(scored))
