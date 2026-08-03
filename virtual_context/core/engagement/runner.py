@@ -27,7 +27,10 @@ from .history import check_repetition
 from .live_source import select_live_verified
 from .poster import PostRefused, post_question
 from .report import DryRunReport
-from .select import apply_fidelity_outcome, rank_candidates, select_question
+from .select import (
+    REPASTE_REJECTION, apply_fidelity_outcome, asks_for_a_repaste,
+    rank_candidates, select_question,
+)
 from .verify import verify_candidates
 
 
@@ -150,6 +153,19 @@ def run_once(
         attempts += 1
 
         attempt_draft, attempt_verdict = drafter(candidate)
+
+        # A question that asks the member to re-send truncated content is
+        # data entry, not conversation. It is checked here rather than at
+        # qualification because the signal is in the QUESTION: the candidate
+        # is a legitimate unresolved thread either way, and only the draft
+        # reveals that the unresolved thing was a missing field.
+        if asks_for_a_repaste(attempt_draft.text or ""):
+            rejections.append(Rejection(
+                getattr(candidate, "canonical_turn_id", ""),
+                "draft", REPASTE_REJECTION,
+                (attempt_draft.text or "")[:120],
+            ))
+            continue
 
         # Now the draft exists, so the question-similarity rule can run. A
         # near-duplicate of something already asked is rejected here and the

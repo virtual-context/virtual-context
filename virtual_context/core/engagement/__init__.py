@@ -89,6 +89,8 @@ from .fidelity import (
 )
 from .report import DryRunReport
 from .select import (
+    REPASTE_REJECTION,
+    asks_for_a_repaste,
     REASON_BROADER_POOL_EMPTY,
     REASON_BROADER_POOL_NOT_CONFIGURED,
     REASON_BROADER_QUESTIONS_RECENT,
@@ -182,6 +184,8 @@ __all__ = [
     "assess_thread",
     "collect_candidates",
     "load_channel_allowlist",
+    "REPASTE_REJECTION",
+    "asks_for_a_repaste",
     "rank_candidates",
     "run_fidelity_gate",
     "select_question",

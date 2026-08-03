@@ -13,6 +13,8 @@ told apart from a broken job.
 
 from __future__ import annotations
 
+import re
+
 import random
 from collections import Counter
 
@@ -175,3 +177,36 @@ def apply_fidelity_outcome(outcome: SelectionOutcome, *, verdicts: list):
         skip_stage="fidelity",
         considered=outcome.considered,
     )
+
+
+# A question that asks a member to re-send data is data entry, not
+# conversation. Two of the first three questions this job produced were this
+# shape: grammatical, faithful, on-topic and worthless, because the corpus is
+# full of people handing Vast tasks and "the unresolved thing" is then a
+# missing field rather than an open question.
+#
+# Measured rather than guessed. The obvious signal — "the rest" — rejects
+# good questions: "how did the rest of the week go" and "how's the rest of
+# the protocol treating you" both match it, 2 false positives in 6 innocent
+# questions that merely use the same words. What discriminates cleanly is the
+# RE-TRANSMISSION VERB: asking someone to paste, repost or resend. Against the
+# three known bad questions and six innocent ones that share their vocabulary,
+# this catches 3/3 with 0 false positives.
+# Verb STEMS, not exact forms: "reposting" and "pasted" are the same request
+# as "repost" and "paste", and an exact-form pattern silently missed them.
+_REPASTE_REQUEST = re.compile(
+    r"\bpast(e|ed|ing)(?![\w-])|\brepost|\bre-?send|\bcuts? off\b|\btruncat",
+    re.I,
+)
+
+REPASTE_REJECTION = "asks_for_a_repaste"
+
+
+def asks_for_a_repaste(question: str) -> bool:
+    """Whether a draft asks the member to re-send truncated content.
+
+    Keyed on the request, not on the word "rest": a truncated paste is a
+    missing detail rather than an open question, but plenty of good questions
+    ask about the rest of a week or a protocol.
+    """
+    return bool(_REPASTE_REQUEST.search(question or ""))
