@@ -95,7 +95,15 @@ class PostRecord:
     # happened; "posted" means the message id came back. A day is taken in
     # either state, because the only irreversible mistake here is sending
     # twice.
+    # "staged"    review post is up, awaiting the owner
+    # "approved"  approval seen, publish claimed, send in flight
+    # "posted"    published, discord_message_id is the real reply
+    # "declined"  rejected; the day was released in the same statement
+    # "pending"   the pre-staging claim shape: sent, or possibly sent
     status: str = "posted"
+    # The review post in the staging channel, distinct from the published
+    # reply. Both exist for a staged row that was approved.
+    staged_message_id: str = ""
     # The row's own handle, so a record read back can be addressed.
     #
     # Without it the operator surface was unusable: pending_claims() reported
@@ -121,8 +129,15 @@ class InMemoryPostHistory:
     def __init__(self) -> None:
         self._records: dict[str, PostRecord] = {}
         self._order: list[str] = []
+        # Days freed by a decline. The durable backend does this by nulling
+        # eastern_day; in memory the record keeps its timestamp, so the
+        # released day is tracked alongside it to keep the two agreeing.
+        self._declined_days: set = set()
 
     def record(self, entry: PostRecord) -> str:
+        if entry.posted_at is not None:
+            # A new claim on a previously declined day retakes it.
+            self._declined_days.discard(_eastern_day(entry.posted_at))
         if entry.posted_at is not None and self.day_is_claimed(
             _eastern_day(entry.posted_at),
         ):
@@ -155,14 +170,47 @@ class InMemoryPostHistory:
 
     def day_is_claimed(self, day: date) -> bool:
         """Whether any record — pending or posted — holds this civil day."""
+        if day in self._declined_days:
+            return False
         return any(
             _eastern_day(r.posted_at) == day
             for r in self.all()
-            if r.posted_at is not None
+            if r.posted_at is not None and r.status != "declined"
         )
 
     def pending(self) -> list[PostRecord]:
         return [r for r in self.all() if r.status == "pending"]
+
+    def claim_for_publish(self, handle: str) -> bool:
+        """Same compare-and-set contract as the durable backend."""
+        import dataclasses
+
+        record = self._records.get(handle)
+        if record is None:
+            raise KeyError(f"no post history record for handle {handle!r}")
+        if record.status != "staged":
+            return False
+        self._records[handle] = dataclasses.replace(record, status="approved")
+        return True
+
+    def decline(self, handle: str) -> bool:
+        """Decline and release the day together. See the durable backend."""
+        import dataclasses
+
+        record = self._records.get(handle)
+        if record is None:
+            raise KeyError(f"no post history record for handle {handle!r}")
+        if record.status == "declined":
+            return False
+        if record.status != "staged":
+            raise ValueError(
+                f"cannot decline a row with status {record.status!r}; only a "
+                "staged row can be declined, and a published message cannot "
+                "be unpublished by releasing its day"
+            )
+        self._records[handle] = dataclasses.replace(record, status="declined")
+        self._declined_days.add(_eastern_day(record.posted_at))
+        return True
 
 
 def topic_fingerprint(text: str) -> int:
@@ -301,6 +349,12 @@ CREATE TABLE IF NOT EXISTS engagement_post_history (
 ALTER TABLE engagement_post_history
     ADD COLUMN IF NOT EXISTS eastern_day DATE;
 
+-- Staging has two message ids: the review post in the staging channel and
+-- the published reply in the source channel. One column cannot hold both,
+-- and conflating them loses the ability to say which message a row refers to.
+ALTER TABLE engagement_post_history
+    ADD COLUMN IF NOT EXISTS staged_message_id TEXT NOT NULL DEFAULT '';
+
 UPDATE engagement_post_history
    SET eastern_day = (posted_at::timestamptz AT TIME ZONE 'America/New_York')::date
  WHERE eastern_day IS NULL;
@@ -428,8 +482,9 @@ class PostgresPostHistory:
                        id, tenant_id, conversation_id, posted_at, channel_id,
                        question_type, tagged_actor_id, source_message_ids,
                        topic_fingerprint, question_text, discord_message_id,
-                       resolution, status, eastern_day
-                   ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                       resolution, status, eastern_day, staged_message_id
+                   ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                             %s, %s, %s)""",
                 (
                     handle, self._tenant_id, self._conversation_id,
                     entry.posted_at.isoformat(), entry.channel_id,
@@ -437,7 +492,7 @@ class PostgresPostHistory:
                     _join_ids(entry.source_message_ids),
                     int(entry.topic_fingerprint or 0), entry.question_text,
                     entry.discord_message_id, entry.resolution, entry.status,
-                    _eastern_day(entry.posted_at),
+                    _eastern_day(entry.posted_at), entry.staged_message_id,
                 ),
             )
 
@@ -447,6 +502,7 @@ class PostgresPostHistory:
             raise ValueError("update called with no changes")
         columns = {
             "discord_message_id", "status", "resolution", "question_text",
+            "staged_message_id",
         }
         unknown = set(changes) - columns
         if unknown:
@@ -490,6 +546,56 @@ class PostgresPostHistory:
     def pending(self) -> list[PostRecord]:
         return self._select("AND status = 'pending'")
 
+    def claim_for_publish(self, handle: str) -> bool:
+        """Move one staged row to approved. True only for the caller that won.
+
+        A compare-and-set on status, so two pollers seeing the same approval
+        cannot both publish: the UPDATE matches only while the row is still
+        staged, and exactly one caller gets a row. Checking then writing would
+        let both read "staged" before either wrote.
+        """
+        with self._connect() as conn:
+            cur = conn.execute(
+                """UPDATE engagement_post_history SET status = 'approved'
+                    WHERE id = %s AND tenant_id = %s AND status = 'staged'""",
+                (handle, self._tenant_id),
+            )
+            return cur.rowcount == 1
+
+    def decline(self, handle: str) -> bool:
+        """Decline a staged row and free its day, in one statement.
+
+        Atomic because the two orderings are not symmetric. Declining without
+        releasing costs a day and is recoverable tomorrow; releasing without
+        declining leaves the row readable as staged with the day free, so the
+        next run stages a SECOND question while the first still awaits
+        approval — two staged messages, either publishable. One statement
+        removes the choice rather than making it carefully.
+
+        Returns True if this call declined it, False if it was already
+        declined; a poller can see the same reply twice and must not treat
+        its own correct behaviour as an error. Anything other than a staged
+        or declined row raises, so a decline arriving after a publish is
+        visible rather than absorbed.
+        """
+        with self._connect() as conn:
+            cur = conn.execute(
+                """UPDATE engagement_post_history
+                      SET status = 'declined', eastern_day = NULL
+                    WHERE id = %s AND tenant_id = %s AND status = 'staged'""",
+                (handle, self._tenant_id),
+            )
+            if cur.rowcount == 1:
+                return True
+        current = self._one(handle)
+        if current.status == "declined":
+            return False
+        raise ValueError(
+            f"cannot decline a row with status {current.status!r}; only a "
+            "staged row can be declined, and a published message cannot be "
+            "unpublished by releasing its day"
+        )
+
     def since(self, moment: datetime) -> list[PostRecord]:
         return [r for r in self.all() if r.posted_at >= moment]
 
@@ -507,7 +613,7 @@ class PostgresPostHistory:
     _COLUMN_NAMES = (
         "id", "posted_at", "channel_id", "question_type", "tagged_actor_id",
         "source_message_ids", "topic_fingerprint", "question_text",
-        "discord_message_id", "resolution", "status",
+        "discord_message_id", "resolution", "status", "staged_message_id",
     )
     _COLUMNS = ", ".join(_COLUMN_NAMES)
 
@@ -570,4 +676,5 @@ def _row_to_record(row, columns) -> PostRecord:
         discord_message_id=field("discord_message_id"),
         resolution=field("resolution"),
         status=field("status"),
+        staged_message_id=str(field("staged_message_id") or ""),
     )

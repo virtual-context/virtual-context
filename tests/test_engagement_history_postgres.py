@@ -834,3 +834,106 @@ class TestARecordCanBeAddressed:
         """Neither backend may leave it empty on a row read back."""
         history.record(_record())
         assert history.all()[0].id != ""
+
+
+class TestApprovalIsExactlyOnce:
+    """Two pollers seeing one approval must not both publish.
+
+    Tested with two callers rather than one call twice, because the failure
+    needs both to read the row before either writes — the same shape as the
+    schema-executor defect, which one sequential call could never show.
+    """
+
+    def test_only_one_of_two_callers_wins(self, durable):
+        handle = durable.record(_record(status="staged"))
+        first = durable.claim_for_publish(handle)
+        second = durable.claim_for_publish(handle)
+        assert [first, second] == [True, False]
+        assert durable.all()[0].status == "approved"
+
+    def test_concurrent_callers_still_yield_one_winner(self, pg_store, durable):
+        """Real concurrency, separate connections, no sequencing."""
+        import threading
+
+        handle = durable.record(_record(status="staged"))
+        wins: list = []
+        barrier = threading.Barrier(4, timeout=10)
+
+        def attempt():
+            history = PostgresPostHistory(
+                pg_store, tenant_id=durable._tenant_id,
+                conversation_id="sk:agent:vast:discord",
+            )
+            barrier.wait()
+            wins.append(history.claim_for_publish(handle))
+
+        threads = [threading.Thread(target=attempt) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert wins.count(True) == 1, f"{wins.count(True)} callers would publish"
+
+    def test_an_approved_row_cannot_be_claimed_again(self, durable):
+        handle = durable.record(_record(status="staged"))
+        durable.claim_for_publish(handle)
+        assert durable.claim_for_publish(handle) is False
+
+
+class TestDecliningIsAtomicAndIdempotent:
+    """Declining frees the day in the same statement that declines.
+
+    The orderings are not symmetric. Declining without releasing costs a day.
+    Releasing without declining leaves the row reading `staged` with the day
+    free, so the next run stages a second question while the first still
+    awaits approval — two staged messages, either publishable.
+    """
+
+    def test_declining_frees_the_day(self, history):
+        now = datetime(2026, 8, 2, 16, 0, tzinfo=timezone.utc)
+        handle = history.record(_record(posted_at=now, status="staged"))
+        assert already_posted_today(history, now=now) is True
+        assert history.decline(handle) is True
+        assert already_posted_today(history, now=now) is False
+
+    def test_the_declined_row_is_kept_for_audit(self, history):
+        handle = history.record(_record(
+            status="staged", question_text="rejected question",
+        ))
+        history.decline(handle)
+        row = history.all()[0]
+        assert row.status == "declined"
+        assert row.question_text == "rejected question"
+        assert row.source_message_ids == ("1524917968440524991",)
+
+    def test_a_second_decline_is_a_no_op_not_an_error(self, history):
+        """A poller can see the same reply twice."""
+        handle = history.record(_record(status="staged"))
+        assert history.decline(handle) is True
+        assert history.decline(handle) is False
+
+    def test_a_published_row_cannot_be_declined(self, history):
+        """A late decline must not release the day or imply an unpublish."""
+        handle = history.record(_record(
+            status="posted", discord_message_id="1533835931390443521",
+        ))
+        with pytest.raises(ValueError, match="only a staged row"):
+            history.decline(handle)
+        assert history.all()[0].status == "posted"
+
+    def test_a_freed_day_can_be_claimed_again(self, history):
+        now = datetime(2026, 8, 2, 16, 0, tzinfo=timezone.utc)
+        first = history.record(_record(posted_at=now, status="staged"))
+        history.decline(first)
+        history.record(_record(posted_at=now, question_text="second attempt"))
+        assert already_posted_today(history, now=now) is True
+
+    def test_the_two_message_ids_are_separate_fields(self, history):
+        handle = history.record(_record(
+            status="staged", staged_message_id="1111111111111111111",
+        ))
+        history.update(handle, discord_message_id="2222222222222222222",
+                       status="posted")
+        row = history.all()[0]
+        assert row.staged_message_id == "1111111111111111111"
+        assert row.discord_message_id == "2222222222222222222"
