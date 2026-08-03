@@ -9,6 +9,9 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+import pytest
+
+import virtual_context.core.engagement.poster as poster_module
 from virtual_context.core.engagement import (
     Draft, FidelityVerdict, InMemoryPostHistory, MessageSourceRecord,
     rehearsal_allowlist, run_once,
@@ -70,6 +73,12 @@ def _run(**over):
     return run_once(**kw)
 
 
+@pytest.fixture
+def posting_permitted(monkeypatch):
+    """Permission is shipped config; the send path costs an explicit patch."""
+    monkeypatch.setattr(poster_module, "POSTING_ENABLED", True)
+
+
 class TestDryRunIsTheDefault:
     def test_a_run_sends_nothing_by_default(self):
         calls = {"n": 0}
@@ -88,32 +97,32 @@ class TestDryRunIsTheDefault:
         assert "Did you end up starting the SS-31?" in rendered
         assert "SOURCE RE-FETCHED LIVE" in rendered
 
-    def test_asking_to_post_without_enabling_refuses(self):
+    def test_asking_to_post_in_the_shipped_build_refuses(self):
         """Two separate switches: intent, and permission."""
         result = _run(post=True, message_sender=lambda **kw: "1")
         assert result.posted_message_id == ""
-        assert "not enabled" in result.refused
+        assert "disabled in this build" in result.refused
 
 
 class TestPostingWhenAskedAndEnabled:
-    def test_it_posts_to_the_rehearsal_channel_only(self):
+    def test_it_posts_to_the_rehearsal_channel_only(self, posting_permitted):
         seen = {}
 
         def _sender(*, channel_id, content):
             seen.update(channel_id=channel_id, content=content)
             return "9990001"
 
-        result = _run(post=True, enabled=True, message_sender=_sender)
+        result = _run(post=True, message_sender=_sender)
         assert result.posted_message_id == "9990001"
         assert seen["channel_id"] == VASTTEST
         assert seen["content"] == "Did you end up starting the SS-31?"
 
-    def test_the_post_is_recorded_and_blocks_a_second_that_day(self):
+    def test_the_post_is_recorded_and_blocks_a_second_that_day(self, posting_permitted):
         history = InMemoryPostHistory()
-        first = _run(post=True, enabled=True, history=history,
+        first = _run(post=True, history=history,
                      message_sender=lambda **kw: "1")
         assert first.posted_message_id == "1"
-        second = _run(post=True, enabled=True, history=history,
+        second = _run(post=True, history=history,
                       message_sender=lambda **kw: "2")
         assert second.posted_message_id == ""
         assert "already gone out" in second.refused
@@ -134,7 +143,7 @@ class TestNoVerifiedCandidate:
             calls["n"] += 1
             return "x"
 
-        _run(post=True, enabled=True, source_fetcher=lambda **kw: (404, None),
+        _run(post=True, source_fetcher=lambda **kw: (404, None),
              message_sender=_sender)
         assert calls["n"] == 0
 

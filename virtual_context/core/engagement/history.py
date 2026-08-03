@@ -30,8 +30,10 @@ from __future__ import annotations
 
 import hashlib
 import re
+import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from .candidates import Rejection
 
@@ -42,6 +44,15 @@ QUESTION_SIMILARITY_WINDOW = timedelta(days=60)
 CHANNEL_WINDOW = timedelta(days=7)
 CHANNEL_MAX_IN_WINDOW = 3
 SIMILARITY_DISTANCE = 12  # bits of a 64-bit simhash
+
+# The civil day the claim is keyed on. A restart, a manual re-run and a
+# duplicate wake-up must all resolve to the same day, so it is a calendar
+# date in one fixed zone rather than an elapsed interval.
+POSTING_ZONE = "America/New_York"
+
+
+def _eastern_day(moment: datetime) -> date:
+    return moment.astimezone(ZoneInfo(POSTING_ZONE)).date()
 
 _TOKEN = re.compile(r"[a-z0-9]+")
 _STOPWORDS = frozenset({
@@ -72,28 +83,55 @@ class PostRecord:
 
 
 class InMemoryPostHistory:
-    """Reference implementation. The durable backend is gated on approval."""
+    """Reference implementation, kept honest against the durable one.
+
+    ``record`` returns an opaque handle rather than nothing, and ``update``
+    takes that handle rather than a list position. The position-based form
+    read naturally here and could not be implemented durably at all: an
+    index into a Python list has no meaning in a table, and two processes
+    computing "the last row" both arrive at the same number and confirm each
+    other's claim. Since that claim is the primitive preventing a duplicate
+    post, the reference implementation must not make it look easier than it
+    is.
+    """
 
     def __init__(self) -> None:
-        self._records: list[PostRecord] = []
+        self._records: dict[str, PostRecord] = {}
+        self._order: list[str] = []
 
-    def record(self, entry: PostRecord) -> None:
-        self._records.append(entry)
+    def record(self, entry: PostRecord) -> str:
+        handle = uuid.uuid4().hex
+        self._records[handle] = entry
+        self._order.append(handle)
+        return handle
 
-    def update(self, index: int, **changes) -> PostRecord:
-        """Replace a record in place, for the claim-then-confirm sequence."""
+    def update(self, handle: str, **changes) -> PostRecord:
+        """Replace one record by handle, for the claim-then-confirm sequence."""
         import dataclasses
 
-        self._records[index] = dataclasses.replace(
-            self._records[index], **changes,
+        if handle not in self._records:
+            raise KeyError(f"no post history record for handle {handle!r}")
+        self._records[handle] = dataclasses.replace(
+            self._records[handle], **changes,
         )
-        return self._records[index]
+        return self._records[handle]
 
     def since(self, moment: datetime) -> list[PostRecord]:
-        return [r for r in self._records if r.posted_at >= moment]
+        return [r for r in self.all() if r.posted_at >= moment]
 
     def all(self) -> list[PostRecord]:
-        return list(self._records)
+        return [self._records[h] for h in self._order]
+
+    def day_is_claimed(self, day: date) -> bool:
+        """Whether any record — pending or posted — holds this civil day."""
+        return any(
+            _eastern_day(r.posted_at) == day
+            for r in self.all()
+            if r.posted_at is not None
+        )
+
+    def pending(self) -> list[PostRecord]:
+        return [r for r in self.all() if r.status == "pending"]
 
 
 def topic_fingerprint(text: str) -> int:
@@ -215,6 +253,13 @@ CREATE INDEX IF NOT EXISTS engagement_post_history_channel
 """
 
 
+# Fixed, so every applier takes the same lock. blake2b-8 of
+# "engagement_post_history schema", read as a signed bigint; the literal is
+# written out rather than computed so it is greppable and cannot drift with a
+# hashing change.
+ENGAGEMENT_SCHEMA_LOCK = 2278691887160911542
+
+
 def apply_engagement_history_schema(store) -> str:
     """Create the history table from the shipped DDL, idempotently.
 
@@ -231,6 +276,15 @@ def apply_engagement_history_schema(store) -> str:
     comment cuts the CREATE TABLE in half, and the executor would then send a
     truncated statement — worse than the hand-application it was meant to
     replace, because it would look automated while being broken.
+
+    An advisory lock wraps the whole script, because ``IF NOT EXISTS`` is
+    idempotent across *time* and not across *concurrency*: two sessions can
+    both find the table absent and both try to create it, and Postgres then
+    fails the loser inside its catalogue rather than treating it as the
+    no-op the clause implies. Measured at 8 failures in 12 concurrent
+    applies before the lock, 0 after. Every applier must go through here for
+    the lock to mean anything, which is the second reason this is a function
+    rather than a snippet to copy.
     """
     connect = getattr(getattr(store, "pool", None), "connection", None)
     if not callable(connect):
@@ -240,5 +294,184 @@ def apply_engagement_history_schema(store) -> str:
             "canonical_turns"
         )
     with connect() as conn:
-        conn.execute(ENGAGEMENT_HISTORY_DDL)
+        conn.execute("SELECT pg_advisory_lock(%s)", (ENGAGEMENT_SCHEMA_LOCK,))
+        try:
+            conn.execute(ENGAGEMENT_HISTORY_DDL)
+        finally:
+            conn.execute(
+                "SELECT pg_advisory_unlock(%s)", (ENGAGEMENT_SCHEMA_LOCK,),
+            )
     return ENGAGEMENT_HISTORY_DDL
+
+
+class PostgresPostHistory:
+    """The durable ledger. Same interface as the in-memory reference.
+
+    Scoped to one tenant and one conversation at construction, so no query
+    here can reach another tenant's rows even if a caller passes the wrong
+    conversation id — the scope is not a filter the caller supplies per call.
+
+    ``day_is_claimed`` is a real query rather than a scan of loaded rows,
+    because it is the one question asked on every run and the only one whose
+    answer decides whether an irreversible action happens. The Eastern day is
+    computed in SQL from the stored timestamp rather than in Python from a
+    loaded set, so a row written by another process counts immediately.
+
+    ``all`` does load the tenant's rows. That is deliberate and bounded: the
+    job posts at most once a day, so the table grows by roughly 365 rows a
+    year, and the thread-reuse rule in ``check_repetition`` is unbounded in
+    time — it must see every source message id ever used, or it will re-mine
+    a thread it used two years ago. A windowed query would be faster and
+    wrong.
+    """
+
+    def __init__(self, store, *, tenant_id: str, conversation_id: str) -> None:
+        connect = getattr(getattr(store, "pool", None), "connection", None)
+        if not callable(connect):
+            raise RuntimeError(
+                "this store exposes no connection pool; the durable post "
+                "history requires the Postgres tenant-scoped backend"
+            )
+        self._connect = connect
+        self._tenant_id = str(tenant_id)
+        self._conversation_id = str(conversation_id)
+
+    # -- writes ---------------------------------------------------------
+
+    def record(self, entry: PostRecord) -> str:
+        """Insert one record and return its handle.
+
+        The handle is the row's own primary key, so a confirmation later
+        addresses exactly the row this call created — not "the most recent
+        row", which is what a second process would also compute.
+        """
+        handle = uuid.uuid4().hex
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT INTO engagement_post_history (
+                       id, tenant_id, conversation_id, posted_at, channel_id,
+                       question_type, tagged_actor_id, source_message_ids,
+                       topic_fingerprint, question_text, discord_message_id,
+                       resolution, status
+                   ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                (
+                    handle, self._tenant_id, self._conversation_id,
+                    entry.posted_at.isoformat(), entry.channel_id,
+                    entry.question_type, entry.tagged_actor_id,
+                    _join_ids(entry.source_message_ids),
+                    int(entry.topic_fingerprint or 0), entry.question_text,
+                    entry.discord_message_id, entry.resolution, entry.status,
+                ),
+            )
+        return handle
+
+    def update(self, handle: str, **changes) -> PostRecord:
+        """Confirm or amend one row, addressed by handle."""
+        if not changes:
+            raise ValueError("update called with no changes")
+        columns = {
+            "discord_message_id", "status", "resolution", "question_text",
+        }
+        unknown = set(changes) - columns
+        if unknown:
+            raise ValueError(f"not updatable: {sorted(unknown)}")
+        assignments = ", ".join(f"{c} = %s" for c in changes)
+        params = list(changes.values()) + [handle, self._tenant_id]
+        with self._connect() as conn:
+            cur = conn.execute(
+                f"UPDATE engagement_post_history SET {assignments} "
+                "WHERE id = %s AND tenant_id = %s",
+                params,
+            )
+            if cur.rowcount != 1:
+                raise KeyError(
+                    f"no post history record for handle {handle!r} "
+                    f"(rows updated: {cur.rowcount})"
+                )
+        return self._one(handle)
+
+    # -- reads ----------------------------------------------------------
+
+    def day_is_claimed(self, day: date) -> bool:
+        """Whether any row — pending or posted — holds this civil day.
+
+        The comparison happens in Postgres so it sees committed rows from
+        every process, and the zone conversion happens there too so a row
+        written near UTC midnight lands on the same civil day this asks for.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                """SELECT EXISTS (
+                       SELECT 1 FROM engagement_post_history
+                        WHERE tenant_id = %s
+                          AND (posted_at::timestamptz AT TIME ZONE %s)::date = %s
+                   )""",
+                (self._tenant_id, POSTING_ZONE, day),
+            ).fetchone()
+        return bool(row[0])
+
+    def pending(self) -> list[PostRecord]:
+        return self._select("AND status = 'pending'")
+
+    def since(self, moment: datetime) -> list[PostRecord]:
+        return [r for r in self.all() if r.posted_at >= moment]
+
+    def all(self) -> list[PostRecord]:
+        return self._select("")
+
+    # -- internals ------------------------------------------------------
+
+    _COLUMNS = (
+        "id, posted_at, channel_id, question_type, tagged_actor_id, "
+        "source_message_ids, topic_fingerprint, question_text, "
+        "discord_message_id, resolution, status"
+    )
+
+    def _select(self, extra: str) -> list[PostRecord]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT {self._COLUMNS} FROM engagement_post_history "
+                f"WHERE tenant_id = %s {extra} ORDER BY posted_at, id",
+                (self._tenant_id,),
+            ).fetchall()
+        return [_row_to_record(r) for r in rows]
+
+    def _one(self, handle: str) -> PostRecord:
+        with self._connect() as conn:
+            row = conn.execute(
+                f"SELECT {self._COLUMNS} FROM engagement_post_history "
+                "WHERE id = %s AND tenant_id = %s",
+                (handle, self._tenant_id),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"no post history record for handle {handle!r}")
+        return _row_to_record(row)
+
+
+def _join_ids(ids) -> str:
+    return ",".join(str(i) for i in (ids or ()) if str(i))
+
+
+def _split_ids(blob: str) -> tuple[str, ...]:
+    return tuple(p for p in (blob or "").split(",") if p)
+
+
+def _row_to_record(row) -> PostRecord:
+    (
+        _id, posted_at, channel_id, question_type, tagged_actor_id,
+        source_message_ids, topic_fingerprint, question_text,
+        discord_message_id, resolution, status,
+    ) = row
+    return PostRecord(
+        posted_at=datetime.fromisoformat(posted_at),
+        channel_id=channel_id,
+        question_type=question_type,
+        tagged_actor_id=tagged_actor_id,
+        source_message_ids=_split_ids(source_message_ids),
+        # NUMERIC comes back as Decimal; the fingerprint is compared bitwise.
+        topic_fingerprint=int(topic_fingerprint or 0),
+        question_text=question_text,
+        discord_message_id=discord_message_id,
+        resolution=resolution,
+        status=status,
+    )

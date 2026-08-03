@@ -9,6 +9,11 @@ without wondering what it can reach.
 Dry run is the default and posting is a separate, explicit argument. A caller
 that forgets the flag produces a report and sends nothing, which is the
 behaviour you want from the mistake that is easiest to make.
+
+``post`` is intent and belongs to the caller. Permission does not: whether
+this build may post at all is shipped configuration read by the poster, and
+there is deliberately no parameter here that reaches it. A caller can decline
+to post; it cannot grant itself the right to.
 """
 
 from __future__ import annotations
@@ -19,7 +24,7 @@ from typing import Any, Callable
 
 from .candidates import Rejection, collect_candidates
 from .live_source import select_live_verified
-from .poster import POSTING_ENABLED_BY_DEFAULT, PostRefused, post_question
+from .poster import PostRefused, post_question
 from .report import DryRunReport
 from .select import apply_fidelity_outcome, rank_candidates, select_question
 from .verify import verify_candidates
@@ -47,7 +52,6 @@ def run_once(
     source_fetcher: Callable[..., Any],
     message_sender: Callable[..., Any] | None = None,
     post: bool = False,
-    enabled: bool = POSTING_ENABLED_BY_DEFAULT,
 ) -> RunResult:
     """Select, verify, draft, and optionally send one question.
 
@@ -114,7 +118,7 @@ def run_once(
             channel_id=_post_target(allowlist),
             verification=_verification_for(chosen, live_rejections),
             history=history, sender=message_sender, now=now,
-            question_type=outcome.kind, enabled=enabled,
+            question_type=outcome.kind,
         )
     except PostRefused as exc:
         return RunResult(report=report, refused=str(exc),

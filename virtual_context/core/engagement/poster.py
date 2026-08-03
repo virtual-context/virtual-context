@@ -26,9 +26,19 @@ from zoneinfo import ZoneInfo
 from .allowlist import POST_CHANNEL_IDS
 from .history import PostRecord, topic_fingerprint
 
-# Ships dark. Posting is the one action here that cannot be undone, so it is
-# never the fallback behaviour: a caller must ask for it in so many words.
-POSTING_ENABLED_BY_DEFAULT = False
+# Ships dark, and deliberately NOT as a parameter.
+#
+# Permission and intent are different things. A caller says whether it wants
+# to post today (``post=`` on the runner); it does not get to say whether
+# posting is allowed at all. As a parameter with a safe default, the only
+# property a test could establish was that today's caller chooses not to pass
+# ``enabled=True`` — a convention that holds until someone writes a second
+# caller. Read from the module instead, enabling posting is a committed,
+# reviewable edit to this line, and no caller can reach it.
+#
+# This is the same shape as POST_CHANNEL_IDS below, which is imported rather
+# than injected and is why a caller cannot post to a community channel.
+POSTING_ENABLED = False
 
 POSTING_ZONE = "America/New_York"
 
@@ -52,6 +62,9 @@ def pending_claims(history) -> list:
     mistake happens. It stays claimed and is surfaced here for a person to
     resolve.
     """
+    query = getattr(history, "pending", None)
+    if callable(query):
+        return list(query())
     return [r for r in history.all() if getattr(r, "status", "") == "pending"]
 
 
@@ -67,6 +80,12 @@ def already_posted_today(history, *, now: datetime) -> bool:
     cannot produce a second post.
     """
     today = now.astimezone(ZoneInfo(POSTING_ZONE)).date()
+    # A durable backend answers this in the database, so a row committed by
+    # another process counts immediately and no growing table is loaded to
+    # answer a yes/no question. The scan is the reference path only.
+    claimed = getattr(history, "day_is_claimed", None)
+    if callable(claimed):
+        return bool(claimed(today))
     for record in history.all():
         posted = getattr(record, "posted_at", None)
         if posted is None:
@@ -86,13 +105,12 @@ def post_question(
     sender: Callable[..., Any],
     now: datetime,
     question_type: str,
-    enabled: bool = POSTING_ENABLED_BY_DEFAULT,
 ) -> PostResult:
     """Send one question, or refuse and say which precondition failed."""
-    if not enabled:
+    if not POSTING_ENABLED:
         raise PostRefused(
-            "posting is not enabled; it must be requested explicitly and is "
-            "never the fallback behaviour"
+            "posting is disabled in this build; it is shipped configuration "
+            "and cannot be enabled by a caller"
         )
     if channel_id not in POST_CHANNEL_IDS:
         raise PostRefused(
@@ -119,13 +137,17 @@ def post_question(
     if not body:
         raise PostRefused("refusing to send an empty question")
 
-    # Claim the day BEFORE sending. A Discord send and a Postgres write
+    # Claim the day BEFORE sending, and address the confirmation by the
+    # handle this claim returned. "The last row" is not an address: a second
+    # process computes the same one and confirms a claim it did not make.
+    #
+    # A Discord send and a Postgres write
     # cannot be made atomic, so the ordering decides which way a failure
     # between them breaks. Claiming first means a crash costs a post; sending
     # first means it costs the record, and the next run then sees an unclaimed
     # day and posts again. Skipping a day is recoverable; posting twice into a
     # community channel is not.
-    history.record(PostRecord(
+    handle = history.record(PostRecord(
         posted_at=now,
         channel_id=channel_id,
         question_type=question_type,
@@ -136,7 +158,6 @@ def post_question(
         discord_message_id="",
         status="pending",
     ))
-    claim_index = len(history.all()) - 1
 
     message_id = str(sender(channel_id=channel_id, content=body) or "")
     if not message_id:
@@ -144,6 +165,6 @@ def post_question(
         # stays taken precisely because we cannot tell.
         raise PostRefused("the send returned no message id; treating as failed")
 
-    history.update(claim_index, discord_message_id=message_id, status="posted")
+    history.update(handle, discord_message_id=message_id, status="posted")
     day = now.astimezone(ZoneInfo(POSTING_ZONE)).date().isoformat()
     return PostResult(message_id=message_id, channel_id=channel_id, day=day)

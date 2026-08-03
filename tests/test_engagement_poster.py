@@ -13,9 +13,12 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+import virtual_context.core.engagement.poster as poster_module
+from virtual_context.core.engagement import run_once
+
 from virtual_context.core.engagement import (
     POST_CHANNEL_IDS,
-    POSTING_ENABLED_BY_DEFAULT,
+    POSTING_ENABLED,
     SOURCE_CHANNEL_IDS,
     Candidate,
     InMemoryPostHistory,
@@ -53,36 +56,67 @@ def _post(**over):
         candidate=_cand(), question="Did you start the SS-31?",
         channel_id=VASTTEST, verification=_verified(),
         history=InMemoryPostHistory(), sender=_send, now=NOW,
-        question_type="timed", enabled=True,
+        question_type="timed",
     )
     kw.update(over)
     return post_question(**kw)
 
 
-class TestPostingShipsDisabled:
-    def test_the_shipped_default_is_off(self):
-        assert POSTING_ENABLED_BY_DEFAULT is False
+@pytest.fixture
+def posting_permitted(monkeypatch):
+    """Grant permission the only way it can be granted: patch the module.
 
-    def test_posting_without_asking_refuses(self):
-        with pytest.raises(PostRefused, match="not enabled"):
-            _post(enabled=POSTING_ENABLED_BY_DEFAULT)
+    Permission is shipped configuration, not a parameter, so exercising the
+    send path costs an explicit patch of a named constant. That is the price
+    of the guarantee — a caller has no argument that reaches this, so the
+    only way in is one that is obvious in a diff and absent from every
+    production caller.
+    """
+    monkeypatch.setattr(poster_module, "POSTING_ENABLED", True)
+
+
+class TestPostingShipsDisabled:
+    def test_the_shipped_value_is_off(self):
+        assert POSTING_ENABLED is False
+
+    def test_posting_refuses_in_the_shipped_build(self):
+        with pytest.raises(PostRefused, match="disabled in this build"):
+            _post()
+
+    def test_no_argument_can_enable_posting(self):
+        """The boundary, asserted on the shipped signature.
+
+        A caller cannot pass permission because there is no parameter to
+        pass it through. This is what makes the guarantee testable as
+        impossibility rather than as the current caller's restraint.
+        """
+        import inspect
+
+        for func in (post_question, run_once):
+            params = set(inspect.signature(func).parameters)
+            assert "enabled" not in params, func.__name__
+            assert not params & {"posting_enabled", "allow_post", "force"}
+
+    def test_enabling_requires_editing_the_module(self, posting_permitted):
+        """The inverse: with the constant patched, the guard passes."""
+        assert _post().message_id == "9990001"
 
 
 class TestChannelRefusal:
-    def test_the_rehearsal_channel_is_the_only_destination(self):
+    def test_the_rehearsal_channel_is_the_only_destination(self, posting_permitted):
         assert POST_CHANNEL_IDS == (VASTTEST,)
 
     @pytest.mark.parametrize("community", SOURCE_CHANNEL_IDS)
-    def test_every_source_channel_is_refused_by_id(self, community):
+    def test_every_source_channel_is_refused_by_id(self, posting_permitted, community):
         """Refused, not merely checked — by id, against the shipped tuple."""
         with pytest.raises(PostRefused, match="not a permitted destination"):
             _post(channel_id=community)
 
-    def test_an_unknown_channel_is_refused(self):
+    def test_an_unknown_channel_is_refused(self, posting_permitted):
         with pytest.raises(PostRefused):
             _post(channel_id="999999999999999999")
 
-    def test_nothing_is_sent_when_the_channel_is_refused(self):
+    def test_nothing_is_sent_when_the_channel_is_refused(self, posting_permitted):
         calls = {"n": 0}
 
         def _counting(**kw):
@@ -95,39 +129,39 @@ class TestChannelRefusal:
 
 
 class TestVerificationGate:
-    def test_no_verification_refuses(self):
+    def test_no_verification_refuses(self, posting_permitted):
         with pytest.raises(PostRefused, match="not confirmed live"):
             _post(verification=None)
 
-    def test_a_failed_verification_refuses(self):
+    def test_a_failed_verification_refuses(self, posting_permitted):
         with pytest.raises(PostRefused, match="not confirmed live"):
             _post(verification=LiveVerification(False, "source_message_deleted"))
 
-    def test_a_verification_for_another_message_refuses(self):
+    def test_a_verification_for_another_message_refuses(self, posting_permitted):
         """A pass is not transferable between candidates or runs."""
         with pytest.raises(PostRefused, match="different message"):
             _post(verification=LiveVerification(True, "", "", "111111111111"))
 
-    def test_a_verification_with_no_message_id_refuses(self):
+    def test_a_verification_with_no_message_id_refuses(self, posting_permitted):
         """Guards against a stale verdict shape carrying an implicit pass."""
         with pytest.raises(PostRefused, match="different message"):
             _post(verification=LiveVerification(True))
 
 
 class TestIdempotentPerEasternDay:
-    def test_a_second_post_the_same_day_refuses(self):
+    def test_a_second_post_the_same_day_refuses(self, posting_permitted):
         history = InMemoryPostHistory()
         _post(history=history)
         with pytest.raises(PostRefused, match="already gone out"):
             _post(history=history)
 
-    def test_the_next_eastern_day_is_allowed(self):
+    def test_the_next_eastern_day_is_allowed(self, posting_permitted):
         history = InMemoryPostHistory()
         _post(history=history)
         result = _post(history=history, now=NOW + timedelta(days=1))
         assert result.day == "2026-08-04"
 
-    def test_the_key_is_the_civil_day_not_an_elapsed_interval(self):
+    def test_the_key_is_the_civil_day_not_an_elapsed_interval(self, posting_permitted):
         """23:30 and 00:30 Eastern are different days, 1 hour apart."""
         history = InMemoryPostHistory()
         late = datetime(2026, 8, 3, 23, 30, tzinfo=EASTERN)
@@ -135,7 +169,7 @@ class TestIdempotentPerEasternDay:
         result = _post(history=history, now=late + timedelta(hours=1))
         assert result.day == "2026-08-04"
 
-    def test_a_utc_timestamped_record_still_matches_its_eastern_day(self):
+    def test_a_utc_timestamped_record_still_matches_its_eastern_day(self, posting_permitted):
         history = InMemoryPostHistory()
         _post(history=history, now=NOW)
         # Same instant expressed in UTC must not read as a different day.
@@ -145,15 +179,15 @@ class TestIdempotentPerEasternDay:
 
 
 class TestTheSendItself:
-    def test_an_empty_question_is_refused(self):
+    def test_an_empty_question_is_refused(self, posting_permitted):
         with pytest.raises(PostRefused, match="empty question"):
             _post(question="   ")
 
-    def test_a_send_returning_no_id_is_treated_as_failed(self):
+    def test_a_send_returning_no_id_is_treated_as_failed(self, posting_permitted):
         with pytest.raises(PostRefused, match="no message id"):
             _post(sender=lambda **kw: "")
 
-    def test_a_successful_post_is_recorded_in_history(self):
+    def test_a_successful_post_is_recorded_in_history(self, posting_permitted):
         history = InMemoryPostHistory()
         result = _post(history=history)
         assert result.message_id == "9990001"
@@ -164,7 +198,7 @@ class TestTheSendItself:
         assert record.question_type == "timed"
         assert record.topic_fingerprint != 0
 
-    def test_the_history_record_carries_no_member_content(self):
+    def test_the_history_record_carries_no_member_content(self, posting_permitted):
         history = InMemoryPostHistory()
         _post(history=history)
         record = history.all()[0]
@@ -172,7 +206,7 @@ class TestTheSendItself:
 
 
 class TestTheModuleHoldsNoCredential:
-    def test_it_imports_no_http_client_and_opens_no_socket(self):
+    def test_it_imports_no_http_client_and_opens_no_socket(self, posting_permitted):
         import ast
         import inspect
 
@@ -192,7 +226,7 @@ class TestTheModuleHoldsNoCredential:
         for forbidden in ("httpx", "requests", "urllib", "socket", "http"):
             assert forbidden not in imported, forbidden
 
-    def test_no_credential_is_bound_or_embedded(self):
+    def test_no_credential_is_bound_or_embedded(self, posting_permitted):
         """Inspects the code, not the prose.
 
         A word sweep flagged the docstring sentence explaining that this
@@ -237,7 +271,7 @@ class TestTheDayIsClaimedBeforeTheSend:
     Skipping is recoverable; a duplicate in a community channel is not.
     """
 
-    def test_a_send_that_raises_leaves_the_day_claimed(self):
+    def test_a_send_that_raises_leaves_the_day_claimed(self, posting_permitted):
         from virtual_context.core.engagement import pending_claims
 
         history = InMemoryPostHistory()
@@ -253,7 +287,7 @@ class TestTheDayIsClaimedBeforeTheSend:
         assert history.all()[0].status == "pending"
         assert history.all()[0].discord_message_id == ""
 
-    def test_a_claimed_day_refuses_a_second_attempt(self):
+    def test_a_claimed_day_refuses_a_second_attempt(self, posting_permitted):
         """The whole point: a crash must not licence a retry."""
         history = InMemoryPostHistory()
 
@@ -265,7 +299,7 @@ class TestTheDayIsClaimedBeforeTheSend:
         with pytest.raises(PostRefused, match="already gone out"):
             _post(history=history)
 
-    def test_a_send_returning_no_id_still_holds_the_day(self):
+    def test_a_send_returning_no_id_still_holds_the_day(self, posting_permitted):
         """We cannot tell whether it landed, so the day stays spent."""
         from virtual_context.core.engagement import pending_claims
 
@@ -275,7 +309,7 @@ class TestTheDayIsClaimedBeforeTheSend:
         assert already_posted_today(history, now=NOW) is True
         assert len(pending_claims(history)) == 1
 
-    def test_a_successful_send_confirms_the_claim(self):
+    def test_a_successful_send_confirms_the_claim(self, posting_permitted):
         from virtual_context.core.engagement import pending_claims
 
         history = InMemoryPostHistory()
@@ -285,7 +319,7 @@ class TestTheDayIsClaimedBeforeTheSend:
         assert record.discord_message_id == "9990001"
         assert pending_claims(history) == []
 
-    def test_the_claim_exists_before_the_sender_is_called(self):
+    def test_the_claim_exists_before_the_sender_is_called(self, posting_permitted):
         """Proves the order directly rather than inferring it from outcomes."""
         history = InMemoryPostHistory()
         seen = {}
@@ -301,7 +335,7 @@ class TestTheDayIsClaimedBeforeTheSend:
         assert seen["claimed_at_send_time"] is True
         assert seen["status"] == "pending"
 
-    def test_a_pending_claim_is_never_auto_retried(self):
+    def test_a_pending_claim_is_never_auto_retried(self, posting_permitted):
         """Retrying an unconfirmed send is how a duplicate happens."""
         from virtual_context.core.engagement import pending_claims
 
@@ -328,7 +362,7 @@ class TestAFailedConfirmationStillHoldsTheDay:
         def update(self, index, **changes):
             raise OSError("connection reset while confirming")
 
-    def test_the_day_stays_claimed_when_the_confirmation_fails(self):
+    def test_the_day_stays_claimed_when_the_confirmation_fails(self, posting_permitted):
         from virtual_context.core.engagement import pending_claims
 
         history = self._FailsOnUpdate()
@@ -345,7 +379,7 @@ class TestAFailedConfirmationStillHoldsTheDay:
         assert already_posted_today(history, now=NOW) is True
         assert len(pending_claims(history)) == 1
 
-    def test_it_never_re_sends_after_a_failed_confirmation(self):
+    def test_it_never_re_sends_after_a_failed_confirmation(self, posting_permitted):
         history = self._FailsOnUpdate()
         sent = {"n": 0}
 
@@ -360,7 +394,7 @@ class TestAFailedConfirmationStillHoldsTheDay:
 
         assert sent["n"] == 1, "re-sent a question that had already gone out"
 
-    def test_the_unconfirmed_claim_has_no_message_id(self):
+    def test_the_unconfirmed_claim_has_no_message_id(self, posting_permitted):
         """So an operator can tell it apart from a completed post."""
         history = self._FailsOnUpdate()
         with pytest.raises(OSError):

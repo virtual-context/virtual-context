@@ -14,6 +14,7 @@ from .history import (
     ENGAGEMENT_HISTORY_DDL,
     apply_engagement_history_schema,
     InMemoryPostHistory,
+    PostgresPostHistory,
     PostRecord,
     check_repetition,
     fingerprint_distance,
@@ -56,7 +57,7 @@ from .live_source import (
     verify_source_live,
 )
 from .poster import (
-    POSTING_ENABLED_BY_DEFAULT,
+    POSTING_ENABLED,
     PostRefused,
     PostResult,
     already_posted_today,
@@ -106,6 +107,7 @@ __all__ = [
     "ENGAGEMENT_HISTORY_DDL",
     "apply_engagement_history_schema",
     "InMemoryPostHistory",
+    "PostgresPostHistory",
     "PostRecord",
     "check_repetition",
     "fingerprint_distance",
@@ -138,7 +140,7 @@ __all__ = [
     "LiveVerification",
     "select_live_verified",
     "verify_source_live",
-    "POSTING_ENABLED_BY_DEFAULT",
+    "POSTING_ENABLED",
     "PostRefused",
     "PostResult",
     "already_posted_today",
