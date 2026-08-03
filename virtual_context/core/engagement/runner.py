@@ -30,6 +30,13 @@ from .select import apply_fidelity_outcome, rank_candidates, select_question
 from .verify import verify_candidates
 
 
+# How many candidates a run will draft before giving the day up. Small on
+# purpose: each attempt costs a composer call, a judge call and a live source
+# request, and the failures worth surviving are single unlucky calls rather
+# than a systematically unusable pool.
+DRAFT_ATTEMPT_CAP = 3
+
+
 @dataclass
 class RunResult:
     report: DryRunReport
@@ -70,12 +77,56 @@ def run_once(
     rejections += list(qualify_rejections)
 
     ranked = rank_candidates(qualified)
-    # The source is re-checked here, immediately before a question is drafted
-    # from it, so the verdict a post relies on belongs to this run.
-    chosen, live_rejections = select_live_verified(
-        ranked, fetcher=source_fetcher,
-    )
-    rejections += list(live_rejections)
+
+    # A failed draft costs a candidate, not the day. One flaky model call
+    # against a pool of qualified candidates should not decide that there was
+    # nothing worth asking; the run advances to the next-ranked one.
+    #
+    # Bounded deliberately. Every attempt spends model calls and a live source
+    # request, so this walks a few candidates rather than the ranking: the
+    # difference worth having is between "one unlucky call" and "no good
+    # question today", and that is settled within a handful of attempts.
+    chosen = None
+    draft = verdict = outcome = None
+    remaining = list(ranked)
+    attempts = 0
+    while remaining and attempts < DRAFT_ATTEMPT_CAP:
+        # Live verification runs per attempt, inside the loop. A pass belongs
+        # to one message in one run and is not transferable between
+        # candidates, so falling through must re-verify rather than carry the
+        # previous candidate's verdict forward.
+        candidate, live_rejections = select_live_verified(
+            remaining, fetcher=source_fetcher,
+        )
+        rejections += list(live_rejections)
+        if candidate is None:
+            break
+        remaining = remaining[remaining.index(candidate) + 1:]
+        attempts += 1
+
+        attempt_draft, attempt_verdict = drafter(candidate)
+        attempt_outcome = apply_fidelity_outcome(
+            select_question(verified=[candidate], rejections=rejections,
+                            channel_id=candidate.channel_id),
+            verdicts=[attempt_verdict],
+        )
+        if attempt_outcome.kind != "skip" and (attempt_draft.text or "").strip():
+            chosen = candidate
+            draft, verdict, outcome = (
+                attempt_draft, attempt_verdict, attempt_outcome,
+            )
+            break
+        # A rejected attempt is a named, counted row. Without this, a run that
+        # tried three candidates and rejected all three reads identically to
+        # one where nothing qualified — and those need different responses.
+        rejections.append(Rejection(
+            getattr(candidate, "canonical_turn_id", ""),
+            "draft",
+            attempt_outcome.skip_stage or "draft_rejected",
+            attempt_draft.reason
+            or getattr(attempt_verdict, "reason", "")
+            or attempt_outcome.reason,
+        ))
 
     report = DryRunReport(
         generated_at=now, conversation_id=conversation_id,
@@ -92,15 +143,13 @@ def run_once(
             verified=[], rejections=rejections,
             channel_id=getattr(allowlist, "post_channel_ids", ("",)) and "",
         ))
-        return RunResult(report=report, refused="no_verified_candidate",
-                         rejections=rejections)
+        return RunResult(
+            report=report,
+            refused=("every_draft_rejected" if attempts
+                     else "no_verified_candidate"),
+            rejections=rejections,
+        )
 
-    draft, verdict = drafter(chosen)
-    outcome = apply_fidelity_outcome(
-        select_question(verified=[chosen], rejections=rejections,
-                        channel_id=chosen.channel_id),
-        verdicts=[verdict],
-    )
     report.apply_outcome(outcome)
     report.quote = chosen.text[:500]
     report.question = draft.text if outcome.kind != "skip" else ""

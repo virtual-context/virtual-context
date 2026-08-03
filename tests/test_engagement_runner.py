@@ -194,3 +194,156 @@ class TestEveryQuestionTypeRenders:
         rendered = _run(source_fetcher=lambda **kw: (404, None)).report.render()
         assert "PROPOSED QUESTION" not in rendered
         assert "SKIPPED" in rendered
+
+
+class TestAFailedDraftCostsACandidateNotTheDay:
+    """One flaky model call must not decide there was nothing worth asking.
+
+    Cloud measured both halves of this against production: one run lost the
+    day to a detector that returned no hook on its second call, another
+    composed from a hook that never passed qualification. The hook fix closed
+    the second; this closes the first.
+    """
+
+    def _three(self, n=3):
+        """n distinct candidates, each with its own turn and message id."""
+        import dataclasses
+
+        from virtual_context.core.discord_snowflake import (
+            datetime_to_snowflake_floor,
+        )
+
+        out = []
+        for i in range(n):
+            sent = NOW - timedelta(days=3 + i)
+            base = _result()
+            out.append(dataclasses.replace(
+                base, provenance=dataclasses.replace(
+                    base.provenance, canonical_turn_id=f"ct-{i}",
+                    source_message_id=str(
+                        datetime_to_snowflake_floor(sent) + 7 + i,
+                    ),
+                ),
+            ))
+        return out
+
+    def _sources_for(self, results):
+        """An attestation per candidate, matching what the rows claim.
+
+        Without this every candidate is correctly rejected as
+        no_attested_source and the drafter is never reached — which is the
+        verifier working, not the fall-through failing.
+        """
+        return {
+            r.provenance.canonical_turn_id: MessageSourceRecord(
+                canonical_turn_id=r.provenance.canonical_turn_id,
+                message_id=r.provenance.source_message_id,
+                channel_id=P3, guild_id="1524917037191925871",
+                author_id="1327457861143494767", source_actor_id=ACTOR,
+            )
+            for r in results
+        }
+
+    def _run_three(self, n=3, **over):
+        rows = self._three(n)
+        kw = dict(results=rows, sources=self._sources_for(rows),
+                  senders={r.provenance.canonical_turn_id: "BigTex"
+                           for r in rows})
+        kw.update(over)
+        return _run(**kw)
+
+    def test_it_advances_past_a_rejected_draft(self):
+        seen: list = []
+
+        def _drafter(candidate):
+            seen.append(candidate.canonical_turn_id)
+            if len(seen) == 1:
+                return Draft("", "evidence_not_in_quote"), FidelityVerdict(False)
+            return Draft("a good question?", ""), FidelityVerdict(True)
+
+        result = self._run_three(drafter=_drafter)
+        assert len(seen) == 2, "the run stopped at the first failure"
+        assert result.report.question == "a good question?"
+
+    def test_a_failed_attempt_is_a_counted_row_not_silence(self):
+        """'Tried 3, all rejected' must not read as 'nothing qualified'."""
+        def _drafter(candidate):
+            return Draft("", "evidence_not_in_quote"), FidelityVerdict(False)
+
+        result = self._run_three(drafter=_drafter)
+        draft_rejections = [r for r in result.rejections if r.stage == "draft"]
+        assert len(draft_rejections) >= 1
+        assert all(r.reason for r in draft_rejections), "unnamed rejection"
+        assert result.refused == "every_draft_rejected"
+
+    def test_exhausting_attempts_is_distinguishable_from_none_qualifying(self):
+        def _drafter(candidate):
+            return Draft("", "empty_draft"), FidelityVerdict(False)
+
+        tried = self._run_three(drafter=_drafter)
+        nothing = _run(results=[], drafter=_drafter)
+        assert tried.refused == "every_draft_rejected"
+        assert nothing.refused == "no_verified_candidate"
+
+    def test_the_walk_is_bounded(self):
+        from virtual_context.core.engagement.runner import DRAFT_ATTEMPT_CAP
+
+        calls: list = []
+
+        def _drafter(candidate):
+            calls.append(candidate.canonical_turn_id)
+            return Draft("", "empty_draft"), FidelityVerdict(False)
+
+        self._run_three(n=12, drafter=_drafter)
+        assert len(calls) <= DRAFT_ATTEMPT_CAP, "the walk was unbounded"
+
+    def test_live_verification_runs_for_every_attempt(self):
+        """A pass belongs to one message in one run and is not transferable.
+
+        Falling through must re-verify, not carry the previous candidate's
+        verdict forward — otherwise the guarantee erodes exactly where it is
+        load-bearing, on the candidate that actually gets posted.
+        """
+        fetched: list = []
+        drafted: list = []
+
+        def _fetcher(*, channel_id, message_id):
+            fetched.append(message_id)
+            return 200, {"author": {"id": "1327457861143494767"},
+                         "channel_id": channel_id, "edited_timestamp": None}
+
+        def _drafter(candidate):
+            # Record what had been verified at the moment this draft began.
+            drafted.append((candidate.source_message_id, list(fetched)))
+            if len(drafted) == 1:
+                return Draft("", "empty_draft"), FidelityVerdict(False)
+            return Draft("q?", ""), FidelityVerdict(True)
+
+        self._run_three(drafter=_drafter, source_fetcher=_fetcher)
+        assert len(drafted) == 2, "the run did not fall through"
+        for message_id, verified_before in drafted:
+            # Each drafted candidate had its OWN source fetched before the
+            # draft. A verdict is not transferable between candidates, so
+            # reusing the first pass for the second would show up here as a
+            # draft whose message was never fetched.
+            assert message_id in verified_before, (
+                f"drafted {message_id} without verifying it in this run"
+            )
+        assert len(set(fetched)) == len(fetched), "a message was re-fetched"
+
+    def test_the_day_is_claimed_once_by_the_candidate_that_posts(
+        self, posting_permitted,
+    ):
+        history = InMemoryPostHistory()
+
+        def _drafter(candidate):
+            if candidate.canonical_turn_id == "ct-0":
+                return Draft("", "empty_draft"), FidelityVerdict(False)
+            return Draft("a good question?", ""), FidelityVerdict(True)
+
+        result = self._run_three(drafter=_drafter, post=True,
+                                 history=history,
+                                 message_sender=lambda **kw: "9001")
+        assert result.posted_message_id == "9001"
+        assert len(history.all()) == 1, "a rejected attempt claimed the day"
+        assert history.all()[0].status == "posted"
