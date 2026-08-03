@@ -75,8 +75,8 @@ class TestTheSignalIsTheVerbNotTheWordRest:
         assert asks_for_a_repaste("Mind reposting the list?") is True
         assert asks_for_a_repaste("Can you resend the full stack?") is True
 
-    def test_truncation_language_is_caught(self):
-        assert asks_for_a_repaste("Your message cuts off - what came after?")
+    def test_explicit_truncation_language_is_caught(self):
+        """`truncat` stays; `cuts off` does not. See the class below."""
         assert asks_for_a_repaste("Looks truncated, what was the last one?")
 
     def test_a_word_that_merely_starts_with_paste_is_not_caught(self):
@@ -94,6 +94,42 @@ class TestTheSignalIsTheVerbNotTheWordRest:
     def test_empty_input_is_not_a_repaste_request(self):
         assert asks_for_a_repaste("") is False
         assert asks_for_a_repaste(None) is False
+
+
+class TestCutOffIsOrdinaryVocabularyHere:
+    """`cuts off` was shipped and had to come out.
+
+    It caught zero true positives the re-transmission verbs did not already
+    catch, and caused every false positive found: 3 of 10. In a biohacking
+    channel "cut off your appetite" and "cuts off after a few days" are
+    everyday phrasings.
+
+    The reason it survived the first round is the sharper lesson: the innocent
+    set used to validate the filter contained no non-re-transmission use of
+    "cut off", so a measured zero-false-positive result was taken from a
+    population that could not contain the failure.
+    """
+
+    CUT_OFF_BUT_FINE = [
+        "Did moving the modafinil earlier cut off your deep sleep?",
+        "Has the tirzepatide cut off your appetite entirely, or just "
+        "blunted it?",
+        "You said the nausea cuts off after a few days — did that hold?",
+    ]
+
+    @pytest.mark.parametrize("question", CUT_OFF_BUT_FINE)
+    def test_a_physiological_cut_off_is_not_a_repaste_request(self, question):
+        assert asks_for_a_repaste(question) is False
+
+    def test_the_pattern_does_not_mention_cut_off(self):
+        """Pins the removal, so it cannot be helpfully re-added."""
+        from virtual_context.core.engagement.select import _REPASTE_REQUEST
+
+        assert "cut" not in _REPASTE_REQUEST.pattern
+
+    def test_the_first_real_bad_question_is_still_caught_without_it(self):
+        """It contains "cuts off" — but the verb is what catches it."""
+        assert asks_for_a_repaste(REAL_BAD[0]) is True
 
 
 class TestItIsWiredIntoTheRun:

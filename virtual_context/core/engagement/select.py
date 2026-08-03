@@ -185,6 +185,16 @@ def apply_fidelity_outcome(outcome: SelectionOutcome, *, verdicts: list):
 # full of people handing Vast tasks and "the unresolved thing" is then a
 # missing field rather than an open question.
 #
+# "cuts off" is deliberately NOT in the pattern, and its absence is the
+# hard-won part. It was shipped once and caught ZERO true positives the verbs
+# did not already catch, while causing every false positive measured: "did
+# moving the modafinil earlier cut off your deep sleep", "has the tirzepatide
+# cut off your appetite", "the nausea cuts off after a few days". In a
+# biohacking channel that is ordinary vocabulary, not an edge case. The first
+# innocent set used to validate this filter contained no such phrasing, so it
+# scored zero false positives against a population that could not contain the
+# failure.
+#
 # Measured rather than guessed. The obvious signal — "the rest" — rejects
 # good questions: "how did the rest of the week go" and "how's the rest of
 # the protocol treating you" both match it, 2 false positives in 6 innocent
@@ -195,7 +205,7 @@ def apply_fidelity_outcome(outcome: SelectionOutcome, *, verdicts: list):
 # Verb STEMS, not exact forms: "reposting" and "pasted" are the same request
 # as "repost" and "paste", and an exact-form pattern silently missed them.
 _REPASTE_REQUEST = re.compile(
-    r"\bpast(e|ed|ing)(?![\w-])|\brepost|\bre-?send|\bcuts? off\b|\btruncat",
+    r"\bpast(e|ed|ing)(?![\w-])|\brepost|\bre-?send|\btruncat",
     re.I,
 )
 
