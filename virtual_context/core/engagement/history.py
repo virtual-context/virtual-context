@@ -363,9 +363,20 @@ ALTER TABLE engagement_post_history
 ALTER TABLE engagement_post_history
     ADD COLUMN IF NOT EXISTS source_channel_id TEXT NOT NULL DEFAULT '';
 
-UPDATE engagement_post_history
-   SET eastern_day = (posted_at::timestamptz AT TIME ZONE 'America/New_York')::date
- WHERE eastern_day IS NULL;
+-- There is deliberately NO backfill of eastern_day.
+--
+-- One existed, keyed on `WHERE eastern_day IS NULL`, and it was correct while
+-- NULL could only mean "this row predates the column". It cannot mean only
+-- that any more: releasing a day sets eastern_day = NULL, and that IS the
+-- release mechanism, because a unique index permits many NULLs and one date.
+-- So a re-run tried to re-claim deliberately released days, and collided with
+-- the very index it was migrating toward the moment two rows shared a day —
+-- which is ordinary once a question can be declined and replaced.
+--
+-- Nothing needs backfilling. Every writer sets the column on insert, a fresh
+-- install gets it from the CREATE TABLE above, and an already-migrated table
+-- has its values. A row still NULL is one whose day was released on purpose,
+-- and re-deriving it would take back a day the owner was given.
 
 -- The day claim, enforced by the database rather than by a read-then-write in
 -- application code. Checking first and inserting second is exactly the shape

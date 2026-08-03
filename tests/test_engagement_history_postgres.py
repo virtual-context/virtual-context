@@ -937,3 +937,94 @@ class TestDecliningIsAtomicAndIdempotent:
         row = history.all()[0]
         assert row.staged_message_id == "1111111111111111111"
         assert row.discord_message_id == "2222222222222222222"
+
+
+class TestTheMigrationSurvivesReleasedDays:
+    """The backfill re-claimed days that had been deliberately released.
+
+    `WHERE eastern_day IS NULL` was correct while NULL could only mean "this
+    row predates the column". Releasing a day sets eastern_day = NULL — that
+    IS the mechanism, since a unique index permits many NULLs and one date —
+    so a re-run tried to re-derive those days and collided with the very
+    index it was migrating toward, the moment two rows shared one.
+
+    Two declines on one day are ordinary: a question is rejected, another is
+    offered, that one is rejected too.
+    """
+
+    PRE_MIGRATION = """
+      CREATE TABLE engagement_post_history (
+        id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
+        conversation_id TEXT NOT NULL, posted_at TEXT NOT NULL,
+        channel_id TEXT NOT NULL, question_type TEXT NOT NULL,
+        tagged_actor_id TEXT NOT NULL DEFAULT '',
+        source_message_ids TEXT NOT NULL DEFAULT '',
+        topic_fingerprint NUMERIC(20,0) NOT NULL DEFAULT 0,
+        question_text TEXT NOT NULL DEFAULT '',
+        discord_message_id TEXT NOT NULL DEFAULT '',
+        resolution TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'posted', eastern_day DATE);
+      CREATE UNIQUE INDEX engagement_post_history_one_per_day
+        ON engagement_post_history (tenant_id, eastern_day);
+    """
+
+    @pytest.fixture
+    def legacy_store(self, pg_store):
+        """Production's shape before today, with two released days."""
+        with pg_store.pool.connection() as conn:
+            conn.execute("DROP TABLE IF EXISTS engagement_post_history")
+            conn.execute(self.PRE_MIGRATION)
+            for i, (day, status) in enumerate(
+                [(None, "declined"), (None, "declined"),
+                 ("2026-08-03", "posted")]
+            ):
+                conn.execute(
+                    """INSERT INTO engagement_post_history
+                       (id, tenant_id, conversation_id, posted_at, channel_id,
+                        question_type, status, eastern_day)
+                       VALUES (%s, 'legacy-tenant', 'conv',
+                               '2026-08-03T18:04:00+00:00', '1', 'timed',
+                               %s, %s)""",
+                    (f"row{i}", status, day),
+                )
+        yield pg_store
+        with pg_store.pool.connection() as conn:
+            conn.execute("DROP TABLE IF EXISTS engagement_post_history")
+            apply_engagement_history_schema(pg_store)
+
+    def test_the_migration_runs(self, legacy_store):
+        """It raised UniqueViolation against exactly this shape."""
+        apply_engagement_history_schema(legacy_store)
+
+    def test_it_is_still_idempotent(self, legacy_store):
+        apply_engagement_history_schema(legacy_store)
+        apply_engagement_history_schema(legacy_store)
+
+    def test_released_days_stay_released(self, legacy_store):
+        """Re-deriving one would take back a day the owner was given."""
+        apply_engagement_history_schema(legacy_store)
+        with legacy_store.pool.connection() as conn:
+            rows = conn.execute(
+                "SELECT eastern_day FROM engagement_post_history "
+                "WHERE status = 'declined'"
+            ).fetchall()
+        days = [r["eastern_day"] if isinstance(r, dict) else r[0] for r in rows]
+        assert days == [None, None]
+
+    def test_the_new_columns_arrive(self, legacy_store):
+        apply_engagement_history_schema(legacy_store)
+        with legacy_store.pool.connection() as conn:
+            present = {
+                (r["column_name"] if isinstance(r, dict) else r[0])
+                for r in conn.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name = 'engagement_post_history'"
+                ).fetchall()
+            }
+        assert {"staged_message_id", "source_channel_id"} <= present
+
+    def test_the_ddl_carries_no_backfill(self):
+        """Pins the removal: a reinstated backfill breaks a released day."""
+        from virtual_context.core.engagement import ENGAGEMENT_HISTORY_DDL
+
+        assert "UPDATE engagement_post_history" not in ENGAGEMENT_HISTORY_DDL
