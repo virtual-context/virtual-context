@@ -34,6 +34,18 @@ NOW = datetime(2026, 8, 2, 12, 0, 0, tzinfo=timezone.utc)
 P3 = "1524917968440524990"
 BIGTEX = "actor:discord:1338726888809697364"
 
+# The rehearsal configuration: community channels may be SOURCED from, and
+# only the approved private rehearsal channel may be POSTED to, until the
+# owner approves live posting.
+REHEARSAL_ALLOWLIST = {
+    "source_channel_ids": [
+        "1524917968440524990", "1524917037787250834", "1524964360030785686",
+        "1530567788949798963", "1524918613008580768",
+    ],
+    "post_channel_ids": ["1524946242499514418"],
+    "labels": {"1524946242499514418": "#vasttest"},
+}
+
 
 def _mid(moment):
     return str(datetime_to_snowflake_floor(moment) + 7)
@@ -360,3 +372,110 @@ class TestDraftComposition:
             composer=lambda **kw: seen.update(kw) or "how did it go?",
         )
         assert seen["stance"] == "outcome"
+
+
+# --------------------------------------------- artifact honesty (a) and (b)
+
+
+class TestRejectionAccounting:
+    """Truncating the list made the commonest reason look like the only one."""
+
+    def test_the_report_counts_every_reason_not_just_the_shown_ones(self):
+        from virtual_context.core.engagement import DryRunReport, Rejection
+
+        rejections = (
+            [Rejection(f"ct-{i}", "collect", "channel_not_sourceable")
+             for i in range(142)]
+            + [Rejection(f"ct-r{i}", "timing", "too_recent") for i in range(51)]
+            + [Rejection(f"ct-s{i}", "timing", "same_day") for i in range(37)]
+            + [Rejection(f"ct-o{i}", "timing", "too_old_for_timed_followup")
+               for i in range(3)]
+        )
+        report = DryRunReport(
+            generated_at=NOW, conversation_id="c", channel_id=P3,
+            rejections=rejections, outcome_kind="skip",
+        )
+        rendered = report.render()
+        assert "channel_not_sourceable" in rendered and "142" in rendered
+        assert "too_recent" in rendered and "51" in rendered
+        assert "same_day" in rendered and "37" in rendered
+        assert "too_old_for_timed_followup" in rendered and "3" in rendered
+        assert "233" in rendered  # the total, so nothing hides behind a cap
+
+    def test_examples_are_capped_but_counts_are_not(self):
+        from virtual_context.core.engagement import DryRunReport, Rejection
+
+        report = DryRunReport(
+            generated_at=NOW, conversation_id="c", channel_id=P3,
+            outcome_kind="skip",
+            rejections=[
+                Rejection(f"ct-{i}", "collect", "channel_not_sourceable")
+                for i in range(50)
+            ],
+        )
+        rendered = report.render()
+        assert "50" in rendered
+        assert rendered.count("ct-") <= 6
+
+    def test_the_ladder_is_printed(self):
+        from virtual_context.core.engagement import DryRunReport
+
+        report = DryRunReport(
+            generated_at=NOW, conversation_id="c", channel_id=P3,
+            outcome_kind="skip",
+            ladder=[("input", 400), ("collected", 258), ("verified", 258),
+                    ("timed_eligible", 167), ("composed", 2), ("postable", 0)],
+        )
+        rendered = report.render()
+        for label in ("input", "collected", "verified", "timed_eligible",
+                      "composed", "postable"):
+            assert label in rendered
+
+
+class TestFidelityDowngradesToSkip:
+    def test_all_drafts_rejected_becomes_a_skip_not_a_personal(self):
+        """Reporting the question TYPE where the RESULT belongs is a lie."""
+        from virtual_context.core.engagement import (
+            FidelityVerdict, SelectionOutcome, apply_fidelity_outcome,
+        )
+
+        chosen = SelectionOutcome(kind="personal", candidate=_cand(3),
+                                  considered=400)
+        final = apply_fidelity_outcome(
+            chosen,
+            verdicts=[FidelityVerdict(False, "planned_became_started")],
+        )
+        assert final.kind == "skip"
+        assert final.skip_stage == "fidelity"
+        assert "planned_became_started" in final.reason
+
+    def test_a_surviving_draft_keeps_the_personal_outcome(self):
+        from virtual_context.core.engagement import (
+            FidelityVerdict, SelectionOutcome, apply_fidelity_outcome,
+        )
+
+        chosen = SelectionOutcome(kind="personal", candidate=_cand(3))
+        final = apply_fidelity_outcome(
+            chosen, verdicts=[FidelityVerdict(True, "")],
+        )
+        assert final.kind == "personal"
+
+    def test_a_skip_is_left_alone(self):
+        from virtual_context.core.engagement import (
+            SelectionOutcome, apply_fidelity_outcome,
+        )
+
+        chosen = SelectionOutcome(kind="skip", reason="nothing", skip_stage="collect")
+        assert apply_fidelity_outcome(chosen, verdicts=[]).skip_stage == "collect"
+
+
+class TestPostChannelRestriction:
+    def test_only_the_rehearsal_channel_is_postable(self):
+        """Absence of posting code is not a safety boundary; config is."""
+        from virtual_context.core.engagement import load_channel_allowlist
+
+        allow = load_channel_allowlist(REHEARSAL_ALLOWLIST)
+        assert allow.may_post("1524946242499514418") is True
+        for community in (P3, "1524917037787250834", "1530567788949798963"):
+            assert allow.may_post(community) is False
+            assert allow.may_source(community) is True

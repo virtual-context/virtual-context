@@ -112,3 +112,28 @@ def select_question(
         skip_stage=stage,
         considered=considered,
     )
+
+
+def apply_fidelity_outcome(outcome: SelectionOutcome, *, verdicts: list):
+    """Downgrade a selection whose drafts all failed the fidelity gate.
+
+    Reporting a run where every draft was rejected as a "personal" outcome
+    states the question TYPE where the RESULT belongs, and reads as a working
+    selection. A run that produced nothing postable is a skip, and the stage
+    that rejected it is the fidelity gate.
+    """
+    if outcome.kind != "personal":
+        return outcome
+    if any(getattr(v, "faithful", False) for v in (verdicts or [])):
+        return outcome
+    reasons = [
+        getattr(v, "reason", "") for v in (verdicts or [])
+        if getattr(v, "reason", "")
+    ]
+    detail = "; ".join(reasons) if reasons else "no draft survived the gate"
+    return SelectionOutcome(
+        kind="skip",
+        reason=f"every draft was rejected by the fidelity gate: {detail}",
+        skip_stage="fidelity",
+        considered=outcome.considered,
+    )

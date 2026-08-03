@@ -15,6 +15,7 @@ question the report answers before deciding what it licenses.
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -44,6 +45,7 @@ class DryRunReport:
     considered: int = 0
     skip_reason: str = ""
     skip_stage: str = ""
+    ladder: list = field(default_factory=list)
 
     def render(self) -> str:
         lines: list[str] = []
@@ -102,18 +104,41 @@ class DryRunReport:
             add(f"  reason : {self.skip_reason}")
             add("")
 
-        add(f"REJECTED CANDIDATES ({len(self.rejections)})")
+        if self.ladder:
+            add("SELECTION LADDER")
+            add("-" * 72)
+            for label, count in self.ladder:
+                add(f"  {label:<20} {count}")
+            add("")
+
+        # Counts first, examples second. A truncated list makes the commonest
+        # reason look like the only reason, which is how a working boundary
+        # gets misread as unexplained loss.
+        add(f"WHY CANDIDATES WERE REJECTED ({len(self.rejections)} total)")
         add("-" * 72)
         if not self.rejections:
             add("  (none)")
-        for rejection in self.rejections:
-            detail = getattr(rejection, "detail", "")
-            suffix = f" — {detail}" if detail else ""
-            add(
-                f"  {getattr(rejection, 'canonical_turn_id', ''):<38} "
-                f"[{getattr(rejection, 'stage', '')}] "
-                f"{getattr(rejection, 'reason', '')}{suffix}"
-            )
+        else:
+            grouped: dict[tuple[str, str], list] = {}
+            for rejection in self.rejections:
+                key = (
+                    getattr(rejection, "stage", ""),
+                    getattr(rejection, "reason", ""),
+                )
+                grouped.setdefault(key, []).append(rejection)
+            for (stage, reason), items in sorted(
+                grouped.items(), key=lambda kv: (-len(kv[1]), kv[0]),
+            ):
+                add(f"  [{stage}] {reason}: {len(items)}")
+                for rejection in items[:2]:
+                    detail = getattr(rejection, "detail", "")
+                    suffix = f" — {detail}" if detail else ""
+                    add(
+                        f"      e.g. "
+                        f"{getattr(rejection, 'canonical_turn_id', '')}{suffix}"
+                    )
+                if len(items) > 2:
+                    add(f"      … and {len(items) - 2} more")
         add("")
         add(_EDIT_DELETE_LIMITATION)
         add("=" * 72)

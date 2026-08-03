@@ -21,7 +21,12 @@ from .fidelity import (
     run_fidelity_gate,
 )
 from .report import DryRunReport
-from .select import SelectionOutcome, rank_candidates, select_question
+from .select import (
+    SelectionOutcome,
+    apply_fidelity_outcome,
+    rank_candidates,
+    select_question,
+)
 from .timing import ThreadState, assess_thread, timed_followup_eligibility
 from .verify import MessageSourceRecord, verify_candidates
 
@@ -42,6 +47,7 @@ __all__ = [
     "Rejection",
     "SelectionOutcome",
     "ThreadState",
+    "apply_fidelity_outcome",
     "assess_thread",
     "collect_candidates",
     "load_channel_allowlist",
