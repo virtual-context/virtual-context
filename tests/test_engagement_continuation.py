@@ -290,3 +290,46 @@ class TestContinuationComposition:
 
         assert "not a recent-status check" in CONTINUATION_GUIDANCE
         assert "could be asked of any member" in CONTINUATION_GUIDANCE
+
+
+class TestTheArtifactNamesTheType:
+    """A label that stays inside the candidate never reaches the reviewer."""
+
+    def test_a_continuation_is_named_as_one_with_its_hook(self):
+        from virtual_context.core.engagement import (
+            DryRunReport, SelectionOutcome,
+        )
+
+        candidate = _cand(question_type="personal",
+                          hook_kind="pending_or_surprising_labs")
+        report = DryRunReport(
+            generated_at=NOW, conversation_id="c", channel_id=P3,
+        ).apply_outcome(
+            SelectionOutcome(kind="personal", candidate=candidate),
+        )
+        rendered = report.render()
+        assert "question type: personal" in rendered
+        assert "hook: pending_or_surprising_labs" in rendered
+
+    def test_a_timed_followup_is_named_as_timed_and_shows_no_hook(self):
+        from virtual_context.core.engagement import (
+            DryRunReport, SelectionOutcome,
+        )
+
+        candidate = _cand(question_type="timed")
+        report = DryRunReport(
+            generated_at=NOW, conversation_id="c", channel_id=P3,
+        ).apply_outcome(SelectionOutcome(kind="timed", candidate=candidate))
+        rendered = report.render()
+        assert "question type: timed" in rendered
+        assert "hook:" not in rendered
+
+    def test_a_broader_question_is_named_as_broader(self):
+        from virtual_context.core.engagement import (
+            DryRunReport, SelectionOutcome,
+        )
+
+        report = DryRunReport(
+            generated_at=NOW, conversation_id="c", channel_id=P3,
+        ).apply_outcome(SelectionOutcome(kind="broader", question="q?"))
+        assert "question type: broader" in report.render()

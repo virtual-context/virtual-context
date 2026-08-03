@@ -36,6 +36,12 @@ class DryRunReport:
     channel_id: str
     channel_label: str = ""
     outcome_kind: str = "skip"
+    # Which of the three question types produced this, and what earned the
+    # tag. A reviewer cannot judge whether a name was fairly attached
+    # without knowing that a continuation rests on a specific item and which
+    # one; and a label that stays inside the candidate never reaches him.
+    question_type: str = ""
+    hook_kind: str = ""
     question: str = ""
     quote: str = ""
     attribution: dict = field(default_factory=dict)
@@ -58,6 +64,14 @@ class DryRunReport:
         rejections that came with it.
         """
         self.outcome_kind = getattr(outcome, "kind", self.outcome_kind)
+        candidate = getattr(outcome, "candidate", None)
+        if candidate is not None:
+            self.question_type = (
+                getattr(candidate, "question_type", "") or self.outcome_kind
+            )
+            self.hook_kind = getattr(candidate, "hook_kind", "") or ""
+        elif self.outcome_kind == "broader":
+            self.question_type = "broader"
         self.skip_reason = getattr(outcome, "reason", "") or ""
         self.skip_stage = getattr(outcome, "skip_stage", "") or ""
         added = list(getattr(outcome, "added_rejections", ()) or ())
@@ -76,6 +90,9 @@ class DryRunReport:
         label = f" ({self.channel_label})" if self.channel_label else ""
         add(f"channel      : {self.channel_id}{label}")
         add(f"outcome      : {self.outcome_kind}")
+        if self.question_type:
+            hook = f" (hook: {self.hook_kind})" if self.hook_kind else ""
+            add(f"question type: {self.question_type}{hook}")
         add(f"considered   : {self.considered} candidate(s)")
         add("")
 
