@@ -12,6 +12,7 @@ from .allowlist import (
 )
 from .history import (
     ENGAGEMENT_HISTORY_DDL,
+    apply_engagement_history_schema,
     InMemoryPostHistory,
     PostRecord,
     check_repetition,
@@ -103,6 +104,7 @@ __all__ = [
     "REHEARSAL_CONFIG",
     "SOURCE_CHANNEL_IDS",
     "ENGAGEMENT_HISTORY_DDL",
+    "apply_engagement_history_schema",
     "InMemoryPostHistory",
     "PostRecord",
     "check_repetition",

@@ -300,3 +300,83 @@ class TestTheFingerprintColumnHoldsTheWholeRange:
         high = topic_fingerprint("have you started the SS-31 yet")
         assert high > 2**63 - 1 > low
         assert 0 <= fingerprint_distance(low, high) <= 64
+
+
+class TestTheSchemaExecutor:
+    """The applied text and the asserted text must be the same object."""
+
+    class _FakeConn:
+        def __init__(self, log):
+            self.log = log
+
+        def execute(self, sql):
+            self.log.append(sql)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    class _FakePool:
+        def __init__(self, log):
+            self.log = log
+
+        def connection(self):
+            return TestTheSchemaExecutor._FakeConn(self.log)
+
+    class _FakeStore:
+        def __init__(self, log):
+            self.pool = TestTheSchemaExecutor._FakePool(log)
+
+    def test_it_executes_the_shipped_constant_not_a_copy(self):
+        from virtual_context.core.engagement import (
+            ENGAGEMENT_HISTORY_DDL, apply_engagement_history_schema,
+        )
+
+        log: list[str] = []
+        returned = apply_engagement_history_schema(self._FakeStore(log))
+        assert returned is ENGAGEMENT_HISTORY_DDL
+        joined = " ".join(log)
+        assert "engagement_post_history" in joined
+        assert "NUMERIC(20,0)" in joined
+        assert "status" in joined
+
+    def test_the_whole_script_is_sent_in_one_call(self):
+        """Splitting on semicolons cuts the table in half.
+
+        The explanatory comment contains a semicolon, so a naive split sends
+        a truncated CREATE TABLE — automated-looking and broken, which is
+        worse than the hand-application this replaces.
+        """
+        from virtual_context.core.engagement import apply_engagement_history_schema
+
+        log: list[str] = []
+        apply_engagement_history_schema(self._FakeStore(log))
+        assert len(log) == 1, "the script was split"
+        sent = log[0]
+        assert sent.count("CREATE TABLE") == 1
+        assert sent.count("CREATE INDEX") == 2
+        assert sent.count("IF NOT EXISTS") == 3
+
+    def test_a_naive_split_would_have_truncated_the_table(self):
+        """Pins the hazard so nobody reintroduces the obvious version."""
+        from virtual_context.core.engagement import ENGAGEMENT_HISTORY_DDL
+
+        naive = [p for p in ENGAGEMENT_HISTORY_DDL.split(";") if p.strip()]
+        assert len(naive) == 4, (
+            "the comment semicolon is gone; if the DDL no longer contains "
+            "one, this hazard has changed and the guard should be revisited"
+        )
+        assert "status" not in naive[0], (
+            "a naive split drops the final column from the CREATE TABLE"
+        )
+
+    def test_a_store_without_a_pool_refuses(self):
+        from virtual_context.core.engagement import apply_engagement_history_schema
+
+        class _NoPool:
+            pass
+
+        with pytest.raises(RuntimeError, match="no connection pool"):
+            apply_engagement_history_schema(_NoPool())

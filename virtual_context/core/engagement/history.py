@@ -213,3 +213,32 @@ CREATE INDEX IF NOT EXISTS engagement_post_history_actor
 CREATE INDEX IF NOT EXISTS engagement_post_history_channel
     ON engagement_post_history (tenant_id, channel_id, posted_at);
 """
+
+
+def apply_engagement_history_schema(store) -> str:
+    """Create the history table from the shipped DDL, idempotently.
+
+    An executor rather than a copied snippet: hand-applying means the text
+    that runs and the text the tests assert are related only by the care of
+    whoever copied it. This runs the constant itself, so they cannot drift.
+
+    Every statement is ``IF NOT EXISTS``, so a second run is a no-op and a
+    partially applied state completes rather than conflicting. Returns the
+    DDL that was executed, for the caller to record.
+
+    The whole script is sent in one call rather than split on semicolons.
+    Splitting looks obvious and is wrong here: a semicolon inside the SQL
+    comment cuts the CREATE TABLE in half, and the executor would then send a
+    truncated statement — worse than the hand-application it was meant to
+    replace, because it would look automated while being broken.
+    """
+    connect = getattr(getattr(store, "pool", None), "connection", None)
+    if not callable(connect):
+        raise RuntimeError(
+            "this store exposes no connection pool; the engagement history "
+            "table belongs in the tenant-scoped backend alongside "
+            "canonical_turns"
+        )
+    with connect() as conn:
+        conn.execute(ENGAGEMENT_HISTORY_DDL)
+    return ENGAGEMENT_HISTORY_DDL
