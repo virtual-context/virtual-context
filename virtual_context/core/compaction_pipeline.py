@@ -76,6 +76,24 @@ _ACTOR_CARD_SEMANTIC_CONTRACT = (
 )
 
 
+def _format_rejection_counts(rejected) -> str:
+    """Render rejection counts for a log line without JSON quoting.
+
+    The rebuild log message is wrapped in JSON by downstream log shipping, so a
+    ``json.dumps`` map embedded here puts unescaped double quotes inside that
+    message and makes the whole line unparseable. Only lines with a non-empty
+    map are affected, which is every line that actually carries rejections, so
+    a JSON-based reader silently drops exactly the rows worth reading.
+
+    Emits ``reason:count`` pairs, sorted, comma-joined, in the same
+    quote-free key=value idiom as the rest of the line. ``-`` for an empty map
+    so the field is never blank and cannot be mistaken for a truncated line.
+    """
+    if not rejected:
+        return "-"
+    return ",".join(f"{name}:{count}" for name, count in sorted(rejected.items()))
+
+
 class _ActorCardAdmissionError(RuntimeError):
     """Validation failure that preserves a hashable, non-logged response."""
 
@@ -1258,7 +1276,7 @@ class CompactionPipeline:
                 actor_id[:24],
                 len(fact_sources) + len(turn_sources),
                 len(raw_entries),
-                json.dumps(dict(sorted(rejected.items())), separators=(",", ":")),
+                _format_rejection_counts(rejected),
                 response_hash[:16],
             )
             raise RuntimeError("actor card curation rejected every model entry")
@@ -1385,7 +1403,7 @@ class CompactionPipeline:
             len(normalized),
             written,
             outcome,
-            json.dumps(dict(sorted(rejected.items())), separators=(",", ":")),
+            _format_rejection_counts(rejected),
             response_hash[:16],
         )
         return written

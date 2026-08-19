@@ -622,3 +622,12 @@ Use `pytest -m regression` to run all regression tests.
 | `test_retrieval_assembler_protected_window_merge.py` | BUG-045 |
 | `test_sqlite_mirror_store_methods.py` | BUG-045 |
 | `test_postgres_mirror_store_methods.py` | BUG-045 |
+| `test_rebuild_log_rejection_format.py` | BUG-051 |
+
+### BUG-051 — rejection counts break the JSON log envelope
+
+- **Symptom**: `ACTOR_CARD_REBUILD` log lines carrying a non-empty rejection map are not valid JSON. Any JSON-based analysis of rebuild outcomes silently drops them, and those are exactly the lines that record rejections; lines with empty maps parse cleanly, so the reader looks correct while discarding every interesting row.
+- **Root cause**: the rejection map was rendered with `json.dumps` and interpolated into a log message that downstream shipping wraps in JSON, placing unescaped double quotes inside that message.
+- **Fix**: render the counts as sorted, comma-joined `reason:count` pairs in the same quote-free key=value idiom as the rest of the line, with `-` for an empty map so the field is never blank.
+- **Tests**:
+  - `test_rebuild_log_rejection_format.py`
