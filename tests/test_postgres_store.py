@@ -2,6 +2,34 @@
 
 from __future__ import annotations
 
+# Mirrored from the assertions in ``_assert_canonical_message_source_schema``.
+# Stated once here so a double that drifts from the relation the store demands
+# fails loudly on the shape rather than silently on a None row.
+CANONICAL_MESSAGE_SOURCE_COLUMNS = (
+    "tenant_id", "agent_scope_id", "platform", "account_id",
+    "message_id", "canonical_turn_id",
+    "assistant_canonical_turn_id", "assistant_turn_hash",
+    "turn_group_number", "pair_version",
+    "audience_conversation_id", "channel_id", "guild_id",
+    "author_id", "source_actor_id", "transport_body_sha256",
+    "canonical_body_sha256", "projection_version",
+    "canonical_turn_hash", "reply_target_message_id",
+)
+CANONICAL_MESSAGE_SOURCE_PK = (
+    "PRIMARY KEY (tenant_id, agent_scope_id, platform, account_id, message_id)"
+)
+CANONICAL_MESSAGE_SOURCE_FK = (
+    "FOREIGN KEY (assistant_canonical_turn_id) REFERENCES "
+    "canonical_turns(canonical_turn_id) ON DELETE CASCADE"
+)
+CANONICAL_MESSAGE_SOURCE_ASSISTANT_INDEX = (
+    "CREATE UNIQUE INDEX idx_canonical_message_sources_assistant "
+    "ON public.canonical_message_sources USING btree "
+    "(assistant_canonical_turn_id) "
+    "WHERE (assistant_canonical_turn_id IS NOT NULL)"
+)
+
+
 def _fact_embeddings_catalog_result(sql: str):
     """Truthy catalog rows for the constructor's required-DDL assertions.
 
@@ -31,6 +59,36 @@ def _fact_embeddings_catalog_result(sql: str):
         or "idx_fact_embeddings_conv_model" in sql
     ):
         return _FakeRowsResult([{"present": 1}])
+
+    if "trg_guard_attested_canonical_turn_update" in sql:
+        return _FakeRowsResult([{"present": 1}])
+
+    # ``canonical_message_sources``. The bootstrap counts unpaired legacy rows
+    # and then asserts the relation's shape, so a double whose every query
+    # answers "no rows" makes the count subscript None and the assertion
+    # condemn a database it never looked at. Model a freshly installed,
+    # correctly shaped, empty table.
+    if "canonical_message_sources" in sql:
+        if "count(*)" in sql.lower():
+            return _FakeRowsResult([{"n": 0}])
+        if "information_schema.columns" in sql:
+            return _FakeRowsResult(
+                [{"column_name": c} for c in CANONICAL_MESSAGE_SOURCE_COLUMNS]
+            )
+        if "information_schema.tables" in sql:
+            return _FakeRowsResult([{"present": 1}])
+        if "contype = 'p'" in sql:
+            return _FakeRowsResult([{"definition": CANONICAL_MESSAGE_SOURCE_PK}])
+        if "canonical_message_sources_assistant_fk" in sql:
+            return _FakeRowsResult([{"definition": CANONICAL_MESSAGE_SOURCE_FK}])
+        if "canonical_message_sources_pair_shape" in sql:
+            return _FakeRowsResult([{"present": 1}])
+        if "idx_canonical_message_sources_assistant" in sql:
+            return _FakeRowsResult(
+                [{"indexdef": CANONICAL_MESSAGE_SOURCE_ASSISTANT_INDEX}]
+            )
+        if "pg_trigger" in sql:
+            return _FakeRowsResult([{"present": 1}])
     return None
 
 
