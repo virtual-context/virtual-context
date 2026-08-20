@@ -903,10 +903,19 @@ class ContextAssembler:
             )
             _rendered_trimmed = len(selected_facts) - _admitted
             if _admitted < len(selected_facts):
+                # serialized_tokens against budget is the only pair that can
+                # falsify the selection rule, so both are emitted as fields.
+                # Without them the monitoring watches the rule's output while
+                # staying blind to the rule.
+                _wanted = self.token_counter(self._facts_block(
+                    [fact.format_for_prompt() for fact in selected_facts]
+                ))
                 logger.info(
-                    "Facts block rendered %d of %d selected lines within %dt; "
-                    "the selection record follows the block",
+                    "FACTS_BLOCK_TRIM admitted=%d selected=%d budget=%d "
+                    "serialized_tokens=%d overflow=%d cap=%d path=%s",
                     _admitted, len(selected_facts), facts_tokens,
+                    _wanted, _wanted - facts_tokens, facts_cap,
+                    "dense" if _dense_mode else "legacy",
                 )
                 _ordered_indices = _ordered_indices[:_admitted]
                 selected_facts = selected_facts[:_admitted]
