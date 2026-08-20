@@ -3557,8 +3557,19 @@ class ProxyState:
         except (TypeError, ValueError, AttributeError):
             pass
 
-    def _record_agent_outbound_ids(self, conversation_id: str, metadata) -> None:
+    def _record_agent_outbound_ids(
+        self, conversation_id: str, metadata,
+    ) -> dict | None:
         """Hand any agent-authored identities beside this turn to the store.
+
+        Returns the store's outcome counts, or None when nothing was carried
+        and nothing was attempted. Returned rather than only logged because a
+        sender whose delivery succeeds while every identity is refused
+        otherwise reports success, and the refusal lives only in engine logs it
+        cannot read.
+
+        The counts describe what arrived and nothing about what did not, so no
+        reader can infer that a set was complete.
 
         Fails open in every direction. A sender that carries none, a store that
         does not keep the ledger, and a write that raises all leave the turn
@@ -3569,10 +3580,10 @@ class ProxyState:
             from ..types import get_agent_outbound_ids
             observed = get_agent_outbound_ids(metadata)
             if not observed:
-                return
+                return None
             recorder = getattr(self.engine._store, "record_bot_outbound_messages", None)
             if recorder is None:
-                return
+                return None
             # No scope is derived here. Each entry carries its own, and the
             # store falls back to the channel's recorded namespace, which is
             # the ruler the reader builds its key with. There is no
@@ -3597,11 +3608,13 @@ class ProxyState:
                 (outcome or {}).get("duplicate", 0),
                 ",".join(f"{k}:{v}" for k, v in sorted(declined.items())) or "-",
             )
+            return dict(outcome or {})
         except Exception:
             logger.warning(
                 "agent outbound id capture failed for conv=%s",
                 str(conversation_id)[:12], exc_info=True,
             )
+            return None
 
     def _record_ingestion_watermark(self, history_messages: list[Message], conversation_id: str) -> None:
         """Record the history-widening baseline, or leave it untouched.

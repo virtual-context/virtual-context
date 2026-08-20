@@ -2179,8 +2179,19 @@ class VirtualContextEngine:
             },
         }
 
-    def _record_agent_outbound_ids_from_metadata(self, metadata) -> None:
+    def _record_agent_outbound_ids_from_metadata(self, metadata) -> dict | None:
         """Hand any agent-authored identities on this turn to the store.
+
+        Returns the store's outcome counts, or None when this turn carried no
+        identities and nothing was attempted. The counts are returned rather
+        than only logged so a caller can surface them to whoever sent the
+        identities: a sender whose delivery succeeds while every identity is
+        refused otherwise reports success, and the refusal is visible only in
+        engine logs it cannot read.
+
+        The shape carries no notion of a set it did not see — no total, no
+        denominator — so nothing downstream can infer that the identities it
+        knows about are all the identities there are.
 
         Fails open in every direction: a sender that carries none, a store
         without the ledger, and a raising write all leave the turn exactly as
@@ -2193,10 +2204,10 @@ class VirtualContextEngine:
                 metadata if isinstance(metadata, dict) else None
             )
             if not observed:
-                return
+                return None
             recorder = getattr(self._store, "record_bot_outbound_messages", None)
             if recorder is None:
-                return
+                return None
             outcome = recorder(
                 tenant_id=getattr(self.config, "tenant_id", "") or "",
                 agent_scope_id="",
@@ -2214,11 +2225,13 @@ class VirtualContextEngine:
                 outcome.get("accepted", 0), outcome.get("duplicate", 0),
                 ",".join(f"{k}:{v}" for k, v in sorted(declined.items())) or "-",
             )
+            return dict(outcome)
         except Exception:
             logger.warning(
                 "agent outbound id capture failed on completion",
                 exc_info=True,
             )
+            return None
 
     def persist_completed_turn(
         self,
@@ -2262,6 +2275,10 @@ class VirtualContextEngine:
         )
         source_message_id = ""
 
+        # Assigned later, when identities ride this turn. Bound here so the
+        # closure below can read it on paths that return before recording.
+        agent_outbound_ids_result: dict | None = None
+
         def _completion_outcome(
             actor_id: str = "",
             *,
@@ -2271,13 +2288,22 @@ class VirtualContextEngine:
         ) -> str | dict[str, object]:
             if not (return_outcome and explicit_pair):
                 return actor_id
-            return {
+            outcome: dict[str, object] = {
                 "status": status,
                 "reason": reason,
                 "retryable": bool(retryable),
                 "actor_id": actor_id,
                 "source_message_id": source_message_id,
             }
+            # Only present when identities actually rode this turn. Absent
+            # means none were carried, which is not the same as none existing:
+            # the counts describe what arrived and nothing about what did not,
+            # so no reader can infer a set was complete.
+            if agent_outbound_ids_result is not None:
+                outcome["agent_outbound_ids_result"] = dict(
+                    agent_outbound_ids_result
+                )
+            return outcome
         if explicit_pair:
             if (
                 completed_user_message is None
@@ -2392,7 +2418,9 @@ class VirtualContextEngine:
         # ledger is an additive idempotent set, so a set carried on both is
         # counted once as a duplicate rather than written twice. Reading only
         # one path would silently discard whatever arrived on the other.
-        self._record_agent_outbound_ids_from_metadata(user_turn_metadata)
+        agent_outbound_ids_result = (
+            self._record_agent_outbound_ids_from_metadata(user_turn_metadata)
+        )  # noqa: F841 — read by _completion_outcome via closure
         if requires_current_source_attestation(_actor_key) and not _source_claim:
             logger.error(
                 "SOURCE_ATTESTATION_REQUIRED phase=completion conv=%s route=%s; "
