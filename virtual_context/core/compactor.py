@@ -20,7 +20,7 @@ from ..types import (
     TaggedSegment,
     TagPromptRule,
     TagSummary,
-    TemporalStatus,
+    normalize_temporal_status,
     get_sender_name,
 )
 from .llm_utils import format_code_ref, normalize_code_refs, normalize_tag, parse_llm_json
@@ -199,7 +199,18 @@ For each fact:
   For experience facts: derive the object from the user's own declarative sentence
   ("I went to X", "I visited X", "I got back from X"). A place or activity mentioned
   in a question or comparison is not a standalone experience fact — it is context.
-- "status": one of: active, completed, planned, abandoned, recurring
+- "status": one of: active, completed, ceased, planned, abandoned, recurring
+  active     = still happening now.
+  completed  = an action or a course that ran to its intended end. A treatment
+               taken for its full prescribed length is completed, NOT ceased.
+               Says nothing about whether some other state is ongoing.
+  ceased     = the subject was doing this and is no longer doing it, stopped
+               before or without running its intended course. This is the only
+               status that answers "no longer doing this". Do not infer a
+               reason; ceased does not claim the stopping was deliberate.
+  abandoned  = given up part-way, where the text says it was given up.
+  planned    = intended or scheduled, not begun.
+  recurring  = happens repeatedly rather than once.
 - "fact_type": classify as "personal" (user's life, identity, preferences, plans),
   "experience" (assistant-provided info the user engaged with), or
   "world" (facts about other people, places, things in the user's world)
@@ -251,7 +262,18 @@ For each fact:
 - "subject": who or what the fact is about
 - "verb": the EXACT action verb from the text (e.g. "prefers", "built", "lives in")
 - "object": the specific noun phrase, preserving numbers, names, dates, amounts
-- "status": one of: active, completed, planned, abandoned, recurring
+- "status": one of: active, completed, ceased, planned, abandoned, recurring
+  active     = still happening now.
+  completed  = an action or a course that ran to its intended end. A treatment
+               taken for its full prescribed length is completed, NOT ceased.
+               Says nothing about whether some other state is ongoing.
+  ceased     = the subject was doing this and is no longer doing it, stopped
+               before or without running its intended course. This is the only
+               status that answers "no longer doing this". Do not infer a
+               reason; ceased does not claim the stopping was deliberate.
+  abandoned  = given up part-way, where the text says it was given up.
+  planned    = intended or scheduled, not begun.
+  recurring  = happens repeatedly rather than once.
 - "fact_type": "personal", "experience", or "world"
 - "what": one full sentence capturing the complete fact with all specifics
 - "who": ALL people the fact involves (empty string if n/a). Resolve pronouns.
@@ -878,7 +900,6 @@ class DomainCompactor:
         ]
 
         # D1: Parse extracted facts
-        valid_statuses = {e.value for e in TemporalStatus}
         raw_facts = parsed.get("facts", [])
         facts: list[Fact] = []
 
@@ -892,8 +913,12 @@ class DomainCompactor:
                 if not isinstance(f, dict) or not f.get("subject") or not f.get("object"):
                     continue
                 status = f.get("status", "active")
-                if status not in valid_statuses:
-                    status = "active"
+                status, _status_reason = normalize_temporal_status(status)
+                if _status_reason:
+                    logger.info(
+                        "FACT_STATUS_NORMALIZED reason=%s raw=%s resolved=%s",
+                        _status_reason, str(f.get("status", ""))[:32], status or "-",
+                    )
 
                 # Resolve when_date: LLM first, then deterministic fallback
                 raw_when = _str(f.get("when", ""))
@@ -1071,8 +1096,6 @@ class DomainCompactor:
         role: str,
     ) -> list[Fact]:
         """Run a fact-only extraction over one lane's text."""
-        from ..types import TemporalStatus
-
         system = _FACT_ONLY_INSTRUCTIONS.format(
             session_date=segment.session_date or "unknown",
         )
@@ -1098,7 +1121,6 @@ class DomainCompactor:
         if not isinstance(raw_facts, list):
             return []
 
-        valid_statuses = {e.value for e in TemporalStatus}
 
         def _str(val) -> str:
             if isinstance(val, list):
@@ -1110,8 +1132,12 @@ class DomainCompactor:
             if not isinstance(f, dict) or not f.get("subject") or not f.get("object"):
                 continue
             status = f.get("status", "active")
-            if status not in valid_statuses:
-                status = "active"
+            status, _status_reason = normalize_temporal_status(status)
+            if _status_reason:
+                logger.info(
+                    "FACT_STATUS_NORMALIZED reason=%s raw=%s resolved=%s",
+                    _status_reason, str(f.get("status", ""))[:32], status or "-",
+                )
             facts.append(Fact(
                 subject=_str(f.get("subject", "")),
                 verb=_str(f.get("verb", f.get("role", ""))),

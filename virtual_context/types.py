@@ -21,12 +21,69 @@ DEFAULT_CHAT_MODEL: str = "claude-sonnet-4-5-20250929"
 # ---------------------------------------------------------------------------
 
 class TemporalStatus(str, Enum):
-    """Whether the fact is ongoing, completed, or aspirational."""
+    """Whether the fact is ongoing, concluded, stopped, or aspirational.
+
+    ``COMPLETED`` and ``CEASED`` are deliberately separate. A concluded action
+    and a stopped state are opposite answers to "is this still happening", and
+    only the second one corrects a reader that believes a regimen continues.
+    Before ``CEASED`` existed both wore the same token, so a person's record of
+    stopping was indistinguishable from an inventory tally.
+    """
     ACTIVE = "active"
     COMPLETED = "completed"
+    CEASED = "ceased"
     PLANNED = "planned"
     ABANDONED = "abandoned"
     RECURRING = "recurring"
+
+
+# Words models reach for that mean one of the tokens above. Mapping them is
+# not cosmetic: without it an unrecognised synonym falls through to the unset
+# sentinel and a correct classification is lost. Normalising is strictly
+# better than discarding, because the evidence for the token is the word the
+# model actually chose.
+_STATUS_SYNONYMS = {
+    "ongoing": "active", "current": "active", "in_progress": "active",
+    "in progress": "active", "continuing": "active", "present": "active",
+    "finished": "completed", "done": "completed", "complete": "completed",
+    "concluded": "completed", "past": "completed",
+    "stopped": "ceased", "ended": "ceased", "discontinued": "ceased",
+    "quit": "ceased", "ceased": "ceased", "no longer": "ceased",
+    "former": "ceased", "cessation": "ceased",
+    "abandoned": "abandoned", "gave up": "abandoned", "dropped": "abandoned",
+    "planned": "planned", "intended": "planned", "upcoming": "planned",
+    "future": "planned", "scheduled": "planned",
+    "recurring": "recurring", "repeated": "recurring", "regular": "recurring",
+    "habitual": "recurring",
+}
+
+
+def normalize_temporal_status(raw: object) -> tuple[str, str]:
+    """Return ``(status, reason)`` for a model-supplied status value.
+
+    ``reason`` is ``""`` when the value was already a valid token, ``synonym``
+    when it was mapped, and ``unmapped`` when nothing could be established.
+
+    An unmappable value yields the empty string rather than ``active``.
+    Defaulting to ``active`` turns "the parser could not classify this" into
+    the strongest possible assertion that the state is ongoing, which is the
+    exact claim a stopped regimen needs to contradict. Losing a temporal
+    classification is recoverable by re-deriving; inverting one is what
+    reaches a person as a false statement about them.
+
+    The fact itself is never rejected. Only its temporal claim is unset.
+    """
+    if not isinstance(raw, str):
+        return "", "unmapped"
+    value = raw.strip().lower()
+    if not value:
+        return "", "unmapped"
+    if value in {member.value for member in TemporalStatus}:
+        return value, ""
+    mapped = _STATUS_SYNONYMS.get(value)
+    if mapped:
+        return mapped, "synonym"
+    return "", "unmapped"
 
 
 @dataclass

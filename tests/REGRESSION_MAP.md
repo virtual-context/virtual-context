@@ -626,6 +626,7 @@ Use `pytest -m regression` to run all regression tests.
 | `test_ingestion_watermark_atomicity.py` | BUG-053 |
 | `test_facts_block_budget.py` | BUG-052 |
 | `test_agent_authored_quote_guard.py` | BUG-054 |
+| `test_temporal_status_cessation.py` | BUG-055 |
 | `test_bot_outbound_message_ledger_postgres.py` | BUG-054 |
 | `test_lifecycle_epoch_start_postgres.py` | BUG-054 |
 
@@ -663,3 +664,12 @@ Use `pytest -m regression` to run all regression tests.
   - `test_agent_authored_quote_guard.py`
   - `test_bot_outbound_message_ledger_postgres.py`
   - `test_lifecycle_epoch_start_postgres.py`
+
+### BUG-055 — a stopped state is tokenised identically to a finished action
+
+- **Symptom**: a fact recording that someone stopped an ongoing regimen carries the same `status` value as an inventory tally or a completed purchase, so the record that would correct a false "still doing X" reading is indistinguishable from a stock count. Separately, a status the parser did not recognise was coerced to `active`, turning an unclassifiable value into the strongest available assertion that the state continues.
+- **Root cause**: `TemporalStatus` had no token for a state that ended, so `completed` absorbed both meanings, and the extraction prompts named the five tokens without defining any of them. Both parse sites then applied `if status not in valid_statuses: status = "active"`.
+- **Fix**: adds `ceased` beside an unchanged `completed`, so no stored row changes meaning and only re-derivation reclassifies them. Both prompts now define every token, and state explicitly that a course run to its intended length is `completed` and not `ceased`, and that `ceased` asserts no reason for the stopping. `normalize_temporal_status` maps common synonyms to their token before falling back, since an unrecognised `ongoing` was previously coerced to `active` correctly and a bare fallback would have lost that; only a genuinely unmappable value becomes unset. It returns why it resolved as it did, and the parse sites log it, because the old fallback wrote a valid-looking `active` and the rate was therefore unmeasurable from stored rows.
+- **Known limit**: `active` and unset render identically, so this corrects the stored record and any status-aware consumer, not what the model is shown. A hedged marker was rejected deliberately, since hedged provenance markers were measured to be ignored while definite ones are obeyed.
+- **Tests**:
+  - `test_temporal_status_cessation.py`
