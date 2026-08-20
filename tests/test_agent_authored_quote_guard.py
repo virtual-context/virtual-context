@@ -204,3 +204,42 @@ def test_a_resolved_in_conversation_target_is_still_suppressed_without_the_ledge
 
     assert _subject_lanes(roster) == []
     assert store.asked == []
+
+
+@pytest.mark.regression("BUG-054")
+def test_a_suppression_says_so(caplog):
+    """The guard must announce when it fires.
+
+    Its only other outward sign is the absence of a mis-filed row, and absence
+    of rows looks exactly like absence of traffic. Without this line a feature
+    sitting inert and a feature working perfectly produce identical evidence.
+    """
+    import logging
+
+    store = _Ledger(known={_key("bot-msg-1")})
+    segment, rows = _reply_quoting("bot-msg-1")
+
+    with caplog.at_level(logging.INFO, logger="virtual_context.core.compaction_pipeline"):
+        roster = _pipeline(store)._build_actor_roster(segment, rows)
+
+    assert _subject_lanes(roster) == []
+    assert any("AGENT_QUOTE_SUPPRESSED" in r.message for r in caplog.records), (
+        "the guard suppressed a lane without leaving any trace that it did"
+    )
+    line = next(r.message for r in caplog.records if "AGENT_QUOTE_SUPPRESSED" in r.message)
+    for field in ("conv=", "channel=", "target_message_id=", "canonical_turn_id="):
+        assert field in line
+
+
+@pytest.mark.regression("BUG-054")
+def test_no_suppression_means_no_suppression_line(caplog):
+    """The line must mean what it says, or a reader counting it overcounts."""
+    import logging
+
+    store = _Ledger(known=set())
+    segment, rows = _reply_quoting("unreported-msg")
+
+    with caplog.at_level(logging.INFO, logger="virtual_context.core.compaction_pipeline"):
+        _pipeline(store)._build_actor_roster(segment, rows)
+
+    assert not any("AGENT_QUOTE_SUPPRESSED" in r.message for r in caplog.records)

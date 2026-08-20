@@ -2566,6 +2566,17 @@ class CompactionPipeline:
                     if not target_present and self._quote_is_agent_output(
                         channel_id=channel, target_message_id=target_id,
                     ):
+                        # Say so. The only other evidence that this guard ever
+                        # fires is the absence of new mis-filed rows, and
+                        # absence of rows is indistinguishable from absence of
+                        # traffic. A suppression that leaves no trace cannot be
+                        # told apart from a feature that is inert.
+                        logger.info(
+                            "AGENT_QUOTE_SUPPRESSED conv=%s channel=%s "
+                            "target_message_id=%s canonical_turn_id=%s",
+                            (getattr(self._config, "conversation_id", "") or "")[:12],
+                            channel, target_id, row.canonical_turn_id,
+                        )
                         target_present = True
                     if not target_present:
                         roster.lanes.append(FactLane(

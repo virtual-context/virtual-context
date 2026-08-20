@@ -161,3 +161,85 @@ def test_selection_charges_the_block_so_rendering_never_trims() -> None:
         f"the renderer discarded {block['trimmed']} of {block['selected']} "
         "selected lines, so the fill charged less than the block costs"
     )
+
+
+@pytest.mark.regression("BUG-052")
+def test_every_budget_in_range_reports_a_count_that_survives_a_recount() -> None:
+    """Exhaustive rather than sampled, across every budget in the range.
+
+    ``_format_facts_admitted`` returns the token count measured for the prefix
+    it accepted instead of measuring the rendered block a second time. That
+    saves a call and closes the only window where a counter returning different
+    values for the same input could put an over-cap total into the budget, but
+    it means the returned count is trusted rather than checked. This is what
+    keeps it honest: for every budget, the reported count must equal an
+    independent recount of what was actually returned, and must never exceed
+    the budget.
+    """
+    assembler = _assembler()
+    facts = _facts(10)
+    violations = []
+    for budget in range(0, 200):
+        text, admitted, reported = assembler._format_facts_admitted(facts, budget)
+        recounted = assembler.token_counter(text) if text else 0
+        if reported != recounted or reported > budget:
+            violations.append((budget, admitted, reported, recounted))
+    assert not violations, f"budget/count disagreements: {violations[:5]}"
+
+
+@pytest.mark.regression("BUG-052")
+def test_a_block_costing_exactly_the_budget_is_admitted() -> None:
+    """The comparison is ``<=``, not ``<``. An off-by-one here silently drops a
+    fact from every block that happens to land on its budget."""
+    assembler = _assembler()
+    facts = _facts(10)
+    exact = assembler.token_counter(assembler._facts_block(
+        [fact.format_for_prompt() for fact in facts]
+    ))
+
+    text, admitted, reported = assembler._format_facts_admitted(facts, exact)
+
+    assert admitted == len(facts), "a block costing exactly its budget was trimmed"
+    assert reported == exact
+
+    tighter, fewer, _ = assembler._format_facts_admitted(facts, exact - 1)
+    assert fewer < len(facts)
+    assert assembler.token_counter(tighter) <= exact - 1
+
+
+@pytest.mark.regression("BUG-052")
+def test_an_empty_selection_renders_nothing_rather_than_empty_tags() -> None:
+    """A bare wrapper around no lines is not an empty block, it is a block
+    claiming there are facts and showing none."""
+    assembler = _assembler()
+
+    assert assembler._format_facts_admitted([], 1000) == ("", 0, 0)
+    assert assembler._format_facts_admitted(_facts(5), 0) == ("", 0, 0)
+
+
+@pytest.mark.regression("BUG-052")
+def test_a_prefix_costing_exactly_the_budget_is_admitted_by_the_bisection() -> None:
+    """The same boundary, but on the path that actually decides it.
+
+    A budget equal to the WHOLE block is answered by the fast path and never
+    reaches the search, so it cannot discriminate the comparison inside the
+    bisection. This picks a budget equal to the cost of a proper prefix, which
+    forces the search to run and makes an off-by-one there drop a line that
+    fits exactly.
+    """
+    assembler = _assembler()
+    facts = _facts(10)
+    lines = [fact.format_for_prompt() for fact in facts]
+    whole = assembler.token_counter(assembler._facts_block(lines))
+
+    for keep in range(1, len(lines)):
+        budget = assembler.token_counter(assembler._facts_block(lines[:keep]))
+        if budget >= whole:
+            continue
+        text, admitted, reported = assembler._format_facts_admitted(facts, budget)
+        assert admitted >= keep, (
+            f"a prefix of {keep} costing exactly {budget} was not admitted "
+            f"at that budget; only {admitted} lines were"
+        )
+        assert reported <= budget
+        assert assembler.token_counter(text) <= budget
