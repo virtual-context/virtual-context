@@ -4212,11 +4212,21 @@ class PostgresStore(ContextStore):
             # this seal, which are lost rather than misattributed. A later
             # resurrect overwrites the seal with a real bump, so this never
             # masks a future one.
-            epoch_started_at = self._seal_lifecycle_epoch_start(conversation_id)
-            if epoch_started_at is None:
-                for _ in observed:
-                    _decline("epoch_start_unknown")
-                return outcome
+            # NOT sealed here. Writing a boundary is a production data change
+            # and it is not this path's to make silently on first traffic: the
+            # value cannot be recovered exactly, so choosing one is a decision
+            # about what to admit, not a repair. Decline, name it distinctly,
+            # and say so loudly enough that a permanently inert conversation
+            # cannot be mistaken for a healthy fence.
+            logger.warning(
+                "AGENT_OUTBOUND_EPOCH_START_MISSING conv=%s epoch=%d offered=%d "
+                "— every identity for this conversation declines until a start "
+                "is recorded; this is a missing value, not a fence firing",
+                conversation_id, epoch, len(observed),
+            )
+            for _ in observed:
+                _decline("epoch_start_unknown")
+            return outcome
         cutoff = epoch_started_at - timedelta(seconds=max(0, int(clock_skew_seconds)))
 
         now = datetime.now(timezone.utc)
@@ -4322,42 +4332,6 @@ class PostgresStore(ContextStore):
                 _decline("store_unavailable")
         return outcome
 
-    def _seal_lifecycle_epoch_start(self, conversation_id: str):
-        """Stamp now as the current epoch's start, once, and return it.
-
-        Only ever fills a NULL. A row that already knows when its epoch began
-        keeps that answer, so a seal can neither move a real boundary nor
-        overwrite one a resurrect recorded.
-        """
-        now = datetime.now(timezone.utc)
-        try:
-            with self.pool.connection() as conn:
-                row = conn.execute(
-                    """UPDATE conversations
-                          SET lifecycle_epoch_started_at = %s
-                        WHERE conversation_id = %s
-                          AND lifecycle_epoch_started_at IS NULL
-                    RETURNING lifecycle_epoch_started_at""",
-                    (now, conversation_id),
-                ).fetchone()
-        except Exception:
-            logger.warning("lifecycle epoch seal failed", exc_info=True)
-            return None
-        if row is None:
-            # Another worker sealed it first, or it was never NULL. Read the
-            # value that won rather than assuming this one did.
-            try:
-                return self.get_lifecycle_epoch_started_at(conversation_id)
-            except Exception:
-                return None
-        sealed = row["lifecycle_epoch_started_at"] if isinstance(row, dict) else row[0]
-        logger.info(
-            "LIFECYCLE_EPOCH_SEALED conv=%s sealed_at=%s — identities observed "
-            "before this are declined; the real recreate time is unrecorded",
-            conversation_id, sealed,
-        )
-        return sealed
-
     def _resolve_outbound_target(self, conversation_id: str, _depth: int = 0):
         """(conversation, reason). The conversation an identity belongs to.
 
@@ -4375,11 +4349,27 @@ class PostgresStore(ContextStore):
             return None, "ambiguous_alias_resolution"
         try:
             self.get_lifecycle_epoch(conversation_id)
-            return conversation_id, ""
+            row_exists = True
         except KeyError:
-            pass
+            row_exists = False
         except Exception:
             return None, "store_unavailable"
+
+        if row_exists:
+            # A row existing is not the same as it owning anything. A merged
+            # conversation keeps its row as a husk while its turns move to the
+            # survivor, so recording an identity against it files the evidence
+            # under a conversation the reader never asks about — invisible
+            # rather than wrong, which is worse to diagnose.
+            try:
+                phase = str(self.get_conversation_phase(conversation_id) or "")
+            except Exception:
+                phase = ""
+            if phase == "deleted":
+                return None, "conversation_deleted"
+            if phase != "merged":
+                return conversation_id, ""
+
         try:
             target = self.resolve_conversation_alias(conversation_id)
         except Exception:

@@ -250,11 +250,13 @@ def test_an_unknown_epoch_start_declines_rather_than_assumes():
 
     outcome = _record(store, conv, _identity())
 
-    assert outcome["accepted"] == 1, (
-        "a conversation whose epoch start was never recorded stayed "
-        f"permanently unable to hold any identity: {outcome}"
+    assert outcome["accepted"] == 0
+    assert outcome["epoch_start_unknown"] == 1, (
+        "an unrecorded epoch start must be named distinctly from a fence "
+        f"firing, or a permanently inert conversation reads as a healthy "
+        f"one: {outcome}"
     )
-    assert store.get_lifecycle_epoch_started_at(conv) is not None
+    assert "fence_rejection" not in outcome
 
 
 def test_the_skew_allowance_declines_rather_than_admits():
@@ -569,57 +571,6 @@ def test_a_missing_tenant_is_still_declined():
         observed=[_identity(channel_id=channel)],
     )
     assert outcome["unresolvable_tenant_scope"] == 1
-
-
-def test_an_unrecorded_epoch_start_is_sealed_rather_than_declining_forever():
-    """A conversation resurrected before the column existed has no derivable
-    start. Declining on that is not a fence working — it is a conversation
-    that can never hold evidence again, reported identically to one stale id.
-
-    Sealing records NOW as the start. Everything observed before this instant
-    is still declined, so nothing from a previous incarnation slips through;
-    what is given up is identities observed between the real recreate and the
-    seal, which are lost rather than misattributed.
-    """
-    store = _store()
-    conv, channel = _ns_conv(store)
-    with pg_test_conn().cursor() as cur:
-        cur.execute(
-            "UPDATE conversations SET lifecycle_epoch = 2, "
-            "lifecycle_epoch_started_at = NULL WHERE conversation_id = %s",
-            (conv,),
-        )
-    assert store.get_lifecycle_epoch_started_at(conv) is None
-
-    ident = _identity(channel_id=channel, account_id="vast")
-    ident["agent_scope_id"] = "vast"
-    outcome = _record(store, conv, ident)
-
-    assert outcome["accepted"] == 1, f"still inert after sealing: {outcome}"
-    sealed = store.get_lifecycle_epoch_started_at(conv)
-    assert sealed is not None, "the seal did not persist"
-
-    # Absolute, not relative to itself. Asserting only that older-than-sealed
-    # is declined is satisfied by a seal at the epoch, which would admit every
-    # identity ever observed — the exact thing the fence exists to stop. The
-    # boundary has to actually be NOW.
-    now = datetime.now(timezone.utc)
-    assert now - timedelta(minutes=5) <= sealed <= now + timedelta(minutes=5), (
-        f"sealed at {sealed}, which is not now; a seal in the past admits "
-        "identities from a previous incarnation"
-    )
-
-    # And the seal is a real boundary, not a rubber stamp.
-    old = _identity(channel_id=channel, account_id="vast",
-                    observed_at=sealed - timedelta(days=30))
-    old["agent_scope_id"] = "vast"
-    later = _record(store, conv, old, clock_skew_seconds=0)
-    assert later["accepted"] == 0
-    assert later["fence_rejection"] == 1, (
-        "an identity observed a month before the seal was admitted"
-    )
-
-
 def test_sealing_never_overwrites_a_recorded_start():
     """A row that already knows when its epoch began keeps that answer, so a
     seal can neither move a real boundary nor erase one a resurrect wrote."""
@@ -656,22 +607,49 @@ def test_an_unknown_start_that_cannot_be_sealed_is_named_distinctly():
         "an unknown epoch start was reported as a fence firing; a permanently "
         "inert conversation then reads as one correctly-declined id"
     )
+def test_a_merged_conversation_forwards_to_its_survivor():
+    """A merged conversation keeps its row while its turns move to the
+    survivor. Recording against the husk files the evidence under a
+    conversation the guard never asks about, so it is invisible rather than
+    wrong — the harder of the two to notice.
+    """
+    store = _store()
+    survivor = _live(store)
+    husk = _live(store)
+    with pg_test_conn().cursor() as cur:
+        cur.execute(
+            "UPDATE conversations SET phase = 'merged' WHERE conversation_id = %s",
+            (husk,),
+        )
+        cur.execute(
+            "INSERT INTO conversation_aliases (alias_id, target_id) VALUES (%s, %s) "
+            "ON CONFLICT (alias_id) DO UPDATE SET target_id = EXCLUDED.target_id",
+            (husk, survivor),
+        )
+    ident = _identity()
+
+    outcome = _record(store, husk, ident)
+
+    assert outcome["accepted"] == 1, f"declined: {outcome}"
+    assert _ask(store, survivor, ident) is True, (
+        "the identity was filed against the merged husk, where the guard "
+        "looking at the surviving conversation will never find it"
+    )
+    assert _ask(store, husk, ident) is False
 
 
-def test_the_seal_itself_refuses_to_move_a_recorded_boundary():
-    """Tested against the method directly, because the caller only reaches it
-    when the start is NULL — so the ``IS NULL`` guard is unreachable through
-    the normal path and a mutation removing it would go unnoticed there."""
+def test_a_deleted_conversation_is_declined_not_forwarded():
+    """Merged means the turns moved. Deleted means they are gone, and an
+    identity for them belongs nowhere."""
     store = _store()
     conv = _live(store)
-    original = store.get_lifecycle_epoch_started_at(conv)
-    assert original is not None
+    with pg_test_conn().cursor() as cur:
+        cur.execute(
+            "UPDATE conversations SET phase = 'deleted' WHERE conversation_id = %s",
+            (conv,),
+        )
 
-    returned = store._seal_lifecycle_epoch_start(conv)
+    outcome = _record(store, conv, _identity())
 
-    assert store.get_lifecycle_epoch_started_at(conv) == original, (
-        "the seal overwrote a boundary that was already known"
-    )
-    assert returned == original, (
-        "the seal reported a value other than the one that is stored"
-    )
+    assert outcome["accepted"] == 0
+    assert outcome["conversation_deleted"] == 1
