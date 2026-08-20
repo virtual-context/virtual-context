@@ -296,3 +296,94 @@ def test_an_identity_already_held_for_one_conversation_is_not_evidence_for_anoth
     assert _ask(store, second, ident) is False, (
         "an identity recorded for one conversation became evidence for another"
     )
+
+
+def test_a7_an_identity_for_a_merged_conversation_follows_the_alias():
+    """A7. The messages moved to the survivor, so the identity should too,
+    rather than being declined for a conversation that no longer answers."""
+    store = _store()
+    survivor = _live(store)
+    merged_away = _conv()
+    with pg_test_conn().cursor() as cur:
+        cur.execute(
+            "INSERT INTO conversation_aliases (alias_id, target_id) VALUES (%s, %s) "
+            "ON CONFLICT (alias_id) DO UPDATE SET target_id = EXCLUDED.target_id",
+            (merged_away, survivor),
+        )
+    ident = _identity()
+
+    outcome = _record(store, merged_away, ident)
+
+    assert outcome["accepted"] == 1
+    assert _ask(store, survivor, ident) is True, (
+        "the identity was not recorded against the surviving conversation"
+    )
+
+
+def test_an_alias_chain_that_leads_nowhere_is_declined():
+    """Unresolvable is unknown. The last id in a broken chain is not a
+    fallback target."""
+    store = _store()
+    dangling, nowhere = _conv(), _conv()
+    with pg_test_conn().cursor() as cur:
+        cur.execute(
+            "INSERT INTO conversation_aliases (alias_id, target_id) VALUES (%s, %s) "
+            "ON CONFLICT (alias_id) DO UPDATE SET target_id = EXCLUDED.target_id",
+            (dangling, nowhere),
+        )
+
+    outcome = _record(store, dangling, _identity())
+
+    assert outcome["accepted"] == 0
+    assert outcome["unknown_conversation"] == 1
+
+
+def test_an_alias_cycle_terminates_and_declines():
+    store = _store()
+    a, b = _conv(), _conv()
+    with pg_test_conn().cursor() as cur:
+        for alias, target in ((a, b), (b, a)):
+            cur.execute(
+                "INSERT INTO conversation_aliases (alias_id, target_id) VALUES (%s, %s) "
+                "ON CONFLICT (alias_id) DO UPDATE SET target_id = EXCLUDED.target_id",
+                (alias, target),
+            )
+
+    outcome = _record(store, a, _identity())
+
+    assert outcome["accepted"] == 0
+    assert outcome["unknown_conversation"] == 1
+
+
+def test_an_alias_cycle_is_bounded_rather_than_walked_to_the_recursion_limit():
+    """A cycle must cost a handful of lookups, not a thousand.
+
+    Terminating only because Python's recursion limit is reached would still
+    decline the identity, so the outcome assertion above cannot tell the two
+    apart. What separates them is how many database round-trips a single
+    malformed alias chain costs.
+    """
+    store = _store()
+    a, b = _conv(), _conv()
+    with pg_test_conn().cursor() as cur:
+        for alias, target in ((a, b), (b, a)):
+            cur.execute(
+                "INSERT INTO conversation_aliases (alias_id, target_id) VALUES (%s, %s) "
+                "ON CONFLICT (alias_id) DO UPDATE SET target_id = EXCLUDED.target_id",
+                (alias, target),
+            )
+
+    calls: list[str] = []
+    real = store.resolve_conversation_alias
+
+    def counting(alias_id):
+        calls.append(alias_id)
+        return real(alias_id)
+
+    store.resolve_conversation_alias = counting
+    outcome = _record(store, a, _identity())
+
+    assert outcome["accepted"] == 0
+    assert len(calls) <= 10, (
+        f"a two-node alias cycle cost {len(calls)} lookups; the walk is not bounded"
+    )

@@ -4168,6 +4168,17 @@ class PostgresStore(ContextStore):
 
         if not observed:
             return outcome
+        # An identity can land for a conversation that has since been merged
+        # into, or redirected at, another one. Follow the alias to the survivor
+        # rather than declining, since the messages themselves moved with it. A
+        # chain that does not terminate at a real conversation is unresolvable
+        # and is declined, because guessing which conversation an identity
+        # belongs to is the cross-conversation version of guessing a namespace.
+        conversation_id = self._resolve_outbound_target(conversation_id)
+        if conversation_id is None:
+            for _ in observed:
+                _decline("unknown_conversation")
+            return outcome
         try:
             epoch = self.get_lifecycle_epoch(conversation_id)
             epoch_started_at = self.get_lifecycle_epoch_started_at(conversation_id)
@@ -4241,6 +4252,29 @@ class PostgresStore(ContextStore):
             for _ in rows:
                 _decline("write_failed")
         return outcome
+
+    def _resolve_outbound_target(self, conversation_id: str, _depth: int = 0):
+        """The conversation an identity should be recorded against, or None.
+
+        Bounded so a cycle in the alias table cannot spin here. Exhausting the
+        bound is unresolvable, not a licence to use the last id seen.
+        """
+        if not conversation_id or _depth > 8:
+            return None
+        try:
+            self.get_lifecycle_epoch(conversation_id)
+            return conversation_id
+        except KeyError:
+            pass
+        except Exception:
+            return None
+        try:
+            target = self.resolve_conversation_alias(conversation_id)
+        except Exception:
+            return None
+        if not target or target == conversation_id:
+            return None
+        return self._resolve_outbound_target(target, _depth + 1)
 
     @staticmethod
     def _coerce_observed_at(raw):
