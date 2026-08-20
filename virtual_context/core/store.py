@@ -1325,6 +1325,31 @@ class ContextStore(ABC):
         """
         raise NotImplementedError
 
+    def record_bot_outbound_messages(
+        self, *, tenant_id: str, agent_scope_id: str, conversation_id: str,
+        observed: list, clock_skew_seconds: int = 300,
+    ) -> dict:
+        """Union agent-authored message identities into the ledger.
+
+        Additive and idempotent; the set is never complete and no caller may
+        infer completeness from what it does not contain. Backends without the
+        ledger decline everything, which correctly leaves callers with no
+        positive evidence rather than with a false negative.
+        """
+        return {"accepted": 0, "duplicate": 0, "unsupported": len(observed or [])}
+
+    def is_bot_authored_message(
+        self, *, tenant_id: str, agent_scope_id: str, conversation_id: str,
+        platform: str, account_id: str, channel_id: str, message_id: str,
+    ) -> bool:
+        """Whether this exact identity is on record as authored by the agent.
+
+        True is positive evidence. False is unknown, NOT evidence that someone
+        else authored it, and callers must fall back to their existing
+        behaviour on False rather than to suppression.
+        """
+        return False
+
     def get_conversation_phase(self, conversation_id: str) -> str:
         """Return the current phase for the conversation.
 

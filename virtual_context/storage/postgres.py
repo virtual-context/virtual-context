@@ -2008,6 +2008,13 @@ class PostgresStore(ContextStore):
         # Deliberately its OWN try: an unrelated failure in the canonical
         # bootstrap above must not skip this migration and leave the assertion
         # below to condemn a database it could have repaired.
+        # Its OWN try for the same reason as the block below: this ledger is
+        # an enhancement, and failing to create it must never take down a
+        # bootstrap that would otherwise serve turns.
+        try:
+            self._ensure_bot_outbound_message_schema()
+        except Exception:
+            logger.warning("bot_outbound_messages bootstrap failed", exc_info=True)
         try:
             self._ensure_fact_author_schema()
         except Exception:
@@ -2041,6 +2048,45 @@ class PostgresStore(ContextStore):
         # failures. Assert their presence here and fail startup on a miss
         # rather than silently run without model-versioned fact vectors.
         self._assert_fact_embeddings_schema()
+
+    def _ensure_bot_outbound_message_schema(self) -> None:
+        """Create the ledger of message ids the agent itself authored.
+
+        A quote-reply is matched against ingested transport messages to decide
+        whether the quoted text is already on record. The agent's own outbound
+        ids are recorded nowhere, so a reply quoting the agent never matches and
+        its own words are re-filed as a quoted person's disclosure.
+
+        The key is the full namespaced identity. A bare message id is not an
+        identity: this store holds ids from platforms whose id spaces are
+        unrelated, and matching across them would attribute one platform's
+        message to another's. ``lifecycle_epoch`` records the incarnation the
+        row was accepted under, so rows written before a delete-and-recreate
+        cannot be read as evidence about the conversation that replaced it.
+        """
+        with self.pool.connection() as conn:
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS bot_outbound_messages (
+                       tenant_id TEXT NOT NULL,
+                       agent_scope_id TEXT NOT NULL,
+                       platform TEXT NOT NULL,
+                       account_id TEXT NOT NULL,
+                       channel_id TEXT NOT NULL,
+                       message_id TEXT NOT NULL,
+                       conversation_id TEXT NOT NULL,
+                       lifecycle_epoch INT NOT NULL,
+                       observed_at TIMESTAMPTZ NOT NULL,
+                       created_at TIMESTAMPTZ NOT NULL,
+                       PRIMARY KEY (
+                           tenant_id, agent_scope_id, platform,
+                           account_id, channel_id, message_id
+                       )
+                   )"""
+            )
+            conn.execute(
+                """CREATE INDEX IF NOT EXISTS idx_bot_outbound_conv_epoch
+                       ON bot_outbound_messages(conversation_id, lifecycle_epoch)"""
+            )
 
     def _assert_fact_embeddings_schema(self) -> None:
         with self.pool.connection() as conn:
@@ -4083,6 +4129,174 @@ class PostgresStore(ContextStore):
             if row is None:
                 raise KeyError(conversation_id)
             return int(row["lifecycle_epoch"] if isinstance(row, dict) else row[0])
+
+    # Rejection reasons for record_bot_outbound_messages. Every one is
+    # permanent: retrying an id the ledger declined cannot change the answer.
+    _OUTBOUND_FIELDS = (
+        "platform", "account_id", "channel_id", "message_id",
+    )
+
+    def record_bot_outbound_messages(
+        self, *, tenant_id: str, agent_scope_id: str, conversation_id: str,
+        observed: list, clock_skew_seconds: int = 300,
+    ) -> dict:
+        """Union agent-authored message identities into the ledger.
+
+        Additive and idempotent: re-sending a known identity is a no-op rather
+        than an error or a duplicate row. The set is never treated as complete,
+        because the caller cannot supply a complete one and nothing here may
+        infer completeness from what is absent.
+
+        An identity is declined, permanently, when it is malformed, when the
+        conversation is unknown, or when it cannot be shown to belong to the
+        conversation's current incarnation. That last case is the important
+        one: an identity observed before the current lifecycle epoch began
+        describes the conversation that was deleted, and admitting it would let
+        a queued observation be read as evidence about its successor. The skew
+        allowance is applied so the comparison declines more rather than fewer,
+        since declining costs a repeat of a known bug while admitting wrongly
+        costs a person's words.
+
+        Returns counts keyed by outcome. Never raises for bad input: the caller
+        is an enhancement path and must not be able to fail a turn.
+        """
+        from datetime import timedelta
+        outcome = {"accepted": 0, "duplicate": 0}
+
+        def _decline(reason: str) -> None:
+            outcome[reason] = outcome.get(reason, 0) + 1
+
+        if not observed:
+            return outcome
+        try:
+            epoch = self.get_lifecycle_epoch(conversation_id)
+            epoch_started_at = self.get_lifecycle_epoch_started_at(conversation_id)
+        except KeyError:
+            for _ in observed:
+                _decline("unknown_conversation")
+            return outcome
+        except Exception:
+            logger.warning("bot outbound id epoch lookup failed", exc_info=True)
+            for _ in observed:
+                _decline("lookup_failed")
+            return outcome
+        if epoch_started_at is None:
+            # Unknown start, not an old one. Nothing can be shown to have
+            # happened after a boundary this row does not know.
+            for _ in observed:
+                _decline("epoch_start_unknown")
+            return outcome
+        cutoff = epoch_started_at - timedelta(seconds=max(0, int(clock_skew_seconds)))
+
+        now = datetime.now(timezone.utc)
+        rows = []
+        for entry in observed:
+            try:
+                values = {f: str(entry.get(f, "") or "").strip() for f in self._OUTBOUND_FIELDS}
+                raw_observed = entry.get("observed_at")
+            except AttributeError:
+                _decline("malformed"); continue
+            if any(not v for v in values.values()) or any(
+                len(v) > 256 for v in values.values()
+            ):
+                _decline("malformed"); continue
+            if any(v != str(entry.get(f, "")) for f, v in values.items()):
+                # A value a trim would change is not already canonical, and a
+                # key built from it would not match one built by the reader.
+                _decline("not_canonical"); continue
+            observed_at = self._coerce_observed_at(raw_observed)
+            if observed_at is None:
+                _decline("malformed"); continue
+            if observed_at < cutoff:
+                _decline("predates_epoch"); continue
+            rows.append((
+                str(tenant_id or ""), str(agent_scope_id or ""),
+                values["platform"].lower(), values["account_id"],
+                values["channel_id"], values["message_id"],
+                conversation_id, epoch, observed_at, now,
+            ))
+        if not rows:
+            return outcome
+        try:
+            with self.pool.connection() as conn:
+                for row in rows:
+                    written = conn.execute(
+                        """INSERT INTO bot_outbound_messages (
+                               tenant_id, agent_scope_id, platform, account_id,
+                               channel_id, message_id, conversation_id,
+                               lifecycle_epoch, observed_at, created_at
+                           ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                           ON CONFLICT (tenant_id, agent_scope_id, platform,
+                                        account_id, channel_id, message_id)
+                           DO NOTHING
+                           RETURNING 1""",
+                        row,
+                    ).fetchone()
+                    if written is None:
+                        outcome["duplicate"] += 1
+                    else:
+                        outcome["accepted"] += 1
+        except Exception:
+            logger.warning("bot outbound id write failed", exc_info=True)
+            for _ in rows:
+                _decline("write_failed")
+        return outcome
+
+    @staticmethod
+    def _coerce_observed_at(raw):
+        """Parse an observation time, or None when it is not usable."""
+        if isinstance(raw, datetime):
+            return raw if raw.tzinfo else raw.replace(tzinfo=timezone.utc)
+        if isinstance(raw, str) and raw.strip():
+            try:
+                parsed = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+            except ValueError:
+                return None
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        return None
+
+    def is_bot_authored_message(
+        self, *, tenant_id: str, agent_scope_id: str, conversation_id: str,
+        platform: str, account_id: str, channel_id: str, message_id: str,
+    ) -> bool:
+        """Whether this exact identity is on record as authored by the agent.
+
+        True is positive evidence. False is NOT evidence that a person authored
+        the message: the ledger is always partial, since the delivery path that
+        feeds it reports only one id per reply however many messages the reply
+        became, and a channel may never report at all. Callers must treat False
+        as unknown and fall back to their existing behaviour, never to
+        suppression.
+
+        The match is exact on the full namespaced identity and is additionally
+        required to have been recorded under the conversation's current
+        lifecycle epoch, so a row that survived a delete-and-recreate cannot
+        speak for the conversation that replaced it.
+        """
+        if not all([platform, account_id, channel_id, message_id, conversation_id]):
+            return False
+        try:
+            epoch = self.get_lifecycle_epoch(conversation_id)
+        except Exception:
+            return False
+        try:
+            with self.pool.connection() as conn:
+                row = conn.execute(
+                    """SELECT 1 FROM bot_outbound_messages
+                        WHERE tenant_id = %s AND agent_scope_id = %s
+                          AND platform = %s AND account_id = %s
+                          AND channel_id = %s AND message_id = %s
+                          AND conversation_id = %s AND lifecycle_epoch = %s""",
+                    (
+                        str(tenant_id or ""), str(agent_scope_id or ""),
+                        str(platform).lower(), str(account_id), str(channel_id),
+                        str(message_id), conversation_id, epoch,
+                    ),
+                ).fetchone()
+                return row is not None
+        except Exception:
+            logger.warning("bot outbound id lookup failed", exc_info=True)
+            return False
 
     def get_lifecycle_epoch_started_at(self, conversation_id: str):
         """When the conversation's current lifecycle_epoch began, or None.
