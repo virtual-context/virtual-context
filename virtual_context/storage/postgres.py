@@ -4197,27 +4197,26 @@ class PostgresStore(ContextStore):
                 _decline("store_unavailable")
             return outcome
         if epoch_started_at is None:
-            # A conversation resurrected before the column existed has no
+            # A conversation resurrected before this column existed has no
             # derivable start, so the fence has no boundary to compare against
-            # and every identity for it would decline forever. That is not a
-            # fence working, it is a conversation permanently unable to hold
-            # evidence, and it reported identically to the former.
+            # and every identity offered for it declines permanently. That is
+            # not a fence working: it is a conversation unable to hold evidence
+            # at all, and until this was named separately it reported
+            # identically to one correctly-declined stale identity.
             #
-            # Seal it: record NOW as the start of the current epoch. Safe in
-            # one direction only, which is the direction that matters. The
-            # true recreate happened at some unknown time BEFORE now, so
-            # everything observed before this instant is still declined, and
-            # nothing from a previous incarnation can slip through. What it
-            # gives up is identities observed between the real recreate and
-            # this seal, which are lost rather than misattributed. A later
-            # resurrect overwrites the seal with a real bump, so this never
-            # masks a future one.
-            # NOT sealed here. Writing a boundary is a production data change
-            # and it is not this path's to make silently on first traffic: the
-            # value cannot be recovered exactly, so choosing one is a decision
-            # about what to admit, not a repair. Decline, name it distinctly,
-            # and say so loudly enough that a permanently inert conversation
-            # cannot be mistaken for a healthy fence.
+            # NOTHING IS WRITTEN HERE, DELIBERATELY. An earlier revision sealed
+            # the boundary automatically on first traffic; that was withdrawn.
+            # The true resurrection time is unrecoverable, so choosing a value
+            # is a decision about what to admit rather than a repair, and it
+            # must not happen as a side effect of whichever request arrives
+            # first after a deploy. The recommendation, the candidates and what
+            # each would wrongly admit are in
+            # specs/lifecycle-epoch-start-backfill.md; it is applied by an
+            # explicit admin command, never from this path.
+            #
+            # So this branch only declines, names itself distinctly, and says
+            # so loudly enough that a permanently inert conversation cannot be
+            # mistaken for a healthy fence.
             logger.warning(
                 "AGENT_OUTBOUND_EPOCH_START_MISSING conv=%s epoch=%d offered=%d "
                 "— every identity for this conversation declines until a start "
