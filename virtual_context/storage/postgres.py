@@ -4197,11 +4197,26 @@ class PostgresStore(ContextStore):
                 _decline("store_unavailable")
             return outcome
         if epoch_started_at is None:
-            # Unknown start, not an old one. Nothing can be shown to have
-            # happened after a boundary this row does not know.
-            for _ in observed:
-                _decline("fence_rejection")
-            return outcome
+            # A conversation resurrected before the column existed has no
+            # derivable start, so the fence has no boundary to compare against
+            # and every identity for it would decline forever. That is not a
+            # fence working, it is a conversation permanently unable to hold
+            # evidence, and it reported identically to the former.
+            #
+            # Seal it: record NOW as the start of the current epoch. Safe in
+            # one direction only, which is the direction that matters. The
+            # true recreate happened at some unknown time BEFORE now, so
+            # everything observed before this instant is still declined, and
+            # nothing from a previous incarnation can slip through. What it
+            # gives up is identities observed between the real recreate and
+            # this seal, which are lost rather than misattributed. A later
+            # resurrect overwrites the seal with a real bump, so this never
+            # masks a future one.
+            epoch_started_at = self._seal_lifecycle_epoch_start(conversation_id)
+            if epoch_started_at is None:
+                for _ in observed:
+                    _decline("epoch_start_unknown")
+                return outcome
         cutoff = epoch_started_at - timedelta(seconds=max(0, int(clock_skew_seconds)))
 
         now = datetime.now(timezone.utc)
@@ -4227,6 +4242,12 @@ class PostgresStore(ContextStore):
                 # conversation the fence exists to protect.
                 _decline("malformed_identity"); continue
             if observed_at < cutoff:
+                logger.info(
+                    "AGENT_OUTBOUND_FENCED conv=%s message_id=%s observed_at=%s "
+                    "epoch=%d epoch_started_at=%s",
+                    conversation_id, values["message_id"], observed_at.isoformat(),
+                    epoch, epoch_started_at.isoformat(),
+                )
                 _decline("fence_rejection"); continue
 
             # The scope names WHICH agent authored this, and one gateway
@@ -4300,6 +4321,42 @@ class PostgresStore(ContextStore):
             for _ in rows:
                 _decline("store_unavailable")
         return outcome
+
+    def _seal_lifecycle_epoch_start(self, conversation_id: str):
+        """Stamp now as the current epoch's start, once, and return it.
+
+        Only ever fills a NULL. A row that already knows when its epoch began
+        keeps that answer, so a seal can neither move a real boundary nor
+        overwrite one a resurrect recorded.
+        """
+        now = datetime.now(timezone.utc)
+        try:
+            with self.pool.connection() as conn:
+                row = conn.execute(
+                    """UPDATE conversations
+                          SET lifecycle_epoch_started_at = %s
+                        WHERE conversation_id = %s
+                          AND lifecycle_epoch_started_at IS NULL
+                    RETURNING lifecycle_epoch_started_at""",
+                    (now, conversation_id),
+                ).fetchone()
+        except Exception:
+            logger.warning("lifecycle epoch seal failed", exc_info=True)
+            return None
+        if row is None:
+            # Another worker sealed it first, or it was never NULL. Read the
+            # value that won rather than assuming this one did.
+            try:
+                return self.get_lifecycle_epoch_started_at(conversation_id)
+            except Exception:
+                return None
+        sealed = row["lifecycle_epoch_started_at"] if isinstance(row, dict) else row[0]
+        logger.info(
+            "LIFECYCLE_EPOCH_SEALED conv=%s sealed_at=%s — identities observed "
+            "before this are declined; the real recreate time is unrecorded",
+            conversation_id, sealed,
+        )
+        return sealed
 
     def _resolve_outbound_target(self, conversation_id: str, _depth: int = 0):
         """(conversation, reason). The conversation an identity belongs to.

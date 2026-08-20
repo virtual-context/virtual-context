@@ -3592,7 +3592,7 @@ class ProxyState:
             logger.info(
                 "AGENT_OUTBOUND_IDS conv=%s offered=%d accepted=%d duplicate=%d "
                 "declined=%s",
-                conversation_id[:12], len(observed),
+                conversation_id, len(observed),
                 (outcome or {}).get("accepted", 0),
                 (outcome or {}).get("duplicate", 0),
                 ",".join(f"{k}:{v}" for k, v in sorted(declined.items())) or "-",

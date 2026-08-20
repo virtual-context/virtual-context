@@ -2210,7 +2210,7 @@ class VirtualContextEngine:
             logger.info(
                 "AGENT_OUTBOUND_IDS phase=completion conv=%s offered=%d "
                 "accepted=%d duplicate=%d declined=%s",
-                self.config.conversation_id[:12], len(observed),
+                self.config.conversation_id, len(observed),
                 outcome.get("accepted", 0), outcome.get("duplicate", 0),
                 ",".join(f"{k}:{v}" for k, v in sorted(declined.items())) or "-",
             )
