@@ -623,6 +623,7 @@ Use `pytest -m regression` to run all regression tests.
 | `test_sqlite_mirror_store_methods.py` | BUG-045 |
 | `test_postgres_mirror_store_methods.py` | BUG-045 |
 | `test_rebuild_log_rejection_format.py` | BUG-051 |
+| `test_ingestion_watermark_atomicity.py` | BUG-053 |
 
 ### BUG-051 — rejection counts break the JSON log envelope
 
@@ -631,3 +632,11 @@ Use `pytest -m regression` to run all regression tests.
 - **Fix**: render the counts as sorted, comma-joined `reason:count` pairs in the same quote-free key=value idiom as the rest of the line, with `-` for an empty map so the field is never blank.
 - **Tests**:
   - `test_rebuild_log_rejection_format.py`
+
+### BUG-053 — the widening watermark's hash and count describe different observations
+
+- **Symptom**: a conversation can reach a state where `_detect_and_reset_widened_history` has a recorded head hash but a turn count of zero. `new_turns > old_turns * (1 + threshold)` is then true for any count, so the growth threshold is inert and a single head-hash comparison is all that stands between an ordinary request and `delete_conversation`, which purges `canonical_turns`.
+- **Root cause**: `_ingested_first_hash` and `_ingested_turn_count` were written non-atomically at two sites, and at both the count was written without the hash. In `_record_ingestion_watermark` the hash write was conditional on the buffer carrying a completed turn group while the count write was unconditional; the no-history early return in `resolve_prepare_state` wrote the count alone.
+- **Fix**: the recorder gates both writes on the completed-group count and returns early when it is zero, so the two fields always describe one buffer. The gate is the count rather than the head text because those predicates diverge: a leading assistant message pairs into a completed group by itself, so a buffer can carry a positive count and empty head text, and gating on the head text would skip it and leave a smaller count from an older buffer in place. Both values are computed before either is stored, so a raising helper cannot leave a hash without a count, and the hash is stored first so a reader interleaving between the two statements sees a fresh hash that matches the current head and returns at the detector's equality check. The no-history path writes nothing. A buffer with no completed group preserves the previous baseline rather than clearing it, since clearing would retire widening detection for the single-message buffers that dominate traffic.
+- **Tests**:
+  - `test_ingestion_watermark_atomicity.py`

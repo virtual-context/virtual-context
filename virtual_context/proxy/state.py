@@ -569,7 +569,9 @@ class ProxyState:
         if not history_messages:
             self._ingested_conversations.add(conversation_id)
             self._restore_readiness_pending = False
-            self._ingested_turn_count[conversation_id] = 0
+            # No history carries no baseline. Writing the count alone here
+            # would zero it beside a hash recorded from a real observation,
+            # which is the desync that makes the widening growth guard inert.
             return SessionState.ACTIVE, None
 
         if conversation_id in self._ingested_conversations and not self._restore_readiness_pending:
@@ -3547,13 +3549,42 @@ class ProxyState:
             pass
 
     def _record_ingestion_watermark(self, history_messages: list[Message], conversation_id: str) -> None:
-        if history_messages:
-            first_turn_text = self._combined_turn_text(history_messages, 0)
-            if first_turn_text:
-                self._ingested_first_hash[conversation_id] = (
-                    hashlib.sha256(first_turn_text.encode()).hexdigest()[:16]
-                )
-        self._ingested_turn_count[conversation_id] = self._history_turn_count(history_messages)
+        """Record the history-widening baseline, or leave it untouched.
+
+        The hash and the count are the two halves of one observation and are
+        written together or not at all. Writing the count alone leaves a zero
+        beside a hash retained from an earlier buffer, and ``new_turns <= 0``
+        is false for any count, so the growth threshold goes inert and a single
+        hash comparison is all that stands between an ordinary request and a
+        full conversation purge.
+
+        The gate is the completed-group count, not the head text. Those are not
+        the same predicate: a buffer whose first message is an assistant turn
+        with empty content pairs into a completed group all by itself, so the
+        count is positive while the combined head text is empty. Gating on the
+        head text would skip both writes for such a buffer and leave the
+        previous, smaller count in place, which makes the growth comparison
+        easier to satisfy than the count this buffer would have recorded. An
+        empty head hashes like any other and the detector already refuses to
+        act on a buffer whose own head is empty, so recording it costs nothing
+        and keeps the pair describing one buffer.
+
+        Both values are computed before either is stored, so a raising helper
+        cannot leave one field written. The hash is then stored first,
+        deliberately: the two stores remain separate statements, and a reader
+        interleaving between them sees a fresh hash that matches the head of
+        the buffer which produced it and returns at the detector's equality
+        check. Count-first has no such property.
+        """
+        if not history_messages:
+            return
+        turn_count = self._history_turn_count(history_messages)
+        if turn_count <= 0:
+            return
+        first_turn_text = self._combined_turn_text(history_messages, 0)
+        first_hash = hashlib.sha256(first_turn_text.encode()).hexdigest()[:16]
+        self._ingested_first_hash[conversation_id] = first_hash
+        self._ingested_turn_count[conversation_id] = turn_count
 
     def ingest_if_needed(
         self,
