@@ -357,6 +357,12 @@ SOURCE_CANONICAL_TURN_IDS_KEY = "_vc_source_canonical_turn_ids"
 # conversational text.  Storage still verifies every field against the
 # canonical projection before it mints an immutable source membership.
 SOURCE_ATTESTATION_KEY = "_vc_source_attestation"
+# Message identities the agent itself authored, carried BESIDE the attestation
+# rather than inside it. Deliberately a sibling key: the attested claim is a
+# fixed set of fields describing one inbound message, and a sender that folds a
+# time-varying set into it changes the shape it fingerprints, which can cost a
+# real turn. Nothing here participates in attestation validation or admission.
+AGENT_OUTBOUND_IDS_KEY = "_vc_agent_outbound_ids"
 # Private identity carried only between canonical reconstruction/resume and
 # the tagger.  It is never derived from message text and must never be trusted
 # as permission to rewrite canonical content; the storage CAS independently
@@ -682,6 +688,43 @@ def get_source_attestation(metadata: dict | None) -> dict[str, object]:
     if not isinstance(metadata, dict):
         return {}
     return normalize_source_attestation(metadata.get(SOURCE_ATTESTATION_KEY))
+
+
+def get_agent_outbound_ids(metadata: dict | None) -> list[dict]:
+    """Agent-authored message identities carried beside one turn.
+
+    Read from its own key, so a malformed or absent value can never affect the
+    attested claim next to it, nor whether the turn is admitted. Entries that
+    are not well-formed are dropped individually rather than rejecting the set:
+    the turn is the product and these identities are an enhancement.
+
+    Each surviving entry has non-empty ``platform``, ``account_id``,
+    ``channel_id`` and ``message_id``, already canonical, plus whatever
+    ``observed_at`` was supplied for the receiver to validate. No completeness
+    is implied: this is whatever the sender happened to witness, and the
+    absence of an identity means nothing was observed, never that none exists.
+    """
+    if not isinstance(metadata, dict):
+        return []
+    raw = metadata.get(AGENT_OUTBOUND_IDS_KEY)
+    if not isinstance(raw, list):
+        return []
+    required = ("platform", "account_id", "channel_id", "message_id")
+    cleaned: list[dict] = []
+    for entry in raw[:256]:
+        if not isinstance(entry, dict):
+            continue
+        values = {field: entry.get(field) for field in required}
+        if any(
+            not isinstance(value, str) or not value or value != value.strip()
+            or len(value) > 256
+            for value in values.values()
+        ):
+            continue
+        values["platform"] = values["platform"].lower()
+        values["observed_at"] = entry.get("observed_at")
+        cleaned.append(values)
+    return cleaned
 
 
 def get_actor_display_name(metadata: dict | None) -> str:

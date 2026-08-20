@@ -164,7 +164,7 @@ def test_a6_malformed_metadata_is_dropped_without_raising():
     )
 
     assert outcome["accepted"] == 0
-    assert outcome.get("malformed", 0) + outcome.get("not_canonical", 0) == 5
+    assert outcome["malformed_identity"] == 5
 
 
 def test_a7_an_identity_for_an_unknown_conversation_is_declined():
@@ -173,7 +173,7 @@ def test_a7_an_identity_for_an_unknown_conversation_is_declined():
     outcome = _record(store, _conv(), _identity())
 
     assert outcome["accepted"] == 0
-    assert outcome["unknown_conversation"] == 1
+    assert outcome["conversation_deleted"] == 1
 
 
 def test_a8_the_same_bare_id_in_another_namespace_does_not_match():
@@ -210,7 +210,7 @@ def test_an_identity_observed_before_the_current_epoch_is_declined():
     )
 
     assert outcome["accepted"] == 0
-    assert outcome["predates_epoch"] == 1
+    assert outcome["fence_rejection"] == 1
 
 
 def test_a_row_from_a_previous_epoch_does_not_speak_for_its_successor():
@@ -251,7 +251,7 @@ def test_an_unknown_epoch_start_declines_rather_than_assumes():
     outcome = _record(store, conv, _identity())
 
     assert outcome["accepted"] == 0
-    assert outcome["epoch_start_unknown"] == 1
+    assert outcome["fence_rejection"] == 1
 
 
 def test_the_skew_allowance_declines_rather_than_admits():
@@ -273,7 +273,7 @@ def test_the_skew_allowance_declines_rather_than_admits():
         clock_skew_seconds=300,
     )
 
-    assert just_before["predates_epoch"] == 1
+    assert just_before["fence_rejection"] == 1
     assert within_allowance["accepted"] == 1
 
 
@@ -335,7 +335,7 @@ def test_an_alias_chain_that_leads_nowhere_is_declined():
     outcome = _record(store, dangling, _identity())
 
     assert outcome["accepted"] == 0
-    assert outcome["unknown_conversation"] == 1
+    assert outcome["conversation_deleted"] == 1
 
 
 def test_an_alias_cycle_terminates_and_declines():
@@ -352,7 +352,7 @@ def test_an_alias_cycle_terminates_and_declines():
     outcome = _record(store, a, _identity())
 
     assert outcome["accepted"] == 0
-    assert outcome["unknown_conversation"] == 1
+    assert outcome["ambiguous_alias_resolution"] == 1
 
 
 def test_an_alias_cycle_is_bounded_rather_than_walked_to_the_recursion_limit():
@@ -387,3 +387,56 @@ def test_an_alias_cycle_is_bounded_rather_than_walked_to_the_recursion_limit():
     assert len(calls) <= 10, (
         f"a two-node alias cycle cost {len(calls)} lookups; the walk is not bounded"
     )
+
+
+def test_a_missing_tenant_or_scope_is_declined_by_name():
+    """Half an identity is not an identity. Recording under an empty tenant or
+    scope would put the row in a namespace no reader ever builds."""
+    store = _store()
+    conv = _live(store)
+
+    for kwargs in ({"tenant_id": ""}, {"agent_scope_id": ""}):
+        outcome = store.record_bot_outbound_messages(
+            tenant_id=kwargs.get("tenant_id", TENANT),
+            agent_scope_id=kwargs.get("agent_scope_id", SCOPE),
+            conversation_id=conv, observed=[_identity()],
+        )
+        assert outcome["accepted"] == 0
+        assert outcome["unresolvable_tenant_scope"] == 1
+
+
+def test_an_unreadable_or_ancient_timestamp_cannot_evade_the_fence():
+    """The fence is only as good as the value it compares.
+
+    A record whose observation time cannot be read must not be admitted as
+    though it were fresh, and one stamped at the epoch must not slip past as
+    though it were recent. Either would produce a record that outlives the
+    conversation the fence exists to protect.
+    """
+    store = _store()
+    conv = _live(store)
+    ns = uuid.uuid4().hex[:10]
+
+    unreadable = _record(
+        store, conv, _identity(ns, message_id=f"{ns}-a", observed_at="whenever"),
+    )
+    missing = _record(
+        store, conv, _identity(ns, message_id=f"{ns}-b", observed_at=None),
+    )
+    empty = _record(
+        store, conv, _identity(ns, message_id=f"{ns}-c", observed_at=""),
+    )
+    epoch_zero = _record(
+        store, conv,
+        _identity(ns, message_id=f"{ns}-d",
+                  observed_at=datetime(1970, 1, 1, tzinfo=timezone.utc)),
+    )
+
+    assert unreadable["malformed_identity"] == 1
+    assert missing["malformed_identity"] == 1
+    assert empty["malformed_identity"] == 1
+    assert epoch_zero["fence_rejection"] == 1, (
+        "a record stamped at the epoch was admitted as recent"
+    )
+    for ident in ("a", "b", "c", "d"):
+        assert _ask(store, conv, _identity(ns, message_id=f"{ns}-{ident}")) is False

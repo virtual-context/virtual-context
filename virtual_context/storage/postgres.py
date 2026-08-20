@@ -4174,28 +4174,33 @@ class PostgresStore(ContextStore):
         # chain that does not terminate at a real conversation is unresolvable
         # and is declined, because guessing which conversation an identity
         # belongs to is the cross-conversation version of guessing a namespace.
-        conversation_id = self._resolve_outbound_target(conversation_id)
-        if conversation_id is None:
+        if not str(tenant_id or "") or not str(agent_scope_id or ""):
             for _ in observed:
-                _decline("unknown_conversation")
+                _decline("unresolvable_tenant_scope")
             return outcome
+        resolved, alias_reason = self._resolve_outbound_target(conversation_id)
+        if resolved is None:
+            for _ in observed:
+                _decline(alias_reason)
+            return outcome
+        conversation_id = resolved
         try:
             epoch = self.get_lifecycle_epoch(conversation_id)
             epoch_started_at = self.get_lifecycle_epoch_started_at(conversation_id)
         except KeyError:
             for _ in observed:
-                _decline("unknown_conversation")
+                _decline("conversation_deleted")
             return outcome
         except Exception:
             logger.warning("bot outbound id epoch lookup failed", exc_info=True)
             for _ in observed:
-                _decline("lookup_failed")
+                _decline("store_unavailable")
             return outcome
         if epoch_started_at is None:
             # Unknown start, not an old one. Nothing can be shown to have
             # happened after a boundary this row does not know.
             for _ in observed:
-                _decline("epoch_start_unknown")
+                _decline("fence_rejection")
             return outcome
         cutoff = epoch_started_at - timedelta(seconds=max(0, int(clock_skew_seconds)))
 
@@ -4206,20 +4211,23 @@ class PostgresStore(ContextStore):
                 values = {f: str(entry.get(f, "") or "").strip() for f in self._OUTBOUND_FIELDS}
                 raw_observed = entry.get("observed_at")
             except AttributeError:
-                _decline("malformed"); continue
+                _decline("malformed_identity"); continue
             if any(not v for v in values.values()) or any(
                 len(v) > 256 for v in values.values()
             ):
-                _decline("malformed"); continue
+                _decline("malformed_identity"); continue
             if any(v != str(entry.get(f, "")) for f, v in values.items()):
                 # A value a trim would change is not already canonical, and a
                 # key built from it would not match one built by the reader.
-                _decline("not_canonical"); continue
+                _decline("malformed_identity"); continue
             observed_at = self._coerce_observed_at(raw_observed)
             if observed_at is None:
-                _decline("malformed"); continue
+                # A time that cannot be read is not a time. Treating it as
+                # fresh would make the record immortal and let it outlive the
+                # conversation the fence exists to protect.
+                _decline("malformed_identity"); continue
             if observed_at < cutoff:
-                _decline("predates_epoch"); continue
+                _decline("fence_rejection"); continue
             rows.append((
                 str(tenant_id or ""), str(agent_scope_id or ""),
                 values["platform"].lower(), values["account_id"],
@@ -4250,30 +4258,39 @@ class PostgresStore(ContextStore):
         except Exception:
             logger.warning("bot outbound id write failed", exc_info=True)
             for _ in rows:
-                _decline("write_failed")
+                _decline("store_unavailable")
         return outcome
 
     def _resolve_outbound_target(self, conversation_id: str, _depth: int = 0):
-        """The conversation an identity should be recorded against, or None.
+        """(conversation, reason). The conversation an identity belongs to.
+
+        Returns (id, "") on success, or (None, reason) naming why it could not
+        be resolved. The reason is the wire vocabulary, so the delivery side
+        classifies on one ruler rather than inferring permanence from a status
+        code that drifts the moment either side adds a case.
 
         Bounded so a cycle in the alias table cannot spin here. Exhausting the
         bound is unresolvable, not a licence to use the last id seen.
         """
-        if not conversation_id or _depth > 8:
-            return None
+        if not conversation_id:
+            return None, "conversation_deleted"
+        if _depth > 8:
+            return None, "ambiguous_alias_resolution"
         try:
             self.get_lifecycle_epoch(conversation_id)
-            return conversation_id
+            return conversation_id, ""
         except KeyError:
             pass
         except Exception:
-            return None
+            return None, "store_unavailable"
         try:
             target = self.resolve_conversation_alias(conversation_id)
         except Exception:
-            return None
-        if not target or target == conversation_id:
-            return None
+            return None, "store_unavailable"
+        if not target:
+            return None, "conversation_deleted"
+        if target == conversation_id:
+            return None, "ambiguous_alias_resolution"
         return self._resolve_outbound_target(target, _depth + 1)
 
     @staticmethod

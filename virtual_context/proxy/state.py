@@ -1301,6 +1301,15 @@ class ProxyState:
                 if _rows:
                     canonical_ingest_rows = tuple(_rows)
 
+        # Agent-authored message identities, if the sender carried any beside
+        # this turn. Deliberately after the canonical write and deliberately
+        # unable to affect it: the identities are an enhancement and the turn
+        # is the product, so every failure here is swallowed. They are also
+        # never required to be complete — this is whatever the sender happened
+        # to witness, and an identity that is absent means nothing was
+        # observed, not that none exists.
+        self._record_agent_outbound_ids(conversation_id, current_user_metadata)
+
         # Defense-in-depth: fresh epoch check before the next write.
         self.engine.verify_epoch()
 
@@ -3547,6 +3556,49 @@ class ProxyState:
             )
         except (TypeError, ValueError, AttributeError):
             pass
+
+    def _record_agent_outbound_ids(self, conversation_id: str, metadata) -> None:
+        """Hand any agent-authored identities beside this turn to the store.
+
+        Fails open in every direction. A sender that carries none, a store that
+        does not keep the ledger, and a write that raises all leave the turn
+        exactly as it would have been, because losing an identity costs a
+        repeat of a known bug while failing a turn costs the turn.
+        """
+        try:
+            from ..types import get_agent_outbound_ids
+            observed = get_agent_outbound_ids(metadata)
+            if not observed:
+                return
+            recorder = getattr(self.engine._store, "record_bot_outbound_messages", None)
+            if recorder is None:
+                return
+            scope = observed[0].get("agent_scope_id", "") or getattr(
+                self.engine.config, "agent_scope_id", "",
+            )
+            outcome = recorder(
+                tenant_id=getattr(self.engine.config, "tenant_id", "") or "",
+                agent_scope_id=scope,
+                conversation_id=conversation_id,
+                observed=observed,
+            )
+            declined = {
+                reason: count for reason, count in (outcome or {}).items()
+                if reason not in ("accepted", "duplicate") and count
+            }
+            logger.info(
+                "AGENT_OUTBOUND_IDS conv=%s offered=%d accepted=%d duplicate=%d "
+                "declined=%s",
+                conversation_id[:12], len(observed),
+                (outcome or {}).get("accepted", 0),
+                (outcome or {}).get("duplicate", 0),
+                ",".join(f"{k}:{v}" for k, v in sorted(declined.items())) or "-",
+            )
+        except Exception:
+            logger.warning(
+                "agent outbound id capture failed for conv=%s",
+                str(conversation_id)[:12], exc_info=True,
+            )
 
     def _record_ingestion_watermark(self, history_messages: list[Message], conversation_id: str) -> None:
         """Record the history-widening baseline, or leave it untouched.
