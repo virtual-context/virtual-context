@@ -749,9 +749,12 @@ class ContextAssembler:
         _fact_lines: dict[int, str] = {}
         _fact_tokens: dict[int, int] = {}
         _fact_scores: dict[int, float] = {}
+        # Charged with the separator the renderer joins on, so this never
+        # exceeds the line's true marginal cost in the assembled block. That
+        # makes it usable as a cheap skip test before the exact measurement.
         for i, fact in enumerate(retrieval_result.facts):
             line = fact.format_for_prompt()
-            line_tokens = self.token_counter(line)
+            line_tokens = self.token_counter(line + "\n")
             tag_overlap = len(set(fact.tags) & expanded_tags) if expanded_tags else 0
             try:
                 age_days = (datetime.now(timezone.utc) - fact.mentioned_at).days
@@ -786,6 +789,7 @@ class ContextAssembler:
         pool_used = 0
         tag_sections: dict[str, str] = {}
         selected_fact_indices: list[int] = []
+        _admitted_body = ""
 
         for score, kind, key, tokens in scored_items:
             if kind == "tag":
@@ -802,15 +806,38 @@ class ContextAssembler:
                 logger.info("Pool: '%s' INCLUDE (tag, score=%.2f, %dt, pool %d/%dt)",
                             key, score, tokens, pool_used, pool)
             else:  # fact
+                # Charge what the block will actually cost with this line in
+                # it. A sum of per-line counts is not that cost: it omits the
+                # newline the renderer joins on and the XML wrapper, and an
+                # estimator that divides characters truncates each line's
+                # remainder separately, so the shortfall grows with every line
+                # admitted. The block then ships over this cap and the excess
+                # is taken from whatever is budgeted after it. Measuring the
+                # assembled block is affordable because the block never grows
+                # past the cap.
+                _line = _fact_lines[int(key)]
+                # ``tokens`` is the line charged with its separator and never
+                # exceeds the line's true marginal cost in the block, so a
+                # candidate that already breaks the cap by that measure breaks
+                # it by the real one too. Skipping here keeps the measurement
+                # below off the path for candidates that cannot fit.
                 if facts_tokens + tokens > facts_cap:
                     logger.debug("Fact #%s SKIP (facts cap: %d+%d > %d)", key, facts_tokens, tokens, facts_cap)
                     continue
-                if pool_used + tokens > pool:
-                    logger.debug("Fact #%s SKIP (pool: need %dt, have %dt remaining)", key, tokens, pool - pool_used)
+                _prospective = self.token_counter(
+                    self._facts_block_from_body(_admitted_body, _line)
+                )
+                _marginal = _prospective - facts_tokens
+                if _prospective > facts_cap:
+                    logger.debug("Fact #%s SKIP (facts cap: %d > %d)", key, _prospective, facts_cap)
                     continue
+                if pool_used + _marginal > pool:
+                    logger.debug("Fact #%s SKIP (pool: need %dt, have %dt remaining)", key, _marginal, pool - pool_used)
+                    continue
+                _admitted_body = _line if not _admitted_body else _admitted_body + "\n" + _line
                 selected_fact_indices.append(int(key))
-                facts_tokens += tokens
-                pool_used += tokens
+                facts_tokens = _prospective
+                pool_used += _marginal
         _note("pool_fill", _stage)
 
         # Dense-priority fill: after the legacy floor is selected, add
@@ -823,15 +850,22 @@ class ContextAssembler:
                 _i = _id_to_index.get(_fid)
                 if _i is None or _i in _selected_set:
                     continue
-                _tokens = _fact_tokens[_i]
-                if facts_tokens + _tokens > facts_cap:
+                _line = _fact_lines[_i]
+                if facts_tokens + _fact_tokens[_i] > facts_cap:
                     continue
-                if pool_used + _tokens > pool:
+                _prospective = self.token_counter(
+                    self._facts_block_from_body(_admitted_body, _line)
+                )
+                _marginal = _prospective - facts_tokens
+                if _prospective > facts_cap:
                     continue
+                if pool_used + _marginal > pool:
+                    continue
+                _admitted_body = _line if not _admitted_body else _admitted_body + "\n" + _line
                 selected_fact_indices.append(_i)
                 _selected_set.add(_i)
-                facts_tokens += _tokens
-                pool_used += _tokens
+                facts_tokens = _prospective
+                pool_used += _marginal
 
         logger.info("Pool allocation: tags=%dt (%d sections), facts=%dt (%d facts), total=%d/%dt",
                     tag_tokens, len(tag_sections), facts_tokens, len(selected_fact_indices),
@@ -854,6 +888,47 @@ class ContextAssembler:
                 if retrieval_result.facts[i].id not in _dense_rank_by_id
             )
             _ordered_indices = _dense_selected + _floor_only_selected
+        else:
+            _ordered_indices = sorted(selected_fact_indices)
+
+        # Render against the budget the fill charged, with no slack. Any line
+        # the block cannot hold is removed from the record too: a selection the
+        # rendered block does not contain is a claim about what the model was
+        # shown that is not true.
+        selected_facts = [retrieval_result.facts[i] for i in _ordered_indices]
+        _rendered_trimmed = 0
+        if selected_facts:
+            facts_text, _admitted, facts_tokens_actual = self._format_facts_admitted(
+                selected_facts, facts_tokens,
+            )
+            _rendered_trimmed = len(selected_facts) - _admitted
+            if _admitted < len(selected_facts):
+                logger.info(
+                    "Facts block rendered %d of %d selected lines within %dt; "
+                    "the selection record follows the block",
+                    _admitted, len(selected_facts), facts_tokens,
+                )
+                _ordered_indices = _ordered_indices[:_admitted]
+                selected_facts = selected_facts[:_admitted]
+                selected_fact_indices = list(_ordered_indices)
+        else:
+            facts_text = ""
+            facts_tokens_actual = 0
+        # Report what shipped, not what was reserved. ``trimmed`` is the count
+        # the fill selected but the block could not hold; it is carried in the
+        # instrument rather than left implicit, because a block that silently
+        # drops selected lines is indistinguishable from one that fits.
+        retrieval_result.retrieval_metadata["facts_block"] = {
+            "selected": len(_ordered_indices) + _rendered_trimmed,
+            "rendered": len(_ordered_indices),
+            "trimmed": _rendered_trimmed,
+            "tokens": facts_tokens_actual,
+            "cap": facts_cap,
+        }
+        pool_used += facts_tokens_actual - facts_tokens
+        facts_tokens = facts_tokens_actual
+
+        if _dense_mode:
             selected_dense_only = sum(
                 1 for i in selected_fact_indices
                 if retrieval_result.facts[i].id in _dense_rank_by_id
@@ -880,11 +955,6 @@ class ContextAssembler:
                 selected_floor, selected_dense_only, skipped_dense_budget,
                 facts_tokens, pool - pool_used,
             )
-        else:
-            _ordered_indices = sorted(selected_fact_indices)
-        selected_facts = [retrieval_result.facts[i] for i in _ordered_indices]
-        facts_text = self._format_facts(selected_facts, facts_tokens + 100) if selected_facts else ""
-        facts_tokens_actual = self.token_counter(facts_text) if facts_text else 0
         _note("format_facts", _stage)
 
         # Track presented segment refs
@@ -1112,24 +1182,72 @@ class ContextAssembler:
             assembly_breakdown=_breakdown,
         )
 
-    def _format_facts(self, facts: list[Fact], max_tokens: int) -> str:
-        if not facts:
-            return ""
-        lines: list[str] = []
-        tokens_used = 0
-        # Reserve tokens for the XML wrapper
-        wrapper_overhead = self.token_counter("<facts>\n</facts>")
-        tokens_used += wrapper_overhead
-        for fact in facts:
-            line = fact.format_for_prompt()
-            line_tokens = self.token_counter(line)
-            if tokens_used + line_tokens > max_tokens:
-                break
-            lines.append(line)
-            tokens_used += line_tokens
-        if not lines:
-            return ""
+    @staticmethod
+    def _facts_block_from_body(body: str, extra_line: str) -> str:
+        """The block that would result from appending *extra_line* to *body*.
+
+        Takes the admitted lines already joined so the fill can measure a
+        candidate without rebuilding the whole block from a list on every
+        iteration.
+        """
+        joined = extra_line if not body else body + "\n" + extra_line
+        return "<facts>\n" + joined + "\n</facts>"
+
+    @staticmethod
+    def _facts_block(lines: list[str]) -> str:
+        """The one place the facts block's shape is defined.
+
+        Selection and rendering must measure the same string, or the budget one
+        enforces is not the budget the other ships.
+        """
         return "<facts>\n" + "\n".join(lines) + "\n</facts>"
+
+    def _format_facts(self, facts: list[Fact], max_tokens: int) -> str:
+        text, _, _ = self._format_facts_admitted(facts, max_tokens)
+        return text
+
+    def _format_facts_admitted(
+        self, facts: list[Fact], max_tokens: int,
+    ) -> tuple[str, int, int]:
+        """Render the block and report how many leading facts it holds.
+
+        Measures the assembled block rather than summing per-line counts. The
+        per-line sum undercounts twice: the newline separators between lines are
+        never charged, and an estimator that divides characters truncates each
+        line's remainder independently, so the shortfall grows with the number
+        of lines. The block then ships over the budget the caller enforced, and
+        the excess comes out of whatever is allocated after it.
+
+        Adding a line to a newline-joined block cannot reduce its token count,
+        so the admitted prefix is found by bisection: O(log n) measurements of
+        the real block instead of one measurement per candidate line.
+
+        Returning the admitted count is what keeps the caller's record of
+        selected facts and the rendered block from disagreeing.
+        """
+        if not facts:
+            return "", 0, 0
+        lines = [fact.format_for_prompt() for fact in facts]
+        whole = self._facts_block(lines)
+        whole_tokens = self.token_counter(whole)
+        if whole_tokens <= max_tokens:
+            return whole, len(lines), whole_tokens
+        lo, hi = 0, len(lines)
+        lo_tokens = 0
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            mid_tokens = self.token_counter(self._facts_block(lines[:mid]))
+            if mid_tokens <= max_tokens:
+                lo, lo_tokens = mid, mid_tokens
+            else:
+                hi = mid - 1
+        if lo == 0:
+            return "", 0, 0
+        # Report the count measured for the prefix that was accepted, rather
+        # than measuring the same string again: a second call is redundant, and
+        # it is the only place a counter that does not return the same value
+        # for the same input could put an over-cap total into the budget.
+        return self._facts_block(lines[:lo]), lo, lo_tokens
 
     def _format_tag_section(self, tag: str, summaries: list[StoredSummary]) -> str:
         return format_tag_section(

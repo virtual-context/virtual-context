@@ -624,6 +624,7 @@ Use `pytest -m regression` to run all regression tests.
 | `test_postgres_mirror_store_methods.py` | BUG-045 |
 | `test_rebuild_log_rejection_format.py` | BUG-051 |
 | `test_ingestion_watermark_atomicity.py` | BUG-053 |
+| `test_facts_block_budget.py` | BUG-052 |
 
 ### BUG-051 — rejection counts break the JSON log envelope
 
@@ -640,3 +641,11 @@ Use `pytest -m regression` to run all regression tests.
 - **Fix**: the recorder gates both writes on the completed-group count and returns early when it is zero, so the two fields always describe one buffer. The gate is the count rather than the head text because those predicates diverge: a leading assistant message pairs into a completed group by itself, so a buffer can carry a positive count and empty head text, and gating on the head text would skip it and leave a smaller count from an older buffer in place. Both values are computed before either is stored, so a raising helper cannot leave a hash without a count, and the hash is stored first so a reader interleaving between the two statements sees a fresh hash that matches the current head and returns at the detector's equality check. The no-history path writes nothing. A buffer with no completed group preserves the previous baseline rather than clearing it, since clearing would retire widening detection for the single-message buffers that dominate traffic.
 - **Tests**:
   - `test_ingestion_watermark_atomicity.py`
+
+### BUG-052 — the facts block ships over the budget its selection enforced
+
+- **Symptom**: the rendered `<facts>` block is larger than the token budget the greedy pool fill charged itself for it. `conversation_budget` subtracts the block's actual size, so the overrun is taken from the conversation window rather than from the facts allocation.
+- **Root cause**: selection charged a sum of per-line `token_counter` results while the block delivered is a single joined string. Two costs were never charged: the newline separators the renderer joins lines on, and the XML wrapper. A third accumulated silently, since an estimator that divides characters truncates each line's remainder independently, so the shortfall grew with every line admitted. `_format_facts` repeated the same per-line arithmetic against a `+100` slack, so it could not correct the total either.
+- **Fix**: the fill now charges what the assembled block costs with each candidate line in it, measured through the same `_facts_block` shape the renderer emits, so the running total is the block's real size at every step. This is affordable because the block never grows past its cap. `_format_facts` measures the assembled block too, finding the admitted prefix by bisection since adding a line to a newline-joined block cannot reduce its token count, and it reports how many lines it admitted so the caller can drop any it could not hold from the selection record. `retrieval_metadata["facts_block"]` carries the selected, rendered and trimmed counts, so a block that drops selected lines is visible rather than silent.
+- **Tests**:
+  - `test_facts_block_budget.py`
