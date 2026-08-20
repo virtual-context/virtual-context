@@ -440,3 +440,129 @@ def test_an_unreadable_or_ancient_timestamp_cannot_evade_the_fence():
     )
     for ident in ("a", "b", "c", "d"):
         assert _ask(store, conv, _identity(ns, message_id=f"{ns}-{ident}")) is False
+
+
+def _ns_conv(store, scope="vast", platform="discord", account="vast", channel=None):
+    """A conversation whose channel has a RECORDED namespace.
+
+    The reader builds its key from what the inbound path stored, so a writer
+    test that never seeds that table is testing a different world from the one
+    the guard reads in.
+    """
+    conv = _live(store)
+    channel = channel or f"chan-{uuid.uuid4().hex[:10]}"
+    now = datetime.now(timezone.utc).isoformat()
+    with pg_test_conn().cursor() as cur:
+        cur.execute(
+            """INSERT INTO canonical_turns (
+                   canonical_turn_id, conversation_id, turn_hash, hash_version,
+                   normalized_user_text, normalized_assistant_text,
+                   user_content, assistant_content, sort_key, source_batch_id,
+                   first_seen_at, last_seen_at, covered_ingestible_entries,
+                   tagged_at, created_at, updated_at
+               ) VALUES (gen_random_uuid(), %s, %s, 1, 'u','a','u','a', 1000.0,
+                         gen_random_uuid(), %s, %s, 1, NULL, %s, %s)
+               RETURNING canonical_turn_id""",
+            (conv, f"h-{uuid.uuid4().hex[:8]}", now, now, now, now),
+        )
+        turn_id = cur.fetchone()["canonical_turn_id"]
+        cur.execute(
+            """INSERT INTO canonical_message_sources (
+                   tenant_id, agent_scope_id, platform, account_id, message_id,
+                   canonical_turn_id, assistant_canonical_turn_id,
+                   assistant_turn_hash, audience_conversation_id, channel_id,
+                   guild_id, author_id, source_actor_id,
+                   transport_body_sha256, canonical_body_sha256,
+                   projection_version, canonical_turn_hash, observed_at,
+                   created_at
+               ) VALUES (%s,%s,%s,%s,%s,%s,%s,'h',%s,%s,'g','author','actor',
+                         'sha','sha','1','hash',%s,%s)""",
+            (TENANT, scope, platform, account, f"in-{uuid.uuid4().hex[:8]}",
+             turn_id, turn_id, conv, channel, now, now),
+        )
+    return conv, channel
+
+
+def test_an_entry_carrying_its_own_scope_is_accepted():
+    """The defect that made the ledger unwritable: the scope was read from a
+    config field that does not exist, so every entry was declined for an
+    unresolvable scope before any insert was attempted."""
+    store = _store()
+    conv, channel = _ns_conv(store)
+    ident = _identity(channel_id=channel, account_id="vast")
+    ident["agent_scope_id"] = "vast"
+
+    outcome = store.record_bot_outbound_messages(
+        tenant_id=TENANT, agent_scope_id="", conversation_id=conv,
+        observed=[ident],
+    )
+
+    assert outcome["accepted"] == 1, f"declined: {outcome}"
+    assert store.is_bot_authored_message(
+        tenant_id=TENANT, agent_scope_id="vast", conversation_id=conv,
+        platform="discord", account_id="vast",
+        channel_id=channel, message_id=ident["message_id"],
+    ) is True
+
+
+def test_a_batch_with_no_scope_falls_back_to_the_channel_namespace():
+    """When the sender names none, the channel's RECORDED namespace is the
+    fallback, because that is the ruler the reader builds its key with. A
+    scope invented from local configuration would file the identity under
+    whichever agent this process happens to be."""
+    store = _store()
+    conv, channel = _ns_conv(store)
+    ident = _identity(channel_id=channel, account_id="vast")
+
+    outcome = store.record_bot_outbound_messages(
+        tenant_id=TENANT, agent_scope_id="", conversation_id=conv,
+        observed=[ident],
+    )
+
+    assert outcome["accepted"] == 1, f"declined: {outcome}"
+
+
+def test_a_scope_the_reader_will_not_use_is_declined_by_name():
+    """Writing under a namespace the reader never builds is not merely
+    unmatched, it is unmatchable — and a set that never matches looks exactly
+    like an empty one. It must be counted separately from malformed."""
+    store = _store()
+    conv, channel = _ns_conv(store, scope="vast", account="vast")
+    ident = _identity(channel_id=channel, account_id="vast")
+    ident["agent_scope_id"] = "some-other-agent"
+
+    outcome = store.record_bot_outbound_messages(
+        tenant_id=TENANT, agent_scope_id="", conversation_id=conv,
+        observed=[ident],
+    )
+
+    assert outcome["accepted"] == 0
+    assert outcome["namespace_mismatch"] == 1
+    assert "malformed_identity" not in outcome
+
+
+def test_an_account_id_that_is_not_the_recorded_one_is_declined():
+    """The recorded account is an alias, not a platform snowflake. A sender
+    that helpfully substitutes the snowflake writes an unmatchable row."""
+    store = _store()
+    conv, channel = _ns_conv(store, scope="vast", account="vast")
+    ident = _identity(channel_id=channel, account_id="1540026970606403645")
+    ident["agent_scope_id"] = "vast"
+
+    outcome = store.record_bot_outbound_messages(
+        tenant_id=TENANT, agent_scope_id="", conversation_id=conv,
+        observed=[ident],
+    )
+
+    assert outcome["accepted"] == 0
+    assert outcome["namespace_mismatch"] == 1
+
+
+def test_a_missing_tenant_is_still_declined():
+    store = _store()
+    conv, channel = _ns_conv(store)
+    outcome = store.record_bot_outbound_messages(
+        tenant_id="", agent_scope_id="vast", conversation_id=conv,
+        observed=[_identity(channel_id=channel)],
+    )
+    assert outcome["unresolvable_tenant_scope"] == 1

@@ -3573,12 +3573,15 @@ class ProxyState:
             recorder = getattr(self.engine._store, "record_bot_outbound_messages", None)
             if recorder is None:
                 return
-            scope = observed[0].get("agent_scope_id", "") or getattr(
-                self.engine.config, "agent_scope_id", "",
-            )
+            # No scope is derived here. Each entry carries its own, and the
+            # store falls back to the channel's recorded namespace, which is
+            # the ruler the reader builds its key with. There is no
+            # agent_scope_id on the engine config, and inventing one from
+            # local configuration would file identities under whichever agent
+            # this process happens to be.
             outcome = recorder(
                 tenant_id=getattr(self.engine.config, "tenant_id", "") or "",
-                agent_scope_id=scope,
+                agent_scope_id="",
                 conversation_id=conversation_id,
                 observed=observed,
             )

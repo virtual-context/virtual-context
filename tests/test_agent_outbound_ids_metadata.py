@@ -103,3 +103,68 @@ def test_the_set_is_bounded_so_one_turn_cannot_carry_unbounded_work():
         {AGENT_OUTBOUND_IDS_KEY: [_ident(message_id=str(i)) for i in range(1000)]}
     )
     assert len(parsed) <= 256
+
+
+def test_the_wire_key_is_exactly_this_literal_string():
+    """Pinned as a literal, because the sender and the reader agreeing is not
+    something either side's tests can establish alone.
+
+    Each side's suite asserts its own constant, so two sides shipping two
+    different names are each internally consistent and jointly wrong, and both
+    suites stay green. The only thing that catches it is writing the literal
+    down where a human comparing the two can see it.
+    """
+    assert AGENT_OUTBOUND_IDS_KEY == "_vc_agent_outbound_ids"
+    assert SOURCE_ATTESTATION_KEY == "_vc_source_attestation"
+
+
+def test_agent_scope_id_survives_the_reader():
+    """The defect that made the ledger unwritable.
+
+    The reader rebuilt each entry from a closed field list that omitted
+    agent_scope_id, so the value the sender supplied was dropped before the
+    writer saw it. The writer then fell back to a config attribute that does
+    not exist, resolved an empty scope, and declined every entry for an
+    unresolvable scope before attempting a single insert.
+    """
+    parsed = get_agent_outbound_ids({AGENT_OUTBOUND_IDS_KEY: [
+        _ident(agent_scope_id="vast"),
+    ]})
+
+    assert parsed[0]["agent_scope_id"] == "vast", (
+        "the sender's scope was stripped; the writer cannot name the agent"
+    )
+
+
+def test_a_missing_scope_is_absent_rather_than_empty():
+    """Absent must stay absent so the writer can resolve it from the channel's
+    recorded namespace. An empty string would look like an answer."""
+    parsed = get_agent_outbound_ids({AGENT_OUTBOUND_IDS_KEY: [_ident()]})
+
+    assert "agent_scope_id" not in parsed[0]
+
+
+def test_a_non_canonical_scope_is_dropped_rather_than_trimmed():
+    """It becomes part of a key, so the same rule as every other component."""
+    for bad in (" vast ", "vast ", "", 42, None, "x" * 300):
+        parsed = get_agent_outbound_ids(
+            {AGENT_OUTBOUND_IDS_KEY: [_ident(agent_scope_id=bad)]}
+        )
+        assert "agent_scope_id" not in parsed[0], f"{bad!r} became a key"
+
+
+def test_the_real_captured_body_parses():
+    """The shape actually observed arriving in production, verbatim."""
+    parsed = get_agent_outbound_ids({AGENT_OUTBOUND_IDS_KEY: [{
+        "platform": "discord",
+        "account_id": "vast",
+        "channel_id": "1529892355141013684",
+        "message_id": "1540026970606403645",
+        "observed_at": "2026-08-20T15:57:22.228Z",
+    }]})
+
+    assert len(parsed) == 1
+    assert parsed[0]["account_id"] == "vast", (
+        "account_id must be the alias the inbound path recorded, not a snowflake"
+    )
+    assert parsed[0]["channel_id"] == "1529892355141013684"

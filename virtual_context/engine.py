@@ -2179,6 +2179,47 @@ class VirtualContextEngine:
             },
         }
 
+    def _record_agent_outbound_ids_from_metadata(self, metadata) -> None:
+        """Hand any agent-authored identities on this turn to the store.
+
+        Fails open in every direction: a sender that carries none, a store
+        without the ledger, and a raising write all leave the turn exactly as
+        it would have been. Losing an identity costs a repeat of a known bug;
+        failing here would cost the turn.
+        """
+        try:
+            from .types import get_agent_outbound_ids
+            observed = get_agent_outbound_ids(
+                metadata if isinstance(metadata, dict) else None
+            )
+            if not observed:
+                return
+            recorder = getattr(self._store, "record_bot_outbound_messages", None)
+            if recorder is None:
+                return
+            outcome = recorder(
+                tenant_id=getattr(self.config, "tenant_id", "") or "",
+                agent_scope_id="",
+                conversation_id=self.config.conversation_id,
+                observed=observed,
+            ) or {}
+            declined = {
+                reason: count for reason, count in outcome.items()
+                if reason not in ("accepted", "duplicate") and count
+            }
+            logger.info(
+                "AGENT_OUTBOUND_IDS phase=completion conv=%s offered=%d "
+                "accepted=%d duplicate=%d declined=%s",
+                self.config.conversation_id[:12], len(observed),
+                outcome.get("accepted", 0), outcome.get("duplicate", 0),
+                ",".join(f"{k}:{v}" for k, v in sorted(declined.items())) or "-",
+            )
+        except Exception:
+            logger.warning(
+                "agent outbound id capture failed on completion",
+                exc_info=True,
+            )
+
     def persist_completed_turn(
         self,
         conversation_history: list[Message],
@@ -2346,6 +2387,12 @@ class VirtualContextEngine:
         _source_claim = get_source_attestation(
             user_turn_metadata if isinstance(user_turn_metadata, dict) else None
         )
+        # Agent-authored identities can ride either the prepare that starts a
+        # turn or the ingest that completes it, so both paths read them. The
+        # ledger is an additive idempotent set, so a set carried on both is
+        # counted once as a duplicate rather than written twice. Reading only
+        # one path would silently discard whatever arrived on the other.
+        self._record_agent_outbound_ids_from_metadata(user_turn_metadata)
         if requires_current_source_attestation(_actor_key) and not _source_claim:
             logger.error(
                 "SOURCE_ATTESTATION_REQUIRED phase=completion conv=%s route=%s; "

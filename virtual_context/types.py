@@ -780,6 +780,17 @@ def get_agent_outbound_ids(metadata: dict | None) -> list[dict]:
             continue
         values["platform"] = values["platform"].lower()
         values["observed_at"] = entry.get("observed_at")
+        # Carried through, not derived. One gateway serves several agents, so
+        # a scope guessed from local configuration can file an identity under
+        # the wrong agent — the misattribution this feature exists to remove.
+        # The sender names it per entry or it is absent, and absent means the
+        # receiver must resolve it rather than assume one.
+        scope = entry.get("agent_scope_id")
+        if (
+            isinstance(scope, str) and scope and scope == scope.strip()
+            and len(scope) <= 256
+        ):
+            values["agent_scope_id"] = scope
         cleaned.append(values)
     return cleaned
 

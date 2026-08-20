@@ -4174,7 +4174,7 @@ class PostgresStore(ContextStore):
         # chain that does not terminate at a real conversation is unresolvable
         # and is declined, because guessing which conversation an identity
         # belongs to is the cross-conversation version of guessing a namespace.
-        if not str(tenant_id or "") or not str(agent_scope_id or ""):
+        if not str(tenant_id or ""):
             for _ in observed:
                 _decline("unresolvable_tenant_scope")
             return outcome
@@ -4228,8 +4228,48 @@ class PostgresStore(ContextStore):
                 _decline("malformed_identity"); continue
             if observed_at < cutoff:
                 _decline("fence_rejection"); continue
+
+            # The scope names WHICH agent authored this, and one gateway
+            # serves several. The sender is authoritative because only it
+            # knows; the batch argument is a default; and the channel's own
+            # recorded namespace is the last resort because it is the ruler
+            # the READER builds its key with. Deriving it from local
+            # configuration is not among the options: that is how an identity
+            # gets filed under the wrong agent.
+            entry_scope = entry.get("agent_scope_id")
+            scope = (
+                entry_scope if isinstance(entry_scope, str) and entry_scope
+                else str(agent_scope_id or "")
+            )
+            channel_ns = self.resolve_channel_namespace(
+                conversation_id=conversation_id,
+                channel_id=values["channel_id"],
+            )
+            if not scope and channel_ns:
+                scope = str(channel_ns[0] or "")
+            if not scope:
+                _decline("unresolvable_tenant_scope"); continue
+            if channel_ns and (
+                str(channel_ns[0] or "") != scope
+                or str(channel_ns[1] or "") != values["platform"].lower()
+                or str(channel_ns[2] or "") != values["account_id"]
+            ):
+                # The reader will build its key from the channel's recorded
+                # namespace. A row written under a different one is not merely
+                # unmatched, it is unmatchable, and a set that never matches
+                # cannot be told apart from an empty one. Name it so the two
+                # are distinguishable in the counts.
+                logger.info(
+                    "AGENT_OUTBOUND_NAMESPACE_MISMATCH channel=%s "
+                    "sender=%s/%s/%s recorded=%s/%s/%s",
+                    values["channel_id"], scope, values["platform"].lower(),
+                    values["account_id"], channel_ns[0], channel_ns[1],
+                    channel_ns[2],
+                )
+                _decline("namespace_mismatch"); continue
+
             rows.append((
-                str(tenant_id or ""), str(agent_scope_id or ""),
+                str(tenant_id or ""), scope,
                 values["platform"].lower(), values["account_id"],
                 values["channel_id"], values["message_id"],
                 conversation_id, epoch, observed_at, now,

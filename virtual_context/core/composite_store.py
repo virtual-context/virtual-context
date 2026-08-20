@@ -1592,6 +1592,64 @@ class CompositeStore:
             return int(fn(conversation_id))
         raise KeyError(conversation_id)
 
+    def record_bot_outbound_messages(
+        self, *, tenant_id: str, agent_scope_id: str, conversation_id: str,
+        observed: list, clock_skew_seconds: int = 300,
+    ) -> dict:
+        fn = getattr(self._segments, "record_bot_outbound_messages", None)
+        if not callable(fn):
+            # Backend keeps no ledger. Report the entries as unsupported rather
+            # than as accepted: a caller must never read "nothing went wrong"
+            # as "the identity is on record".
+            return {
+                "accepted": 0, "duplicate": 0,
+                "unsupported": len(observed or []),
+            }
+        return fn(
+            tenant_id=tenant_id, agent_scope_id=agent_scope_id,
+            conversation_id=conversation_id, observed=observed,
+            clock_skew_seconds=clock_skew_seconds,
+        )
+
+    def is_bot_authored_message(
+        self, *, tenant_id: str, agent_scope_id: str, conversation_id: str,
+        platform: str, account_id: str, channel_id: str, message_id: str,
+    ) -> bool:
+        fn = getattr(self._segments, "is_bot_authored_message", None)
+        if not callable(fn):
+            # No ledger means no positive evidence, which is unknown rather
+            # than a denial. Callers must keep their existing behaviour.
+            return False
+        return bool(fn(
+            tenant_id=tenant_id, agent_scope_id=agent_scope_id,
+            conversation_id=conversation_id, platform=platform,
+            account_id=account_id, channel_id=channel_id,
+            message_id=message_id,
+        ))
+
+    def resolve_channel_namespace(self, *, conversation_id: str, channel_id: str):
+        fn = getattr(self._segments, "resolve_channel_namespace", None)
+        if not callable(fn):
+            return None
+        return fn(conversation_id=conversation_id, channel_id=channel_id)
+
+    def get_lifecycle_epoch_started_at(self, conversation_id: str):
+        fn = getattr(self._segments, "get_lifecycle_epoch_started_at", None)
+        if not callable(fn):
+            # Backend does not record it. None means unknown, and a caller
+            # deciding whether evidence belongs to this incarnation must
+            # decline rather than assume.
+            return None
+        return fn(conversation_id)
+
+    def reset_conversation_derived_data(self, *args, **kwargs):
+        fn = getattr(self._segments, "reset_conversation_derived_data", None)
+        if not callable(fn):
+            raise NotImplementedError(
+                "backend cannot reset derived data"
+            )
+        return fn(*args, **kwargs)
+
     def get_conversation_phase(self, conversation_id: str) -> str:
         fn = getattr(self._segments, "get_conversation_phase", None)
         if callable(fn):
