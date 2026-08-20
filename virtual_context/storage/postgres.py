@@ -4255,6 +4255,43 @@ class PostgresStore(ContextStore):
             return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
         return None
 
+    def resolve_channel_namespace(self, *, conversation_id: str, channel_id: str):
+        """The (agent_scope_id, platform, account_id) a channel's messages use.
+
+        The agent's own outbound ids are keyed by the same namespace the
+        inbound path recorded, so a reader asking whether an id is the agent's
+        must build its key with the same values rather than deriving them
+        separately. A key built with a different ruler than the one that wrote
+        it never matches, and a set that never matches is indistinguishable
+        from an empty one.
+
+        Returns None when the channel resolves to zero or to more than one
+        namespace. That is unknown, not a licence to pick: guessing which
+        namespace applies is exactly the cross-namespace collision the key
+        exists to prevent.
+        """
+        if not conversation_id or not channel_id:
+            return None
+        try:
+            with self.pool.connection() as conn:
+                rows = conn.execute(
+                    """SELECT DISTINCT agent_scope_id, platform, account_id
+                         FROM canonical_message_sources
+                        WHERE audience_conversation_id = %s
+                          AND channel_id = %s
+                        LIMIT 2""",
+                    (conversation_id, channel_id),
+                ).fetchall()
+        except Exception:
+            logger.warning("channel namespace lookup failed", exc_info=True)
+            return None
+        if len(rows) != 1:
+            return None
+        row = rows[0]
+        if isinstance(row, dict):
+            return (row["agent_scope_id"], row["platform"], row["account_id"])
+        return (row[0], row[1], row[2])
+
     def is_bot_authored_message(
         self, *, tenant_id: str, agent_scope_id: str, conversation_id: str,
         platform: str, account_id: str, channel_id: str, message_id: str,

@@ -625,6 +625,9 @@ Use `pytest -m regression` to run all regression tests.
 | `test_rebuild_log_rejection_format.py` | BUG-051 |
 | `test_ingestion_watermark_atomicity.py` | BUG-053 |
 | `test_facts_block_budget.py` | BUG-052 |
+| `test_agent_authored_quote_guard.py` | BUG-054 |
+| `test_bot_outbound_message_ledger_postgres.py` | BUG-054 |
+| `test_lifecycle_epoch_start_postgres.py` | BUG-054 |
 
 ### BUG-051 — rejection counts break the JSON log envelope
 
@@ -649,3 +652,14 @@ Use `pytest -m regression` to run all regression tests.
 - **Fix**: the fill now charges what the assembled block costs with each candidate line in it, measured through the same `_facts_block` shape the renderer emits, so the running total is the block's real size at every step. This is affordable because the block never grows past its cap. `_format_facts` measures the assembled block too, finding the admitted prefix by bisection since adding a line to a newline-joined block cannot reduce its token count, and it reports how many lines it admitted so the caller can drop any it could not hold from the selection record. `retrieval_metadata["facts_block"]` carries the selected, rendered and trimmed counts, so a block that drops selected lines is visible rather than silent.
 - **Tests**:
   - `test_facts_block_budget.py`
+
+### BUG-054 — a reply quoting the agent is filed as a person's disclosure
+
+- **Symptom**: quoted text that the agent itself wrote is recorded as a claim made by the person being replied to. The agent can then tell a member it holds a disclosure that member never made.
+- **Root cause**: `_build_actor_roster` resolves a quote-reply against the transport messages it holds and builds `FactLane(role=AUTHOR_ROLE_SUBJECT)` when the quoted message is not among them. The agent's own outbound message ids were stored nowhere, so a reply quoting the agent could never resolve and always took that branch.
+- **Fix**: `bot_outbound_messages` records the identities the agent authored, keyed on platform, account, channel and message so ids from unrelated platforms cannot collide. The guard consults it and suppresses the subject lane only on an exact match, built from the namespace `resolve_channel_namespace` reports for the channel so the reader and the writer use the same values. Absence, an ambiguous channel, a backend without the ledger and a failing lookup all mean unknown and keep the previous behaviour, because the recorded set is always partial and treating a gap in it as evidence would delete a real disclosure. Two lifecycle fences stop an identity speaking for a later incarnation of a conversation: a write is declined when the observation predates `lifecycle_epoch_started_at`, and a read requires the row's epoch to match the conversation's current one.
+- **Known limit**: a reply delivered as several platform messages yields at most one recorded id, so the rest stay unknown and are unaffected.
+- **Tests**:
+  - `test_agent_authored_quote_guard.py`
+  - `test_bot_outbound_message_ledger_postgres.py`
+  - `test_lifecycle_epoch_start_postgres.py`

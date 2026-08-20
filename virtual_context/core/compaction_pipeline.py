@@ -2431,6 +2431,45 @@ class CompactionPipeline:
                     ordered.append(cid)
         return ordered, complete
 
+    def _quote_is_agent_output(
+        self, *, channel_id: str, target_message_id: str,
+    ) -> bool:
+        """Whether the quoted message is one this agent authored.
+
+        True only for an exact match on the full namespaced identity, built
+        from the same values the inbound path recorded for the channel. False
+        means unknown, which includes every case where the identity was never
+        reported, the channel does not resolve to one namespace, or the store
+        does not keep the ledger. Callers must treat False as "no information"
+        and keep their existing behaviour.
+        """
+        if not channel_id or not target_message_id:
+            return False
+        conversation_id = getattr(self._config, "conversation_id", "") or ""
+        if not conversation_id:
+            return False
+        try:
+            namespace = self._store.resolve_channel_namespace(
+                conversation_id=conversation_id, channel_id=channel_id,
+            )
+            if not namespace:
+                return False
+            agent_scope_id, platform, account_id = namespace
+            return bool(self._store.is_bot_authored_message(
+                tenant_id=getattr(self._config, "tenant_id", "") or "",
+                agent_scope_id=agent_scope_id,
+                conversation_id=conversation_id,
+                platform=platform,
+                account_id=account_id,
+                channel_id=channel_id,
+                message_id=target_message_id,
+            ))
+        except Exception:
+            # An enhancement must never be able to change how a turn is filed
+            # by failing. Unknown is the safe answer.
+            logger.warning("agent-authored quote check failed", exc_info=True)
+            return False
+
     def _build_actor_roster(self, segment, physical_by_id: dict) -> "ActorRoster":
         """Build one segment's actor roster and fact lanes from physical rows.
 
@@ -2515,6 +2554,19 @@ class CompactionPipeline:
                         and (getattr(candidate, "user_content", "") or "").strip()
                     ]
                     target_present = len(target_candidates) == 1
+                    # A reply can quote the agent's own earlier message. That
+                    # text is the agent's output, not a disclosure by the
+                    # person being addressed, and filing it as one is how the
+                    # agent's own words become evidence about a named human.
+                    # Only an exact recorded identity counts. Absence means
+                    # unknown and falls through to the behaviour below, never
+                    # to suppression: the recorded set is always partial, since
+                    # a reply split across several platform messages reports at
+                    # most one of them.
+                    if not target_present and self._quote_is_agent_output(
+                        channel_id=channel, target_message_id=target_id,
+                    ):
+                        target_present = True
                     if not target_present:
                         roster.lanes.append(FactLane(
                             role=AUTHOR_ROLE_SUBJECT,

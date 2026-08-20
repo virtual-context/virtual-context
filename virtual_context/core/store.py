@@ -1338,6 +1338,15 @@ class ContextStore(ABC):
         """
         return {"accepted": 0, "duplicate": 0, "unsupported": len(observed or [])}
 
+    def resolve_channel_namespace(self, *, conversation_id: str, channel_id: str):
+        """The (agent_scope_id, platform, account_id) a channel's messages use.
+
+        None means the channel resolves to zero or to several namespaces, which
+        is unknown rather than an invitation to choose one. Backends without
+        the ledger return None for every channel.
+        """
+        return None
+
     def is_bot_authored_message(
         self, *, tenant_id: str, agent_scope_id: str, conversation_id: str,
         platform: str, account_id: str, channel_id: str, message_id: str,
