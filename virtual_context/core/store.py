@@ -1312,6 +1312,19 @@ class ContextStore(ABC):
         """Return the current lifecycle_epoch. Raises KeyError if no row exists."""
         raise NotImplementedError
 
+    def get_lifecycle_epoch_started_at(self, conversation_id: str):
+        """When the current lifecycle_epoch began, or None if not recorded.
+
+        None means unknown, not old. Evidence cannot be shown to belong to this
+        incarnation when the incarnation's start is unknown, so a caller
+        deciding attribution must decline rather than assume. Backends without
+        the column return None for every conversation, which correctly disables
+        any decision that depends on it.
+
+        Raises KeyError if no row exists.
+        """
+        raise NotImplementedError
+
     def get_conversation_phase(self, conversation_id: str) -> str:
         """Return the current phase for the conversation.
 

@@ -1511,6 +1511,27 @@ class PostgresStore(ContextStore):
                         ADD CONSTRAINT conversations_phase_check
                         CHECK (phase IN ('init','ingesting','compacting','active','deleted','merged'))
                 """)
+                # When the current lifecycle_epoch began. Evidence that was
+                # observed before this incarnation of the conversation started
+                # describes its predecessor and must not be attributed here.
+                # NULL means the start is unknown, which is a distinct answer
+                # from "old": a caller cannot conclude anything from it.
+                conn.execute("""
+                    ALTER TABLE conversations
+                        ADD COLUMN IF NOT EXISTS lifecycle_epoch_started_at TIMESTAMPTZ NULL
+                """)
+                # Backfill only where the value is derivable rather than
+                # guessed. lifecycle_epoch = 1 means the conversation has never
+                # been resurrected, so its first epoch began when the row was
+                # created. Rows past epoch 1 were resurrected at a time this
+                # column did not record, so they stay NULL. Idempotent: the
+                # WHERE clause stops matching once the column is populated.
+                conn.execute("""
+                    UPDATE conversations
+                       SET lifecycle_epoch_started_at = created_at
+                     WHERE lifecycle_epoch_started_at IS NULL
+                       AND lifecycle_epoch = 1
+                """)
             except Exception:
                 logger.warning("conversations table bootstrap failed", exc_info=True)
             # one-time backfill of
@@ -3943,10 +3964,11 @@ class PostgresStore(ContextStore):
         with self.pool.connection() as conn, conn.transaction():
             conn.execute(
                 """INSERT INTO conversations (
-                       conversation_id, tenant_id, created_at, updated_at
-                   ) VALUES (%s, %s, %s, %s)
+                       conversation_id, tenant_id, created_at, updated_at,
+                       lifecycle_epoch_started_at
+                   ) VALUES (%s, %s, %s, %s, %s)
                    ON CONFLICT (conversation_id) DO NOTHING""",
-                (owner, tenant, now, now),
+                (owner, tenant, now, now, now),
             )
             row = conn.execute(
                 "SELECT tenant_id FROM conversations "
@@ -4061,6 +4083,27 @@ class PostgresStore(ContextStore):
             if row is None:
                 raise KeyError(conversation_id)
             return int(row["lifecycle_epoch"] if isinstance(row, dict) else row[0])
+
+    def get_lifecycle_epoch_started_at(self, conversation_id: str):
+        """When the conversation's current lifecycle_epoch began, or None.
+
+        None means the start is not recorded, which is not the same as old.
+        Callers deciding whether evidence belongs to this incarnation must
+        treat it as unknown and decline, because "the start is unknown" cannot
+        establish that anything happened after it. Rows resurrected before this
+        column existed report None for that reason and never a guessed value.
+
+        Raises KeyError if no row exists.
+        """
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                "SELECT lifecycle_epoch_started_at FROM conversations "
+                "WHERE conversation_id = %s",
+                (conversation_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(conversation_id)
+            return row["lifecycle_epoch_started_at"] if isinstance(row, dict) else row[0]
 
     def verify_lifecycle_epoch(
         self, conversation_id: str, expected_lifecycle_epoch: int,
@@ -4202,12 +4245,13 @@ class PostgresStore(ContextStore):
                    SET lifecycle_epoch = lifecycle_epoch + 1,
                        phase = 'init',
                        deleted_at = NULL,
-                       updated_at = %s
+                       updated_at = %s,
+                       lifecycle_epoch_started_at = %s
                  WHERE conversation_id = %s
                    AND phase = 'deleted'
                 RETURNING lifecycle_epoch
                 """,
-                (now, conversation_id),
+                (now, now, conversation_id),
             ).fetchone()
             if row is not None:
                 new_epoch = int(row["lifecycle_epoch"] if isinstance(row, dict) else row[0])
