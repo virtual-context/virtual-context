@@ -2463,10 +2463,41 @@ class CompactionPipeline:
                 configured[str(platform or "").strip().lower()] = actor_id
         if not configured:
             return {}
-        senders = {
-            (getattr(row, "sender_actor_id", "") or "").strip()
-            for row in (physical_by_id or {}).values()
-        }
+        # The rows this run holds are NOT the population that can refute an
+        # id. A member quoted in this batch may have spoken only in an earlier
+        # one, and that member is exactly whose words a wrong identity would
+        # destroy. Ask the store for every sender the conversation has ever
+        # had; fall back to the loaded rows only when the backend cannot
+        # answer, and say so, because a narrower check is weaker assurance and
+        # must not look identical to the full one.
+        senders = set()
+        conversation_id = (getattr(self._config, "conversation_id", "") or "")
+        fn = getattr(self._store, "distinct_sender_actor_ids", None)
+        if callable(fn) and conversation_id:
+            try:
+                senders = {str(x or "").strip() for x in (fn(conversation_id) or set())}
+            except Exception:
+                # Verification was attempted and failed. Partial assurance is
+                # not assurance: refuse every identity rather than suppress on
+                # a check that did not complete.
+                logger.warning(
+                    "AGENT_ACTOR_ID_UNVERIFIED conv=%s — the sender set could "
+                    "not be read, so no configured identity is trusted and "
+                    "nothing will be suppressed on this run.",
+                    conversation_id[:12], exc_info=True,
+                )
+                return {}
+        else:
+            logger.info(
+                "AGENT_ACTOR_ID_NARROW_CHECK conv=%s — backend cannot list "
+                "senders; the configured identity is checked only against the "
+                "rows this run holds, which is weaker.",
+                conversation_id[:12],
+            )
+            senders = {
+                (getattr(row, "sender_actor_id", "") or "").strip()
+                for row in (physical_by_id or {}).values()
+            }
         senders.discard("")
         kept = {}
         for platform, actor_id in configured.items():

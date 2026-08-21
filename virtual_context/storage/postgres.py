@@ -11691,6 +11691,29 @@ class PostgresStore(ContextStore):
                 "canonical source uniqueness conflict"
             ) from exc
 
+    def distinct_sender_actor_ids(self, conversation_id: str) -> set[str]:
+        """Every actor id that has ever SENT in this conversation.
+
+        Used to refute a configured agent identity. Scanning only the rows a
+        compaction happens to hold would miss a member who is quoted in this
+        batch but spoke in an earlier one -- and that member is precisely the
+        one whose words a wrong identity would destroy.
+        """
+        with self.pool.connection() as conn:
+            rows = conn.execute(
+                """SELECT DISTINCT sender_actor_id FROM canonical_turns
+                    WHERE conversation_id = %s
+                      AND COALESCE(sender_actor_id, '') <> ''""",
+                (conversation_id,),
+            ).fetchall()
+        out: set[str] = set()
+        for row in rows:
+            value = row["sender_actor_id"] if isinstance(row, dict) else row[0]
+            text = str(value or "").strip()
+            if text:
+                out.add(text)
+        return out
+
     def find_actor_ids_by_display_label(
         self,
         conversation_id: str,

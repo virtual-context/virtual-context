@@ -380,3 +380,54 @@ def test_a_malformed_configured_entry_is_dropped_not_repaired():
     pipeline = _pipeline(_Ledger(known=set()))
     pipeline._config.agent_actor_ids = {"discord": "", "": "x", "bad platform!": "1"}
     assert pipeline._validated_agent_actor_ids(rows) == {}
+
+
+# ---------------------------------------------------------------------------
+# The sender set that refutes an identity is the CONVERSATION's, not the batch's.
+# ---------------------------------------------------------------------------
+
+class _LedgerWithSenders(_Ledger):
+    def __init__(self, senders, raises=False, **kw):
+        super().__init__(**kw)
+        self._senders = set(senders)
+        self._raises = raises
+
+    def distinct_sender_actor_ids(self, conversation_id):
+        if self._raises:
+            raise RuntimeError("store unavailable")
+        return set(self._senders)
+
+
+def test_an_id_belonging_to_a_member_who_never_spoke_in_this_batch_is_rejected():
+    """THE GAP the batch-only check missed. The member is quoted here and
+    spoke only in an earlier batch, so the loaded rows cannot refute the id."""
+    _, rows = _reply_quoting_actor(AGENT, sender_actor=MEMBER)
+    pipeline = _pipeline(_LedgerWithSenders(senders={AGENT}))
+    pipeline._config.agent_actor_ids = AGENT_MAP
+    assert pipeline._validated_agent_actor_ids(rows) == {}
+
+
+def test_a_clean_id_survives_the_widened_check():
+    """Negative control: the widened check must not reject everything."""
+    _, rows = _reply_quoting_actor(AGENT, sender_actor=MEMBER)
+    pipeline = _pipeline(_LedgerWithSenders(senders={MEMBER}))
+    pipeline._config.agent_actor_ids = AGENT_MAP
+    assert pipeline._validated_agent_actor_ids(rows) == {"discord": AGENT}
+
+
+def test_a_failed_sender_lookup_trusts_nothing():
+    """Verification attempted and not completed is not partial assurance."""
+    _, rows = _reply_quoting_actor(AGENT, sender_actor=MEMBER)
+    pipeline = _pipeline(_LedgerWithSenders(senders={MEMBER}, raises=True))
+    pipeline._config.agent_actor_ids = AGENT_MAP
+    assert pipeline._validated_agent_actor_ids(rows) == {}
+
+
+def test_a_backend_without_the_query_says_so(caplog):
+    """A narrower check must not look identical to the full one."""
+    _, rows = _reply_quoting_actor(AGENT, sender_actor=MEMBER)
+    pipeline = _pipeline(_Ledger(known=set()))
+    pipeline._config.agent_actor_ids = AGENT_MAP
+    with caplog.at_level("INFO"):
+        assert pipeline._validated_agent_actor_ids(rows) == {"discord": AGENT}
+    assert any("AGENT_ACTOR_ID_NARROW_CHECK" in r.getMessage() for r in caplog.records)

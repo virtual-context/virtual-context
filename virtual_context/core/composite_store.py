@@ -1592,6 +1592,12 @@ class CompositeStore:
             return int(fn(conversation_id))
         raise KeyError(conversation_id)
 
+    def distinct_sender_actor_ids(self, conversation_id: str) -> set:
+        fn = getattr(self._segments, "distinct_sender_actor_ids", None)
+        if not callable(fn):
+            raise AttributeError("distinct_sender_actor_ids")
+        return fn(conversation_id)
+
     def record_bot_outbound_messages(
         self, *, tenant_id: str, agent_scope_id: str, conversation_id: str,
         observed: list, clock_skew_seconds: int = 300,
