@@ -3980,7 +3980,10 @@ class VirtualContextEngine:
                 turn_count=stored.metadata.turn_count,
                 session_date=stored.metadata.session_date,
             )
-            roster = self._compaction._build_actor_roster(tagged, physical)
+            roster = self._compaction._build_actor_roster(
+                tagged, physical,
+                self._compaction._validated_agent_actor_id(physical),
+            )
             if not roster.complete:
                 report["skipped_incomplete_source"] += 1
                 continue

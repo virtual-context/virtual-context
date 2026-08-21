@@ -2768,6 +2768,15 @@ class VirtualContextConfig:
     curation: CurationConfig = field(default_factory=CurationConfig)
     providers: dict[str, dict] = field(default_factory=dict)
     conversation_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    # The agent's OWN platform actor id, in ``actor:<platform>:<user_id>``
+    # form. Tenant-scoped configuration and deliberately NOT a per-request
+    # value: the only consumer runs during compaction, over canonical rows
+    # ingested months earlier, where no request exists to carry it. A value
+    # supplied per offer would be present for live traffic and absent for
+    # everything already stored -- the same forward-only defect it exists to
+    # repair. Empty means unknown, which is a distinct answer from "no match"
+    # and must never be treated as one.
+    agent_actor_id: str = ""
     # tenant_id ( prod blocker fold ): stamped on every
     # ``conversations`` row at insert time so the body method's Layer C
     # tenant scoping has data to compare against. Cloud's REST handler

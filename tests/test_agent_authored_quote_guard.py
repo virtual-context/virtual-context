@@ -243,3 +243,119 @@ def test_no_suppression_means_no_suppression_line(caplog):
         _pipeline(store)._build_actor_roster(segment, rows)
 
     assert not any("AGENT_QUOTE_SUPPRESSED" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# The actor-id signal. The ledger only ever covers messages recorded since it
+# began, so it cannot answer for history. ``reply_subject_actor_id`` is stamped
+# at ingest and is present on rows written months ago, which is the only reason
+# a rebuild of existing history can suppress anything at all.
+# ---------------------------------------------------------------------------
+
+AGENT = "actor:discord:the-agent"
+MEMBER = "actor:discord:member"
+
+
+def _reply_quoting_actor(subject_actor: str, sender_actor: str = MEMBER):
+    reply = CanonicalTurnRow(
+        conversation_id=CONV, canonical_turn_id="reply",
+        user_content="what do you think?",
+        sender_actor_id=sender_actor,
+        reply_target_message_id="m-1",
+        reply_subject_actor_id=subject_actor,
+        reply_target_body="I take 500mg of berberine daily",
+        reply_attribution_version=1,
+        audience_conversation_id="guild", origin_channel_id=CHAN,
+    )
+    segment = TaggedSegment(messages=[
+        Message(
+            role="user", content="what do you think?",
+            metadata={SOURCE_CANONICAL_TURN_IDS_KEY: ["reply"]},
+        ),
+    ])
+    return segment, {"reply": reply}
+
+
+def test_a_quote_whose_subject_is_the_agent_creates_no_subject_lane():
+    """The signal that reaches historical rows, with an EMPTY ledger."""
+    segment, rows = _reply_quoting_actor(AGENT)
+    pipeline = _pipeline(_Ledger(known=set()))
+    roster = pipeline._build_actor_roster(segment, rows, AGENT)
+    assert _subject_lanes(roster) == []
+
+
+def test_a_quote_of_a_real_member_still_creates_a_subject_lane():
+    """THE SAFETY CASE. An id that is too broad deletes a person's words."""
+    segment, rows = _reply_quoting_actor(MEMBER)
+    pipeline = _pipeline(_Ledger(known=set()))
+    roster = pipeline._build_actor_roster(segment, rows, AGENT)
+    lanes = _subject_lanes(roster)
+    assert len(lanes) == 1
+    assert lanes[0].actor_id == MEMBER
+    assert lanes[0].text == "I take 500mg of berberine daily"
+
+
+def test_the_actor_id_signal_never_consults_the_ledger():
+    """A positive actor-id answer must not depend on a ledger lookup."""
+    segment, rows = _reply_quoting_actor(AGENT)
+    ledger = _Ledger(known=set())
+    pipeline = _pipeline(ledger)
+    pipeline._build_actor_roster(segment, rows, AGENT)
+    assert ledger.asked == []
+
+
+def test_a_configured_id_seen_as_an_inbound_sender_is_rejected():
+    """An id that ever spoke is not the agent, and must suppress nothing."""
+    segment, rows = _reply_quoting_actor(AGENT, sender_actor=AGENT)
+    pipeline = _pipeline(_Ledger(known=set()))
+    # The config MUST carry the id, or the check returns "" for the trivial
+    # reason that nothing was configured and the test proves nothing.
+    pipeline._config.agent_actor_id = AGENT
+    assert pipeline._validated_agent_actor_id(rows) == ""
+    roster = pipeline._build_actor_roster(
+        segment, rows, pipeline._validated_agent_actor_id(rows),
+    )
+    assert len(_subject_lanes(roster)) == 1
+
+
+def test_not_agent_and_unknown_are_different_outcomes():
+    """Both decline to suppress; collapsing them hides an unconfigured guard."""
+    pipeline = _pipeline(_Ledger(known=set()))
+    assert pipeline._quote_is_agent_output(
+        channel_id=CHAN, target_message_id="m-1",
+        reply_subject_actor_id=MEMBER, agent_actor_id=AGENT,
+    ) == CompactionPipeline.QUOTE_NOT_AGENT
+    assert pipeline._quote_is_agent_output(
+        channel_id=CHAN, target_message_id="m-1",
+        reply_subject_actor_id=MEMBER, agent_actor_id="",
+    ) == CompactionPipeline.QUOTE_IDENTITY_UNKNOWN
+
+
+def test_the_suppression_line_names_the_matched_identity(caplog):
+    """Suppression destroys text; the record must say what destroyed it."""
+    segment, rows = _reply_quoting_actor(AGENT)
+    pipeline = _pipeline(_Ledger(known=set()))
+    with caplog.at_level("INFO"):
+        pipeline._build_actor_roster(segment, rows, AGENT)
+    line = [r for r in caplog.records if "AGENT_QUOTE_SUPPRESSED" in r.getMessage()]
+    assert len(line) == 1
+    assert AGENT in line[0].getMessage()
+
+
+def test_outcomes_are_emitted_even_when_every_count_is_zero(caplog):
+    """A guard that never ran and one that matched nothing must differ."""
+    pipeline = _pipeline(_Ledger(known=set()))
+    with caplog.at_level("INFO"):
+        pipeline._log_quote_outcomes()
+    msg = [r.getMessage() for r in caplog.records if "AGENT_QUOTE_OUTCOMES" in r.getMessage()]
+    assert len(msg) == 1
+    assert "agent_authored=0" in msg[0]
+    assert "agent_identity_unknown=0" in msg[0]
+
+
+def test_a_configured_id_never_seen_as_a_sender_survives_validation():
+    """Negative control for the check above: it must not reject everything."""
+    segment, rows = _reply_quoting_actor(AGENT, sender_actor=MEMBER)
+    pipeline = _pipeline(_Ledger(known=set()))
+    pipeline._config.agent_actor_id = AGENT
+    assert pipeline._validated_agent_actor_id(rows) == AGENT

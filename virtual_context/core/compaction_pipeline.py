@@ -2431,31 +2431,118 @@ class CompactionPipeline:
                     ordered.append(cid)
         return ordered, complete
 
+    # Outcomes of the agent-authored quote check. THREE states, not two:
+    # "this is not the agent" and "I cannot tell" both decline to suppress and
+    # are NOT the same answer. Collapsing them makes an unconfigured guard
+    # indistinguishable from a configured one that never matches, which is how
+    # an inert layer reads as a healthy one.
+    QUOTE_AGENT_AUTHORED = "agent_authored"
+    QUOTE_NOT_AGENT = "not_agent"
+    QUOTE_IDENTITY_UNKNOWN = "agent_identity_unknown"
+
+    def _validated_agent_actor_id(self, physical_by_id: dict) -> str:
+        """The configured agent actor id, or "" if the rows contradict it.
+
+        An id that has ever been an INBOUND sender is not the agent. This is
+        checked against stored history rather than waiting for a wrong value to
+        speak, so a misconfiguration is caught before it suppresses anything.
+
+        Failing to "" is deliberate: an id too narrow leaves ghosts, an id too
+        broad DELETES a member's quoted words and leaves nothing behind. The
+        two errors are not comparable, so an unverifiable id must not be used.
+        """
+        configured = (getattr(self._config, "agent_actor_id", "") or "").strip()
+        if not configured:
+            return ""
+        for row in (physical_by_id or {}).values():
+            if (getattr(row, "sender_actor_id", "") or "").strip() == configured:
+                logger.error(
+                    "AGENT_ACTOR_ID_REJECTED conv=%s actor_id=%s — this id "
+                    "appears as an INBOUND SENDER, so it is not the agent. "
+                    "The quote guard is disabled and prior behaviour kept; "
+                    "no quote will be suppressed on this run.",
+                    (getattr(self._config, "conversation_id", "") or "")[:12],
+                    configured,
+                )
+                return ""
+        return configured
+
+    def _record_quote_outcome(self, outcome: str) -> None:
+        counts = getattr(self, "_agent_quote_counts", None)
+        if counts is None:
+            counts = {
+                self.QUOTE_AGENT_AUTHORED: 0,
+                self.QUOTE_NOT_AGENT: 0,
+                self.QUOTE_IDENTITY_UNKNOWN: 0,
+            }
+            self._agent_quote_counts = counts
+        counts[outcome] = counts.get(outcome, 0) + 1
+
+    def _log_quote_outcomes(self) -> None:
+        """Emit the tally, INCLUDING when every count is zero.
+
+        A guard that never ran and a guard that ran and matched nothing are
+        otherwise identical in the record, and the difference is exactly what
+        anyone verifying this needs.
+        """
+        counts = getattr(self, "_agent_quote_counts", None) or {}
+        logger.info(
+            "AGENT_QUOTE_OUTCOMES conv=%s agent_authored=%d not_agent=%d "
+            "agent_identity_unknown=%d",
+            (getattr(self._config, "conversation_id", "") or "")[:12],
+            counts.get(self.QUOTE_AGENT_AUTHORED, 0),
+            counts.get(self.QUOTE_NOT_AGENT, 0),
+            counts.get(self.QUOTE_IDENTITY_UNKNOWN, 0),
+        )
+
     def _quote_is_agent_output(
         self, *, channel_id: str, target_message_id: str,
-    ) -> bool:
-        """Whether the quoted message is one this agent authored.
+        reply_subject_actor_id: str = "", agent_actor_id: str = "",
+    ) -> str:
+        """Classify a quoted message's authorship. Returns one of three states.
 
-        True only for an exact match on the full namespaced identity, built
-        from the same values the inbound path recorded for the channel. False
-        means unknown, which includes every case where the identity was never
-        reported, the channel does not resolve to one namespace, or the store
-        does not keep the ledger. Callers must treat False as "no information"
-        and keep their existing behaviour.
+        CONTRACT CHANGE: this returned ``bool`` and documented False as
+        "unknown, which includes every case where the identity was never
+        reported". That conflated "not the agent" with "cannot tell", and the
+        two need different remedies. Callers must now compare against
+        ``QUOTE_AGENT_AUTHORED`` explicitly; anything else declines to
+        suppress, but only ``QUOTE_IDENTITY_UNKNOWN`` means unevaluable.
+
+        Two independent signals, in order of what they can reach:
+
+        1. ``reply_subject_actor_id`` on the canonical row -- who the platform
+           said authored the quoted message. Recorded at ingest, so it is
+           present on HISTORICAL rows and needs no ledger.
+        2. The outbound ledger -- an exact namespaced identity match. Only
+           covers messages recorded since the ledger began, so it cannot
+           answer for history.
+
+        Signal 1 answers both directions; signal 2 can only ever confirm, and
+        its absence is never a denial because the recorded set is partial by
+        construction.
         """
+        subject = (reply_subject_actor_id or "").strip()
+        agent = (agent_actor_id or "").strip()
+        if agent and subject:
+            return (
+                self.QUOTE_AGENT_AUTHORED if subject == agent
+                else self.QUOTE_NOT_AGENT
+            )
+        # No subject actor recorded, or no configured agent identity. The
+        # ledger can still positively confirm, but it cannot deny.
         if not channel_id or not target_message_id:
-            return False
+            return self.QUOTE_IDENTITY_UNKNOWN
         conversation_id = getattr(self._config, "conversation_id", "") or ""
         if not conversation_id:
-            return False
+            return self.QUOTE_IDENTITY_UNKNOWN
         try:
             namespace = self._store.resolve_channel_namespace(
                 conversation_id=conversation_id, channel_id=channel_id,
             )
             if not namespace:
-                return False
+                return self.QUOTE_IDENTITY_UNKNOWN
             agent_scope_id, platform, account_id = namespace
-            return bool(self._store.is_bot_authored_message(
+            matched = bool(self._store.is_bot_authored_message(
                 tenant_id=getattr(self._config, "tenant_id", "") or "",
                 agent_scope_id=agent_scope_id,
                 conversation_id=conversation_id,
@@ -2464,13 +2551,19 @@ class CompactionPipeline:
                 channel_id=channel_id,
                 message_id=target_message_id,
             ))
+            return (
+                self.QUOTE_AGENT_AUTHORED if matched
+                else self.QUOTE_IDENTITY_UNKNOWN
+            )
         except Exception:
             # An enhancement must never be able to change how a turn is filed
-            # by failing. Unknown is the safe answer.
+            # by failing. Unevaluable is the safe answer.
             logger.warning("agent-authored quote check failed", exc_info=True)
-            return False
+            return self.QUOTE_IDENTITY_UNKNOWN
 
-    def _build_actor_roster(self, segment, physical_by_id: dict) -> "ActorRoster":
+    def _build_actor_roster(
+        self, segment, physical_by_id: dict, agent_actor_id: str = "",
+    ) -> "ActorRoster":
         """Build one segment's actor roster and fact lanes from physical rows.
 
         Everything here comes from stored rows, never from model text or a
@@ -2558,35 +2651,49 @@ class CompactionPipeline:
                     # text is the agent's output, not a disclosure by the
                     # person being addressed, and filing it as one is how the
                     # agent's own words become evidence about a named human.
-                    # Only an exact recorded identity counts. Absence means
-                    # unknown and falls through to the behaviour below, never
-                    # to suppression: the recorded set is always partial, since
-                    # a reply split across several platform messages reports at
-                    # most one of them.
-                    if not target_present and self._quote_is_agent_output(
-                        channel_id=channel, target_message_id=target_id,
-                    ):
-                        # Say so. The only other evidence that this guard ever
-                        # fires is the absence of new mis-filed rows, and
-                        # absence of rows is indistinguishable from absence of
-                        # traffic. A suppression that leaves no trace cannot be
-                        # told apart from a feature that is inert.
-                        logger.info(
-                            "AGENT_QUOTE_SUPPRESSED conv=%s channel=%s "
-                            "target_message_id=%s canonical_turn_id=%s",
-                            (getattr(self._config, "conversation_id", "") or "")[:12],
-                            channel, target_id, row.canonical_turn_id,
+                    # Two signals answer this, and only a positive one
+                    # suppresses. The row's own reply_subject_actor_id is what
+                    # the platform said, so it reaches HISTORICAL rows and can
+                    # answer in both directions. The ledger can only ever
+                    # confirm: its absence is not a denial, because the
+                    # recorded set is partial by construction -- a reply split
+                    # across several platform messages reports at most one of
+                    # them. Anything short of a positive answer falls through
+                    # to the behaviour below, never to suppression.
+                    subject_actor = (
+                        getattr(row, "reply_subject_actor_id", "") or ""
+                    ).strip()
+                    if not target_present:
+                        outcome = self._quote_is_agent_output(
+                            channel_id=channel,
+                            target_message_id=target_id,
+                            reply_subject_actor_id=subject_actor,
+                            agent_actor_id=agent_actor_id,
                         )
-                        target_present = True
+                        self._record_quote_outcome(outcome)
+                        if outcome == self.QUOTE_AGENT_AUTHORED:
+                            # Name the identity that caused this. Suppression
+                            # destroys a quoted block, and an id that is too
+                            # broad would delete a real member's words while
+                            # looking exactly like a working guard. Without the
+                            # matched id the record shows that something was
+                            # destroyed and never what destroyed it.
+                            logger.info(
+                                "AGENT_QUOTE_SUPPRESSED conv=%s channel=%s "
+                                "target_message_id=%s canonical_turn_id=%s "
+                                "matched_actor_id=%s",
+                                (getattr(self._config, "conversation_id", "") or "")[:12],
+                                channel, target_id, row.canonical_turn_id,
+                                subject_actor or "(ledger)",
+                            )
+                            target_present = True
                     if not target_present:
                         roster.lanes.append(FactLane(
                             role=AUTHOR_ROLE_SUBJECT,
                             text=quote,
                             # ONLY the resolved subject. Never the requester's
                             # id: that is the reply-chain contamination path.
-                            actor_id=(
-                                getattr(row, "reply_subject_actor_id", "") or ""
-                            ).strip(),
+                            actor_id=subject_actor,
                             source_message_id=target_id,
                             canonical_turn_id=row.canonical_turn_id,
                             speaker_label=(
@@ -3826,10 +3933,19 @@ class CompactionPipeline:
         # not from the positional cursor above: the cursor walks logical merged
         # rows and cannot survive noncontiguous topic grouping or a session
         # split, so it is not a safe basis for deciding who authored a fact.
+        # Validate the configured agent identity ONCE against every physical
+        # row this run holds, before any suppression decision is taken.
+        self._agent_quote_counts = {
+            self.QUOTE_AGENT_AUTHORED: 0,
+            self.QUOTE_NOT_AGENT: 0,
+            self.QUOTE_IDENTITY_UNKNOWN: 0,
+        }
+        _agent_actor_id = self._validated_agent_actor_id(physical_by_id)
         actor_rosters_by_segment = {
-            seg.id: self._build_actor_roster(seg, physical_by_id)
+            seg.id: self._build_actor_roster(seg, physical_by_id, _agent_actor_id)
             for seg in compactable
         }
+        self._log_quote_outcomes()
         exact_source_ids = {
             seg.id: self._segment_source_ids(seg) for seg in compactable
         }
