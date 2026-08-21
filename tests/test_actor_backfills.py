@@ -392,3 +392,122 @@ def test_batch_operation_continues_past_a_vanished_conversation(tmp_path, capsys
     assert calls == ["conv-a", "conv-gone", "conv-b"]
     error_rows = [r for r in out["results"] if r.get("status") == "error"]
     assert len(error_rows) == 1 and error_rows[0]["conversation_id"] == "conv-gone"
+
+
+# ---------------------------------------------------------------------------
+# The card rebuild is a SEPARATE operation from the fact replacement.
+#
+# It runs AFTER replace_facts_for_segment has committed, so sharing one
+# try/except made a REPAIRED segment report as failed -- and a re-run would
+# then re-derive work that had already succeeded, at LLM cost.
+#
+# And the actor set must come from the NEW facts only. Building it from the
+# rows being deleted re-derives a card from the identities the repair exists
+# to remove, which is the original incident's own mechanism running inside
+# the repair for it.
+# ---------------------------------------------------------------------------
+
+def _seeded_engine_for_card_tests(tmp_path, old_author=None):
+    engine = _engine(tmp_path)
+    now = datetime.now(timezone.utc)
+    engine._store.save_canonical_turn(
+        GUILD, -1, "I prefer terse answers", "noted",
+        canonical_turn_id="ct", sort_key=1, turn_hash="ct",
+        sender="Optics", sender_actor_id=OPTICS,
+        audience_conversation_id=GUILD, audience_attribution_version=1,
+    )
+    engine._store.store_segment(StoredSegment(
+        ref="seg", conversation_id=GUILD, primary_tag="prefs",
+        tags=["prefs"], summary="old", full_text="old", messages=[],
+        metadata=SegmentMetadata(
+            canonical_turn_ids=["ct"], source_mapping_complete=True, turn_count=1,
+        ),
+        created_at=now, start_timestamp=now, end_timestamp=now,
+    ))
+    engine._store.store_facts([Fact(
+        id="old", subject="user", verb="prefers", object="terse answers",
+        segment_ref="seg", conversation_id=GUILD,
+        author_actor_id=old_author or "",
+    )])
+
+    class LLM:
+        def complete(self, **_kwargs):
+            return json.dumps({
+                "summary": "Optics prefers terse answers.",
+                "entities": [], "key_decisions": [], "action_items": [],
+                "date_references": [], "refined_tags": ["prefs"],
+                "facts": [{
+                    "subject": "Optics", "verb": "prefers",
+                    "object": "terse answers", "status": "active",
+                    "fact_type": "personal", "what": "Optics prefers terse answers.",
+                    "speaker": "Optics",
+                }],
+            }), {}
+
+    engine._compactor = DomainCompactor(LLM(), engine.config.compactor)
+    engine._compaction._compactor = engine._compactor
+    return engine
+
+
+def test_a_card_failure_does_not_report_a_repaired_segment_as_failed(tmp_path):
+    """THE MUTATION: the card call raises unconditionally.
+
+    The facts are already committed at that point, so the segment WAS
+    repaired. Reporting it as failed would send a re-run at it.
+    """
+    engine = _seeded_engine_for_card_tests(tmp_path)
+    def _boom(*_a, **_k):
+        raise RuntimeError("actor_card_entries FK violation")
+    engine._compaction._rebuild_actor_card = _boom
+
+    report = engine.backfill_fact_authors(GUILD)
+
+    assert report["updated"] == 1, "the facts committed; this is a repair"
+    assert report["failed"] == 0, "a card failure is not a replacement failure"
+    assert report["card_failed"] == 1, "and it must still be counted somewhere"
+    assert len(engine._store.get_facts_by_segment("seg")) == 1
+    engine.close()
+
+
+def test_the_actor_set_excludes_the_facts_being_deleted(tmp_path):
+    """Defect A: old_facts must not seed the card rebuild."""
+    ghost = "actor:discord:1485681229608259666"
+    engine = _seeded_engine_for_card_tests(tmp_path, old_author=ghost)
+    seen: list[str] = []
+    engine._compaction._rebuild_actor_card = lambda a, **_k: seen.append(a)
+
+    report = engine.backfill_fact_authors(GUILD)
+
+    assert report["updated"] == 1
+    assert ghost not in seen, (
+        "the identity on the DELETED rows must not rebuild a card"
+    )
+    assert seen == [OPTICS], "only the surviving facts' authors"
+    engine.close()
+
+
+def test_a_clean_run_still_reports_updated_and_not_card_failed(tmp_path):
+    """Negative control: the fix must not make everything report failure."""
+    engine = _seeded_engine_for_card_tests(tmp_path)
+    engine._compaction._rebuild_actor_card = lambda *_a, **_k: None
+    report = engine.backfill_fact_authors(GUILD)
+    assert report["updated"] == 1
+    assert report["failed"] == 0
+    assert report["card_failed"] == 0
+    engine.close()
+
+
+def test_a_real_replacement_failure_still_reports_failed(tmp_path):
+    """Negative control the other way: the fix must not swallow real failures."""
+    engine = _seeded_engine_for_card_tests(tmp_path)
+    def _boom(*_a, **_k):
+        raise RuntimeError("store unavailable")
+    engine._store.replace_facts_for_segment = _boom
+    engine._compaction._rebuild_actor_card = lambda *_a, **_k: None
+
+    report = engine.backfill_fact_authors(GUILD)
+
+    assert report["failed"] == 1, "a replacement failure is still a failure"
+    assert report["updated"] == 0
+    assert report["card_failed"] == 0
+    engine.close()

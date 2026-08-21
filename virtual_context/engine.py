@@ -3906,7 +3906,7 @@ class VirtualContextEngine:
             "eligible": 0, "updated": 0, "skipped_existing": 0,
             "skipped_incomplete_source": 0, "skipped_multi_actor": 0,
             "unattributed_subject": 0, "unattributed_speaker": 0,
-            "failed": 0, "dry_run": bool(dry_run),
+            "failed": 0, "card_failed": 0, "dry_run": bool(dry_run),
         }
         physical = {
             row.canonical_turn_id: row
@@ -4016,19 +4016,37 @@ class VirtualContextEngine:
                             report["unattributed_subject"] += 1
                         else:
                             report["unattributed_speaker"] += 1
+                # Authorship of rows being DELETED is not a fact about the
+                # world after this call returns, so old_facts are excluded.
+                # Including them re-derives a card from identities the repair
+                # exists to remove -- which is the original defect's own
+                # mechanism, running inside the repair for it.
                 actors = {
                     (fact.author_actor_id or "").strip()
-                    for fact in [*old_facts, *result.facts]
+                    for fact in result.facts
                     if (fact.author_actor_id or "").strip()
                 }
-                for actor_id in actors:
-                    self._compaction._rebuild_actor_card(actor_id, force=True)
             except Exception:
                 logger.warning(
                     "fact-author backfill failed for segment %s",
                     stored.ref, exc_info=True,
                 )
                 report["failed"] += 1
+                continue
+            # Card rebuilding is a SEPARATE operation with a different failure
+            # meaning, and it runs AFTER replace_facts_for_segment has
+            # committed. Sharing one handler made a repaired segment report as
+            # failed, so a re-run would re-derive work that had succeeded.
+            try:
+                for actor_id in actors:
+                    self._compaction._rebuild_actor_card(actor_id, force=True)
+            except Exception:
+                logger.warning(
+                    "actor card rebuild failed after a successful fact "
+                    "replacement for segment %s; the facts are committed",
+                    stored.ref, exc_info=True,
+                )
+                report["card_failed"] += 1
         return report
 
     def rebuild_actor_cards(
