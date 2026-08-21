@@ -1399,6 +1399,42 @@ class PostgresStore(ContextStore):
                     pass
 
     def _ensure_schema_locked(self) -> None:
+        """Run the whole schema block. COSTS MORE THAN IT LOOKS.
+
+        ``ADD COLUMN IF NOT EXISTS`` takes an ACCESS EXCLUSIVE lock to decide
+        whether it has anything to do, so a statement that does NOTHING costs
+        the same lock as one that does. ACCESS EXCLUSIVE conflicts with every
+        other lock mode including plain SELECT, and a blocked request queues
+        everything behind it rather than being overtaken.
+
+        Measured 2026-08-21 against production: 105 statements here (15
+        ADD COLUMN, 50 CREATE INDEX, 40 CREATE TABLE) and ALL 105 were
+        no-ops -- every object already existed. The block did no work and
+        still took at least 15 ACCESS EXCLUSIVE locks.
+
+        This runs from ``PostgresStore.__init__`` via ``_build_raw_store``,
+        which runs from ``VirtualContextEngine.__init__``. Engines are keyed
+        per conversation in the proxy registry, so the real frequency is
+        ONCE PER NEW CONVERSATION plus once per re-claim after eviction --
+        not once per process, and not once per deploy.
+
+        And ``_ensure_schema`` serializes this across workers on an advisory
+        lock (for good reason -- see its docstring). The consequence is that
+        while one worker's DDL waits behind a long-running read, every OTHER
+        booting worker waits on the advisory lock too. One stalled no-op can
+        stall the whole fleet's boot. This was observed on 2026-08-21: a
+        no-op ALTER waited 1,358s behind an idle-in-transaction read and
+        queued 21 statements behind it.
+
+        There is deliberately no ``lock_timeout`` set here yet; adding one
+        would bound the damage, and it is safe for THIS block specifically
+        because every statement is already failure-tolerant and no-op. Do
+        not copy that reasoning to paths that do real work -- aborting those
+        loses work silently.
+
+        Before adding statements here, consider that each one is paid on
+        every new conversation, forever, whether or not it does anything.
+        """
         with self.pool.connection() as conn:
             # Split SCHEMA_SQL by statements and execute individually
             for stmt in SCHEMA_SQL.split(";"):
