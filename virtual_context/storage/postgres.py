@@ -4208,8 +4208,34 @@ class PostgresStore(ContextStore):
                 raise KeyError(conversation_id)
             return int(row["lifecycle_epoch"] if isinstance(row, dict) else row[0])
 
-    # Rejection reasons for record_bot_outbound_messages. Every one is
-    # permanent: retrying an id the ledger declined cannot change the answer.
+    # Rejection reasons for record_bot_outbound_messages.
+    #
+    # THEY ARE NOT ALL PERMANENT. An earlier revision of this comment claimed
+    # every one was, and that was disproved by this system on 2026-08-21:
+    # ``epoch_start_unknown`` declined every identity for a conversation until
+    # an operator recorded the missing boundary, after which the identical
+    # identity would have been accepted. A caller that treats "permanent" as
+    # licence to DISCARD an identity would have discarded those, and nothing
+    # re-presents them -- both offer sites are on the live turn path.
+    #
+    #   permanent   retrying cannot change the answer
+    #     malformed_identity   the identity's own fields are wrong
+    #     fence_rejection      observed before the boundary, and the boundary
+    #                          only ever moves forward
+    #
+    #   repairable  retrying AFTER a state change can change the answer
+    #     epoch_start_unknown        an operator records the boundary
+    #     namespace_mismatch         the channel's recorded namespace changes
+    #     conversation_deleted       the conversation is resurrected
+    #     unresolvable_tenant_scope  the scope becomes resolvable
+    #     ambiguous_alias_resolution the alias chain is repaired
+    #
+    #   transient   retry later
+    #     store_unavailable
+    #
+    # A sender may drop an identity only on acceptance. Declining is never
+    # licence to forget, whatever the class -- the cost of retaining one is an
+    # inflated count, and the cost of dropping one wrongly is the identity.
     _OUTBOUND_FIELDS = (
         "platform", "account_id", "channel_id", "message_id",
     )
