@@ -431,3 +431,53 @@ def test_a_backend_without_the_query_says_so(caplog):
     with caplog.at_level("INFO"):
         assert pipeline._validated_agent_actor_ids(rows) == {"discord": AGENT}
     assert any("AGENT_ACTOR_ID_NARROW_CHECK" in r.getMessage() for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# END TO END: config dict -> loaded config -> guard behaviour.
+#
+# Every test above sets ``pipeline._config.agent_actor_ids`` directly, so all
+# of them passed while nothing parsed the key and the value could not reach a
+# real engine. Testing the two ends without the wire between them is how a
+# field can exist, be read, and never be connected.
+# ---------------------------------------------------------------------------
+
+def test_the_configured_map_reaches_the_guard_from_a_config_dict():
+    from virtual_context.config import load_config
+    cfg = load_config(config_dict={"agent_actor_ids": {"discord": AGENT_UID}})
+    _, rows = _reply_quoting_actor(AGENT, sender_actor=MEMBER)
+    pipeline = _pipeline(_LedgerWithSenders(senders={MEMBER}))
+    pipeline._config = cfg
+    assert pipeline._validated_agent_actor_ids(rows) == {"discord": AGENT}
+
+
+def test_a_quote_of_the_agent_is_suppressed_using_only_loaded_config():
+    """The whole chain: yaml-shaped input through to no subject lane."""
+    from virtual_context.config import load_config
+    cfg = load_config(config_dict={"agent_actor_ids": {"discord": AGENT_UID}})
+    segment, rows = _reply_quoting_actor(AGENT, sender_actor=MEMBER)
+    pipeline = _pipeline(_LedgerWithSenders(senders={MEMBER}))
+    pipeline._config = cfg
+    roster = pipeline._build_actor_roster(
+        segment, rows, pipeline._validated_agent_actor_ids(rows),
+    )
+    assert _subject_lanes(roster) == []
+
+
+def test_a_member_quote_survives_the_whole_chain():
+    """Same chain, safety direction: a real member's words are not destroyed."""
+    from virtual_context.config import load_config
+    cfg = load_config(config_dict={"agent_actor_ids": {"discord": AGENT_UID}})
+    segment, rows = _reply_quoting_actor(MEMBER, sender_actor=MEMBER)
+    pipeline = _pipeline(_LedgerWithSenders(senders={MEMBER}))
+    pipeline._config = cfg
+    roster = pipeline._build_actor_roster(
+        segment, rows, pipeline._validated_agent_actor_ids(rows),
+    )
+    assert len(_subject_lanes(roster)) == 1
+
+
+def test_a_non_mapping_config_value_is_ignored_not_crashed_on():
+    from virtual_context.config import load_config
+    cfg = load_config(config_dict={"agent_actor_ids": "actor:discord:1485"})
+    assert cfg.agent_actor_ids == {}

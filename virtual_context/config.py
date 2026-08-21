@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import json
 import os
 from pathlib import Path
@@ -45,6 +47,9 @@ CONFIG_FILENAMES = [
     "virtualcontext.yml",
     "virtualcontext.json",
 ]
+
+
+logger = logging.getLogger(__name__)
 
 
 def _discover_config() -> Path | None:
@@ -495,6 +500,25 @@ def _build_config(raw: dict[str, Any], *, validate: bool = True) -> VirtualConte
     # REST handler. Empty default is correct for single-user proxy / dev.
     if "tenant_id" in raw:
         cfg.tenant_id = raw["tenant_id"]
+    # The agent's own platform user ids, platform -> bare id. Passed through
+    # UNMODIFIED on purpose: the consumer assembles the full actor string with
+    # the same normaliser the ingest path uses, and pre-assembling or cleaning
+    # it here would create a second derivation that can drift from the value it
+    # is compared against. Only the SHAPE is checked, because the consumer
+    # iterates ``.items()`` and a non-mapping would raise inside compaction.
+    # Malformed entries survive this step and are dropped by the validator,
+    # which owns every transformation and the per-platform rejection.
+    if "agent_actor_ids" in raw:
+        _agent_ids = raw["agent_actor_ids"]
+        if isinstance(_agent_ids, dict):
+            cfg.agent_actor_ids = dict(_agent_ids)
+        else:
+            logger.warning(
+                "agent_actor_ids must be a mapping of platform to id; got %s. "
+                "Ignoring it: the quote guard stays unconfigured and suppresses "
+                "nothing, which is the safe direction.",
+                type(_agent_ids).__name__,
+            )
 
     if validate:
         errors = validate_config(cfg)
