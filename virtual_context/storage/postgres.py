@@ -1520,6 +1520,36 @@ class PostgresStore(ContextStore):
                     ALTER TABLE conversations
                         ADD COLUMN IF NOT EXISTS lifecycle_epoch_started_at TIMESTAMPTZ NULL
                 """)
+                # How the boundary above was arrived at. A timestamp alone
+                # cannot say whether it was observed or chosen, and the two
+                # licence different conclusions: an observed boundary dates a
+                # real resurrection, a chosen one dates only the decision to
+                # stop declining. Without this column a chosen value is
+                # indistinguishable from an observed one to every later
+                # reader, including anyone dating an incident forensically.
+                conn.execute("""
+                    ALTER TABLE conversations
+                        ADD COLUMN IF NOT EXISTS lifecycle_epoch_start_source TEXT NULL
+                """)
+                conn.execute("""
+                    COMMENT ON COLUMN conversations.lifecycle_epoch_started_at IS
+                    'When the CURRENT lifecycle_epoch began. This answers "when did '
+                    'this incarnation start", NOT "what history may I show". A '
+                    'consumer that needs the second must not reuse this column: a '
+                    'sealed boundary is later than the real resurrection, so '
+                    'filtering history on it would silently exclude the entire '
+                    'corpus of a sealed conversation. NULL means unknown, which is '
+                    'a distinct answer from old. See lifecycle_epoch_start_source.'
+                """)
+                conn.execute("""
+                    COMMENT ON COLUMN conversations.lifecycle_epoch_start_source IS
+                    'Provenance of lifecycle_epoch_started_at. observed = recorded '
+                    'by a real epoch bump. derived_created_at = epoch 1, so the '
+                    'epoch began when the row was created. sealed = chosen by an '
+                    'explicit admin action because the true resurrection time was '
+                    'unrecoverable; it is LATER than the real boundary and dates '
+                    'the decision, not the event. NULL = provenance unknown.'
+                """)
                 # Backfill only where the value is derivable rather than
                 # guessed. lifecycle_epoch = 1 means the conversation has never
                 # been resurrected, so its first epoch began when the row was
@@ -1528,9 +1558,21 @@ class PostgresStore(ContextStore):
                 # WHERE clause stops matching once the column is populated.
                 conn.execute("""
                     UPDATE conversations
-                       SET lifecycle_epoch_started_at = created_at
+                       SET lifecycle_epoch_started_at = created_at,
+                           lifecycle_epoch_start_source = 'derived_created_at'
                      WHERE lifecycle_epoch_started_at IS NULL
                        AND lifecycle_epoch = 1
+                """)
+                # Rows filled by an earlier build of the backfill above carry a
+                # value but no provenance. The predicate re-derives it rather
+                # than assuming: only a row still at epoch 1 whose boundary
+                # equals its creation time can have come from that backfill.
+                conn.execute("""
+                    UPDATE conversations
+                       SET lifecycle_epoch_start_source = 'derived_created_at'
+                     WHERE lifecycle_epoch_start_source IS NULL
+                       AND lifecycle_epoch = 1
+                       AND lifecycle_epoch_started_at = created_at
                 """)
             except Exception:
                 logger.warning("conversations table bootstrap failed", exc_info=True)
@@ -4480,6 +4522,17 @@ class PostgresStore(ContextStore):
         treat it as unknown and decline, because "the start is unknown" cannot
         establish that anything happened after it. Rows resurrected before this
         column existed report None for that reason and never a guessed value.
+
+        THIS COLUMN ANSWERS "WHEN DID THIS INCARNATION BEGIN", NOT "WHAT
+        HISTORY MAY I SHOW". Do not reuse it as a history filter. A boundary
+        that was sealed rather than observed is LATER than the real
+        resurrection, so every fact already stored in that conversation
+        predates its own epoch start; filtering history on this value would
+        silently exclude the whole corpus. The fence is the only consumer that
+        wants "later is stricter" -- a history filter wants the opposite, and
+        one value cannot be correct for both. Check
+        ``lifecycle_epoch_start_source`` before drawing any conclusion about
+        WHEN the epoch began: 'sealed' dates the decision, not the event.
 
         Raises KeyError if no row exists.
         """
