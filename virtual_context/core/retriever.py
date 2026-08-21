@@ -177,8 +177,18 @@ class ContextRetriever:
         except Exception:
             return []
 
-    def _relevance_vector(self, message: str) -> list[float] | None:
-        """Embed the query for relevance ordering, or None to keep date order.
+    def _relevance_vector(
+        self, message: str, precomputed: list[float] | None = None,
+    ) -> list[float] | None:
+        """The query vector for relevance ordering, or None to keep date order.
+
+        *precomputed* is the embedding the inbound tagger already produced for
+        this same message. Reusing it matters: under an embedding inbound
+        tagger the query has ALREADY been embedded by the time the fact floor
+        is fetched, and embedding it again is a second round-trip to the same
+        encoder for a vector we are holding. It is the same model that produced
+        the stored fact vectors, and cosine distance is scale-invariant, so an
+        un-normalised vector orders identically.
 
         Every failure here is non-fatal by design: no embedder configured, an
         embedder that raises, or the switch turned off all mean the floor stays
@@ -186,8 +196,7 @@ class ContextRetriever:
         """
         if not getattr(self.config, "fact_relevance_ordering", True):
             return None
-        embed_fn = self._query_embed_fn
-        if embed_fn is None or not message:
+        if not message:
             return None
         # Ask the store BEFORE embedding. Embedding first would spend a model
         # call on every single retrieval during the whole window between this
@@ -196,6 +205,13 @@ class ContextRetriever:
         # costs one query per process, not one per retrieval.
         ready = getattr(self.store, "vector_ordering_ready", None)
         if ready is None or not ready():
+            return None
+        if precomputed:
+            return list(precomputed)
+        # No tagger vector available (an LLM inbound tagger produces none), so
+        # fall back to embedding the query here.
+        embed_fn = self._query_embed_fn
+        if embed_fn is None:
             return None
         try:
             vec = embed_fn([message])[0]
@@ -702,7 +718,7 @@ class ContextRetriever:
                 message, context_turns, expanded_tags, retrieval_metadata,
             )
         elif self.config.prefetch_facts and expanded_tags:
-            _rel_vec = self._relevance_vector(message)
+            _rel_vec = self._relevance_vector(message, query_embedding)
             facts = self._fetch_facts_by_tags(expanded_tags, query_embedding=_rel_vec)
             logger.info("Retriever: facts=%d (prefetch tags=%s order=%s)", len(facts),
                         expanded_tags, "relevance" if _rel_vec else "date")

@@ -233,3 +233,39 @@ def test_kill_switch_is_wired_to_yaml():
     assert load("retrieval: {}\n").retriever.fact_relevance_ordering is True
     assert load("retrieval:\n  fact_relevance_ordering: false\n"
                 ).retriever.fact_relevance_ordering is False
+
+
+# --- the query must not be embedded twice --------------------------------
+
+def test_precomputed_vector_is_reused_without_embedding():
+    """Under an embedding inbound tagger the query is ALREADY embedded.
+
+    Embedding it again is a second round-trip to the same encoder for a
+    vector the retriever is already holding.
+    """
+    embedded = []
+    r = _retriever(_Store(ready=True),
+                   embed=lambda xs: embedded.append(xs) or [[9.9]])
+    assert r._relevance_vector("hello", [0.1, 0.2]) == [0.1, 0.2]
+    assert embedded == [], "re-embedded a query it already had"
+
+
+def test_precomputed_ignored_when_store_not_ready():
+    r = _retriever(_Store(ready=False), embed=lambda xs: [[9.9]])
+    assert r._relevance_vector("hello", [0.1, 0.2]) is None
+
+
+def test_precomputed_ignored_when_switch_off():
+    class Off(_Cfg):
+        fact_relevance_ordering = False
+    r = _retriever(_Store(ready=True), cfg=Off(), embed=lambda xs: [[9.9]])
+    assert r._relevance_vector("hello", [0.1, 0.2]) is None
+
+
+def test_falls_back_to_embedding_when_no_precomputed_vector():
+    """An LLM inbound tagger produces no query vector; the floor still works."""
+    embedded = []
+    r = _retriever(_Store(ready=True),
+                   embed=lambda xs: embedded.append(xs) or [[0.5]])
+    assert r._relevance_vector("hello", None) == [0.5]
+    assert embedded == [["hello"]]
