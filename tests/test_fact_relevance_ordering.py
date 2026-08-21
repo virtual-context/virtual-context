@@ -176,11 +176,41 @@ def test_gate_is_cached():
     assert s.pool.opened == 1
 
 
-def test_gate_caches_false_too():
+def test_gate_caches_false_briefly():
     s = _store_with(row=(1,))
     PostgresStore.vector_ordering_ready(s)
     PostgresStore.vector_ordering_ready(s)
     assert s.pool.opened == 1
+
+
+def test_false_is_rechecked_so_a_backfill_needs_no_restart():
+    """A process that started before the backfill must pick the column up.
+
+    Caching False permanently would leave every long-lived process on date
+    ordering until it was restarted, which reads as 'the feature did not turn
+    on' rather than as a stale cache.
+    """
+    import virtual_context.storage.postgres as pg
+    conn = _Conn((1,))                      # a NULL still remains
+    s = PostgresStore.__new__(PostgresStore)
+    s.pool = _Pool(conn)
+    clock = [1000.0]
+    real = pg.time.monotonic
+    pg.time.monotonic = lambda: clock[0]
+    try:
+        assert PostgresStore.vector_ordering_ready(s) is False
+        clock[0] += 5                        # inside the window: no new query
+        assert PostgresStore.vector_ordering_ready(s) is False
+        assert s.pool.opened == 1
+        conn._row = None                     # backfill completes
+        clock[0] += 120                      # window expires
+        assert PostgresStore.vector_ordering_ready(s) is True
+        assert s.pool.opened == 2
+        clock[0] += 10_000                   # True is never re-checked
+        assert PostgresStore.vector_ordering_ready(s) is True
+        assert s.pool.opened == 2
+    finally:
+        pg.time.monotonic = real
 
 
 # --- the parameter cannot be reached positionally ------------------------

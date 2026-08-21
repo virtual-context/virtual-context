@@ -10,6 +10,7 @@ import os
 import re
 import signal
 import threading
+import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
@@ -13288,9 +13289,19 @@ class PostgresStore(ContextStore):
         converted. Checked once per store and cached; on anything unexpected
         the answer is False and the caller keeps date ordering.
         """
-        cached = getattr(self, "_vector_ready", None)
-        if cached is not None:
-            return cached
+        # Cache TRUE forever and FALSE only briefly. The asymmetry is
+        # deliberate and it is about the cost of each answer as much as its
+        # staleness. Proving zero NULLs means scanning the whole table, so that
+        # result must be cached; finding a NULL stops at the first one, so
+        # re-asking is cheap in exactly the state where the answer is False.
+        # Caching False permanently would mean a process that started before
+        # the backfill kept date ordering until it was restarted -- the feature
+        # would appear not to have turned on, which is the confusing failure.
+        if getattr(self, "_vector_ready", False):
+            return True
+        checked_at = getattr(self, "_vector_ready_checked_at", None)
+        if checked_at is not None and (time.monotonic() - checked_at) < 60.0:
+            return False
         ready = False
         try:
             with self.pool.connection() as conn:
@@ -13302,6 +13313,7 @@ class PostgresStore(ContextStore):
             # No column, no extension, or no permission. Date ordering stands.
             ready = False
         self._vector_ready = ready
+        self._vector_ready_checked_at = time.monotonic()
         if not ready:
             logger.info(
                 "VECTOR_ORDERING unavailable; facts stay date-ordered"
