@@ -2440,32 +2440,48 @@ class CompactionPipeline:
     QUOTE_NOT_AGENT = "not_agent"
     QUOTE_IDENTITY_UNKNOWN = "agent_identity_unknown"
 
-    def _validated_agent_actor_id(self, physical_by_id: dict) -> str:
-        """The configured agent actor id, or "" if the rows contradict it.
+    def _validated_agent_actor_ids(self, physical_by_id: dict) -> dict:
+        """Configured agent identities by platform, minus any the rows refute.
 
-        An id that has ever been an INBOUND sender is not the agent. This is
-        checked against stored history rather than waiting for a wrong value to
-        speak, so a misconfiguration is caught before it suppresses anything.
+        An id that has ever been an INBOUND sender is not the agent. Checked
+        against stored history rather than waiting for a wrong value to speak,
+        so a misconfiguration is caught before it suppresses anything.
 
-        Failing to "" is deliberate: an id too narrow leaves ghosts, an id too
-        broad DELETES a member's quoted words and leaves nothing behind. The
-        two errors are not comparable, so an unverifiable id must not be used.
+        Rejection is PER PLATFORM: a bad discord entry must not disable a good
+        telegram one. Malformed entries are dropped and never repaired -- a
+        repaired identity is a guess, and a guess here deletes a person's
+        words. An id too narrow leaves ghosts; an id too broad destroys a
+        member's quoted text and leaves nothing behind. Those costs are not
+        comparable, so anything unverifiable is discarded.
         """
-        configured = (getattr(self._config, "agent_actor_id", "") or "").strip()
+        from ..types import _normalize_actor_id
+        raw = getattr(self._config, "agent_actor_ids", None) or {}
+        configured = {}
+        for platform, user_id in raw.items():
+            actor_id = _normalize_actor_id(str(platform or ""), str(user_id or ""))
+            if actor_id:
+                configured[str(platform or "").strip().lower()] = actor_id
         if not configured:
-            return ""
-        for row in (physical_by_id or {}).values():
-            if (getattr(row, "sender_actor_id", "") or "").strip() == configured:
+            return {}
+        senders = {
+            (getattr(row, "sender_actor_id", "") or "").strip()
+            for row in (physical_by_id or {}).values()
+        }
+        senders.discard("")
+        kept = {}
+        for platform, actor_id in configured.items():
+            if actor_id in senders:
                 logger.error(
-                    "AGENT_ACTOR_ID_REJECTED conv=%s actor_id=%s — this id "
-                    "appears as an INBOUND SENDER, so it is not the agent. "
-                    "The quote guard is disabled and prior behaviour kept; "
-                    "no quote will be suppressed on this run.",
+                    "AGENT_ACTOR_ID_REJECTED conv=%s platform=%s actor_id=%s — "
+                    "this id appears as an INBOUND SENDER, so it is not the "
+                    "agent. The comparison is disabled for this platform and "
+                    "prior behaviour kept; nothing will be suppressed by it.",
                     (getattr(self._config, "conversation_id", "") or "")[:12],
-                    configured,
+                    platform, actor_id,
                 )
-                return ""
-        return configured
+                continue
+            kept[platform] = actor_id
+        return kept
 
     def _record_quote_outcome(self, outcome: str) -> None:
         counts = getattr(self, "_agent_quote_counts", None)
@@ -2497,7 +2513,7 @@ class CompactionPipeline:
 
     def _quote_is_agent_output(
         self, *, channel_id: str, target_message_id: str,
-        reply_subject_actor_id: str = "", agent_actor_id: str = "",
+        reply_subject_actor_id: str = "", agent_actor_ids: dict | None = None,
     ) -> str:
         """Classify a quoted message's authorship. Returns one of three states.
 
@@ -2522,12 +2538,20 @@ class CompactionPipeline:
         construction.
         """
         subject = (reply_subject_actor_id or "").strip()
-        agent = (agent_actor_id or "").strip()
-        if agent and subject:
-            return (
-                self.QUOTE_AGENT_AUTHORED if subject == agent
-                else self.QUOTE_NOT_AGENT
-            )
+        agents = agent_actor_ids or {}
+        if agents and subject.startswith("actor:"):
+            # The platform is inside the id, so no store lookup is needed. An
+            # id whose platform is NOT configured is unevaluable, not a
+            # mismatch -- reporting "not the agent" there would claim a
+            # negative we never checked.
+            parts = subject.split(":", 2)
+            platform = parts[1].strip().lower() if len(parts) == 3 else ""
+            expected = agents.get(platform, "")
+            if expected:
+                return (
+                    self.QUOTE_AGENT_AUTHORED if subject == expected
+                    else self.QUOTE_NOT_AGENT
+                )
         # No subject actor recorded, or no configured agent identity. The
         # ledger can still positively confirm, but it cannot deny.
         if not channel_id or not target_message_id:
@@ -2562,7 +2586,7 @@ class CompactionPipeline:
             return self.QUOTE_IDENTITY_UNKNOWN
 
     def _build_actor_roster(
-        self, segment, physical_by_id: dict, agent_actor_id: str = "",
+        self, segment, physical_by_id: dict, agent_actor_ids: dict | None = None,
     ) -> "ActorRoster":
         """Build one segment's actor roster and fact lanes from physical rows.
 
@@ -2668,7 +2692,7 @@ class CompactionPipeline:
                             channel_id=channel,
                             target_message_id=target_id,
                             reply_subject_actor_id=subject_actor,
-                            agent_actor_id=agent_actor_id,
+                            agent_actor_ids=agent_actor_ids,
                         )
                         self._record_quote_outcome(outcome)
                         if outcome == self.QUOTE_AGENT_AUTHORED:
@@ -3940,9 +3964,9 @@ class CompactionPipeline:
             self.QUOTE_NOT_AGENT: 0,
             self.QUOTE_IDENTITY_UNKNOWN: 0,
         }
-        _agent_actor_id = self._validated_agent_actor_id(physical_by_id)
+        _agent_actor_ids = self._validated_agent_actor_ids(physical_by_id)
         actor_rosters_by_segment = {
-            seg.id: self._build_actor_roster(seg, physical_by_id, _agent_actor_id)
+            seg.id: self._build_actor_roster(seg, physical_by_id, _agent_actor_ids)
             for seg in compactable
         }
         self._log_quote_outcomes()

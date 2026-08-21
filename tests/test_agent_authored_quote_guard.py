@@ -252,7 +252,9 @@ def test_no_suppression_means_no_suppression_line(caplog):
 # a rebuild of existing history can suppress anything at all.
 # ---------------------------------------------------------------------------
 
-AGENT = "actor:discord:the-agent"
+AGENT_UID = "the-agent"
+AGENT = "actor:discord:" + AGENT_UID
+AGENT_MAP = {"discord": AGENT_UID}
 MEMBER = "actor:discord:member"
 
 
@@ -280,7 +282,7 @@ def test_a_quote_whose_subject_is_the_agent_creates_no_subject_lane():
     """The signal that reaches historical rows, with an EMPTY ledger."""
     segment, rows = _reply_quoting_actor(AGENT)
     pipeline = _pipeline(_Ledger(known=set()))
-    roster = pipeline._build_actor_roster(segment, rows, AGENT)
+    roster = pipeline._build_actor_roster(segment, rows, {'discord': AGENT})
     assert _subject_lanes(roster) == []
 
 
@@ -288,7 +290,7 @@ def test_a_quote_of_a_real_member_still_creates_a_subject_lane():
     """THE SAFETY CASE. An id that is too broad deletes a person's words."""
     segment, rows = _reply_quoting_actor(MEMBER)
     pipeline = _pipeline(_Ledger(known=set()))
-    roster = pipeline._build_actor_roster(segment, rows, AGENT)
+    roster = pipeline._build_actor_roster(segment, rows, {'discord': AGENT})
     lanes = _subject_lanes(roster)
     assert len(lanes) == 1
     assert lanes[0].actor_id == MEMBER
@@ -300,7 +302,7 @@ def test_the_actor_id_signal_never_consults_the_ledger():
     segment, rows = _reply_quoting_actor(AGENT)
     ledger = _Ledger(known=set())
     pipeline = _pipeline(ledger)
-    pipeline._build_actor_roster(segment, rows, AGENT)
+    pipeline._build_actor_roster(segment, rows, {'discord': AGENT})
     assert ledger.asked == []
 
 
@@ -310,10 +312,10 @@ def test_a_configured_id_seen_as_an_inbound_sender_is_rejected():
     pipeline = _pipeline(_Ledger(known=set()))
     # The config MUST carry the id, or the check returns "" for the trivial
     # reason that nothing was configured and the test proves nothing.
-    pipeline._config.agent_actor_id = AGENT
-    assert pipeline._validated_agent_actor_id(rows) == ""
+    pipeline._config.agent_actor_ids = AGENT_MAP
+    assert pipeline._validated_agent_actor_ids(rows) == {}
     roster = pipeline._build_actor_roster(
-        segment, rows, pipeline._validated_agent_actor_id(rows),
+        segment, rows, pipeline._validated_agent_actor_ids(rows),
     )
     assert len(_subject_lanes(roster)) == 1
 
@@ -323,11 +325,11 @@ def test_not_agent_and_unknown_are_different_outcomes():
     pipeline = _pipeline(_Ledger(known=set()))
     assert pipeline._quote_is_agent_output(
         channel_id=CHAN, target_message_id="m-1",
-        reply_subject_actor_id=MEMBER, agent_actor_id=AGENT,
+        reply_subject_actor_id=MEMBER, agent_actor_ids={"discord": AGENT},
     ) == CompactionPipeline.QUOTE_NOT_AGENT
     assert pipeline._quote_is_agent_output(
         channel_id=CHAN, target_message_id="m-1",
-        reply_subject_actor_id=MEMBER, agent_actor_id="",
+        reply_subject_actor_id=MEMBER, agent_actor_ids=None,
     ) == CompactionPipeline.QUOTE_IDENTITY_UNKNOWN
 
 
@@ -336,7 +338,7 @@ def test_the_suppression_line_names_the_matched_identity(caplog):
     segment, rows = _reply_quoting_actor(AGENT)
     pipeline = _pipeline(_Ledger(known=set()))
     with caplog.at_level("INFO"):
-        pipeline._build_actor_roster(segment, rows, AGENT)
+        pipeline._build_actor_roster(segment, rows, {'discord': AGENT})
     line = [r for r in caplog.records if "AGENT_QUOTE_SUPPRESSED" in r.getMessage()]
     assert len(line) == 1
     assert AGENT in line[0].getMessage()
@@ -357,5 +359,24 @@ def test_a_configured_id_never_seen_as_a_sender_survives_validation():
     """Negative control for the check above: it must not reject everything."""
     segment, rows = _reply_quoting_actor(AGENT, sender_actor=MEMBER)
     pipeline = _pipeline(_Ledger(known=set()))
-    pipeline._config.agent_actor_id = AGENT
-    assert pipeline._validated_agent_actor_id(rows) == AGENT
+    pipeline._config.agent_actor_ids = AGENT_MAP
+    assert pipeline._validated_agent_actor_ids(rows) == {"discord": AGENT}
+
+
+def test_an_unconfigured_platform_is_unknown_not_a_mismatch():
+    """Telegram is uncovered here. Claiming "not the agent" for a platform we
+    never configured asserts a negative nobody checked."""
+    pipeline = _pipeline(_Ledger(known=set()))
+    assert pipeline._quote_is_agent_output(
+        channel_id="", target_message_id="",
+        reply_subject_actor_id="actor:telegram:999",
+        agent_actor_ids={"discord": AGENT},
+    ) == CompactionPipeline.QUOTE_IDENTITY_UNKNOWN
+
+
+def test_a_malformed_configured_entry_is_dropped_not_repaired():
+    """A repaired identity is a guess, and a guess here deletes a person's words."""
+    _, rows = _reply_quoting_actor(AGENT)
+    pipeline = _pipeline(_Ledger(known=set()))
+    pipeline._config.agent_actor_ids = {"discord": "", "": "x", "bad platform!": "1"}
+    assert pipeline._validated_agent_actor_ids(rows) == {}

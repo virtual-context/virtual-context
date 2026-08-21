@@ -3982,7 +3982,7 @@ class VirtualContextEngine:
             )
             roster = self._compaction._build_actor_roster(
                 tagged, physical,
-                self._compaction._validated_agent_actor_id(physical),
+                self._compaction._validated_agent_actor_ids(physical),
             )
             if not roster.complete:
                 report["skipped_incomplete_source"] += 1
