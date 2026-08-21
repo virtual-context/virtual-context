@@ -2484,7 +2484,7 @@ class CompactionPipeline:
                     "AGENT_ACTOR_ID_UNVERIFIED conv=%s — the sender set could "
                     "not be read, so no configured identity is trusted and "
                     "nothing will be suppressed on this run.",
-                    conversation_id[:12], exc_info=True,
+                    conversation_id, exc_info=True,
                 )
                 return {}
         else:
@@ -2492,7 +2492,7 @@ class CompactionPipeline:
                 "AGENT_ACTOR_ID_NARROW_CHECK conv=%s — backend cannot list "
                 "senders; the configured identity is checked only against the "
                 "rows this run holds, which is weaker.",
-                conversation_id[:12],
+                conversation_id,
             )
             senders = {
                 (getattr(row, "sender_actor_id", "") or "").strip()
@@ -2507,7 +2507,7 @@ class CompactionPipeline:
                     "this id appears as an INBOUND SENDER, so it is not the "
                     "agent. The comparison is disabled for this platform and "
                     "prior behaviour kept; nothing will be suppressed by it.",
-                    (getattr(self._config, "conversation_id", "") or "")[:12],
+                    (getattr(self._config, "conversation_id", "") or ""),
                     platform, actor_id,
                 )
                 continue
@@ -2536,7 +2536,7 @@ class CompactionPipeline:
         logger.info(
             "AGENT_QUOTE_OUTCOMES conv=%s agent_authored=%d not_agent=%d "
             "agent_identity_unknown=%d",
-            (getattr(self._config, "conversation_id", "") or "")[:12],
+            (getattr(self._config, "conversation_id", "") or ""),
             counts.get(self.QUOTE_AGENT_AUTHORED, 0),
             counts.get(self.QUOTE_NOT_AGENT, 0),
             counts.get(self.QUOTE_IDENTITY_UNKNOWN, 0),
@@ -2737,7 +2737,7 @@ class CompactionPipeline:
                                 "AGENT_QUOTE_SUPPRESSED conv=%s channel=%s "
                                 "target_message_id=%s canonical_turn_id=%s "
                                 "matched_actor_id=%s",
-                                (getattr(self._config, "conversation_id", "") or "")[:12],
+                                (getattr(self._config, "conversation_id", "") or ""),
                                 channel, target_id, row.canonical_turn_id,
                                 subject_actor or "(ledger)",
                             )
@@ -4199,8 +4199,13 @@ class CompactionPipeline:
                         **self._compaction_guard_kwargs(operation_id),
                     )
                     if _deleted:
-                        logger.info("  Replaced %d old facts with %d new for segment %s",
-                                    _deleted, _inserted, result.primary_tag)
+                        # Name the REF as well as the tag. Eviction is keyed on
+                        # segment_ref and one tag maps to many refs, so a reader
+                        # counting segments from the tag alone counts tags.
+                        logger.info(
+                            "  Replaced %d old facts with %d new for segment %s ref=%s",
+                            _deleted, _inserted, result.primary_tag, _seg_ref,
+                        )
                     else:
                         logger.info("  Stored %d facts for segment %s", _inserted, result.primary_tag)
                     # Embed-on-write: only for facts actually inserted. The
