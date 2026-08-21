@@ -4687,7 +4687,8 @@ class PostgresStore(ContextStore):
                        phase = 'init',
                        deleted_at = NULL,
                        updated_at = %s,
-                       lifecycle_epoch_started_at = %s
+                       lifecycle_epoch_started_at = %s,
+                       lifecycle_epoch_start_source = 'observed'
                  WHERE conversation_id = %s
                    AND phase = 'deleted'
                 RETURNING lifecycle_epoch
