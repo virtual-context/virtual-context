@@ -2443,6 +2443,16 @@ class RetrieverConfig:
     # selected only by tag membership and ordered by mentioned_at.
     # YAML key: retrieval.fact_dense_retrieval.
     fact_dense_retrieval: bool = False
+
+    # Order the tag-gated fact floor by cosine distance to the query instead of
+    # by mentioned_at. This is a KILL SWITCH, not the readiness gate: the
+    # storage layer independently refuses to use the vector column until every
+    # embedding row has been backfilled, because a partially-filled column
+    # sorts NULLs last and returns a silently short answer. Turning this on
+    # cannot make an incomplete backfill go live; turning it off reverts to
+    # date ordering without a redeploy.
+    # YAML key: retrieval.fact_relevance_ordering.
+    fact_relevance_ordering: bool = True
     # Cap on the number of dense kNN fact candidates unioned into the pool.
     # Mirrors scoring.embedding_limit; the assembler's facts_max_tokens budget
     # remains the final cap. YAML key: retrieval.fact_dense_top_n.
