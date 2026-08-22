@@ -375,7 +375,6 @@ def _build_config(raw: dict[str, Any], *, validate: bool = True) -> VirtualConte
         embedding_model=retrieval_raw.get("embedding_model", _ret_defaults.embedding_model),
         embedding_threshold=retrieval_raw.get("embedding_threshold", _ret_defaults.embedding_threshold),
         fact_dense_retrieval=retrieval_raw.get("fact_dense_retrieval", _ret_defaults.fact_dense_retrieval),
-        fact_relevance_ordering=retrieval_raw.get("fact_relevance_ordering", _ret_defaults.fact_relevance_ordering),
         fact_dense_top_n=retrieval_raw.get("fact_dense_top_n", _ret_defaults.fact_dense_top_n),
         scoring=scoring_config,
     )

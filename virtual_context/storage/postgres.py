@@ -10,7 +10,6 @@ import os
 import re
 import signal
 import threading
-import time
 from collections.abc import Collection
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -1632,25 +1631,6 @@ class PostgresStore(ContextStore):
                 conn.execute("""
                     ALTER TABLE conversations
                         ADD COLUMN IF NOT EXISTS lifecycle_epoch_start_source TEXT NULL
-                """)
-                # Relevance-ordered fact retrieval reads this column. The
-                # extension is NOT created here: pgvector is not a trusted
-                # extension, so CREATE EXTENSION needs superuser and the
-                # application user does not have it. Absent the extension this
-                # ALTER fails, the guarded block swallows it, and retrieval
-                # falls back to date ordering -- which is the pre-existing
-                # behaviour and the correct failure direction.
-                #
-                # NO BACKFILL HERE, DELIBERATELY. This block runs on every
-                # store construction, which is once per new conversation, and
-                # ADD COLUMN takes ACCESS EXCLUSIVE. A 52k-row UPDATE on that
-                # path would hold the strongest lock Postgres has, repeatedly,
-                # for work that only ever needs doing once. The backfill is an
-                # explicit one-time operation.
-                conn.execute("SET LOCAL lock_timeout = '5s'")
-                conn.execute("""
-                    ALTER TABLE fact_embeddings
-                        ADD COLUMN IF NOT EXISTS embedding vector(384)
                 """)
                 conn.execute("""
                     COMMENT ON COLUMN conversations.lifecycle_epoch_started_at IS
@@ -13373,62 +13353,13 @@ class PostgresStore(ContextStore):
                     count += 1
             return count
 
-    def vector_ordering_ready(self) -> bool:
-        """Whether every embedding row has been backfilled into the vector column.
-
-        A partially-backfilled column degrades SILENTLY: rows with a NULL
-        embedding sort last under ``<=>`` rather than raising, so the ordering
-        returns plausible results that are missing exactly the rows nobody
-        converted. Checked once per store and cached; on anything unexpected
-        the answer is False and the caller keeps date ordering.
-        """
-        # Cache TRUE forever and FALSE only briefly. The asymmetry is
-        # deliberate and it is about the cost of each answer as much as its
-        # staleness. Proving zero NULLs means scanning the whole table, so that
-        # result must be cached; finding a NULL stops at the first one, so
-        # re-asking is cheap in exactly the state where the answer is False.
-        # Caching False permanently would mean a process that started before
-        # the backfill kept date ordering until it was restarted -- the feature
-        # would appear not to have turned on, which is the confusing failure.
-        if getattr(self, "_vector_ready", False):
-            return True
-        checked_at = getattr(self, "_vector_ready_checked_at", None)
-        if checked_at is not None and (time.monotonic() - checked_at) < 60.0:
-            return False
-        ready = False
-        try:
-            with self.pool.connection() as conn:
-                row = conn.execute(
-                    "SELECT 1 FROM fact_embeddings WHERE embedding IS NULL LIMIT 1"
-                ).fetchone()
-                ready = row is None
-        except Exception:
-            # No column, no extension, or no permission. Date ordering stands.
-            ready = False
-        self._vector_ready = ready
-        self._vector_ready_checked_at = time.monotonic()
-        if not ready:
-            logger.info(
-                "VECTOR_ORDERING unavailable; facts stay date-ordered"
-            )
-        return ready
-
     def query_facts(
         self, *, subject: str | None = None, verb: str | None = None,
         verbs: list[str] | None = None, object_contains: str | None = None,
         status: str | None = None, fact_type: str | None = None,
         tags: list[str] | None = None, limit: int = 50,
         conversation_id: str | None = None,
-        order_by_embedding: list[float] | None = None,
     ) -> list[Fact]:
-        """Facts matching the filters, newest first.
-
-        *order_by_embedding* orders by cosine distance to that vector instead
-        of by ``mentioned_at``. It is OPT-IN per call: every caller that does
-        not pass it keeps date ordering, so the retrieval floor can be
-        relevance-ordered without changing dedup, supersession or any other
-        consumer that reads the first element as the newest.
-        """
         with self.pool.connection() as conn:
             conditions: list[str] = []
             params: list = []
@@ -13457,35 +13388,7 @@ class PostgresStore(ContextStore):
                 params.append(fact_type)
             conditions.append("f.superseded_by IS NULL")
 
-            if order_by_embedding is not None and self.vector_ordering_ready():
-                # Relevance ordering. A separate query shape rather than a
-                # modified one: the tagged branch below uses SELECT DISTINCT,
-                # and Postgres forbids ordering a DISTINCT select by an
-                # expression absent from its select list. The join is on both
-                # key columns so exactly one embedding row matches per fact,
-                # which removes the need for DISTINCT at all.
-                where = " AND ".join(conditions) if conditions else "TRUE"
-                vec = "[" + ",".join(str(float(x)) for x in order_by_embedding) + "]"
-                tag_clause = ""
-                pre: list = []
-                if tags:
-                    tag_clause = (
-                        " AND EXISTS (SELECT 1 FROM fact_tags ft"
-                        "              WHERE ft.fact_id = f.id AND ft.tag = ANY(%s))"
-                    )
-                    pre = [tags]
-                sql = f"""
-                    SELECT f.* FROM facts f
-                    JOIN fact_embeddings fe
-                      ON fe.fact_id = f.id
-                     AND fe.conversation_id = f.conversation_id
-                     AND fe.embedding IS NOT NULL
-                    WHERE {where}{tag_clause}
-                    ORDER BY fe.embedding <=> %s::vector
-                    LIMIT %s
-                """
-                rows = conn.execute(sql, params + pre + [vec, limit]).fetchall()
-            elif tags:
+            if tags:
                 where = " AND ".join(conditions) if conditions else "TRUE"
                 sql = f"""
                     SELECT DISTINCT f.* FROM facts f

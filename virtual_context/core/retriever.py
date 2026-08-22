@@ -144,81 +144,11 @@ class ContextRetriever:
         except Exception:
             return []
 
-    def _fetch_facts_by_tags(
-        self, tags: list[str], limit: int = 500,
-        query_embedding: list[float] | None = None,
-    ) -> list:
-        """The tag-gated fact floor.
-
-        *query_embedding* orders the block by relevance rather than by recency.
-        It defaults to None so the dense arm's own call to this method keeps a
-        date-ordered floor: that arm re-ranks the floor itself, and reordering
-        its input would change what it re-ranks.
-        """
-        kwargs = {"tags": tags, "limit": limit,
-                  "conversation_id": self._conversation_id}
-        if query_embedding is not None:
-            # Only mentioned when relevance is actually wanted, so a store that
-            # has never heard of the parameter is untouched in the common case.
-            kwargs["order_by_embedding"] = query_embedding
+    def _fetch_facts_by_tags(self, tags: list[str], limit: int = 500) -> list:
         try:
-            return self.store.query_facts(**kwargs)
-        except TypeError as exc:
-            if "order_by_embedding" not in str(exc):
-                return []
-            # A store predating the parameter. Date ordering, not an outage.
-            logger.warning(
-                "FACT_RELEVANCE_ORDER store rejected order_by_embedding; date order")
-            kwargs.pop("order_by_embedding", None)
-            try:
-                return self.store.query_facts(**kwargs)
-            except Exception:
-                return []
+            return self.store.query_facts(tags=tags, limit=limit, conversation_id=self._conversation_id)
         except Exception:
             return []
-
-    def _relevance_vector(
-        self, message: str, precomputed: list[float] | None = None,
-    ) -> list[float] | None:
-        """The query vector for relevance ordering, or None to keep date order.
-
-        *precomputed* is the embedding the inbound tagger already produced for
-        this same message. Reusing it matters: under an embedding inbound
-        tagger the query has ALREADY been embedded by the time the fact floor
-        is fetched, and embedding it again is a second round-trip to the same
-        encoder for a vector we are holding. It is the same model that produced
-        the stored fact vectors, and cosine distance is scale-invariant, so an
-        un-normalised vector orders identically.
-
-        Every failure here is non-fatal by design: no embedder configured, an
-        embedder that raises, or the switch turned off all mean the floor stays
-        exactly as it is today.
-        """
-        if not getattr(self.config, "fact_relevance_ordering", True):
-            return None
-        if not message:
-            return None
-        # Ask the store BEFORE embedding. Embedding first would spend a model
-        # call on every single retrieval during the whole window between this
-        # code deploying and the backfill running -- for a vector the store is
-        # going to refuse. The readiness answer is cached per store, so this
-        # costs one query per process, not one per retrieval.
-        ready = getattr(self.store, "vector_ordering_ready", None)
-        if ready is None or not ready():
-            return None
-        if precomputed:
-            return list(precomputed)
-        # No tagger vector available (an LLM inbound tagger produces none), so
-        # fall back to embedding the query here.
-        embed_fn = self._query_embed_fn
-        if embed_fn is None:
-            return None
-        try:
-            vec = embed_fn([message])[0]
-        except Exception:
-            logger.warning("FACT_RELEVANCE_ORDER query embed failed; date order")
-            return None
-        return list(vec) if vec is not None else None
 
     def _fetch_facts_dense(
         self,
@@ -718,10 +648,8 @@ class ContextRetriever:
                 message, context_turns, expanded_tags, retrieval_metadata,
             )
         elif self.config.prefetch_facts and expanded_tags:
-            _rel_vec = self._relevance_vector(message, query_embedding)
-            facts = self._fetch_facts_by_tags(expanded_tags, query_embedding=_rel_vec)
-            logger.info("Retriever: facts=%d (prefetch tags=%s order=%s)", len(facts),
-                        expanded_tags, "relevance" if _rel_vec else "date")
+            facts = self._fetch_facts_by_tags(expanded_tags)
+            logger.info("Retriever: facts=%d (prefetch tags=%s)", len(facts), expanded_tags)
         else:
             facts = self._fetch_all_facts()
             logger.info("Retriever: facts=%d (all, prefetch=%s)", len(facts),
