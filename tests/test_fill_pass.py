@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 from datetime import datetime, timezone
 
 from virtual_context.proxy.formats import detect_format
+from virtual_context.core.summary_identity import SUMMARY_ATTRIBUTION_QUARANTINE
 from virtual_context.types import (
     RetrievalResult, StoredSummary, AssembledContext, TagSummary, SegmentMetadata,
 )
@@ -58,7 +59,8 @@ def test_format_tag_section_standalone():
     result = format_tag_section("cooking", [s1])
     assert '<virtual-context tags="cooking, italian"' in result
     assert "[1/1]" in result
-    assert "Italian cooking techniques" in result
+    assert "speaker attribution is unresolved" in result
+    assert "Italian cooking techniques" not in result
     assert "</virtual-context>" in result
 
 
@@ -134,6 +136,51 @@ def test_fill_pass_adds_breadth_summaries():
     )
     assert summaries_added >= 1
     mock_store.get_all_tag_summaries.assert_called_once_with(conversation_id="test")
+    rendered = json.dumps(result)
+    assert "Italian cooking" not in rendered
+    assert "Bread baking" not in rendered
+    assert SUMMARY_ATTRIBUTION_QUARANTINE in rendered
+
+
+def test_fill_pass_quarantines_unscoped_overflow_segment_summary():
+    """A direct StoredSummary without attribution must fail closed."""
+    from virtual_context.proxy.message_filter import fill_pass
+
+    body = _make_anthropic_body(["hello"])
+    fmt = detect_format(body)
+    summary = StoredSummary(
+        ref="seg-health",
+        primary_tag="health",
+        tags=["health"],
+        summary="BigTex stopped tesamorelin.",
+        summary_tokens=20,
+        metadata=SegmentMetadata(),
+        start_timestamp=datetime.now(timezone.utc),
+    )
+    assembled = AssembledContext(
+        presented_segment_refs=set(),
+        presented_tags=set(),
+        tag_sections={},
+        retrieval_result=RetrievalResult(overflow_summaries=[summary]),
+    )
+
+    result, summaries_added, _ = fill_pass(
+        body=body,
+        fmt=fmt,
+        outbound_tokens=1_000,
+        target_tokens=10_000,
+        assembled=assembled,
+        pre_filter_body=copy.deepcopy(body),
+        store=None,
+        conversation_id="test",
+        summary_ratio=1.0,
+    )
+
+    rendered = json.dumps(result)
+    assert summaries_added == 1
+    assert "health" in rendered
+    assert "BigTex stopped tesamorelin." not in rendered
+    assert SUMMARY_ATTRIBUTION_QUARANTINE in rendered
 
 
 def test_presented_tags_from_segments_and_full_sections():
@@ -229,11 +276,12 @@ def test_fill_pass_accounting_summary_and_turns():
 
     assert summaries_added >= 1
     result_json = json.dumps(result_body)
-    assert "Historical events discussed" in result_json
+    assert "Historical events discussed" not in result_json
+    assert SUMMARY_ATTRIBUTION_QUARANTINE in result_json
 
 
 def test_fill_pass_sanitizes_restored_turns():
-    """Restored turns must have thinking blocks stripped and media replaced."""
+    """Restored turns keep sanitized user source and omit generated output."""
     from virtual_context.proxy.message_filter import _sanitize_restored_turn
 
     messages = [
@@ -252,10 +300,9 @@ def test_fill_pass_sanitizes_restored_turns():
     user_content = sanitized[0]["content"]
     assert any(b.get("text") == "[image removed from restored turn]" for b in user_content)
     assert not any(b.get("type") == "image" for b in user_content)
-
-    asst_content = sanitized[1]["content"]
-    assert not any(b.get("type") == "thinking" for b in asst_content)
-    assert any(b.get("text") == "here is my answer" for b in asst_content)
+    assert len(sanitized) == 1
+    assert sanitized[0]["role"] == "user"
+    assert "here is my answer" not in json.dumps(sanitized)
 
 
 def test_fill_pass_no_restore_tool_references():

@@ -7,11 +7,19 @@ token bound. The selection SQL's strict-prefix clause is load-bearing:
 equality rows are intentional passthrough stubs.
 """
 
+import json
+from types import SimpleNamespace
+
 import pytest
 
 from virtual_context.cli.resummarize_cmd import (
     _DAMAGE_PREDICATE,
+    _actor_fingerprint,
+    _audience_fingerprint,
+    _identity_selection_sql,
     _selection_sql,
+    classify_identity_violation,
+    classify_tag_summary_identity_violation,
     classify_generated,
 )
 
@@ -19,6 +27,19 @@ _COUNT = lambda text: len(text) // 4  # noqa: E731 - the compactor default
 
 
 LONG_SOURCE = "Filing detail: the deadline moved to March. " * 60
+def _proved_metadata(**updates):
+    metadata = {
+        "canonical_turn_ids": ["ct-1"],
+        "source_mapping_complete": True,
+        "source_speaker_labels": ["BigTex"],
+        "source_speaker_identity_count": 1,
+        "source_speaker_identity_fingerprint": _actor_fingerprint({"actor-a"}),
+        "source_audience_fingerprint": _audience_fingerprint({
+            ("guild-1", "channel-1"),
+        }),
+    }
+    metadata.update(updates)
+    return metadata
 
 
 def test_faithful_summary_is_accepted():
@@ -91,6 +112,74 @@ def test_range_and_resume_clauses_appear_only_when_set():
     assert "created_at::timestamptz >= %(since)s::timestamptz" in ranged
     assert "created_at::timestamptz < %(until)s::timestamptz" in ranged
     assert "ref > %(after_ref)s" in ranged
+
+
+def test_identity_selection_scans_conversation_without_prefix_predicate():
+    sql = _identity_selection_sql(None, None, None)
+    assert "conversation_id = %(conversation_id)s" in sql
+    assert _DAMAGE_PREDICATE not in sql
+    assert "left(full_text" not in sql
+    assert "ORDER BY ref ASC" in sql
+
+
+def test_identity_selection_honors_range_and_resume_bounds():
+    sql = _identity_selection_sql("2026-08-01", "2026-08-22", "seg-9")
+    assert "created_at::timestamptz >= %(since)s::timestamptz" in sql
+    assert "created_at::timestamptz < %(until)s::timestamptz" in sql
+    assert "ref > %(after_ref)s" in sql
+
+
+def test_identity_classifier_requires_positive_proof_even_for_subjectless_prose():
+    reasons = classify_identity_violation({
+        "summary": "Stopped MOTS-c after the appointment.",
+        "metadata_json": "{}",
+    })
+    # This passive fragment has no lexical referent; provenance, not wording,
+    # is what makes it an identity violation.
+    assert "summary_ambiguous_human_referent" not in reasons
+    assert "source_mapping_incomplete" in reasons
+    assert "speaker_identity_count_unproved" in reasons
+    assert "audience_fingerprint_missing" in reasons
+
+
+def test_identity_classifier_accepts_current_single_actor_audience_proof():
+    assert classify_identity_violation({
+        "summary": "BigTex stopped MOTS-c after the appointment.",
+        "metadata_json": _proved_metadata(),
+    }, {
+        "ct-1": {
+            "canonical_turn_id": "ct-1",
+            "sender_actor_id": "actor-a",
+            "sender": "BigTex",
+            "audience_conversation_id": "guild-1",
+            "origin_channel_id": "channel-1",
+            "audience_attribution_version": 1,
+            "reply_subject_actor_id": "",
+            "reply_subject_label": "",
+            "has_user_content": True,
+            "has_assistant_content": True,
+            "has_reply_target_body": False,
+        },
+    }) == ()
+
+
+def test_identity_classifier_reports_lexical_and_multi_actor_damage():
+    reasons = classify_identity_violation({
+        "summary": "The user tolerates Tesamorelin.",
+        "metadata_json": _proved_metadata(
+            source_speaker_identity_count=2,
+            source_speaker_labels=["BigTex", "Kuw9239"],
+        ),
+    })
+    assert "summary_ambiguous_human_referent" in reasons
+    assert "speaker_identity_not_single" in reasons
+
+
+def test_tag_summary_classifier_names_only_violating_prose_fields():
+    assert classify_tag_summary_identity_violation({
+        "summary": "The user changed medication.",
+        "description": "Medication timeline for BigTex.",
+    }) == ("summary", "description")
 
 
 def test_stripped_length_uses_bound_parameter_not_literal():
@@ -257,3 +346,173 @@ def test_report_note_names_the_completion_path():
     # The constant is what the report actually emits.
     src = inspect.getsource(cmd_admin_resummarize_segments)
     assert '"note": _REPORT_NOTE' in src
+
+
+class _Rows:
+    def __init__(self, *, one=None, many=None):
+        self._one = one
+        self._many = many
+
+    def fetchone(self):
+        return self._one
+
+    def fetchall(self):
+        return self._many
+
+
+class _IdentityAuditConnection:
+    def __init__(self):
+        self.statements = []
+        self.segment_rows = [
+            {
+                "ref": "safe", "summary": "BigTex changed medication.",
+                "metadata_json": _proved_metadata(), "tags": ["health"],
+            },
+            {
+                "ref": "ambiguous", "summary": "The user changed medication.",
+                "metadata_json": _proved_metadata(), "tags": ["health"],
+            },
+            {
+                "ref": "unproved", "summary": "Stopped after the visit.",
+                "metadata_json": {}, "tags": ["appointments"],
+            },
+        ]
+        self.tag_rows = [
+            {
+                "tag": "health", "summary": "The user changed medication.",
+                "description": "BigTex health history",
+                "source_segment_refs": '["ambiguous"]',
+            },
+            {
+                "tag": "unlinked", "summary": "Kuw9239 discussed sleep.",
+                "description": "She later changed the dose.",
+                "source_segment_refs": '["safe"]',
+            },
+        ]
+        self.source_rows = [{
+            "canonical_turn_id": "ct-1",
+            "sender_actor_id": "actor-a",
+            "sender": "BigTex",
+            "audience_conversation_id": "guild-1",
+            "origin_channel_id": "channel-1",
+            "audience_attribution_version": 1,
+            "reply_subject_actor_id": "",
+            "reply_subject_label": "",
+            "has_user_content": True,
+            "has_assistant_content": True,
+            "has_reply_target_body": False,
+        }]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def execute(self, sql, params=None):
+        self.statements.append((sql, params))
+        if sql.startswith("SELECT count(*) AS n, md5") and "FROM segments" in sql:
+            return _Rows(one={"n": 3, "digest": "segments"})
+        if sql.startswith("SELECT count(*) AS n, max(updated_at)"):
+            return _Rows(one={"n": 1, "max_updated": "now"})
+        if sql.startswith("SELECT count(*) AS n, md5") and "FROM tag_summaries" in sql:
+            return _Rows(one={"n": 2, "digest": "tags"})
+        if sql.startswith("SELECT ref, conversation_id"):
+            return _Rows(many=self.segment_rows)
+        if sql.startswith("SELECT canonical_turn_id, sender_actor_id"):
+            return _Rows(many=self.source_rows)
+        if sql.startswith("SELECT tag, summary, description"):
+            return _Rows(many=self.tag_rows)
+        raise AssertionError(f"unexpected SQL: {sql}")
+
+
+def _identity_args(**updates):
+    values = {
+        "conversation_id": "guild-1",
+        "tenant_id": "tenant-1",
+        "identity_violations": True,
+        "apply": False,
+        "postgres_dsn": "postgresql://unused",
+        "since": None,
+        "until": None,
+        "after_ref": None,
+        "include_short": False,
+    }
+    values.update(updates)
+    return SimpleNamespace(**values)
+
+
+def test_identity_dry_run_is_read_only_and_reports_segments_and_tag_fields(
+    monkeypatch, capsys,
+):
+    from virtual_context.cli import resummarize_cmd
+
+    connection = _IdentityAuditConnection()
+    connection_modes = []
+
+    def fake_connect(_dsn, *, read_only):
+        connection_modes.append(read_only)
+        return connection
+
+    monkeypatch.setattr(resummarize_cmd, "_connect", fake_connect)
+    resummarize_cmd.cmd_admin_resummarize_segments(_identity_args())
+    report = json.loads(capsys.readouterr().out)
+
+    assert connection_modes == [True]
+    assert report["status"] == "dry_run"
+    assert report["mode"] == "identity_violations"
+    assert report["server_enforced_read_only"] is True
+    assert report["scanned_segments"] == 3
+    assert report["selected"] == 2
+    assert [row["ref"] for row in report["segments"]] == [
+        "ambiguous", "unproved",
+    ]
+    assert report["reason_counts"]["summary_ambiguous_human_referent"] == 1
+    assert report["reason_counts"]["source_mapping_incomplete"] == 1
+    assert report["affected_tags"] == ["appointments", "health"]
+    assert report["tag_summaries"]["rows_with_field_violations"] == 2
+    assert report["tag_summaries"]["field_violation_counts"] == {
+        "description": 2, "summary": 2,
+    }
+    assert report["tag_summaries"]["affected_prose_field_counts"] == {
+        "description": 1, "summary": 1,
+    }
+    assert report["checksums_stable"] is True
+    assert not any(
+        sql.lstrip().upper().startswith(("UPDATE", "INSERT", "DELETE"))
+        for sql, _params in connection.statements
+    )
+
+
+def test_identity_apply_is_refused_before_database_or_engine_access(
+    monkeypatch, capsys,
+):
+    from virtual_context.cli import resummarize_cmd
+
+    monkeypatch.setattr(
+        resummarize_cmd, "_connect",
+        lambda *_args, **_kwargs: pytest.fail("database must not be opened"),
+    )
+    with pytest.raises(SystemExit) as exc:
+        resummarize_cmd.cmd_admin_resummarize_segments(
+            _identity_args(apply=True),
+        )
+    assert exc.value.code == 1
+    report = json.loads(capsys.readouterr().out)
+    assert report["stage"] == "identity_violations_apply"
+    assert "exact audience-scoped canonical source rows" in report["error"]
+    assert "rerun without --apply" in report["error"]
+
+
+def test_default_mode_still_dispatches_unchanged_prefix_dry_run(monkeypatch):
+    from virtual_context.cli import resummarize_cmd
+
+    calls = []
+    monkeypatch.setattr(resummarize_cmd, "_dry_run", lambda args: calls.append(args))
+    monkeypatch.setattr(
+        resummarize_cmd, "_identity_dry_run",
+        lambda _args: pytest.fail("identity mode must be explicit"),
+    )
+    args = _identity_args(identity_violations=False)
+    resummarize_cmd.cmd_admin_resummarize_segments(args)
+    assert calls == [args]

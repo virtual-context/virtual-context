@@ -3,11 +3,24 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from virtual_context.types import SearchConfig
+from virtual_context.types import (
+    AUDIENCE_ATTRIBUTION_VERSION,
+    Fact,
+    SearchConfig,
+    SegmentMetadata,
+    SpeakerRetrievalContext,
+    StoredSegment,
+)
+from virtual_context.core.summary_identity import (
+    HistoricalSourceLane,
+    SummarySourceProjection,
+    render_source_projection_for_model,
+)
 
 
 def _mock_engine(**overrides):
@@ -17,6 +30,25 @@ def _mock_engine(**overrides):
     for k, v in overrides.items():
         setattr(engine, k, v)
     return engine
+
+
+def _canonical_transcript(speaker: str, content: str) -> str:
+    return render_source_projection_for_model(SummarySourceProjection(
+        lanes=(HistoricalSourceLane(
+            speaker=speaker,
+            role="historical_human",
+            content=content,
+        ),),
+        complete=True,
+    ))
+
+
+def _historical_source_payload(excerpt: str) -> dict:
+    prefix = "<historical-source-transcript>\n"
+    suffix = "\n</historical-source-transcript>"
+    assert excerpt.startswith(prefix)
+    assert excerpt.endswith(suffix)
+    return json.loads(excerpt[len(prefix):-len(suffix)])
 
 from virtual_context.core.tool_loop import (
     VC_TOOL_NAMES,
@@ -228,6 +260,7 @@ class TestExecuteVCTool:
             intent_context="",
             mode="lookup",
             channel="",
+            speaker_context=SpeakerRetrievalContext.ineligible(),
         )
         parsed = json.loads(result)
         assert parsed["found"] is True
@@ -310,16 +343,21 @@ class TestToolResultVerificationHint:
         assert parsed["shared_value_candidates"][0]["value"] == "5,000 queries/second"
         assert parsed["results"][0]["excerpt"].startswith("User: support 5,000 queries/sec")
 
-    def test_search_summaries_preserves_preference_anchor_fields(self):
+    def test_search_summaries_omits_lossy_preference_anchor_fields(self):
         engine = _mock_engine()
+        context = SpeakerRetrievalContext(
+            owner_conversation_id="owner",
+            audience_conversation_id="guild",
+            audience_channel_id="health",
+        )
         engine.search_summaries.return_value = {
             "mode": "lookup",
             "found": True,
             "results": [
                 {
-                    "excerpt": (
-                        "User specified initial requirement of 500 EC2 instances "
-                        "at $0.11/hour."
+                    "excerpt": _canonical_transcript(
+                        "BigTex",
+                        "500 EC2 instances are required at $0.11/hour.",
                     ),
                     "topic": "cost-analysis",
                     "segment_ref": "seg-anchor",
@@ -341,12 +379,308 @@ class TestToolResultVerificationHint:
             engine,
             "vc_search_summaries",
             {"query": "cloud cost estimation", "mode": "lookup"},
+            speaker_context=context,
         )
 
         parsed = json.loads(result)
-        assert parsed["chosen_preference_anchor"]["hourly_rate"] == "$0.11/hour"
-        assert parsed["anchor_example_calculation"]["hourly_compute_total"] == "$55/hour"
-        assert parsed["results"][0]["excerpt"].startswith("User specified initial requirement")
+        assert "chosen_preference_anchor" not in parsed
+        assert "anchor_example_calculation" not in parsed
+        assert "reader_hint" not in parsed
+        lane = _historical_source_payload(
+            parsed["results"][0]["excerpt"],
+        )["lanes"][0]
+        assert lane["display_name"] == "BigTex"
+        assert lane["source_speaker_ref"].startswith("historical_")
+        assert lane["content"] == (
+            "500 EC2 instances are required at $0.11/hour."
+        )
+
+    def test_search_summaries_drops_unsafe_source_and_derived_anchor_bundle(self):
+        engine = _mock_engine()
+        engine.search_summaries.return_value = {
+            "mode": "lookup",
+            "found": True,
+            "results": [{
+                "excerpt": "The user selected AWS at $2/hour for 100 instances.",
+                "topic": "cost-analysis",
+                "segment_ref": "seg-unsafe",
+            }],
+            "reader_hint": "Repeat the selected preference anchor.",
+            "chosen_preference_anchor": {
+                "provider": "AWS",
+                "hourly_rate": "$2/hour",
+                "instance_count": "100",
+            },
+            "anchor_example_calculation": {
+                "formula": "$2/hour * 100 = $200/hour",
+            },
+        }
+
+        result = execute_vc_tool(
+            engine,
+            "vc_search_summaries",
+            {"query": "cloud cost", "mode": "lookup"},
+        )
+
+        parsed = json.loads(result)
+        assert parsed["found"] is False
+        assert parsed["results"] == []
+        assert "chosen_preference_anchor" not in parsed
+        assert "anchor_example_calculation" not in parsed
+        assert "reader_hint" not in parsed
+        assert "The user" not in result
+
+    def test_group_search_summary_requires_provenance_wrapper_at_tool_boundary(self):
+        engine = _mock_engine()
+        context = SpeakerRetrievalContext(
+            owner_conversation_id="owner",
+            audience_conversation_id="guild",
+            audience_channel_id="health",
+        )
+        engine.search_summaries.return_value = {
+            "found": True,
+            "results": [{
+                "excerpt": "Tesamorelin was tolerated well.",
+                "topic": "health",
+                "segment_ref": "seg-unproved",
+            }],
+        }
+
+        result = execute_vc_tool(
+            engine,
+            "vc_search_summaries",
+            {"query": "tesamorelin"},
+            speaker_context=context,
+        )
+
+        engine.search_summaries.assert_called_once_with(
+            query="tesamorelin",
+            max_results=20,
+            intent_context="",
+            mode="lookup",
+            speaker_context=context,
+        )
+        assert json.loads(result)["results"] == []
+        assert "Tesamorelin was tolerated well" not in result
+
+    def test_group_search_omits_generated_related_fact_prose(self):
+        engine = _mock_engine()
+        engine.config.conversation_id = "owner"
+        guild_context = SpeakerRetrievalContext(
+            owner_conversation_id="owner",
+            audience_conversation_id="guild",
+            audience_channel_id="health",
+        )
+        dm_context = SpeakerRetrievalContext(
+            owner_conversation_id="owner",
+            audience_conversation_id="dm",
+            audience_channel_id="",
+        )
+        guild_actor = "actor:discord:guild"
+        dm_actor = "actor:discord:dm"
+
+        def _summary_result(**kwargs):
+            context = kwargs["speaker_context"]
+            label = (
+                "BigTex"
+                if context.audience_conversation_id == "guild"
+                else "DMFriend"
+            )
+            return {
+                "found": True,
+                "results": [{
+                    "excerpt": _canonical_transcript(
+                        label,
+                        "Peptide dosing was discussed.",
+                    ),
+                    "topic": "health",
+                }],
+            }
+
+        engine.search_summaries.side_effect = _summary_result
+        engine._store.search_facts.return_value = [
+            Fact(
+                id="fact-guild",
+                subject="the user",
+                verb="discussed",
+                object="guild-only dosage",
+                what="BigTex discussed guild-only dosage details.",
+                segment_ref="seg-guild",
+                author_actor_id=guild_actor,
+                author_attribution_version=2,
+                author_source_role="requester",
+            ),
+            Fact(
+                id="fact-dm",
+                subject="the user",
+                verb="disclosed",
+                object="dm-secret dosage",
+                what="DMFriend disclosed dm-secret dosage details.",
+                segment_ref="seg-dm",
+                author_actor_id=dm_actor,
+                author_attribution_version=2,
+                author_source_role="requester",
+            ),
+        ]
+        segments = {
+            "seg-guild": StoredSegment(
+                ref="seg-guild",
+                conversation_id="owner",
+                full_text="raw guild-only source text",
+                metadata=SegmentMetadata(
+                    canonical_turn_ids=["turn-guild"],
+                    source_mapping_complete=True,
+                ),
+            ),
+            "seg-dm": StoredSegment(
+                ref="seg-dm",
+                conversation_id="owner",
+                full_text="raw dm-secret source text",
+                metadata=SegmentMetadata(
+                    canonical_turn_ids=["turn-dm"],
+                    source_mapping_complete=True,
+                ),
+            ),
+        }
+        engine._store.get_segment.side_effect = (
+            lambda ref, **kwargs: segments.get(ref)
+        )
+        rows = {
+            ("owner", "turn-guild"): SimpleNamespace(
+                user_content="guild source",
+                sender="BigTex",
+                sender_actor_id=guild_actor,
+                audience_conversation_id="guild",
+                origin_channel_id="health",
+                audience_attribution_version=AUDIENCE_ATTRIBUTION_VERSION,
+                reply_target_body="",
+                sort_key=1.0,
+            ),
+            ("owner", "turn-dm"): SimpleNamespace(
+                user_content="private source",
+                sender="DMFriend",
+                sender_actor_id=dm_actor,
+                audience_conversation_id="dm",
+                origin_channel_id="",
+                audience_attribution_version=AUDIENCE_ATTRIBUTION_VERSION,
+                reply_target_body="",
+                sort_key=2.0,
+            ),
+        }
+        engine._store.get_canonical_turn_rows_by_id.side_effect = (
+            lambda keys, **kwargs: {
+                key: rows[key] for key in keys if key in rows
+            }
+        )
+
+        guild_output = execute_vc_tool(
+            engine,
+            "vc_search_summaries",
+            {"query": "peptide dosage"},
+            speaker_context=guild_context,
+        )
+        guild_payload = json.loads(guild_output)
+        assert "related_facts" not in guild_payload
+        assert "related_facts_count" not in guild_payload
+        guild_lane = _historical_source_payload(
+            guild_payload["results"][0]["excerpt"],
+        )["lanes"][0]
+        assert guild_lane["display_name"] == "BigTex"
+        assert "dm-secret" not in guild_output
+        assert "guild-only dosage details" not in guild_output
+        assert guild_actor not in guild_output
+        assert dm_actor not in guild_output
+        assert "raw guild-only source text" not in guild_output
+        assert all(
+            item.get("source") != "fact_segment"
+            for item in guild_payload["results"]
+        )
+
+        dm_output = execute_vc_tool(
+            engine,
+            "vc_search_summaries",
+            {"query": "peptide dosage"},
+            speaker_context=dm_context,
+        )
+        dm_payload = json.loads(dm_output)
+        assert "related_facts" not in dm_payload
+        assert "related_facts_count" not in dm_payload
+        dm_lane = _historical_source_payload(
+            dm_payload["results"][0]["excerpt"],
+        )["lanes"][0]
+        assert dm_lane["display_name"] == "DMFriend"
+        assert "guild-only" not in dm_output
+        assert "dm-secret dosage details" not in dm_output
+        assert guild_actor not in dm_output
+        assert dm_actor not in dm_output
+        assert "raw dm-secret source text" not in dm_output
+        assert all(
+            item.get("source") != "fact_segment"
+            for item in dm_payload["results"]
+        )
+
+        unproved_output = execute_vc_tool(
+            engine,
+            "vc_search_summaries",
+            {"query": "peptide dosage"},
+        )
+        unproved_payload = json.loads(unproved_output)
+        assert "related_facts" not in unproved_payload
+        assert "related_facts_count" not in unproved_payload
+        assert "guild-only" not in unproved_output
+        assert "dm-secret" not in unproved_output
+        engine._store.search_facts.assert_not_called()
+        engine._store.get_superseded_facts.assert_not_called()
+
+    def test_group_remember_when_keeps_only_canonical_lane_bound_milestones(self):
+        engine = _mock_engine()
+        context = SpeakerRetrievalContext(
+            owner_conversation_id="owner",
+            audience_conversation_id="guild",
+            audience_channel_id="health",
+        )
+        wrapped = _canonical_transcript(
+            "BigTex",
+            "Tesamorelin was tolerated well.",
+        )
+        engine.remember_when.return_value = {
+            "mode": "summarize_over_time",
+            "found": True,
+            "ordered_milestones": [
+                {"date": "2026-01-01", "point": wrapped, "source": "segment"},
+                {
+                    "date": "2026-01-02",
+                    "point": "Experienced edema at 2 mg.",
+                    "source": "segment",
+                },
+            ],
+        }
+
+        result = execute_vc_tool(
+            engine,
+            "vc_remember_when",
+            {"query": "tesamorelin", "time_range": {}, "mode": "summarize_over_time"},
+            speaker_context=context,
+        )
+
+        engine.remember_when.assert_called_once_with(
+            query="tesamorelin",
+            time_range={},
+            max_results=None,
+            mode="summarize_over_time",
+            intent_context="",
+            speaker_context=context,
+        )
+        parsed = json.loads(result)
+        assert [item["date"] for item in parsed["ordered_milestones"]] == [
+            "2026-01-01",
+        ]
+        lane = _historical_source_payload(
+            parsed["ordered_milestones"][0]["point"],
+        )["lanes"][0]
+        assert lane["display_name"] == "BigTex"
+        assert lane["content"] == "Tesamorelin was tolerated well."
+        assert "Experienced edema" not in result
 
     def test_find_session_calls_engine_with_session_filter(self):
         engine = _mock_engine()
@@ -364,9 +698,12 @@ class TestToolResultVerificationHint:
             intent_context="",
             session_filter="2023/05/29",
             mode="lookup",
+            speaker_context=SpeakerRetrievalContext.ineligible(),
         )
         parsed = json.loads(result)
         assert parsed["found"] is True
+        assert parsed["results"] == []
+        assert "found it" not in result
 
     def test_find_quote_does_not_pass_session_filter(self):
         """vc_find_quote must NOT pass session_filter to engine."""
@@ -394,11 +731,12 @@ class TestToolResultVerificationHint:
             max_results=None,
             mode="auto",
             intent_context="What auth issues came up recently?",
+            speaker_context=SpeakerRetrievalContext.ineligible(),
         )
         parsed = json.loads(result)
         assert parsed["found"] is True
 
-    def test_remember_when_summarize_over_time_prefers_ordered_milestones_payload(self):
+    def test_remember_when_summarize_over_time_omits_unbound_milestones(self):
         engine = _mock_engine()
         engine.remember_when.return_value = {
             "query": "error types handling challenges",
@@ -449,10 +787,46 @@ class TestToolResultVerificationHint:
 
         parsed = json.loads(result)
         assert parsed["mode"] == "summarize_over_time"
-        assert parsed["ordered_milestones"][0]["theme"] == "context handling challenges"
-        assert "results" not in parsed
-        assert "facts_in_window" not in parsed
-        assert "reader_hint" in parsed
+        assert "ordered_milestones" not in parsed
+        assert parsed["results"] == []
+        assert parsed["facts_in_window"] == []
+        assert "reader_hint" not in parsed
+        assert "InvalidTokenTypeError" not in result
+        assert "IndexScoringError" not in result
+
+    def test_remember_when_drops_milestone_derived_from_unsafe_summary(self):
+        engine = _mock_engine()
+        engine.remember_when.return_value = {
+            "mode": "summarize_over_time",
+            "found": True,
+            "ordered_milestones": [
+                {
+                    "date": "2026-01-01",
+                    "point": "The user stopped tesamorelin.",
+                    "source": "segment",
+                },
+                {
+                    "date": "2026-01-02",
+                    "point": "BigTex discussed recovery.",
+                    "source": "segment",
+                },
+            ],
+        }
+
+        result = execute_vc_tool(
+            engine,
+            "vc_remember_when",
+            {
+                "query": "tesamorelin",
+                "time_range": {},
+                "mode": "summarize_over_time",
+            },
+        )
+
+        parsed = json.loads(result)
+        assert "ordered_milestones" not in parsed
+        assert "The user stopped" not in result
+        assert "BigTex discussed recovery" not in result
 
     def test_remember_when_change_over_time_prefers_date_buckets_payload(self):
         engine = _mock_engine()
@@ -516,12 +890,15 @@ class TestToolResultVerificationHint:
 
         parsed = json.loads(result)
         assert parsed["mode"] == "change_over_time"
-        assert "phase_milestones" in parsed
-        assert "ordered_milestones" in parsed
+        assert "phase_milestones" not in parsed
+        assert "ordered_milestones" not in parsed
         assert parsed["date_buckets"][0]["date"] == "2024-11-05"
+        assert parsed["date_buckets"][0]["results"] == []
+        assert parsed["date_buckets"][0]["facts"] == []
         assert "results" not in parsed
         assert "facts_in_window" not in parsed
         assert "reader_hint" in parsed
+        assert "Window size mismatch" not in result
 
     def test_remember_when_window_overview_prefers_date_buckets_payload(self):
         engine = _mock_engine()
@@ -1115,6 +1492,7 @@ class TestRunToolLoop:
             intent_context="test",
             mode="lookup",
             channel="",
+            speaker_context=SpeakerRetrievalContext.ineligible(),
         )
 
     def test_passes_last_user_text_as_intent_context(self):
@@ -1153,6 +1531,7 @@ class TestRunToolLoop:
             intent_context="Where do I currently keep my old sneakers?",
             mode="lookup",
             channel="",
+            speaker_context=SpeakerRetrievalContext.ineligible(),
         )
 
     def test_strips_injected_context_from_intent_context_and_adds_lookup_grounding_hint(self):
@@ -1224,6 +1603,7 @@ class TestRunToolLoop:
             intent_context=question,
             mode="lookup",
             channel="",
+            speaker_context=SpeakerRetrievalContext.ineligible(),
         )
 
         sent_body = mock_client.post.call_args[1]["json"]
@@ -1918,7 +2298,7 @@ class TestToolLoopInjectsReassembledContext:
             result = run_tool_loop(engine, initial, original_request, _anthropic_adapter())
 
         assert result.text == "The DB was PostgreSQL."
-        engine.reassemble_context.assert_called_once()
+        engine.reassemble_context.assert_called_once_with(speaker_context=None)
 
         # Verify the captured continuation request has updated context
         assert len(result.raw_requests) == 1

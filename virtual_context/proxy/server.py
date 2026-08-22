@@ -40,6 +40,7 @@ from ..core.tool_loop import (
     is_vc_tool,
     execute_vc_tool,
 )
+from ..core.summary_identity import render_summary_for_model
 from ..types import (  # noqa: F401 — re-exported
     CanonicalTurnRow,
     Fact,
@@ -372,7 +373,9 @@ def _serialize_recall_segment(
         "selected_because": reasons,
         "matched_query_tags": matched_query_tags,
         "related_match_tags": related_match_tags,
-        "summary": summary.summary,
+        "summary": render_summary_for_model(
+            summary.summary, require_proved_scope=True,
+        ),
         "summary_tokens": summary.summary_tokens,
         "full_tokens": summary.full_tokens,
         "turn_count": meta.turn_count if meta else 0,
@@ -541,6 +544,7 @@ def _roles_for_active_user(
         audience_conversation_id=audience_conversation_id,
         origin_channel_id=channel_id,
         audience_channel_id=speaker_channel_id,
+        audience_channel_scope=speaker_audience_scope,
         audience_channel_label=channel_label,
     )
 

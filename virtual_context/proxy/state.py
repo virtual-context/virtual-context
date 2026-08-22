@@ -3310,6 +3310,7 @@ class ProxyState:
 
         retrieval = getattr(self.engine, "_retrieval", None)
         if retrieval is not None:
+            retrieval._last_reassembly_snapshot = None
             retrieval._last_retrieval_result = None
             retrieval._last_conversation_history = None
             retrieval._presented_segment_refs.clear()

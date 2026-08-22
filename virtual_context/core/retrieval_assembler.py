@@ -94,7 +94,18 @@ class RetrievalAssembler:
         self._last_conversation_history: list[Message] | None = None
         self._last_model_name: str = ""
         self._last_request_roles = None
+        # Request-local authority binding for the cached retrieval snapshot.
+        # Reassembly is allowed only when its caller presents this same
+        # context (or the same non-empty roster snapshot token).  A later
+        # request must never inherit the authority of the request that most
+        # recently populated the cache.
         self._last_speaker_context = None
+        # Reassembly reads this single immutable binding rather than the
+        # compatibility fields above.  Publishing one tuple is atomic under
+        # Python's object assignment semantics, so overlapping requests can
+        # observe either the complete old snapshot or the complete new one,
+        # never a result from request B paired with request A's authority.
+        self._last_reassembly_snapshot = None
         self._presented_segment_refs: set[str] = set()
         self._context_hint_cache_key: str = ""
         self._context_hint_cache_value: str = ""
@@ -640,10 +651,23 @@ class RetrievalAssembler:
         # Cache the exact assembly view. Re-applying a conversation-scoped
         # watermark during paging reassembly can remove channel-local rows a
         # second time and recreate the half-turn loss fixed above.
-        self._last_conversation_history = list(uncompacted)
+        cached_history = list(uncompacted)
+        self._last_conversation_history = cached_history
         self._last_model_name = model_name
         self._last_request_roles = request_roles
-        self._last_speaker_context = speaker_context
+        # Roster construction may replace the inbound context with a frozen
+        # copy carrying the request's unique snapshot id.  Cache the context
+        # that the caller is handed back, not the pre-roster input, so the
+        # reassembly capability remains bound to this exact request.
+        effective_speaker_context = assembled.speaker_context or speaker_context
+        self._last_speaker_context = effective_speaker_context
+        self._last_reassembly_snapshot = (
+            retrieval_result,
+            cached_history,
+            model_name,
+            request_roles,
+            effective_speaker_context,
+        )
         self._presented_segment_refs = set(assembled.presented_segment_refs)
 
         return assembled
@@ -652,7 +676,30 @@ class RetrievalAssembler:
     # reassemble_context
     # ------------------------------------------------------------------
 
-    def reassemble_context(self) -> str:
+    @staticmethod
+    def _reassembly_context_matches(cached_context, caller_context) -> bool:
+        """Return whether *caller_context* owns the cached request snapshot.
+
+        ``None`` is an explicit absence of authority, not a request to reuse
+        whatever authority was cached most recently.  Context objects without
+        a roster token are therefore matched by identity.  When roster
+        construction minted a non-empty request token, an exact frozen-context
+        match carrying that same token is also accepted.
+        """
+        if cached_context is None or caller_context is None:
+            return cached_context is caller_context
+        if cached_context is caller_context:
+            return True
+
+        cached_token = getattr(cached_context, "roster_snapshot_id", "") or ""
+        caller_token = getattr(caller_context, "roster_snapshot_id", "") or ""
+        return bool(
+            cached_token
+            and caller_token == cached_token
+            and caller_context == cached_context
+        )
+
+    def reassemble_context(self, *, speaker_context=None) -> str:
         """Re-assemble context with the current working set.
 
         Call after ``expand_topic()`` / ``collapse_topic()`` to get an
@@ -660,14 +707,23 @@ class RetrievalAssembler:
         Reuses the retrieval result from the most recent
         ``on_message_inbound()`` call -- no re-tagging or re-retrieval.
 
-        Returns the updated prepend_text, or "" if no prior inbound call.
+        ``speaker_context`` must be the request-owned context returned from
+        the inbound assembly (or the original object when no roster was
+        emitted).  A missing, ineligible, stale, or different request context
+        never inherits the cached request's authority.
+
+        Returns the updated prepend_text, or "" if no matching prior inbound
+        call exists.
         """
-        rr = self._last_retrieval_result
-        history = self._last_conversation_history
-        if rr is None:
+        snapshot = self._last_reassembly_snapshot
+        if snapshot is None:
+            return ""
+        rr, history, model_name, request_roles, cached_speaker_context = snapshot
+        if not self._reassembly_context_matches(
+            cached_speaker_context, speaker_context,
+        ):
             return ""
 
-        model_name = self._last_model_name
         _pm = self._resolve_paging_mode(model_name) if self.config.paging.enabled else None
         context_hint = self._build_context_hint(paging_mode=_pm)
         core_context = self._assembler.load_core_context()
@@ -686,8 +742,8 @@ class RetrievalAssembler:
             context_hint=context_hint,
             working_set=ws_param,
             full_segments=full_segments_param,
-            request_roles=self._last_request_roles,
-            speaker_context=self._last_speaker_context,
+            request_roles=request_roles,
+            speaker_context=speaker_context,
         )
         return assembled.prepend_text
 
@@ -1153,9 +1209,9 @@ class RetrievalAssembler:
                 break
             selected.append({
                 "tag": ts.tag,
-                "summary": ts.summary,
                 "tokens": ts.summary_tokens,
-                "description": ts.description or "",
+                "source_segment_refs": list(ts.source_segment_refs),
+                "source_turn_numbers": list(ts.source_turn_numbers),
             })
             total_tokens += ts.summary_tokens
         return {

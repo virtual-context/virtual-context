@@ -30,8 +30,7 @@ _SYSTEM = (
 )
 
 _CONSOLIDATION_PROMPT = """\
-Below is a list of tags from a conversation memory store.  Each tag has a
-description explaining what it covers.
+Below is a list of tag names from a conversation memory store.
 
 Your job: identify groups of tags that refer to THE SAME broad topic and
 should be unified so that a search for any member of the group also finds
@@ -49,10 +48,10 @@ Rules:
    Trivial morphological variants (plurals, hyphenation) are already handled
    elsewhere — focus on SEMANTIC relationships.
 5. Keep the number of groups reasonable.  Quality over quantity.
-6. Many tags have "(no description)".  Use the tag NAME as a semantic signal:
-   "model-tanks" clearly relates to scale modeling even without a description.
+6. Use only each tag NAME as a semantic signal: "model-tanks" clearly relates
+   to scale modeling from its name alone.
 
-Tags (tag → description):
+Tag names:
 {tag_list}
 
 Respond with JSON:
@@ -122,7 +121,8 @@ def consolidate_tags(
 ) -> ConsolidationResult:
     """Run tag consolidation on *store*.
 
-    1. Load all tags with descriptions (from tag_summaries).
+    1. Load all tag names. Derived tag/segment prose is intentionally withheld
+       because this stateless job has no audience-bound speaker proof.
     2. Send to LLM to identify semantic clusters.
     3. Write alias mappings to tag_aliases table.
     4. Backfill segment_tags: for every segment that has an alias tag,
@@ -137,39 +137,22 @@ def consolidate_tags(
     Returns:
         ConsolidationResult with groups found and counts of writes.
     """
-    # Gather tags + descriptions
+    # Layer-2 summaries and orphan segment snippets have no audience-bound
+    # speaker proof at this stateless model boundary. Use names only.
     all_tags = store.get_all_tags()
-    tag_summaries = {ts.tag: ts for ts in store.get_all_tag_summaries()}
+    tag_names = [ts.tag for ts in all_tags]
 
-    # For tags without summaries, pull a snippet from their segment text.
-    # This is critical — unsummarized tags are the most likely to be
-    # orphaned and need consolidation the most.
-    orphan_descriptions = _get_orphan_tag_descriptions(store, tag_summaries)
-
-    tag_entries: list[tuple[str, str]] = []
-    for ts in all_tags:
-        summary = tag_summaries.get(ts.tag)
-        desc = ""
-        if summary:
-            desc = summary.description or summary.summary[:150]
-        else:
-            desc = orphan_descriptions.get(ts.tag, "")
-        tag_entries.append((ts.tag, desc))
-
-    if not tag_entries:
+    if not tag_names:
         logger.info("No tags found — nothing to consolidate.")
         return ConsolidationResult()
 
-    logger.info("Consolidating %d tags...", len(tag_entries))
+    logger.info("Consolidating %d tags...", len(tag_names))
 
     # Batch tag entries and call LLM for each batch
     all_groups: list[ConsolidationGroup] = []
-    for batch_start in range(0, len(tag_entries), batch_size):
-        batch = tag_entries[batch_start:batch_start + batch_size]
-        tag_list = "\n".join(
-            f"- {tag}: {desc}" if desc else f"- {tag}: (no description)"
-            for tag, desc in batch
-        )
+    for batch_start in range(0, len(tag_names), batch_size):
+        batch = tag_names[batch_start:batch_start + batch_size]
+        tag_list = "\n".join(f"- {tag}" for tag in batch)
         prompt = _CONSOLIDATION_PROMPT.format(tag_list=tag_list)
 
         try:
@@ -211,25 +194,6 @@ def consolidate_tags(
     logger.info("Backfilled %d segment_tags entries.", result.segment_tags_added)
 
     return result
-
-
-def _get_orphan_tag_descriptions(
-    store: ContextStore,
-    tag_summaries: dict,
-) -> dict[str, str]:
-    """Get descriptions for tags that have no tag_summary entry.
-
-    Delegates to the store's ``get_orphan_tag_snippets`` method to fetch
-    one segment summary snippet per orphan tag, so the LLM has context
-    for consolidation decisions.
-    """
-    try:
-        rows = store.get_orphan_tag_snippets(limit=1000)
-        return {row["tag"]: row["snippet"] for row in rows}
-    except Exception as e:
-        logger.warning("Failed to fetch orphan tag descriptions: %s", e)
-        return {}
-
 
 def _merge_transitive_groups(
     groups: list[ConsolidationGroup],

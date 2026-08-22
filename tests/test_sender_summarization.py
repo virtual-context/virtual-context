@@ -8,7 +8,7 @@ metadata, so a stored sender never reached the summarizer.
 These tests pin the adapters:
 
 * Canonical-row compaction builds user ``Message.metadata`` so the compactor
-  emits ``"BigTex: ..."``; a row without a sender still emits ``"User: ..."``.
+  emits ``"BigTex: ..."``; a row without a safe sender emits ``"Source: ..."``.
 * A mid-message session-boundary split preserves metadata on both halves.
 * History reconstruction groups physical user/assistant half-rows into logical
   turns, labels only the user half, and still drops an incomplete trailing
@@ -23,9 +23,12 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
-
-from virtual_context.types import CanonicalTurnRow, Message, get_sender_name
+from virtual_context.types import (
+    AUDIENCE_ATTRIBUTION_VERSION,
+    CanonicalTurnRow,
+    Message,
+    get_sender_name,
+)
 from virtual_context.storage.sqlite import SQLiteStore
 
 
@@ -41,6 +44,15 @@ class _RowStore:
         return list(self._rows)
 
 
+class _PhysicalRowStore(_RowStore):
+    def __init__(self, logical_rows, physical_rows):
+        super().__init__(logical_rows)
+        self._physical_rows = physical_rows
+
+    def get_all_canonical_turns(self, conversation_id):
+        return list(self._physical_rows)
+
+
 def _pipeline(rows):
     from virtual_context.config import VirtualContextConfig
     from virtual_context.core.compaction_pipeline import CompactionPipeline
@@ -54,6 +66,12 @@ def _pipeline(rows):
     pipeline = CompactionPipeline.__new__(CompactionPipeline)
     pipeline._store = _RowStore(rows)
     pipeline._config = config
+    return pipeline
+
+
+def _pipeline_with_physical(logical_rows, physical_rows):
+    pipeline = _pipeline(logical_rows)
+    pipeline._store = _PhysicalRowStore(logical_rows, physical_rows)
     return pipeline
 
 
@@ -102,6 +120,85 @@ class TestLoadCompactableRows:
         assert messages[0].content == "toes tingling"
         assert "BigTex" not in messages[0].content
 
+    def test_legacy_rows_without_turn_groups_are_not_collapsed(self):
+        pipeline = _pipeline([
+            _row(canonical_turn_id="ct-1", user_content="first"),
+            _row(canonical_turn_id="ct-2", user_content="second"),
+        ])
+
+        _rows, messages = pipeline._load_compactable_rows()
+
+        assert [message.content for message in messages] == ["first", "second"]
+
+    def test_mixed_logical_user_row_is_reconstructed_as_exact_physical_messages(self):
+        logical = _row(
+            canonical_turn_id="logical",
+            turn_group_number=7,
+            user_content="BigTex words\nKuw words",
+            assistant_content="answer",
+            sender="BigTex",
+            sender_actor_id="actor:discord:1",
+        )
+        physical = [
+            _row(
+                canonical_turn_id="ct-bigtex",
+                turn_number=10,
+                turn_group_number=7,
+                sort_key=10.0,
+                user_content="BigTex words",
+                sender="BigTex",
+                sender_actor_id="actor:discord:1",
+                audience_conversation_id="audience:guild:1",
+                audience_attribution_version=AUDIENCE_ATTRIBUTION_VERSION,
+                origin_channel_id="channel:medical",
+            ),
+            _row(
+                canonical_turn_id="ct-kuw",
+                turn_number=11,
+                turn_group_number=7,
+                sort_key=11.0,
+                user_content="Kuw words",
+                sender="Kuw9239",
+                sender_actor_id="actor:discord:2",
+                audience_conversation_id="audience:guild:1",
+                audience_attribution_version=AUDIENCE_ATTRIBUTION_VERSION,
+                origin_channel_id="channel:medical",
+            ),
+            _row(
+                canonical_turn_id="ct-assistant",
+                turn_number=12,
+                turn_group_number=7,
+                sort_key=12.0,
+                assistant_content="answer",
+                audience_conversation_id="audience:guild:1",
+                audience_attribution_version=AUDIENCE_ATTRIBUTION_VERSION,
+                origin_channel_id="channel:medical",
+            ),
+        ]
+        pipeline = _pipeline_with_physical([logical], physical)
+
+        _rows, messages = pipeline._load_compactable_rows()
+
+        assert [message.content for message in messages] == [
+            "BigTex words", "Kuw words", "answer",
+        ]
+        assert [message.source_actor_id for message in messages[:2]] == [
+            "actor:discord:1", "actor:discord:2",
+        ]
+        assert [
+            message.metadata["_vc_source_canonical_turn_ids"]
+            for message in messages
+        ] == [["ct-bigtex"], ["ct-kuw"], ["ct-assistant"]]
+        assert {
+            message.source_audience_conversation_id for message in messages
+        } == {"audience:guild:1"}
+        assert {
+            message.source_origin_channel_id for message in messages
+        } == {"channel:medical"}
+        assert {
+            message.source_audience_attribution_version for message in messages
+        } == {AUDIENCE_ATTRIBUTION_VERSION}
+
 
 # ---------------------------------------------------------------------------
 # Compactor rendering
@@ -117,18 +214,19 @@ class TestFormatConversation:
         compactor = self._compactor()
         text = compactor._format_conversation([
             Message(role="user", content="toes tingling",
-                    metadata={"sender": {"name": "BigTex"}}),
+                    metadata={"sender": {"name": "BigTex"}},
+                    source_actor_id="actor:discord:bigtex"),
             Message(role="assistant", content="hm"),
         ])
         assert "BigTex: toes tingling" in text
         assert "Assistant: hm" in text
 
-    def test_no_sender_still_emits_user_label(self):
+    def test_no_sender_emits_neutral_source_label(self):
         compactor = self._compactor()
         text = compactor._format_conversation([
             Message(role="user", content="toes tingling"),
         ])
-        assert "User: toes tingling" in text
+        assert "Source: toes tingling" in text
 
 
 # ---------------------------------------------------------------------------
@@ -173,7 +271,7 @@ class TestSplitSessionBoundaryMessages:
             Message(role="user", content="first[Session from 2026-01-01]second"),
         ])
         text = compactor._format_conversation(out)
-        assert text.count("User: ") == 2
+        assert text.count("Source: ") == 2
 
 
 # ---------------------------------------------------------------------------

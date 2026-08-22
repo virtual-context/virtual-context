@@ -45,6 +45,7 @@ from ..core.canonical_turns import STRIP_WHITESPACE
 from ..core.store import ContextStore
 from ..core.exceptions import CanonicalSourceConflict, ConversationLifecycleConflict
 from ..types import AUDIENCE_ATTRIBUTION_VERSION, ChunkEmbedding, ConversationStats, DepthLevel, EngineStateSnapshot, Fact, FactLink, FactSignal, CanonicalTurnChunkEmbedding, CanonicalTurnReconcileRow, CanonicalTurnRow, LinkedFact, QuoteResult, SegmentMetadata, SourceProvenance, SpeakerRetrievalContext, StoredSegment, StoredSummary, TagStats, TagSummary, TemporalStatus, TurnTagEntry, WorkingSetEntry, channel_excerpt_prefix, strip_channel_hash
+from ..types import strict_segment_identity_metadata
 from ..types import (
     CARD_CROSS_CONTEXT_KINDS,
     CARD_KINDS,
@@ -390,6 +391,57 @@ def _escape_like(text: str) -> str:
     return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+def _speaker_canonical_scope_sql(
+    speaker_context: SpeakerRetrievalContext,
+    conversation_id: str | None,
+    *,
+    prefix: str = "",
+) -> tuple[str, list[object]] | None:
+    """Return the exact request-owned canonical-row predicate.
+
+    The caller-provided conversation id may only narrow to the immutable
+    owner carried by the trusted request context.  Audience and attribution
+    version are always exact.  Channel scope is likewise request-owned:
+    ``channel`` requires exact equality (including the empty DM channel),
+    while the explicitly configured ``conversation`` policy admits only
+    non-empty group-channel rows in the same audience.  An incomplete or
+    contradictory context has no safe interpretation and returns ``None``.
+    """
+    if not getattr(speaker_context, "eligible", False):
+        return None
+    owner = (speaker_context.owner_conversation_id or "").strip()
+    audience = (speaker_context.audience_conversation_id or "").strip()
+    if not owner or not audience:
+        return None
+    if conversation_id is not None and (conversation_id or "").strip() != owner:
+        return None
+
+    column = f"{prefix}." if prefix else ""
+    sql = (
+        f" AND {column}conversation_id = ?"
+        f" AND {column}audience_conversation_id = ?"
+        f" AND {column}audience_attribution_version = ?"
+    )
+    params: list[object] = [
+        owner, audience, AUDIENCE_ATTRIBUTION_VERSION,
+    ]
+    channel_scope = (
+        speaker_context.audience_channel_scope or "channel"
+    ).strip()
+    if channel_scope == "conversation":
+        # A non-empty trusted request origin proves this is a group request;
+        # non-empty stored channels keep DM rows outside the widened policy.
+        if not (speaker_context.request_origin_channel_id or "").strip():
+            return None
+        sql += f" AND TRIM(COALESCE({column}origin_channel_id, '')) <> ''"
+    elif channel_scope == "channel":
+        sql += f" AND COALESCE({column}origin_channel_id, '') = ?"
+        params.append((speaker_context.audience_channel_id or "").strip())
+    else:
+        return None
+    return sql, params
+
+
 # SQLite analog of the Postgres ``_BACKLOG_DETECTION_SQL`` per
 # compaction-backlog sweeper spec v1.4 §3.1. SQLite has no
 # ``make_interval`` so the grace cutoff uses ``julianday('now', '-' ||
@@ -641,6 +693,7 @@ def _build_turn_excerpt(
 
 def _row_to_segment(row: sqlite3.Row, tags: list[str]) -> StoredSegment:
     metadata_raw = json.loads(row["metadata_json"])
+    identity_metadata = strict_segment_identity_metadata(metadata_raw)
     return StoredSegment(
         ref=row["ref"],
         conversation_id=row["conversation_id"],
@@ -658,14 +711,22 @@ def _row_to_segment(row: sqlite3.Row, tags: list[str]) -> StoredSegment:
             date_references=metadata_raw.get("date_references", []),
             code_refs=metadata_raw.get("code_refs", []),
             turn_count=metadata_raw.get("turn_count", 0),
-            canonical_turn_ids=metadata_raw.get("canonical_turn_ids", []),
+            canonical_turn_ids=identity_metadata["canonical_turn_ids"],
+            source_speaker_labels=identity_metadata["source_speaker_labels"],
+            source_speaker_identity_count=identity_metadata[
+                "source_speaker_identity_count"
+            ],
+            source_speaker_identity_fingerprint=identity_metadata[
+                "source_speaker_identity_fingerprint"
+            ],
+            source_audience_fingerprint=identity_metadata[
+                "source_audience_fingerprint"
+            ],
             start_turn_number=metadata_raw.get("start_turn_number", -1),
             end_turn_number=metadata_raw.get("end_turn_number", -1),
             generated_by_turn_id=metadata_raw.get("generated_by_turn_id", ""),
             session_date=metadata_raw.get("session_date", ""),
-            source_mapping_complete=bool(
-                metadata_raw.get("source_mapping_complete", False)
-            ),
+            source_mapping_complete=identity_metadata["source_mapping_complete"],
         ),
         created_at=_str_to_dt(row["created_at"]),
         start_timestamp=_str_to_dt(row["start_timestamp"]),
@@ -677,6 +738,7 @@ def _row_to_segment(row: sqlite3.Row, tags: list[str]) -> StoredSegment:
 
 def _row_to_summary(row: sqlite3.Row, tags: list[str]) -> StoredSummary:
     metadata_raw = json.loads(row["metadata_json"])
+    identity_metadata = strict_segment_identity_metadata(metadata_raw)
     return StoredSummary(
         ref=row["ref"],
         primary_tag=row["primary_tag"],
@@ -691,14 +753,22 @@ def _row_to_summary(row: sqlite3.Row, tags: list[str]) -> StoredSummary:
             date_references=metadata_raw.get("date_references", []),
             code_refs=metadata_raw.get("code_refs", []),
             turn_count=metadata_raw.get("turn_count", 0),
-            canonical_turn_ids=metadata_raw.get("canonical_turn_ids", []),
+            canonical_turn_ids=identity_metadata["canonical_turn_ids"],
+            source_speaker_labels=identity_metadata["source_speaker_labels"],
+            source_speaker_identity_count=identity_metadata[
+                "source_speaker_identity_count"
+            ],
+            source_speaker_identity_fingerprint=identity_metadata[
+                "source_speaker_identity_fingerprint"
+            ],
+            source_audience_fingerprint=identity_metadata[
+                "source_audience_fingerprint"
+            ],
             start_turn_number=metadata_raw.get("start_turn_number", -1),
             end_turn_number=metadata_raw.get("end_turn_number", -1),
             generated_by_turn_id=metadata_raw.get("generated_by_turn_id", ""),
             session_date=metadata_raw.get("session_date", ""),
-            source_mapping_complete=bool(
-                metadata_raw.get("source_mapping_complete", False)
-            ),
+            source_mapping_complete=identity_metadata["source_mapping_complete"],
         ),
         created_at=_str_to_dt(row["created_at"]),
         start_timestamp=_str_to_dt(row["start_timestamp"]),
@@ -3610,6 +3680,18 @@ CREATE TABLE IF NOT EXISTS request_captures (
             "code_refs": getattr(segment.metadata, "code_refs", []),
             "turn_count": segment.metadata.turn_count,
             "canonical_turn_ids": getattr(segment.metadata, "canonical_turn_ids", []),
+            "source_speaker_labels": getattr(
+                segment.metadata, "source_speaker_labels", [],
+            ),
+            "source_speaker_identity_count": int(getattr(
+                segment.metadata, "source_speaker_identity_count", 0,
+            ) or 0),
+            "source_speaker_identity_fingerprint": str(getattr(
+                segment.metadata, "source_speaker_identity_fingerprint", "",
+            ) or ""),
+            "source_audience_fingerprint": str(getattr(
+                segment.metadata, "source_audience_fingerprint", "",
+            ) or ""),
             "start_turn_number": getattr(segment.metadata, "start_turn_number", -1),
             "end_turn_number": getattr(segment.metadata, "end_turn_number", -1),
             "generated_by_turn_id": getattr(segment.metadata, "generated_by_turn_id", ""),
@@ -4087,6 +4169,12 @@ CREATE TABLE IF NOT EXISTS request_captures (
         Every candidate carries ``SourceProvenance`` projected from the exact
         physical row that matched, before dedupe, merging, or reranking.
         """
+        request_scope = _speaker_canonical_scope_sql(
+            speaker_context, conversation_id,
+        )
+        if request_scope is None:
+            return []
+        scope_sql, scope_params = request_scope
         conn = self._get_conn()
         _sc = getattr(self, "search_config", None)
         _ctx_chars = _sc.excerpt_context_chars if _sc else 200
@@ -4159,9 +4247,8 @@ CREATE TABLE IF NOT EXISTS request_captures (
                         OR (sender LIKE ? ESCAPE '\\'
                             AND TRIM(COALESCE(user_content, '')) <> ''))"""
         params: list[object] = [pattern, pattern, sender_pattern]
-        if conversation_id is not None:
-            sql += " AND conversation_id = ?"
-            params.append(conversation_id)
+        sql += scope_sql
+        params.extend(scope_params)
         chan_sql, chan_params = _channel_filter()
         sql += chan_sql
         params.extend(chan_params)
@@ -4236,14 +4323,14 @@ CREATE TABLE IF NOT EXISTS request_captures (
                         reply_target_body, reply_subject_actor_id,
                         reply_subject_label, primary_tag, tags_json,
                         session_date, origin_channel_id, origin_channel_label,
+                        source_message_id,
                         audience_conversation_id, audience_attribution_version
                  FROM canonical_turns_ordinal
                  WHERE reply_target_body LIKE ?
                    AND TRIM(COALESCE(reply_target_body, '')) <> ''"""
         params = [pattern]
-        if conversation_id is not None:
-            sql += " AND conversation_id = ?"
-            params.append(conversation_id)
+        sql += scope_sql
+        params.extend(scope_params)
         chan_sql, chan_params = _channel_filter()
         sql += chan_sql
         params.extend(chan_params)
@@ -8203,24 +8290,22 @@ CREATE TABLE IF NOT EXISTS request_captures (
         is deliberately not projected here (``-1``): the physical hydration
         lookup supplies presentation ordinals from the row itself.
         """
-        owner = speaker_context.owner_conversation_id or ""
-        if owner:
-            if conversation_id is not None and conversation_id != owner:
-                return []
-            scope_id: str | None = owner
-        else:
-            scope_id = conversation_id
+        request_scope = _speaker_canonical_scope_sql(
+            speaker_context, conversation_id, prefix="ct",
+        )
+        if request_scope is None:
+            return []
+        scope_sql, scope_params = request_scope
         conn = self._get_conn()
         sql = """SELECT ctc.conversation_id, ctc.canonical_turn_id, ctc.side,
                         ctc.chunk_index, ctc.text, ctc.embedding_json
                  FROM canonical_turn_chunks ctc
                  JOIN canonical_turns ct
                    ON ct.conversation_id = ctc.conversation_id
-                  AND ct.canonical_turn_id = ctc.canonical_turn_id"""
-        params: list[object] = []
-        if scope_id is not None:
-            sql += " WHERE ctc.conversation_id = ?"
-            params.append(scope_id)
+                  AND ct.canonical_turn_id = ctc.canonical_turn_id
+                 WHERE 1 = 1"""
+        sql += scope_sql
+        params = list(scope_params)
         sql += " ORDER BY ctc.conversation_id, ct.sort_key, ctc.side, ctc.chunk_index"
         rows = conn.execute(sql, params).fetchall()
         return [
@@ -8719,6 +8804,12 @@ CREATE TABLE IF NOT EXISTS request_captures (
         audience = (speaker_context.audience_conversation_id or "").strip()
         if not audience:
             return []
+        request_scope = _speaker_canonical_scope_sql(
+            speaker_context, conversation_id,
+        )
+        if request_scope is None:
+            return []
+        scope_sql, scope_params = request_scope
 
         _sc = getattr(self, "search_config", None)
         _ctx_chars = _sc.excerpt_context_chars if _sc else 200
@@ -8731,13 +8822,9 @@ CREATE TABLE IF NOT EXISTS request_captures (
                         audience_conversation_id, audience_attribution_version
                  FROM canonical_turns_ordinal
                  WHERE sender_actor_id = ?
-                   AND TRIM(COALESCE(user_content, '')) <> ''
-                   AND audience_conversation_id = ?
-                   AND audience_attribution_version = ?"""
-        params: list[object] = [actor, audience, AUDIENCE_ATTRIBUTION_VERSION]
-        if conversation_id:
-            sql += " AND conversation_id = ?"
-            params.append(conversation_id)
+                   AND TRIM(COALESCE(user_content, '')) <> ''"""
+        sql += scope_sql
+        params: list[object] = [actor, *scope_params]
         # Send time comes from the message id, which encodes it; a stored
         # ingest timestamp records when the row was written and diverges
         # across a backfill. The all-digits guard is the two-GLOB idiom
@@ -11005,7 +11092,13 @@ CREATE TABLE IF NOT EXISTS request_captures (
         """
         if not keys:
             return {}
-        owner = speaker_context.owner_conversation_id or ""
+        request_scope = _speaker_canonical_scope_sql(
+            speaker_context, None,
+        )
+        if request_scope is None:
+            return {}
+        scope_sql, scope_params = request_scope
+        owner = (speaker_context.owner_conversation_id or "").strip()
         by_conversation: dict[str, list[str]] = {}
         for conversation_id, canonical_turn_id in keys:
             if not conversation_id or not canonical_turn_id:
@@ -11038,8 +11131,9 @@ CREATE TABLE IF NOT EXISTS request_captures (
                            source_batch_id, created_at, updated_at
                     FROM canonical_turns_ordinal
                     WHERE conversation_id = ?
-                      AND canonical_turn_id IN ({placeholders})""",
-                [conversation_id, *turn_ids],
+                      AND canonical_turn_id IN ({placeholders})
+                    {scope_sql}""",
+                [conversation_id, *turn_ids, *scope_params],
             ).fetchall()
             for row in rows:
                 parsed = _row_to_canonical_turn(row)

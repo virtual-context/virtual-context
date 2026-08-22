@@ -259,8 +259,8 @@ class TestEndToEndSenderIdentity:
         assert "charlotte tilbury" in formatted
         assert get_sender_name(meta) == "Sania"
 
-    def test_no_metadata_falls_back_to_role(self):
-        """Without metadata, compactor uses role as label."""
+    def test_no_metadata_uses_neutral_source_label(self):
+        """Without proved metadata, compactor avoids a generic human label."""
         from virtual_context.core.compactor import DomainCompactor
         from virtual_context.types import CompactorConfig
 
@@ -268,7 +268,7 @@ class TestEndToEndSenderIdentity:
         asst = Message(role="assistant", content="Hi")
         compactor = DomainCompactor(llm_provider=None, config=CompactorConfig())
         formatted = compactor._format_conversation([msg, asst])
-        assert "User:" in formatted or "User (" in formatted
+        assert "Source:" in formatted or "Source (" in formatted
 
 
 class TestEnvelopeTimestamps:

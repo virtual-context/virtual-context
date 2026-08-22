@@ -12,6 +12,11 @@ from ..core.speaker_labels import (
     annotate_aggregate_entry,
     strip_to_structural_speaker_fields,
 )
+from ..core.summary_identity import (
+    render_summary_for_model,
+    sanitize_summary_payload_for_model,
+)
+from ..types import SpeakerRetrievalContext
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +80,36 @@ def recall_context(
         The assembled virtual-context block as XML, or empty string if no relevant context.
     """
     engine = _get_engine()
-    return engine.transform(message, active_tags=active_tags)
+    result = engine.retrieve(message, active_tags=active_tags)
+    summaries = list(getattr(result, "summaries", None) or [])
+    if not summaries:
+        return ""
+
+    # MCP carries no validated request audience. Do not call ``transform``:
+    # its legacy convenience path has no speaker context and may assemble
+    # StoredSummary prose without proving an audience-bound owner. Preserve
+    # the canonical tag-section shape, but require proof for every summary and
+    # retain the opaque source ref so a withheld row remains identifiable.
+    from ..core.assembler import format_tag_section
+
+    rendered_summary_by_object: dict[int, str] = {}
+    summaries_by_tag: dict[str, list] = {}
+    for summary in summaries:
+        rendered_summary_by_object[id(summary)] = render_summary_for_model(
+            summary.summary,
+            require_proved_scope=True,
+        )
+        summaries_by_tag.setdefault(summary.primary_tag, []).append(summary)
+
+    return "\n\n".join(
+        format_tag_section(
+            tag,
+            tag_summaries,
+            rendered_summary_by_object=rendered_summary_by_object,
+            include_source_refs=True,
+        )
+        for tag, tag_summaries in summaries_by_tag.items()
+    )
 
 
 @mcp.tool()
@@ -164,17 +198,27 @@ def expand_topic(
 
 @mcp.tool()
 def recall_all() -> str:
-    """Load summaries of all stored conversation topics at once.
+    """List all stored conversation topics at once.
 
     Use when the user asks for a broad overview or wants to know
-    everything discussed. Returns all tag summaries within token budget.
+    which topics are available. Returns tag names, stored token counts, and
+    source references within budget; stateless MCP withholds layer-2 prose.
     """
     engine = _get_engine()
     result = engine.recall_all()
-    if _speaker_annotations_enabled(engine) and isinstance(result, dict):
+    if isinstance(result, dict):
         for summary_entry in result.get("summaries") or []:
-            annotate_aggregate_entry(summary_entry)
-        strip_to_structural_speaker_fields(result)
+            if not isinstance(summary_entry, dict):
+                continue
+            # Stateless MCP never has audience proof for layer-2 prose. Strip
+            # it even when talking to an older engine that still returns the
+            # legacy fields; tag and source structure remain useful.
+            summary_entry.pop("summary", None)
+            summary_entry.pop("description", None)
+            if _speaker_annotations_enabled(engine):
+                annotate_aggregate_entry(summary_entry)
+        if _speaker_annotations_enabled(engine):
+            strip_to_structural_speaker_fields(result)
     return json.dumps(result)
 
 
@@ -190,7 +234,9 @@ def remember_when(query: str, time_range: dict, max_results: int = 12, mode: str
         time_range=time_range,
         max_results=max_results,
         mode=mode,
+        speaker_context=SpeakerRetrievalContext.ineligible(),
     )
+    result = sanitize_summary_payload_for_model(result)
     result = _stateless_speaker_exposure(engine, result)
     return json.dumps(result)
 
@@ -218,9 +264,15 @@ def find_quote(query: str, mode: str = "lookup", channel: str = "") -> str:
     """
     engine = _get_engine()
     # Keep MCP behavior aligned with proxy tool loop: always return top 20.
-    # No speaker context is supplied: stateless MCP has no validated
-    # audience, so retrieval stays on the unconditioned path.
-    result = engine.find_quote(query, max_results=20, mode=mode, channel=channel)
+    # Stateless MCP has no validated request audience.  State that absence
+    # explicitly so it fails closed instead of selecting owner-wide history.
+    result = engine.find_quote(
+        query,
+        max_results=20,
+        mode=mode,
+        channel=channel,
+        speaker_context=SpeakerRetrievalContext.ineligible(),
+    )
     result = _stateless_speaker_exposure(engine, result)
     return json.dumps(result)
 
@@ -233,7 +285,13 @@ def search_summaries(query: str, mode: str = "lookup") -> str:
     especially for cross-topic aggregation or coverage questions.
     """
     engine = _get_engine()
-    result = engine.search_summaries(query, max_results=20, mode=mode)
+    result = engine.search_summaries(
+        query,
+        max_results=20,
+        mode=mode,
+        speaker_context=SpeakerRetrievalContext.ineligible(),
+    )
+    result = sanitize_summary_payload_for_model(result)
     result = _stateless_speaker_exposure(engine, result)
     return json.dumps(result)
 
@@ -292,7 +350,7 @@ def get_domain_summaries(tag: str) -> str:
             f"Tags: {', '.join(s.tags)}\n"
             f"Tokens: {s.summary_tokens}\n"
             f"Created: {s.created_at.isoformat()}\n\n"
-            f"{s.summary}"
+            f"{render_summary_for_model(s.summary, require_proved_scope=True)}"
         )
     return "\n\n---\n\n".join(parts)
 

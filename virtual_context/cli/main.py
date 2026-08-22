@@ -3022,6 +3022,13 @@ def main():
         help="Write repairs; the default is a server-enforced read-only dry run",
     )
     resummarize_parser.add_argument(
+        "--identity-violations", action="store_true",
+        help=(
+            "Inventory ambiguous summary prose and missing speaker/audience "
+            "provenance; read-only only (identity apply is refused safely)"
+        ),
+    )
+    resummarize_parser.add_argument(
         "--include-short", action="store_true",
         help="Opt in segments whose stripped source is under 256 chars",
     )
@@ -3352,7 +3359,7 @@ def main():
                 "  virtual-context admin backfill-channels [<conversation_id>] [--tenant-id <id>] [--all-convs-for-tenant] [--dry-run] [--limit N]\n"
                 "  virtual-context admin reattribute-audience <conversation_id> <from_audience> <to_audience> --tenant-id <id> [--apply] [--limit N]\n"
                 "  virtual-context admin rebuild-derived-data <conversation_id> --tenant-id <id> [--apply]\n"
-                "  virtual-context admin resummarize-segments <conversation_id> --tenant-id <id> [--apply] [--include-short] [--limit N] [--after-ref <ref>] [--since <ts>] [--until <ts>] [--journal <path>] [--max-consecutive-provider-failures N] [--postgres-dsn <dsn>]\n"
+                "  virtual-context admin resummarize-segments <conversation_id> --tenant-id <id> [--identity-violations] [--apply] [--include-short] [--limit N] [--after-ref <ref>] [--since <ts>] [--until <ts>] [--journal <path>] [--max-consecutive-provider-failures N] [--postgres-dsn <dsn>]\n"
                 "  virtual-context admin resequence-canonical-turns <conversation_id> --tenant-id <id> [--apply]\n"
                 "  virtual-context admin normalize-canonical-actor-ids <conversation_id> --tenant-id <id> --platform <platform> [--apply]\n"
                 "  virtual-context admin reindex-canonical-turn-embeddings [<conversation_id>] [--tenant-id <id>] [--all-convs-for-tenant] [--apply] [--limit N]\n"

@@ -18,12 +18,18 @@ from typing import TYPE_CHECKING
 
 from .math_utils import cosine_similarity
 from .quote_search import _parse_session_date as _parse_session_date_str
+from .summary_identity import (
+    SUMMARY_ATTRIBUTION_QUARANTINE,
+    contains_ambiguous_human_referent,
+    render_segment_refs_for_model,
+    resolve_segment_ref_attributions,
+)
 
 if TYPE_CHECKING:
     from .semantic_search import SemanticSearchManager
     from .search_engine import SearchEngine
     from .store import ContextStore
-    from ..types import VirtualContextConfig
+    from ..types import SpeakerRetrievalContext, VirtualContextConfig
 
 logger = logging.getLogger(__name__)
 
@@ -176,6 +182,7 @@ class TemporalResolver:
         max_results: int | None = None,
         mode: str = "auto",
         intent_context: str = "",
+        speaker_context: "SpeakerRetrievalContext | None" = None,
     ) -> dict:
         """Find memory snippets for *query* constrained to a resolved date window."""
         resolved_mode = self._normalize_remember_when_mode(mode)
@@ -214,6 +221,10 @@ class TemporalResolver:
             target_date=state_target_date,
             intent_context=intent_context,
         )
+        filtered, segment_actors = self._scope_segment_results_for_request(
+            filtered,
+            speaker_context=speaker_context,
+        )
         if (
             resolved_mode in _REMEMBER_WHEN_CHANGE_MODES
             and not filtered
@@ -230,6 +241,10 @@ class TemporalResolver:
                 target_date=state_target_date,
                 intent_context=intent_context,
             )
+            filtered, segment_actors = self._scope_segment_results_for_request(
+                filtered,
+                speaker_context=speaker_context,
+            )
 
         # Structured facts should be topic-matched first, then filtered/diversified
         # inside the time window. Falling back to a raw date scan is a last resort.
@@ -243,6 +258,10 @@ class TemporalResolver:
             mode=resolved_mode,
             segment_results=filtered,
             target_date=state_target_date,
+        )
+        fact_results, fact_actors = self._scope_fact_results_for_request(
+            fact_results,
+            speaker_context=speaker_context,
         )
         if (
             resolved_mode in _REMEMBER_WHEN_CHANGE_MODES
@@ -260,6 +279,10 @@ class TemporalResolver:
                 segment_results=filtered,
                 target_date=state_target_date,
             )
+            fact_results, fact_actors = self._scope_fact_results_for_request(
+                fact_results,
+                speaker_context=speaker_context,
+            )
         if resolved_mode in _REMEMBER_WHEN_CHANGE_MODES:
             filtered = self._supplement_change_results_for_fact_backed_dates(
                 query=query,
@@ -269,10 +292,24 @@ class TemporalResolver:
                 start=start,
                 end=end,
             )
+            filtered, segment_actors = self._scope_segment_results_for_request(
+                filtered,
+                speaker_context=speaker_context,
+            )
 
         message = ""
         if not filtered and not fact_results and query:
-            raw = self._search.find_quote(query=query, max_results=max(max_results * 4, 20))
+            try:
+                raw = self._search.find_quote(
+                    query=query,
+                    max_results=max(max_results * 4, 20),
+                    speaker_context=speaker_context,
+                )
+            except TypeError:
+                raw = self._search.find_quote(
+                    query=query,
+                    max_results=max(max_results * 4, 20),
+                )
             if raw.get("found"):
                 fallback_results: list[dict] = []
                 for item in raw.get("results", []):
@@ -285,6 +322,10 @@ class TemporalResolver:
                     if len(fallback_results) >= max_results:
                         break
                 filtered = fallback_results
+                filtered, segment_actors = self._scope_segment_results_for_request(
+                    filtered,
+                    speaker_context=speaker_context,
+                )
             if not filtered:
                 message = raw.get("message", f"No matches for '{query}' in the requested time window.")
         elif not filtered and not fact_results:
@@ -303,7 +344,15 @@ class TemporalResolver:
             "facts_in_window": fact_results,
             "message": message,
         }
-        if resolved_mode in (_REMEMBER_WHEN_SUMMARY_MODES | _REMEMBER_WHEN_CHANGE_MODES):
+        canonical_source_mode = bool(
+            speaker_context is not None
+            and getattr(speaker_context, "eligible", False)
+        )
+        if (
+            not canonical_source_mode
+            and resolved_mode
+            in (_REMEMBER_WHEN_SUMMARY_MODES | _REMEMBER_WHEN_CHANGE_MODES)
+        ):
             ordered_milestones = self._build_ordered_milestones(
                 query=query,
                 results=filtered,
@@ -317,7 +366,10 @@ class TemporalResolver:
                 )
                 if phase_milestones:
                     result["phase_milestones"] = phase_milestones
-        if resolved_mode in _REMEMBER_WHEN_DATE_BUCKET_MODES:
+        if (
+            not canonical_source_mode
+            and resolved_mode in _REMEMBER_WHEN_DATE_BUCKET_MODES
+        ):
             date_buckets = self._build_change_date_buckets(
                 results=filtered,
                 facts=fact_results,
@@ -325,7 +377,12 @@ class TemporalResolver:
             )
             if date_buckets:
                 result["date_buckets"] = date_buckets
-        if state_target_date is not None:
+        historical_actors = segment_actors | fact_actors
+        if (
+            not canonical_source_mode
+            and state_target_date is not None
+            and len(historical_actors) <= 1
+        ):
             state_view = self._resolve_state_view(
                 results=filtered,
                 facts=fact_results,
@@ -346,7 +403,77 @@ class TemporalResolver:
             )
             if state_anchor:
                 result["state_anchor"] = state_anchor
+        elif state_target_date is not None:
+            # A chronology can be shown with each source explicitly scoped,
+            # but choosing one cross-speaker "current state" would silently
+            # let the newest participant suppress everyone else.
+            result["target_date"] = state_target_date.isoformat()
+            result["state_resolution"] = "withheld_multiple_historical_speakers"
         return result
+
+    def _scope_segment_results_for_request(
+        self,
+        results: list[dict],
+        *,
+        speaker_context: "SpeakerRetrievalContext | None",
+    ) -> tuple[list[dict], set[str]]:
+        """Admit summary-derived rows only with exact audience-bound proof."""
+        if speaker_context is None:
+            return results, set()
+        if not getattr(speaker_context, "eligible", False):
+            return [], set()
+
+        conversation_id = self._config.conversation_id or ""
+        attributions = resolve_segment_ref_attributions(
+            (item.get("segment_ref") for item in results),
+            store=self._store,
+            conversation_id=conversation_id,
+            speaker_context=speaker_context,
+        )
+        rendered_by_ref = render_segment_refs_for_model(
+            (item.get("segment_ref") for item in results),
+            store=self._store,
+            conversation_id=conversation_id,
+            speaker_context=speaker_context,
+        )
+        scoped: list[dict] = []
+        actors: set[str] = set()
+        for item in results:
+            ref = str(item.get("segment_ref", "") or "").strip()
+            attribution = attributions.get(ref)
+            if attribution is None or not attribution.is_proved_single_human:
+                continue
+            excerpt = rendered_by_ref.get(
+                ref, SUMMARY_ATTRIBUTION_QUARANTINE,
+            )
+            if excerpt == SUMMARY_ATTRIBUTION_QUARANTINE:
+                continue
+            projected = dict(item)
+            projected["excerpt"] = excerpt
+            # The exact transcript may contain both human and assistant
+            # lanes. A segment-wide human label would relabel the assistant's
+            # words, so only lane-local labels inside the envelope survive.
+            projected.pop("historical_speaker", None)
+            scoped.append(projected)
+            actors.update(attribution.actor_ids)
+        return scoped, actors
+
+    def _scope_fact_results_for_request(
+        self,
+        results: list[dict],
+        *,
+        speaker_context: "SpeakerRetrievalContext | None",
+    ) -> tuple[list[dict], set[str]]:
+        """Withhold derived fact prose at model-facing summary boundaries.
+
+        Fact rows remain useful inside retrieval, but author/source metadata
+        cannot prove that generated ``what`` prose preserved modality, time,
+        or coreference. Exact canonical human turns are the only evidence
+        admitted when a request context marks this as a model-facing path.
+        """
+        if speaker_context is None:
+            return results, set()
+        return [], set()
 
     def _default_remember_when_max_results(self, resolved_mode: str) -> int:
         base = self._config.search.remember_when_max_results
@@ -458,6 +585,8 @@ class TemporalResolver:
             if not segment_ref:
                 continue
             summary_text = str(seg.summary or "").strip()
+            if contains_ambiguous_human_referent(summary_text):
+                summary_text = ""
             excerpt = summary_text or str(seg.full_text or "").strip()
             if not excerpt:
                 continue
@@ -575,6 +704,8 @@ class TemporalResolver:
                         continue
                     tag = str(getattr(hit, "primary_tag", "") or "")
                     summary_text = str(getattr(hit, "summary", "") or "")
+                    if contains_ambiguous_human_referent(summary_text):
+                        continue
                     bucket = candidates.setdefault(
                         segment_ref,
                         {
@@ -677,7 +808,9 @@ class TemporalResolver:
                 except Exception:
                     seg = None
                 if seg is not None and seg.summary:
-                    bucket["summary_text"] = seg.summary
+                    safe_summary = str(seg.summary)
+                    if not contains_ambiguous_human_referent(safe_summary):
+                        bucket["summary_text"] = safe_summary
 
         if mode in _REMEMBER_WHEN_STATE_MODES and target_date is not None:
             selected = self._select_state_candidates(
@@ -715,7 +848,14 @@ class TemporalResolver:
                 except Exception:
                     seg = None
                 if seg is not None and seg.summary:
-                    excerpt = seg.summary
+                    safe_summary = str(seg.summary)
+                    if not contains_ambiguous_human_referent(safe_summary):
+                        excerpt = safe_summary
+            if (
+                contains_ambiguous_human_referent(excerpt)
+                and "summary" in str(quote.match_type or "")
+            ):
+                continue
             if mode in _REMEMBER_WHEN_CHANGE_MODES:
                 excerpt = self._change_result_excerpt(str(excerpt or ""))
             result = {
@@ -782,7 +922,10 @@ class TemporalResolver:
             if parsed is None or not (start <= parsed <= end):
                 continue
             summary_text = str(seg.summary or "").strip()
-            if not summary_text:
+            if (
+                not summary_text
+                or contains_ambiguous_human_referent(summary_text)
+            ):
                 continue
             semantic_text = " ".join(
                 part for part in [
@@ -1199,7 +1342,10 @@ class TemporalResolver:
             if not segment_ref or segment_ref in existing_refs:
                 continue
             summary_text = str(seg.summary or "").strip()
-            if not summary_text:
+            if (
+                not summary_text
+                or contains_ambiguous_human_referent(summary_text)
+            ):
                 continue
             semantic_text = " ".join(
                 part for part in [

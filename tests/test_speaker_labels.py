@@ -12,8 +12,6 @@ from __future__ import annotations
 import os
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
-import dataclasses
-
 import pytest
 
 from virtual_context.core.speaker_labels import (
@@ -223,6 +221,37 @@ class TestResolveSpeakerLabels:
         labels = resolve_speaker_labels(store, {ACTOR}, speaker_context=_ctx())
         assert labels == {ACTOR: "Scoped Name"}
 
+    @pytest.mark.parametrize("unsafe_label", [
+        ACTOR,
+        f"@{ACTOR}",
+        "@actor\u2060:discord:111",
+        "actor\ufe0f:discord:111",
+        "User.",
+        "(You)",
+        "I (BigTex)",
+    ])
+    def test_unsafe_latest_label_is_omitted_without_older_fallback(
+        self, unsafe_label,
+    ):
+        store = _RowStore([
+            _row(sender="Older Safe", sort_key=1000.0, ctid="ct-a"),
+            _row(sender=unsafe_label, sort_key=2000.0, ctid="ct-b"),
+        ])
+
+        assert resolve_speaker_labels(
+            store, {ACTOR}, speaker_context=_ctx(),
+        ) == {}
+
+    @pytest.mark.parametrize("safe_label", ["BigTex", "Renée", "李雷"])
+    def test_explicit_human_labels_remain_available(self, safe_label):
+        labels = resolve_speaker_labels(
+            _RowStore([_row(sender=safe_label)]),
+            {ACTOR},
+            speaker_context=_ctx(),
+        )
+
+        assert labels == {ACTOR: safe_label}
+
 
 class TestAnnotationGateRouter:
     def _config(self, enabled: bool):
@@ -296,12 +325,33 @@ class TestQuoteProjection:
 
     def test_unresolved_reply_surfaces_only_an_unverified_claim(self):
         fields = project_quote_speaker_fields(
-            _prov("subject", claimed="someone typed this"), {},
+            _prov("subject", claimed="Mystery Guest"), {},
         )
         assert fields["speaker_label"] == ""
         assert fields["speaker_handle"] == ""
         assert fields["speaker_verified"] is False
-        assert fields["claimed_speaker_label"] == "someone typed this"
+        assert fields["claimed_speaker_label"] == "Mystery Guest"
+
+    @pytest.mark.parametrize("unsafe_label", [
+        ACTOR,
+        f"@{ACTOR}",
+        "@actor\u2060:discord:111",
+        "User.",
+        "(You)",
+    ])
+    def test_projection_blanks_unsafe_verified_and_claimed_labels(
+        self, unsafe_label,
+    ):
+        verified = project_quote_speaker_fields(
+            _prov("requester", ACTOR), {ACTOR: unsafe_label},
+        )
+        claimed = project_quote_speaker_fields(
+            _prov("subject", claimed=unsafe_label), {},
+        )
+
+        assert verified["speaker_label"] == ""
+        assert verified["speaker_verified"] is True
+        assert "claimed_speaker_label" not in claimed
 
     def test_assistant_lane_uses_the_reserved_identity(self):
         fields = project_quote_speaker_fields(_prov("assistant"), {})
@@ -386,6 +436,15 @@ class TestFactProjection:
             "speaker_actor_known": True,
             "speaker_verified": True,
         }
+
+    def test_version_two_unsafe_label_is_blank_even_from_direct_mapping(self):
+        fields = project_fact_speaker_fields(
+            _fact(2, role="requester", actor=ACTOR),
+            {ACTOR: ACTOR},
+        )
+
+        assert fields["speaker_label"] == ""
+        assert fields["speaker_verified"] is True
 
     def test_version_two_empty_actor_stays_unattributed(self):
         fact = _fact(2, role="subject", actor="")
@@ -507,4 +566,4 @@ class TestSQLiteBackedLabelResolution:
         dm_labels = resolve_speaker_labels(
             store, {ACTOR, OTHER_ACTOR}, speaker_context=_ctx(DM),
         )
-        assert dm_labels == {ACTOR: "SnookieBear", OTHER_ACTOR: "Hidden Person"}
+        assert dm_labels == {ACTOR: "SnookieBear"}

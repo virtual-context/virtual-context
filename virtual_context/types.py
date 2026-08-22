@@ -285,6 +285,19 @@ class Message:
     timestamp: datetime | None = None
     metadata: dict | None = None
     raw_content: list[dict] | None = None
+    # Ephemeral physical-row identity used only while grouping compaction
+    # input. It is excluded from repr and every stored/model-facing message
+    # projection remains an explicit role/content/metadata allowlist.
+    source_actor_id: str = field(default="", repr=False, compare=False)
+    # Logical TurnTagIndex coordinate shared by every physical row that backed
+    # one store-level logical group. Multiple physical humans may therefore
+    # receive the same tags without shifting every later index lookup.
+    source_logical_turn_number: int = field(default=-1, repr=False, compare=False)
+    # Exact physical source scope used only for compaction admission. These
+    # fields never enter stored/model-facing message projections.
+    source_audience_conversation_id: str = field(default="", repr=False, compare=False)
+    source_origin_channel_id: str = field(default="", repr=False, compare=False)
+    source_audience_attribution_version: int = field(default=0, repr=False, compare=False)
 
 
 def get_sender_name(metadata: dict | None) -> str | None:
@@ -893,8 +906,23 @@ class SpeakerRetrievalContext:
     owner_conversation_id: str = ""
     audience_conversation_id: str = ""
     audience_channel_id: str = ""
+    # ``channel`` requires exact source/request channel equality, including
+    # the empty channel used by DMs. ``conversation`` is an explicit trusted
+    # policy choice for unified guild owners: source and request must both be
+    # group-channel rows, but sibling channels may be read. Keeping this mode
+    # explicit prevents a missing channel from becoming an accidental
+    # wildcard.
+    audience_channel_scope: str = "channel"
+    request_origin_channel_id: str = ""
     requester_actor_id: str = field(default="", repr=False)
     roster_snapshot_id: str = ""
+    # Model-visible roster labels paired with their internal actors. This is
+    # request-local collision evidence only: excluded from repr and never
+    # serialized. Canonical transcript rendering uses it to withhold a source
+    # label that would be indistinguishable from another visible participant.
+    roster_label_actor_pairs: tuple[tuple[str, str], ...] = field(
+        default=(), repr=False,
+    )
     original_active_user_text: str = field(default="", repr=False)
 
     @property
@@ -924,6 +952,8 @@ class SpeakerRetrievalContext:
             owner_conversation_id=roles.owner_conversation_id or "",
             audience_conversation_id=roles.audience_conversation_id or "",
             audience_channel_id=roles.audience_channel_id or "",
+            audience_channel_scope=roles.audience_channel_scope or "channel",
+            request_origin_channel_id=roles.origin_channel_id or "",
             requester_actor_id=roles.requester_actor_id or "",
             original_active_user_text=original_active_user_text or "",
         )
@@ -1001,6 +1031,7 @@ class RequestRoles:
     # raw recent group history may be mirrored; DMs intentionally carry none.
     origin_channel_id: str = ""
     audience_channel_id: str = ""
+    audience_channel_scope: str = "channel"
     audience_channel_label: str = ""
 
 
@@ -1394,6 +1425,21 @@ class SegmentMetadata:
     code_refs: list[dict] = field(default_factory=list)
     turn_count: int = 0
     canonical_turn_ids: list[str] = field(default_factory=list)
+    # Exact display labels from a complete physical-row roster at generation
+    # time.  This is model-facing rollup provenance only; durable actor ids
+    # remain internal and are deliberately never stored here.
+    source_speaker_labels: list[str] = field(default_factory=list)
+    # Number of distinct durable human actors proved by the complete roster.
+    # The count permits deterministic single-actor rollup admission without
+    # persisting or exposing the actor ids themselves. Zero means unproved.
+    source_speaker_identity_count: int = 0
+    # Opaque equality proof for that actor set. It is never placed in a model
+    # prompt; rollups use it only to distinguish equal display names belonging
+    # to different actors. Empty means legacy or otherwise unproved.
+    source_speaker_identity_fingerprint: str = ""
+    # Opaque equality proof for the exact validated source audience+channel.
+    # Empty means legacy, mixed-scope, or otherwise unproved.
+    source_audience_fingerprint: str = ""
     start_turn_number: int = -1
     end_turn_number: int = -1
     generated_by_turn_id: str = ""
@@ -1406,6 +1452,60 @@ class SegmentMetadata:
     # positional slice is not a row mapping. An incomplete mapping makes fact
     # authorship empty rather than guessed.
     source_mapping_complete: bool = False
+
+
+def strict_segment_identity_metadata(raw: object) -> dict[str, object]:
+    """Fail-empty parser for persisted summary identity provenance.
+
+    These fields are authorization evidence at model-render time.  Python's
+    ordinary ``bool``/``str``/``int`` coercions would turn malformed legacy or
+    attacker-controlled values (``"false"``, ``7``, ``True``) into apparently
+    valid proof, so only the exact JSON shapes emitted by current compaction
+    are accepted.
+    """
+    if not isinstance(raw, dict):
+        raw = {}
+
+    canonical_raw = raw.get("canonical_turn_ids")
+    canonical_ids = (
+        list(canonical_raw)
+        if isinstance(canonical_raw, list)
+        and all(type(value) is str and bool(value.strip()) for value in canonical_raw)
+        else []
+    )
+    labels_raw = raw.get("source_speaker_labels")
+    labels = (
+        list(labels_raw)
+        if isinstance(labels_raw, list)
+        and all(type(value) is str and bool(value.strip()) for value in labels_raw)
+        else []
+    )
+    count_raw = raw.get("source_speaker_identity_count")
+    count = (
+        count_raw
+        if type(count_raw) is int and count_raw >= 0
+        else 0
+    )
+    actor_fingerprint_raw = raw.get("source_speaker_identity_fingerprint")
+    actor_fingerprint = (
+        actor_fingerprint_raw
+        if type(actor_fingerprint_raw) is str
+        else ""
+    )
+    audience_fingerprint_raw = raw.get("source_audience_fingerprint")
+    audience_fingerprint = (
+        audience_fingerprint_raw
+        if type(audience_fingerprint_raw) is str
+        else ""
+    )
+    return {
+        "canonical_turn_ids": canonical_ids,
+        "source_mapping_complete": raw.get("source_mapping_complete") is True,
+        "source_speaker_labels": labels,
+        "source_speaker_identity_count": count,
+        "source_speaker_identity_fingerprint": actor_fingerprint,
+        "source_audience_fingerprint": audience_fingerprint,
+    }
 
 
 # ---------------------------------------------------------------------------

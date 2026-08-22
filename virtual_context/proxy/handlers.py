@@ -25,6 +25,7 @@ from ..core.tool_loop import (
 from ..types import Message, SpeakerRetrievalContext
 
 from .formats import get_format
+from .message_filter import sanitize_chain_snapshot_messages
 from .helpers import (
     _forward_headers,
     _extract_delta_text,
@@ -325,6 +326,24 @@ class _ProxyToolRuntime:
             chain = json.loads(snapshot["chain_json"])
         except (json.JSONDecodeError, TypeError):
             return {"error": f"invalid chain_json for ref {ref}"}
+        if not isinstance(chain, list) or not all(
+            isinstance(message, dict) for message in chain
+        ):
+            return {"error": f"invalid chain_json for ref {ref}"}
+
+        # Re-apply admission at the read boundary so snapshots written by old
+        # versions cannot replay request-scoped VC retrieval prose. For a VC
+        # chain this also removes downstream assistant text, which may repeat
+        # the unsafe generated clause after the tool result itself.
+        sanitized_chain = sanitize_chain_snapshot_messages(chain)
+        if not sanitized_chain:
+            return {"error": f"chain snapshot ref {ref} has no restorable source messages"}
+        if sanitized_chain != chain:
+            logger.warning(
+                "CHAIN-RESTORE: stripped ineligible VC-derived content ref=%s",
+                ref,
+            )
+        chain = sanitized_chain
 
         # Rehydrate any stubbed tool results within the chain.
         # The chain snapshot stores messages from pre_filter_body, so tool
@@ -1157,7 +1176,9 @@ async def _handle_streaming(
                     # Re-assemble context with updated working set
                     # so the LLM sees the expanded content in this
                     # turn (not deferred to next turn).
-                    new_prepend = state.engine.reassemble_context()
+                    new_prepend = state.engine.reassemble_context(
+                        speaker_context=speaker_context,
+                    )
                     reassembled_body = _inject_context(
                         body, new_prepend, api_format,
                     ) if new_prepend else body
@@ -2409,7 +2430,9 @@ def _handle_vcrecall(
     results = engine.find_quote(
         query,
         max_results=10,
-        speaker_context=speaker_context,
+        speaker_context=(
+            speaker_context or SpeakerRetrievalContext.ineligible()
+        ),
     )
 
     if not results.get("found"):

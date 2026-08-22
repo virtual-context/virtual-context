@@ -1,11 +1,9 @@
 """Gate routing and context forwarding for speaker-aware retrieval.
 
-``SearchEngine.find_quote`` is the gate router: a supplied
-``SpeakerRetrievalContext`` reaches candidate generation only when
-``speaker_annotations_enabled`` is on AND the context proved its audience.
-Otherwise the context is normalized to ``None`` before candidate
-generation, which selects the complete legacy retrieval branch — an
-ineligible context is never repaired to the resolved owner.
+``SearchEngine.find_quote`` always sends explicit request authority to
+candidate generation.  ``speaker_annotations_enabled`` gates presentation
+only; absent or ineligible authority reaches quote search as an ineligible
+sentinel and fails closed instead of selecting the legacy branch.
 
 Callers thread the context, they never gate: the VC tool executor, the
 engine's synchronous tool-loop wrapper, and the VCRECALL command handler
@@ -51,14 +49,16 @@ class TestGateRouter:
             turn_tag_index=MagicMock(), config=config,
         )
 
-    def test_gate_off_normalizes_an_eligible_context_to_none(self):
+    def test_gate_off_keeps_authority_but_disables_annotations(self):
         engine = self._engine(enabled=False)
+        context = _ctx()
         with patch(
             "virtual_context.core.search_engine._find_quote",
             return_value={"found": False},
         ) as spy:
-            engine.find_quote("q", speaker_context=_ctx())
-        assert spy.call_args.kwargs["speaker_context"] is None
+            engine.find_quote("q", speaker_context=context)
+        assert spy.call_args.kwargs["speaker_context"] is context
+        assert spy.call_args.kwargs["speaker_annotations"] is False
 
     def test_gate_on_forwards_the_exact_eligible_context(self):
         engine = self._engine(enabled=True)
@@ -69,19 +69,22 @@ class TestGateRouter:
         ) as spy:
             engine.find_quote("q", speaker_context=context)
         assert spy.call_args.kwargs["speaker_context"] is context
+        assert spy.call_args.kwargs["speaker_annotations"] is True
 
-    def test_gate_on_still_drops_an_ineligible_context(self):
+    def test_gate_on_preserves_ineligible_context_for_refusal(self):
         engine = self._engine(enabled=True)
+        context = _ctx(audience_conversation_id="")
         with patch(
             "virtual_context.core.search_engine._find_quote",
             return_value={"found": False},
         ) as spy:
             engine.find_quote(
-                "q", speaker_context=_ctx(audience_conversation_id=""),
+                "q", speaker_context=context,
             )
-        assert spy.call_args.kwargs["speaker_context"] is None
+        assert spy.call_args.kwargs["speaker_context"] is context
+        assert spy.call_args.kwargs["speaker_annotations"] is False
 
-    def test_no_context_stays_none(self):
+    def test_direct_no_context_keeps_isolated_legacy_path(self):
         engine = self._engine(enabled=True)
         with patch(
             "virtual_context.core.search_engine._find_quote",
@@ -89,9 +92,66 @@ class TestGateRouter:
         ) as spy:
             engine.find_quote("q")
         assert spy.call_args.kwargs["speaker_context"] is None
+        assert spy.call_args.kwargs["speaker_annotations"] is False
+
+    def test_summary_search_routes_the_same_gate_to_core_search(self):
+        engine = self._engine(enabled=True)
+        context = _ctx()
+        with patch(
+            "virtual_context.core.search_engine._search_summaries",
+            return_value={"found": False, "results": []},
+        ) as spy:
+            engine.search_summaries("q", speaker_context=context)
+        assert spy.call_args.kwargs["speaker_context"] is context
+
+    def test_summary_search_gate_off_still_forwards_incident_containment_context(self):
+        engine = self._engine(enabled=False)
+        context = _ctx()
+        with patch(
+            "virtual_context.core.search_engine._search_summaries",
+            return_value={"found": False, "results": []},
+        ) as spy:
+            engine.search_summaries("q", speaker_context=context)
+        assert spy.call_args.kwargs["speaker_context"] is context
+
+    def test_summary_search_preserves_explicit_ineligible_context_for_refusal(self):
+        engine = self._engine(enabled=False)
+        context = _ctx(audience_conversation_id="")
+        with patch(
+            "virtual_context.core.search_engine._search_summaries",
+            return_value={"found": False, "results": []},
+        ) as spy:
+            engine.search_summaries("q", speaker_context=context)
+        assert spy.call_args.kwargs["speaker_context"] is context
 
 
 class TestContextForwarding:
+    def test_engine_search_summaries_forwards_the_context(self):
+        from virtual_context.engine import VirtualContextEngine
+
+        recorder = MagicMock()
+        context = _ctx()
+        VirtualContextEngine.search_summaries(
+            SimpleNamespace(_search=recorder),
+            "q",
+            speaker_context=context,
+        )
+        assert recorder.search_summaries.call_args.kwargs["speaker_context"] is context
+
+    def test_engine_remember_when_forwards_the_context(self):
+        from virtual_context.engine import VirtualContextEngine
+
+        recorder = MagicMock()
+        recorder.remember_when.return_value = {"found": False, "results": []}
+        context = _ctx()
+        VirtualContextEngine.remember_when(
+            SimpleNamespace(_temporal=recorder),
+            "q",
+            {"last_n_days": 30},
+            speaker_context=context,
+        )
+        assert recorder.remember_when.call_args.kwargs["speaker_context"] is context
+
     def test_execute_vc_tool_forwards_a_derived_context(self):
         from virtual_context.core.tool_loop import execute_vc_tool
 
@@ -106,7 +166,7 @@ class TestContextForwarding:
         )
         assert engine.find_quote.call_args.kwargs["speaker_context"] is context
 
-    def test_execute_vc_tool_keeps_the_legacy_call_shape_without_one(self):
+    def test_execute_vc_tool_supplies_ineligible_context_without_one(self):
         from virtual_context.core.tool_loop import execute_vc_tool
 
         engine = MagicMock()
@@ -115,7 +175,9 @@ class TestContextForwarding:
         engine.config.search.tool_guard_enabled = False
         engine.find_quote.return_value = {"found": False, "results": []}
         execute_vc_tool(engine, "vc_find_quote", {"query": "x"})
-        assert "speaker_context" not in engine.find_quote.call_args.kwargs
+        context = engine.find_quote.call_args.kwargs["speaker_context"]
+        assert isinstance(context, SpeakerRetrievalContext)
+        assert context.eligible is False
 
     def test_engine_query_with_tools_forwards_the_context(self):
         from virtual_context.engine import VirtualContextEngine

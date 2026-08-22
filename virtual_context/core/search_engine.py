@@ -12,6 +12,10 @@ from typing import TYPE_CHECKING
 from .quote_search import find_quote as _find_quote
 from .quote_search import search_summaries as _search_summaries
 from .store import ContextStore
+from .summary_identity import (
+    SUMMARY_ATTRIBUTION_QUARANTINE,
+    sanitize_summary_payload_for_model,
+)
 from .turn_tag_index import TurnTagIndex
 
 if TYPE_CHECKING:
@@ -62,12 +66,12 @@ class SearchEngine:
     ) -> dict:
         """Turn-first quote search over stored canonical history.
 
-        ``speaker_context`` is the request-owned retrieval authority.
-        This is the gate router: unless ``speaker_annotations_enabled``
-        is on AND the context proved its audience, the context is
-        normalized to ``None`` before candidate generation, which selects
-        the complete legacy retrieval branch byte-for-byte. An ineligible
-        context is never repaired to the resolved owner.
+        ``speaker_context`` is the request-owned retrieval authority.  Model
+        retrieval surfaces must carry an explicit context; an ineligible
+        sentinel therefore fails closed.  A literal ``None`` remains the
+        isolated compatibility path for direct non-model legacy/admin calls.
+        The annotation flag controls presentation only; it never disables
+        authorization for a supplied context.
 
         ``speaker_handles`` is the request-snapshot actor-to-handle map
         used only for result annotation. It rides the same gate: when the
@@ -75,7 +79,7 @@ class SearchEngine:
         """
         if max_results is None:
             max_results = self._config.search.find_quote_default_results
-        speaker_context = self._route_speaker_context(speaker_context)
+        annotation_context = self._route_speaker_context(speaker_context)
         return _find_quote(
             self._store,
             self._semantic,
@@ -88,8 +92,9 @@ class SearchEngine:
             channel=channel,
             speaker_context=speaker_context,
             speaker_handles=(
-                speaker_handles if speaker_context is not None else None
+                speaker_handles if annotation_context is not None else None
             ),
+            speaker_annotations=annotation_context is not None,
         )
 
     def _route_speaker_context(
@@ -98,10 +103,10 @@ class SearchEngine:
     ) -> SpeakerRetrievalContext | None:
         """Select the retrieval branch for a supplied speaker context.
 
-        Returns the context unchanged only when the activation gate is on
-        and the context proved a pre-alias audience; otherwise ``None``,
-        which every store and candidate seam treats as the untouched
-        legacy branch.
+        Returns the context unchanged only when annotation presentation is
+        enabled and the context proved a pre-alias audience.  Candidate
+        authorization is handled independently by :meth:`find_quote` and
+        never consults this presentation gate.
         """
         if speaker_context is None:
             return None
@@ -117,6 +122,8 @@ class SearchEngine:
         self,
         tag: str,
         conversation_history: list[Message] | None = None,
+        *,
+        speaker_context: SpeakerRetrievalContext | None = None,
     ) -> dict:
         """Return all raw turns associated with a tag, from both stored segments and live history.
 
@@ -137,17 +144,36 @@ class SearchEngine:
             tags=[tag], min_overlap=1, limit=500,
             conversation_id=self._config.conversation_id,
         )
+        from .summary_identity import render_summaries_for_model
+
+        rendered_segments = render_summaries_for_model(
+            segments,
+            store=self._store,
+            conversation_id=self._config.conversation_id,
+            speaker_context=speaker_context,
+        )
+        rendered_by_ref = {
+            segment.ref: rendered
+            for segment, rendered in zip(
+                segments, rendered_segments, strict=True,
+            )
+        }
         seen_refs: set[str] = set()
         for seg in segments:
             if seg.ref in seen_refs:
                 continue
             seen_refs.add(seg.ref)
             meta = seg.metadata or SegmentMetadata(turn_count=0)
+            rendered = rendered_by_ref.get(
+                seg.ref, SUMMARY_ATTRIBUTION_QUARANTINE,
+            )
             result["stored_turns"].append({
                 "segment_ref": seg.ref,
-                "messages": seg.messages,
-                "full_text": seg.full_text,
-                "summary": seg.summary,
+                # Stored messages/full_text/summary are all derived blobs.
+                # Only the exact canonical projection is model-safe.
+                "messages": [],
+                "full_text": rendered,
+                "summary": rendered,
                 "turn_count": meta.turn_count,
                 "created_at": str(seg.created_at),
             })
@@ -205,10 +231,18 @@ class SearchEngine:
         intent_context: str = "",
         session_filter: str = "",
         mode: str = "lookup",
+        *,
+        speaker_context: SpeakerRetrievalContext | None = None,
     ) -> dict:
         if max_results is None:
             max_results = self._config.search.find_quote_default_results
-        return _search_summaries(
+        # Summary identity containment is an incident safety boundary, not an
+        # optional annotation feature. A missing context is unproved authority,
+        # never a legacy opt-out from the exact-row bridge.
+        from ..types import SpeakerRetrievalContext as _SpeakerContext
+
+        resolved_context = speaker_context or _SpeakerContext.ineligible()
+        result = _search_summaries(
             self._store,
             self._semantic,
             query,
@@ -217,4 +251,9 @@ class SearchEngine:
             session_filter=session_filter,
             mode=mode,
             conversation_id=self._config.conversation_id,
+            speaker_context=resolved_context,
+        )
+        return sanitize_summary_payload_for_model(
+            result,
+            allow_proved_renderings=resolved_context.eligible,
         )

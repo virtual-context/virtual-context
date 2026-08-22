@@ -15,8 +15,6 @@ import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-import pytest
-
 from virtual_context.core.assembler import ContextAssembler
 from virtual_context.core.retrieval_assembler import RetrievalAssembler
 from virtual_context.core.speaker_roster import render_speaker_roster
@@ -203,13 +201,16 @@ def _roster_handles(text: str) -> list[str]:
 # Ship dark
 # ---------------------------------------------------------------------------
 
-def test_gate_off_reads_nothing_renders_nothing_adds_no_budget_key():
+def test_gate_off_reads_nothing_renders_nothing_but_keeps_request_authority():
     store = _three_member_store()
     out = _assemble(_assembler(store, roster_enabled=False), _ctx())
 
     assert out.speaker_roster_text == ""
     assert out.speaker_roster_snapshot is None
-    assert out.speaker_context is None
+    # Roster presentation is independently gated.  The exact request audience
+    # remains available to downstream summary/fill boundaries so they cannot
+    # mistake a disabled roster for permission to read owner-wide history.
+    assert out.speaker_context == _ctx()
     assert "speaker-roster" not in out.prepend_text
     assert "speaker_roster" not in out.budget_breakdown
     # No membership scan, no assignment read, no allocation: nothing at all.
@@ -316,7 +317,7 @@ def test_hard_cap_rebuild_keeps_rendered_roster_snapshot_and_enum_in_sync():
     assert out.budget_breakdown["speaker_roster"] == _tc(out.speaker_roster_text)
 
 
-def test_full_eviction_emits_no_roster_no_context_and_no_speaker_parameter():
+def test_full_eviction_emits_no_roster_but_keeps_request_authority():
     store = _three_member_store()
     baseline = _assemble(_assembler(RosterStore()), _ctx())
     floor = _tc(baseline.prepend_text)
@@ -327,7 +328,9 @@ def test_full_eviction_emits_no_roster_no_context_and_no_speaker_parameter():
 
     assert out.speaker_roster_text == ""
     assert out.speaker_roster_snapshot is None
-    assert out.speaker_context is None
+    # Budget eviction removes only the model-visible roster.  The internal
+    # request authority is still required for scoped recovery and reassembly.
+    assert out.speaker_context == _ctx()
     assert "speaker-roster" not in out.prepend_text
     defs = vc_tool_definitions_for_runtime(
         None, restore_available=False,

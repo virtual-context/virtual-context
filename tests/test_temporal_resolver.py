@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 from virtual_context.core.temporal_resolver import TemporalResolver
 from virtual_context.types import (
+    AUDIENCE_ATTRIBUTION_VERSION,
     Fact,
     LinkedFact,
     QuoteResult,
     SegmentMetadata,
+    SpeakerRetrievalContext,
     StoredSegment,
     VirtualContextConfig,
 )
@@ -68,6 +72,7 @@ class FakeStore:
         self.segment_facts: dict[str, list[Fact]] = {}
         self.linked_facts: list[LinkedFact] = []
         self.fallback_called = False
+        self.canonical_rows: dict[tuple[str, str], object] = {}
 
     def search(self, query: str, limit: int = 5, conversation_id: str | None = None):
         return self.summary_hits.get(query, [])[:limit]
@@ -110,6 +115,13 @@ class FakeStore:
     def get_linked_facts(self, fact_ids: list[str], depth: int = 1):
         return self.linked_facts[:]
 
+    def get_canonical_turn_rows_by_id(self, keys, *, speaker_context):
+        return {
+            key: self.canonical_rows[key]
+            for key in keys
+            if key in self.canonical_rows
+        }
+
 
 class FakeSearch:
     def __init__(self) -> None:
@@ -139,6 +151,201 @@ def _make_config() -> VirtualContextConfig:
     cfg = VirtualContextConfig(conversation_id="conv-1")
     cfg.search.remember_when_max_results = 4
     return cfg
+
+
+def _speaker_context() -> SpeakerRetrievalContext:
+    return SpeakerRetrievalContext(
+        tenant_id="tenant",
+        owner_conversation_id="conv-1",
+        audience_conversation_id="guild-1",
+        audience_channel_id="health",
+    )
+
+
+def _canonical_row(
+    canonical_id: str,
+    actor: str,
+    label: str,
+    *,
+    audience: str = "guild-1",
+    channel: str = "health",
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        conversation_id="conv-1",
+        canonical_turn_id=canonical_id,
+        user_content="source text",
+        sender_actor_id=actor,
+        sender=label,
+        audience_conversation_id=audience,
+        audience_attribution_version=AUDIENCE_ATTRIBUTION_VERSION,
+        origin_channel_id=channel,
+        sort_key=1.0,
+        reply_target_body="",
+    )
+
+
+def _historical_source_payload(excerpt: str) -> dict:
+    prefix = "<historical-source-transcript>\n"
+    suffix = "\n</historical-source-transcript>"
+    assert excerpt.startswith(prefix)
+    assert excerpt.endswith(suffix)
+    return json.loads(excerpt[len(prefix):-len(suffix)])
+
+
+def test_remember_when_requires_exact_audience_bound_summary_provenance() -> None:
+    store = FakeStore()
+    search = FakeSearch()
+    resolver = TemporalResolver(store=store, search_engine=search, config=_make_config())
+
+    public = _make_segment(
+        "public", "health", "July-01-2024",
+        "Tesamorelin was tolerated well.",
+    )
+    public.metadata.canonical_turn_ids = ["ct-public"]
+    public.metadata.source_mapping_complete = True
+    private = _make_segment(
+        "private", "health", "July-02-2024",
+        "BigTex discussed a private protocol.",
+    )
+    private.metadata.canonical_turn_ids = ["ct-private"]
+    private.metadata.source_mapping_complete = True
+    store.segments = {"public": public, "private": private}
+    store.segment_hits["tesamorelin"] = [
+        _make_quote("public", "health", "July-01-2024", public.summary),
+        _make_quote("private", "health", "July-02-2024", private.summary),
+    ]
+    store.canonical_rows[("conv-1", "ct-public")] = _canonical_row(
+        "ct-public", "actor-bigtex", "BigTex",
+    )
+    store.canonical_rows[("conv-1", "ct-private")] = _canonical_row(
+        "ct-private", "actor-bigtex", "PrivateNickname",
+        audience="private-dm",
+        channel="",
+    )
+    store.fallback_facts = [
+        Fact(
+            id="fact-public",
+            subject="BigTex",
+            verb="tolerated",
+            object="tesamorelin",
+            what="BigTex currently tolerates tesamorelin.",
+            when_date="2024-07-01",
+            conversation_id="conv-1",
+            segment_ref="public",
+            author_actor_id="actor-bigtex",
+        ),
+    ]
+
+    result = resolver.remember_when(
+        query="tesamorelin",
+        time_range={
+            "kind": "between_dates",
+            "start": "2024-07-01",
+            "end": "2024-07-03",
+        },
+        max_results=4,
+        mode="lookup",
+        speaker_context=_speaker_context(),
+    )
+
+    assert [item["segment_ref"] for item in result["results"]] == ["public"]
+    item = result["results"][0]
+    assert "historical_speaker" not in item
+    payload = _historical_source_payload(item["excerpt"])
+    assert payload["source"] == "canonical_turns"
+    assert payload["generated_summary_prose_used"] is False
+    assert len(payload["lanes"]) == 1
+    lane = payload["lanes"][0]
+    assert lane["source_speaker_ref"].startswith("historical_")
+    assert lane | {"source_speaker_ref": "<opaque>"} == {
+        "source_speaker_ref": "<opaque>",
+        "display_name": "BigTex",
+        "role": "historical_human",
+        "content": "source text",
+        "session_date": "",
+        "current_requester_match": "unproved",
+    }
+    assert "Tesamorelin was tolerated well." not in str(result)
+    assert "PrivateNickname" not in str(result)
+    assert result["facts_in_window"] == []
+    assert "currently tolerates" not in str(result)
+    assert store.fallback_called is True
+
+
+def test_remember_when_explicit_ineligible_context_never_falls_back_to_owner_history() -> None:
+    store = FakeStore()
+    resolver = TemporalResolver(
+        store=store,
+        search_engine=FakeSearch(),
+        config=_make_config(),
+    )
+    segment = _make_segment(
+        "seg-1", "health", "July-01-2024", "BigTex stopped tesamorelin.",
+    )
+    store.segments[segment.ref] = segment
+    store.segment_hits["tesamorelin"] = [
+        _make_quote(
+            segment.ref, "health", "July-01-2024", segment.summary,
+        ),
+    ]
+
+    result = resolver.remember_when(
+        query="tesamorelin",
+        time_range={
+            "kind": "between_dates",
+            "start": "2024-07-01",
+            "end": "2024-07-03",
+        },
+        speaker_context=SpeakerRetrievalContext.ineligible(),
+    )
+
+    assert result["results"] == []
+    assert result["facts_in_window"] == []
+    assert "BigTex stopped" not in str(result)
+
+
+def test_remember_when_does_not_choose_one_state_across_historical_speakers() -> None:
+    store = FakeStore()
+    resolver = TemporalResolver(
+        store=store,
+        search_engine=FakeSearch(),
+        config=_make_config(),
+    )
+    for ref, canonical_id, actor, label, day in (
+        ("seg-a", "ct-a", "actor-a", "BigTex", "July-01-2024"),
+        ("seg-b", "ct-b", "actor-b", "Kuw9239", "July-02-2024"),
+    ):
+        segment = _make_segment(ref, "health", day, f"{label} state snapshot.")
+        segment.metadata.canonical_turn_ids = [canonical_id]
+        segment.metadata.source_mapping_complete = True
+        store.segments[ref] = segment
+        store.canonical_rows[("conv-1", canonical_id)] = _canonical_row(
+            canonical_id, actor, label,
+        )
+    store.segment_hits["state"] = [
+        _make_quote("seg-a", "health", "July-01-2024", "BigTex state snapshot."),
+        _make_quote("seg-b", "health", "July-02-2024", "Kuw9239 state snapshot."),
+    ]
+
+    result = resolver.remember_when(
+        query="state",
+        time_range={
+            "kind": "between_dates",
+            "start": "2024-07-01",
+            "end": "2024-07-03",
+        },
+        max_results=4,
+        mode="state_at_time",
+        speaker_context=_speaker_context(),
+    )
+
+    assert result["state_resolution"] == "withheld_multiple_historical_speakers"
+    assert "chosen_state" not in result
+    assert all("historical_speaker" not in item for item in result["results"])
+    assert {
+        _historical_source_payload(item["excerpt"])["lanes"][0]["display_name"]
+        for item in result["results"]
+    } == {"BigTex", "Kuw9239"}
 
 
 def test_remember_when_prefers_time_diverse_results_for_timeline_queries():
@@ -759,6 +966,33 @@ def test_remember_when_summarize_over_time_emits_ordered_milestones():
     assert "deploy stages" in milestones[3]["point"].lower()
 
 
+def test_remember_when_drops_unsafe_summary_before_milestone_derivation():
+    store = FakeStore()
+    resolver = TemporalResolver(
+        store=store,
+        search_engine=FakeSearch(),
+        config=_make_config(),
+    )
+    unsafe = "The user stopped tesamorelin after side effects."
+    segment = _make_segment("seg-unsafe", "health", "July-03-2024", unsafe)
+    store.segments[segment.ref] = segment
+    store.summary_hits["tesamorelin"] = [segment]
+
+    result = resolver.remember_when(
+        query="tesamorelin",
+        time_range={
+            "kind": "between_dates",
+            "start": "2024-07-01",
+            "end": "2024-07-29",
+        },
+        max_results=4,
+        mode="summarize_over_time",
+    )
+
+    assert unsafe not in repr(result)
+    assert not result.get("ordered_milestones")
+
+
 def test_remember_when_change_over_time_also_emits_ordered_milestones():
     store = FakeStore()
     search = FakeSearch()
@@ -1263,13 +1497,13 @@ def test_remember_when_state_at_time_scores_segment_summaries_not_numeric_quote_
         "seg-noise",
         "jira-automation",
         "November-01-2024",
-        "User configured Jira automation rules and latency tracking uploads.",
+        "BigTex configured Jira automation rules and latency tracking uploads.",
     )
     store.segments["seg-anchor"] = _make_segment(
         "seg-anchor",
         "segmentation-optimization",
         "November-01-2024",
-        "User is managing a Jira sprint with 17 tasks targeting 88% completion.",
+        "BigTex is managing a Jira sprint with 17 tasks targeting 88% completion.",
     )
 
     result = resolver.remember_when(
@@ -1325,13 +1559,13 @@ def test_remember_when_state_at_time_keeps_late_query_terms_for_disambiguation()
         "seg-noise",
         "jira-automation",
         "November-01-2024",
-        "User configured Jira automation rules for sprint tasks.",
+        "BigTex configured Jira automation rules for sprint tasks.",
     )
     store.segments["seg-anchor"] = _make_segment(
         "seg-anchor",
         "segmentation-optimization",
         "November-01-2024",
-        "User is managing a Jira sprint with 17 tasks targeting 88% completion.",
+        "BigTex is managing a Jira sprint with 17 tasks targeting 88% completion.",
     )
 
     result = resolver.remember_when(

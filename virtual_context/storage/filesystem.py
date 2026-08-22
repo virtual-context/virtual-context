@@ -14,7 +14,7 @@ import yaml
 
 from ..core.store import ContextStore
 from ..core.exceptions import ConversationLifecycleConflict
-from ..types import ChunkEmbedding, ConversationStats, DepthLevel, EngineStateSnapshot, QuoteResult, SegmentMetadata, StoredSegment, StoredSummary, TagStats, TagSummary, TurnTagEntry, WorkingSetEntry
+from ..types import ChunkEmbedding, ConversationStats, DepthLevel, EngineStateSnapshot, QuoteResult, SegmentMetadata, StoredSegment, StoredSummary, TagStats, TagSummary, TurnTagEntry, WorkingSetEntry, strict_segment_identity_metadata
 from .helpers import dt_to_str as _dt_to_str, str_to_dt as _str_to_dt, extract_excerpt as _extract_excerpt
 
 
@@ -54,6 +54,24 @@ def _segment_to_markdown(seg: StoredSegment) -> str:
         "date_references": seg.metadata.date_references,
         "code_refs": getattr(seg.metadata, "code_refs", []),
         "turn_count": seg.metadata.turn_count,
+        "canonical_turn_ids": list(getattr(
+            seg.metadata, "canonical_turn_ids", [],
+        ) or []),
+        "source_mapping_complete": bool(getattr(
+            seg.metadata, "source_mapping_complete", False,
+        )),
+        "source_speaker_labels": list(getattr(
+            seg.metadata, "source_speaker_labels", [],
+        ) or []),
+        "source_speaker_identity_count": int(getattr(
+            seg.metadata, "source_speaker_identity_count", 0,
+        ) or 0),
+        "source_speaker_identity_fingerprint": str(getattr(
+            seg.metadata, "source_speaker_identity_fingerprint", "",
+        ) or ""),
+        "source_audience_fingerprint": str(getattr(
+            seg.metadata, "source_audience_fingerprint", "",
+        ) or ""),
         "start_turn_number": getattr(seg.metadata, "start_turn_number", -1),
         "end_turn_number": getattr(seg.metadata, "end_turn_number", -1),
         "generated_by_turn_id": getattr(seg.metadata, "generated_by_turn_id", ""),
@@ -132,6 +150,7 @@ def _markdown_to_segment(text: str, ref: str) -> StoredSegment | None:
             except json.JSONDecodeError:
                 pass
 
+    identity_metadata = strict_segment_identity_metadata(fm)
     metadata = SegmentMetadata(
         entities=fm.get("entities", []),
         key_decisions=fm.get("key_decisions", []),
@@ -139,6 +158,18 @@ def _markdown_to_segment(text: str, ref: str) -> StoredSegment | None:
         date_references=fm.get("date_references", []),
         code_refs=fm.get("code_refs", []),
         turn_count=fm.get("turn_count", 0),
+        canonical_turn_ids=identity_metadata["canonical_turn_ids"],
+        source_mapping_complete=identity_metadata["source_mapping_complete"],
+        source_speaker_labels=identity_metadata["source_speaker_labels"],
+        source_speaker_identity_count=identity_metadata[
+            "source_speaker_identity_count"
+        ],
+        source_speaker_identity_fingerprint=identity_metadata[
+            "source_speaker_identity_fingerprint"
+        ],
+        source_audience_fingerprint=identity_metadata[
+            "source_audience_fingerprint"
+        ],
         start_turn_number=fm.get("start_turn_number", -1),
         end_turn_number=fm.get("end_turn_number", -1),
         generated_by_turn_id=fm.get("generated_by_turn_id", ""),

@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import re
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date
 from itertools import product
 
@@ -27,6 +27,13 @@ from .speaker_labels import (
     resolve_speaker_labels,
 )
 from .store import ContextStore
+from .summary_identity import (
+    SUMMARY_ATTRIBUTION_QUARANTINE,
+    SummarySpeakerAttribution,
+    render_source_projection_for_model,
+    resolve_summary_source_projections,
+    resolve_summary_speaker_attributions,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -287,12 +294,24 @@ def _extract_summary_preference_anchor(
         excerpt = str(row.get("excerpt", "")).strip()
         if not excerpt:
             continue
+        historical_speaker = str(row.get("historical_speaker", "")).strip()
         for sentence in _split_summary_sentences(excerpt):
             rate_match = _RATE_PER_HOUR_RE.search(sentence)
             count_match = _INSTANCE_COUNT_RE.search(sentence)
             if not rate_match or not count_match:
                 continue
-            if not any(pattern.search(sentence) for pattern in _PREFERENCE_CUE_PATTERNS):
+            named_preference_cue = bool(
+                historical_speaker
+                and re.search(
+                    rf"(?<!\w){re.escape(historical_speaker)}\s+"
+                    r"(?:specified|requested|preferred|wanted|required)\b",
+                    sentence,
+                    re.IGNORECASE,
+                )
+            )
+            if not named_preference_cue and not any(
+                pattern.search(sentence) for pattern in _PREFERENCE_CUE_PATTERNS
+            ):
                 continue
             rate_text = f"${rate_match.group(1)}/hour"
             try:
@@ -301,13 +320,19 @@ def _extract_summary_preference_anchor(
             except ValueError:
                 continue
             anchor = {
-                "type": "user_requirement",
+                "type": (
+                    "historical_speaker_requirement"
+                    if historical_speaker
+                    else "historical_requirement"
+                ),
                 "provider": _infer_anchor_provider(sentence),
                 "hourly_rate": rate_text,
                 "instance_count": f"{count_value:,}",
                 "evidence": sentence,
                 "source_result_index": idx,
             }
+            if historical_speaker:
+                anchor["historical_speaker"] = historical_speaker
             calc = {
                 "hourly_compute_total": _format_hourly_total(rate_value, count_value),
                 "formula": f"{rate_text} * {count_value:,} instances = {_format_hourly_total(rate_value, count_value)}",
@@ -856,6 +881,74 @@ def _speaker_affinity(
     return 1.0 if (getattr(provenance, "actor_id", "") or "") == actor else 0.0
 
 
+def _speaker_request_scope_is_valid(
+    speaker_context: SpeakerRetrievalContext,
+    conversation_id: str | None,
+) -> bool:
+    """Whether a request context can authorize this exact owner read."""
+    if not getattr(speaker_context, "eligible", False):
+        return False
+    owner = (speaker_context.owner_conversation_id or "").strip()
+    audience = (speaker_context.audience_conversation_id or "").strip()
+    if not owner or not audience or (conversation_id or "").strip() != owner:
+        return False
+    channel_scope = (
+        speaker_context.audience_channel_scope or "channel"
+    ).strip()
+    if channel_scope == "conversation":
+        return bool((speaker_context.request_origin_channel_id or "").strip())
+    return channel_scope == "channel"
+
+
+def _candidate_is_in_speaker_request_scope(
+    qr: QuoteResult,
+    speaker_context: SpeakerRetrievalContext,
+) -> bool:
+    """Admit one physical candidate under immutable request authority.
+
+    This is a defense-in-depth check for store doubles, older adapters, and
+    future candidate sources.  Real SQL stores apply the same predicates
+    before their ORDER BY / LIMIT so an ineligible top hit cannot starve an
+    eligible lower-ranked row.
+    """
+    provenance = getattr(qr, "provenance", None)
+    if provenance is None or (qr.source_scope or "") != "turn":
+        return False
+    owner = (speaker_context.owner_conversation_id or "").strip()
+    audience = (speaker_context.audience_conversation_id or "").strip()
+    if not owner or not audience:
+        return False
+    if (getattr(provenance, "conversation_id", "") or "").strip() != owner:
+        return False
+    if (
+        getattr(provenance, "audience_conversation_id", "") or ""
+    ).strip() != audience:
+        return False
+    version = int(
+        getattr(provenance, "audience_attribution_version", 0) or 0
+    )
+    if version != AUDIENCE_ATTRIBUTION_VERSION:
+        return False
+
+    row_channel = (
+        getattr(provenance, "origin_channel_id", "") or ""
+    ).strip()
+    channel_scope = (
+        speaker_context.audience_channel_scope or "channel"
+    ).strip()
+    if channel_scope == "conversation":
+        return bool(
+            (speaker_context.request_origin_channel_id or "").strip()
+            and row_channel
+        )
+    if channel_scope != "channel":
+        return False
+    expected_channel = (
+        speaker_context.audience_channel_id or ""
+    ).strip()
+    return row_channel == expected_channel
+
+
 def _classify_speaker_only_candidate(
     qr: QuoteResult,
     conditioning: SpeakerConditioning,
@@ -880,19 +973,10 @@ def _classify_speaker_only_candidate(
     * ``"unknown"`` — mixed, unattributed, or empty-actor candidates; an
       unknown actor is never assigned to the only known roster member.
     """
-    provenance = getattr(qr, "provenance", None)
-    if provenance is None or (qr.source_scope or "") != "turn":
+    if not _candidate_is_in_speaker_request_scope(qr, speaker_context):
         return "ineligible"
-    audience = speaker_context.audience_conversation_id or ""
-    if (getattr(provenance, "audience_conversation_id", "") or "") != audience:
-        return "ineligible"
-    version = int(getattr(provenance, "audience_attribution_version", 0) or 0)
-    if version != AUDIENCE_ATTRIBUTION_VERSION:
-        return "ineligible"
-    wanted_channel = speaker_context.audience_channel_id or ""
-    if wanted_channel:
-        if (getattr(provenance, "origin_channel_id", "") or "") != wanted_channel:
-            return "ineligible"
+    provenance = qr.provenance
+    assert provenance is not None
     role = getattr(provenance, "source_role", "") or "unattributed"
     if role in ("requester", "subject"):
         actor = getattr(provenance, "actor_id", "") or ""
@@ -1368,6 +1452,13 @@ def _search_find_quote_candidates(
             conversation_id=conversation_id,
             **scope,
         )
+        if speaker_context is not None:
+            lexical_results = [
+                result for result in lexical_results
+                if _candidate_is_in_speaker_request_scope(
+                    result, speaker_context,
+                )
+            ]
         if filtering:
             lexical_results = _filter_speaker_only_candidates(
                 lexical_results,
@@ -1394,6 +1485,13 @@ def _search_find_quote_candidates(
             conversation_id=conversation_id,
             **scope,
         )
+        if speaker_context is not None:
+            semantic_results = [
+                result for result in semantic_results
+                if _candidate_is_in_speaker_request_scope(
+                    result, speaker_context,
+                )
+            ]
         if filtering:
             semantic_results = _filter_speaker_only_candidates(
                 semantic_results,
@@ -1440,6 +1538,12 @@ def _search_find_quote_candidates(
             # stay disjoint and the actor predicate is applied identically.
             # ``counted_identities`` carries over, so nothing is counted twice.
             if recalled:
+                recalled = [
+                    result for result in recalled
+                    if _candidate_is_in_speaker_request_scope(
+                        result, speaker_context,
+                    )
+                ]
                 results.extend(
                     _filter_speaker_only_candidates(
                         recalled,
@@ -2119,7 +2223,7 @@ def _apply_aggregate_total_metadata(
         "AGGREGATE-TOTAL MODE: Use component-specific values to compute a total "
         "across the named components. Prefer aggregate_total_candidates that "
         "cover all requested components. Do not require one excerpt to state the "
-        "final total verbatim. Only sum values when they are component-specific "
+        "final total verbatim. Only sum values when the values are component-specific "
         "and use the same unit. "
         + (
             f"Coverage is still missing for: {', '.join(missing_components)}. "
@@ -2806,6 +2910,129 @@ def _supplement_aggregate_total_from_summaries(
     return augmented
 
 
+def _contain_summary_results_for_speaker_context(
+    store: ContextStore,
+    results: list[QuoteResult],
+    *,
+    conversation_id: str | None,
+    speaker_context: SpeakerRetrievalContext,
+) -> tuple[list[QuoteResult], dict[str, SummarySpeakerAttribution]]:
+    """Prove and render segment results before any model-visible derivation.
+
+    The bridge is exact-segment -> exact canonical ids -> exact physical rows.
+    A tool output, missing segment, incomplete mapping, mixed-human segment, or
+    audience/channel mismatch is omitted as one evidence bundle. Actor ids stay
+    only in the returned internal attribution map; model-visible results receive
+    the audience-safe historical label and the explicit attribution wrapper.
+    """
+    segments_by_ref: OrderedDict[str, object] = OrderedDict()
+    for result in results:
+        ref = (result.segment_ref or "").strip()
+        if not ref or result.source_scope in {"turn", "tool_output"}:
+            continue
+        if ref in segments_by_ref:
+            continue
+        try:
+            segment = store.get_segment(ref, conversation_id=conversation_id)
+        except Exception:
+            segment = None
+        if segment is not None:
+            segments_by_ref[ref] = segment
+
+    refs = list(segments_by_ref)
+    segment_values = list(segments_by_ref.values())
+    attributions = resolve_summary_speaker_attributions(
+        segment_values,
+        store=store,
+        conversation_id=conversation_id or "",
+        speaker_context=speaker_context,
+    )
+    attribution_by_ref = dict(zip(refs, attributions, strict=True))
+    projections = resolve_summary_source_projections(
+        segment_values,
+        store=store,
+        conversation_id=conversation_id or "",
+        speaker_context=speaker_context,
+    )
+    projection_by_ref = dict(zip(refs, projections, strict=True))
+
+    contained: list[QuoteResult] = []
+    proved_by_ref: dict[str, SummarySpeakerAttribution] = {}
+    for result in results:
+        ref = (result.segment_ref or "").strip()
+        attribution = attribution_by_ref.get(ref)
+        projection = projection_by_ref.get(ref)
+        if attribution is None or projection is None:
+            continue
+        rendered = render_source_projection_for_model(projection)
+        if rendered == SUMMARY_ATTRIBUTION_QUARANTINE:
+            continue
+        contained.append(replace(result, text=rendered))
+        proved_by_ref[result.segment_ref] = attribution
+    return contained, proved_by_ref
+
+
+def _project_summary_historical_speaker(
+    entry: dict[str, object],
+    result: QuoteResult,
+    attributions: dict[str, SummarySpeakerAttribution],
+) -> None:
+    """Canonical transcript lanes carry their own role-local speakers.
+
+    A segment-wide label would stamp the same human over an adjacent assistant
+    lane and recreate the reassignment this boundary exists to prevent.
+    """
+    return None
+
+
+def _all_summary_results_prove_same_actor(
+    results: list[QuoteResult],
+    attributions: dict[str, SummarySpeakerAttribution],
+) -> bool:
+    """Whether every surviving result is exactly attributed to one actor."""
+    actors: set[str] = set()
+    for result in results:
+        attribution = attributions.get(result.segment_ref)
+        if attribution is None or not attribution.is_proved_single_human:
+            return False
+        actors.update(attribution.actor_ids)
+    return bool(results) and len(actors) == 1
+
+
+def _strip_canonical_summary_derivatives(response: dict) -> dict:
+    """Keep canonical excerpts and structural metadata, never prose derivatives.
+
+    Quantity lists, current-state priorities, calculations, preference anchors,
+    coverage prose, and reader hints were historically synthesized from the
+    generated summary text. Recomputing them from a multi-lane JSON envelope
+    would also erase which exact lane supplied a value. They remain disabled
+    until each derivative carries a validated canonical-row/lane reference.
+    """
+    allowed_response = {
+        "query", "mode", "query_intent", "session_filter", "found",
+        "results", "message",
+    }
+    allowed_entry = {
+        "excerpt", "topic", "segment_ref", "segment_refs", "session",
+        "session_date_normalized", "match_type", "similarity",
+        "merged_count", "historical_speaker", "matched_components",
+    }
+    for key in list(response):
+        if key not in allowed_response:
+            response.pop(key, None)
+    results = response.get("results")
+    if isinstance(results, list):
+        response["results"] = [
+            {
+                key: value for key, value in entry.items()
+                if key in allowed_entry
+            }
+            if isinstance(entry, dict) else entry
+            for entry in results
+        ]
+    return response
+
+
 def search_summaries(
     store: ContextStore,
     semantic: SemanticSearchManager,
@@ -2815,6 +3042,8 @@ def search_summaries(
     session_filter: str = "",
     mode: str = "lookup",
     conversation_id: str | None = None,
+    *,
+    speaker_context: SpeakerRetrievalContext | None = None,
 ) -> dict:
     """Search compacted summaries, segment text, and related stored context.
 
@@ -2825,6 +3054,17 @@ def search_summaries(
         return {"error": "empty query"}
 
     mode = _normalize_search_summary_mode(mode)
+    if (
+        speaker_context is not None
+        and not getattr(speaker_context, "eligible", False)
+    ):
+        return {
+            "query": query,
+            "mode": mode,
+            "found": False,
+            "results": [],
+            "message": "Summary search was withheld because request audience authority is unproved.",
+        }
     coverage_components: list[str] = []
 
     query_intent = _detect_query_intent(query)
@@ -2875,6 +3115,34 @@ def search_summaries(
             coverage_components,
             conversation_id=conversation_id,
         )
+    # This boundary precedes every reader hint, value candidate, and
+    # calculation below. On the speaker-aware branch, exact physical-row proof
+    # replaces the old actor-blind lexical filter: safe single-speaker history
+    # is explicitly attributed, while incomplete/mixed/cross-audience evidence
+    # is omitted as one indivisible bundle. The legacy branch retains its
+    # stateless guard for callers without request-owned retrieval authority.
+    speaker_gate_active = bool(
+        speaker_context is not None
+        and getattr(speaker_context, "eligible", False)
+    )
+    summary_attributions: dict[str, SummarySpeakerAttribution] = {}
+    if speaker_gate_active:
+        assert speaker_context is not None
+        results, summary_attributions = _contain_summary_results_for_speaker_context(
+            store,
+            results,
+            conversation_id=conversation_id,
+            speaker_context=speaker_context,
+        )
+    else:
+        # Generated summary prose is not evidence even when it happens to use
+        # a real name. Without request-owned canonical-row authority there is
+        # no safe projection, so the summary search fails closed.
+        results = []
+
+    # Rank only admissible evidence. Ranking first would let a handful of
+    # high-scoring private/mixed rows consume ``max_results`` and hide safe
+    # lower-ranked history even though those rows are subsequently withheld.
     results = _rerank_quote_results(
         results,
         query,
@@ -2943,6 +3211,9 @@ def search_summaries(
                         "session_date_normalized": session_dates_normalized.get(session_date, ""),
                         "match_type": qr.match_type,
                     }
+                    _project_summary_historical_speaker(
+                        entry, qr, summary_attributions,
+                    )
                     if mode in _MULTI_EVIDENCE_SUMMARY_MODES and coverage_components:
                         matched_components = _match_coverage_components(
                             qr.text,
@@ -2996,6 +3267,9 @@ def search_summaries(
                 "topic": qr.tag,
                 "match_type": qr.match_type,
             }
+            _project_summary_historical_speaker(
+                entry, qr, summary_attributions,
+            )
             if mode in _MULTI_EVIDENCE_SUMMARY_MODES and coverage_components:
                 matched_components = _match_coverage_components(
                     qr.text,
@@ -3031,7 +3305,7 @@ def search_summaries(
             response["reader_hint"] = (
                 "COVERAGE MODE: Use the returned excerpts to cover multiple sides "
                 "of the question. "
-                "Do not add separate numeric values unless an excerpt explicitly says they should be summed. "
+                "Do not add separate numeric values unless an excerpt explicitly says the values should be summed. "
                 "Prefer repeated or shared values that recur across multiple matched components. "
                 + (
                     f"Coverage is still missing for: {', '.join(missing_components)}. "
@@ -3049,7 +3323,11 @@ def search_summaries(
                 query=query,
                 intent_context=intent_context,
             )
-        return response
+        return (
+            _strip_canonical_summary_derivatives(response)
+            if speaker_gate_active
+            else response
+        )
 
     session_items = list(session_groups.items())
     if query_intent == "current_state":
@@ -3063,7 +3341,15 @@ def search_summaries(
         )
 
     current_state_multi_session = False
-    if query_intent == "current_state" and len(session_items) > 1:
+    same_actor_current_state = (
+        not speaker_gate_active
+        or _all_summary_results_prove_same_actor(results, summary_attributions)
+    )
+    if (
+        query_intent == "current_state"
+        and len(session_items) > 1
+        and same_actor_current_state
+    ):
         # Only suppress older sessions when the newest session has a
         # topically relevant match (FTS/like hit, or semantic >= 0.4).
         # Without this gate, an unrelated session that happened to be
@@ -3093,6 +3379,9 @@ def search_summaries(
                     "session_date_normalized": session_dates_normalized.get(session_date, ""),
                     "match_type": qr.match_type,
                 }
+                _project_summary_historical_speaker(
+                    entry, qr, summary_attributions,
+                )
                 if mode in _MULTI_EVIDENCE_SUMMARY_MODES and coverage_components:
                     matched_components = _match_coverage_components(
                         qr.text,
@@ -3170,6 +3459,9 @@ def search_summaries(
             "segment_ref": qr.segment_ref,
             "match_type": qr.match_type,
         }
+        _project_summary_historical_speaker(
+            entry, qr, summary_attributions,
+        )
         if mode in _MULTI_EVIDENCE_SUMMARY_MODES and coverage_components:
             matched_components = _match_coverage_components(
                 qr.text,
@@ -3200,15 +3492,27 @@ def search_summaries(
         newest_date = ""
         if formatted:
             newest_date = formatted[0].get("session_date_normalized", "") or formatted[0].get("session", "")
-        response["reader_hint"] = (
-            "CURRENT-STATE RESOLUTION RULE (mandatory): "
-            "The most recent session"
-            + (f" ({newest_date})" if newest_date else "")
-            + " is the single authoritative source for the user's current state. "
-            "Older sessions are superseded history — do NOT use them to override the newest session. "
-            "Intent language ('going to', 'planning to', 'looking forward to') in the newest session "
-            "counts as the current answer because the question date is after that session."
-        )
+        if speaker_gate_active:
+            historical_speaker = str(
+                formatted[0].get("historical_speaker", "") if formatted else ""
+            ).strip()
+            response["reader_hint"] = (
+                "CURRENT-STATE RESOLUTION RULE (mandatory): "
+                "The most recent proved session"
+                + (f" ({newest_date})" if newest_date else "")
+                + f" is authoritative for {historical_speaker}'s state within the returned history. "
+                f"Older sessions attributed to {historical_speaker} are superseded history. "
+                "Identity continuity with this request is unproved."
+            )
+        else:
+            response["reader_hint"] = (
+                "CURRENT-STATE RESOLUTION RULE (mandatory): "
+                "The most recent session"
+                + (f" ({newest_date})" if newest_date else "")
+                + " is the preferred temporal evidence within the returned history. "
+                "Older sessions are superseded history — do NOT use them to override the newest session. "
+                "Identity continuity with this request is unproved."
+            )
     elif mode == "exact_value":
         _apply_exact_value_metadata(
             response,
@@ -3223,7 +3527,7 @@ def search_summaries(
         response["reader_hint"] = (
             "COVERAGE MODE: Use the returned excerpts to cover multiple sides "
             "of the question. "
-            "Do not add separate numeric values unless an excerpt explicitly says they should be summed. "
+            "Do not add separate numeric values unless an excerpt explicitly says the values should be summed. "
             "Prefer repeated or shared values that recur across multiple matched components. "
             + (
                 f"Coverage is still missing for: {', '.join(missing_components)}. "
@@ -3250,15 +3554,34 @@ def search_summaries(
             provider = str(anchor.get("provider", "")).strip() or "the anchored provider"
             hourly_rate = str(anchor.get("hourly_rate", "")).strip()
             instance_count = str(anchor.get("instance_count", "")).strip()
-            response["reader_hint"] = (
-                "PREFERENCE-FOLLOWING RULE (mandatory): A concrete user-specified "
-                "requirement was found in the summaries. Carry the chosen_preference_anchor "
-                "forward into the answer as the user's example. "
-                f"Explicitly mention {provider} at {hourly_rate} for {instance_count} instances, "
-                "and you may use anchor_example_calculation to illustrate the structure. "
-                "Do not substitute alternate illustrative rates or counts from supporting summaries."
-            )
-    return response
+            historical_speaker = str(
+                anchor.get("historical_speaker", "")
+            ).strip()
+            if historical_speaker:
+                response["reader_hint"] = (
+                    "PREFERENCE-FOLLOWING RULE (mandatory): A concrete requirement "
+                    f"attributed to {historical_speaker} was found. "
+                    f"Carry chosen_preference_anchor forward only as {historical_speaker}'s "
+                    "historical example; identity continuity with this request is unproved. "
+                    f"Explicitly mention {provider} at {hourly_rate} for {instance_count} instances, "
+                    "and anchor_example_calculation may illustrate the structure. "
+                    "Do not substitute alternate illustrative rates or counts from supporting summaries."
+                )
+            else:
+                response["reader_hint"] = (
+                    "PREFERENCE-FOLLOWING RULE (mandatory): A concrete historical "
+                    "requirement was found in the summaries. Carry chosen_preference_anchor "
+                    "forward only as historical evidence; identity continuity with this "
+                    "request is unproved. "
+                    f"Explicitly mention {provider} at {hourly_rate} for {instance_count} instances, "
+                    "and anchor_example_calculation may illustrate the structure. "
+                    "Do not substitute alternate illustrative rates or counts from supporting summaries."
+                )
+    return (
+        _strip_canonical_summary_derivatives(response)
+        if speaker_gate_active
+        else response
+    )
 
 
 def _apply_speaker_conditioning_metadata(
@@ -3307,6 +3630,7 @@ def find_quote(
     speaker_context: SpeakerRetrievalContext | None = None,
     speaker_conditioning: SpeakerConditioning | None = None,
     speaker_handles: dict[str, str] | None = None,
+    speaker_annotations: bool = True,
 ) -> dict:
     """Search canonical archived turns only.
 
@@ -3316,13 +3640,11 @@ def find_quote(
     ``channel`` is byte-identical to the unscoped behavior.
 
     ``speaker_context`` selects the physical role-local candidate branch and
-    is forwarded to both candidate sources; ``None`` keeps the shipped legacy
-    branch byte-identical end to end. On the speaker-aware branch each
-    turn-backed result is annotated at this boundary from its physical
-    role-local provenance: audience-scoped label, verification flags, and
-    ``source_role``. ``speaker_handles`` maps internal actor ids to this
-    request's immutable roster snapshot handles; actors outside the map
-    keep an empty ``speaker_handle``.
+    is forwarded to both candidate sources; ``None`` is reserved for explicit
+    non-model legacy/admin callers.  Any supplied context must prove the exact
+    owner, audience, attribution version, and request-owned channel policy or
+    the read fails closed.  ``speaker_annotations`` controls presentation
+    only; it can never disable candidate authorization.
 
     ``speaker_conditioning`` is the execution layer's already-validated
     conditioning resolution. ``None`` — every legacy caller — changes
@@ -3338,6 +3660,19 @@ def find_quote(
         return {"error": "empty query"}
 
     mode = _normalize_find_quote_mode(mode)
+    if speaker_context is not None and not _speaker_request_scope_is_valid(
+        speaker_context, conversation_id,
+    ):
+        return {
+            "query": query,
+            "mode": mode,
+            "found": False,
+            "results": [],
+            "message": (
+                "No conversation search was performed because request "
+                "retrieval authority is unproved."
+            ),
+        }
     if (
         speaker_conditioning is not None
         and speaker_conditioning.speaker_only_requested
@@ -3417,7 +3752,7 @@ def find_quote(
     # provenance is annotated with nothing. The legacy branch
     # (``speaker_context=None``) skips all of it byte-identically.
     speaker_labels: dict[str, str] = {}
-    if speaker_context is not None:
+    if speaker_context is not None and speaker_annotations:
         speaker_labels = resolve_speaker_labels(
             store,
             collect_quote_actor_ids(
@@ -3446,7 +3781,7 @@ def find_quote(
             entry["match_type"] = qr.match_type
             entry["similarity"] = qr.similarity
         entry["segment_ref"] = qr.segment_ref
-        if speaker_context is not None:
+        if speaker_context is not None and speaker_annotations:
             entry.update(
                 project_quote_speaker_fields(
                     getattr(qr, "provenance", None),

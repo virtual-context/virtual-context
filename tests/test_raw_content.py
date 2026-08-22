@@ -154,7 +154,7 @@ def test_format_conversation_falls_back_to_content():
     ]
     compactor = DomainCompactor.__new__(DomainCompactor)
     result = compactor._format_conversation(messages)
-    assert "User: hello" in result
+    assert "Source: hello" in result
     assert "Assistant: world" in result
 
 

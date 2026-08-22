@@ -349,7 +349,11 @@ class TestRoleLocalPredicatesAndDisjointCounts:
         result = find_quote(
             LimitStore(corpus), SemanticStub(), "peptide",
             max_results=5, conversation_id=OWNER,
-            speaker_context=_ctx(audience_channel_id=""),
+            speaker_context=_ctx(
+                audience_channel_id="",
+                audience_channel_scope="conversation",
+                request_origin_channel_id="chan-1",
+            ),
             speaker_conditioning=_bea_only_conditioning(),
         )
 

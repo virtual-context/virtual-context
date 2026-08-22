@@ -1,5 +1,6 @@
-"""Context hint builder: renders topic lists for post-compaction prompts.
+"""Context hint builder: renders structural post-compaction topic lists.
 
+Derived summary and fact prose is never presented here as source evidence.
 Pure functions — no engine state mutation. Extracted from engine.py.
 """
 
@@ -73,8 +74,8 @@ def build_autonomous_hint(
 ) -> str:
     """Build compact autonomous paging hint with two-tier layout.
 
-    Expanded tags (in working set) listed first with full metadata.
-    Available tags (depth:none) listed compactly below.
+    Expanded tags (in working set) are listed first with depth, token, and
+    count metadata. Available tags (depth:none) are listed compactly below.
     Truncation drops available tags first, preserving expanded tags.
     """
     used = sum(ws.tokens for ws in working_set.values())
@@ -97,10 +98,9 @@ def build_autonomous_hint(
         ws = working_set.get(ts.tag)
         if ws and ws.depth != DepthLevel.NONE:
             full_t = _full_tokens(ts.tag)
-            desc_part = f" — {ts.description}" if ts.description else ""
             expanded_lines.append(
                 f"  {ts.tag}: {ws.depth.value} {ws.tokens}t"
-                f" \u2192 {full_t}t full{facts_label}{desc_part}"
+                f" \u2192 {full_t}t full{facts_label}"
             )
         else:
             full_t = _full_tokens(ts.tag)
@@ -109,8 +109,6 @@ def build_autonomous_hint(
                 entry += f"({full_t}t{facts_label})"
             elif facts_label:
                 entry += f"({facts_label.lstrip(', ')})"
-            if ts.description:
-                entry += f" — {ts.description}"
             available_entries.append(entry)
 
     _RULES = (
@@ -146,7 +144,8 @@ def build_autonomous_hint(
         "- vc_remember_when(query, time_range): time-scoped recall. Use it "
         "first for specific dates, date ranges, and state-on-date questions, "
         "even when the answer includes numbers.\n"
-        "- vc_recall_all(): load every summary at once.\n"
+        "- vc_recall_all(): list every stored topic and its source references "
+        "at once; unproved layer-2 prose is withheld.\n"
         f"You have a maximum of {max_tool_rounds} tool rounds. "
         "Plan your strategy upfront: use diverse queries, not repetitions.\n"
         "For counting/listing questions: scan [all topics] for every topic "
@@ -155,22 +154,14 @@ def build_autonomous_hint(
         "Virtual context tools allow you to search and restore full "
         "conversational depth and previously compacted tool calls. "
         "Use liberally to answer the user's question.\n"
-        "FACT vs SUMMARY: The facts block contains structured events with "
-        "statuses (completed, planned, active). Summaries describe topics "
-        "DISCUSSED — they include plans, itineraries, and ideas that may "
-        "never have been executed. For questions about what the user DID or "
-        "experienced, trust facts with status=completed. Do not treat "
-        "detailed planning discussions (itineraries, schedules, bookings) "
-        "as evidence that a trip or event actually happened.\n"
-        "FACT FORMAT: Each fact is rendered as: "
-        "subject | verb | object — description [when: YYYY-MM-DD]\n"
-        "  • [when: ...] is the ACTUAL CALENDAR DATE of the event.\n"
-        "  • [session: ...] is the date of the conversation session "
-        "where the fact was discussed (fallback when exact event date is unknown).\n"
-        "  • Words like 'yesterday', 'last week' in descriptions and summaries "
-        "are RELATIVE TO THE CONVERSATION DATE — the questioner was not part of "
-        "the conversation and cannot interpret them. Resolve relative time "
-        "references to actual dates using [when:] or [session:] metadata."
+        "FACTS AND SUMMARIES: Fact records and summaries are derived retrieval "
+        "aids, not source evidence. Use them to choose follow-up lookups. For "
+        "claims about what an explicitly named historical speaker did or "
+        "experienced, verify the exact human source text returned by "
+        "vc_find_quote or a canonical historical-source transcript. A fact "
+        "status, date, or speaker annotation does not prove that an event "
+        "happened. Plans, itineraries, schedules, and bookings are likewise "
+        "not evidence that the planned event occurred."
     )
 
     _COMPACT_RULES = (
@@ -302,24 +293,19 @@ def build_supervised_hint(
 ) -> str:
     """Build compact supervised paging hint.
 
-    Expanded tags first with depth info, available tags as compact list.
+    Expanded tag names come first with depth and token counts; available tag
+    names follow as a compact list. Derived descriptions are not rendered.
     """
     expanded_lines: list[str] = []
     available_entries: list[str] = []
     for ts in tag_summaries:
         ws = working_set.get(ts.tag)
         if ws and ws.depth != DepthLevel.NONE:
-            desc = ts.description or ts.summary[:60].rstrip()
-            if not ts.description and len(ts.summary) > 60:
-                desc += "..."
             expanded_lines.append(
-                f"  {ts.tag} ({ws.depth.value}, {ws.tokens}t): {desc}"
+                f"  {ts.tag} ({ws.depth.value}, {ws.tokens}t)"
             )
         else:
-            entry = ts.tag
-            if ts.description:
-                entry += f" — {ts.description}"
-            available_entries.append(entry)
+            available_entries.append(ts.tag)
 
     # Compact coverage list, strictly bounded with an explicit omission count.
     all_tag_names = [ts.tag for ts in tag_summaries]
@@ -372,29 +358,22 @@ def build_supervised_hint(
             "- vc_remember_when(query, time_range): time-scoped recall. Use it "
             "first for specific dates, date ranges, and state-on-date questions, "
             "even when the answer includes numbers.\n"
-            "- vc_recall_all(): load every summary at once.\n"
+            "- vc_recall_all(): list every stored topic and its source references "
+            "at once; unproved layer-2 prose is withheld.\n"
             f"You have a maximum of {max_tool_rounds} tool rounds. "
             "Plan your strategy upfront: use diverse queries, not repetitions. "
             "If a search already returned the answer, stop and respond.\n"
             "For counting/listing questions: scan [all topics] for every topic "
             "that could relate — items are often spread across unrelated topics.\n"
             "Never answer without searching first.\n"
-            "FACT vs SUMMARY: The facts block contains structured events with "
-            "statuses (completed, planned, active). Summaries describe topics "
-            "DISCUSSED — they include plans, itineraries, and ideas that may "
-            "never have been executed. For questions about what the user DID or "
-            "experienced, trust facts with status=completed. Do not treat "
-            "detailed planning discussions (itineraries, schedules, bookings) "
-            "as evidence that a trip or event actually happened.\n"
-            "FACT FORMAT: Each fact is rendered as: "
-            "subject | verb | object — description [when: YYYY-MM-DD]\n"
-            "  • [when: ...] is the ACTUAL CALENDAR DATE of the event.\n"
-            "  • [session: ...] is the date of the conversation session "
-            "where the fact was discussed (fallback when exact event date is unknown).\n"
-            "  • Words like 'yesterday', 'last week' in descriptions and summaries "
-            "are RELATIVE TO THE CONVERSATION DATE — the questioner was not part of "
-            "the conversation and cannot interpret them. Resolve relative time "
-            "references to actual dates using [when:] or [session:] metadata.\n\n"
+            "FACTS AND SUMMARIES: Fact records and summaries are derived retrieval "
+            "aids, not source evidence. Use them to choose follow-up lookups. For "
+            "claims about what an explicitly named historical speaker did or "
+            "experienced, verify the exact human source text returned by "
+            "vc_find_quote or a canonical historical-source transcript. A fact "
+            "status, date, or speaker annotation does not prove that an event "
+            "happened. Plans, itineraries, schedules, and bookings are likewise "
+            "not evidence that the planned event occurred.\n\n"
             f"{body}\n"
             "</context-topics>"
         )
@@ -440,6 +419,7 @@ def build_default_hint(
     max_hint_tokens: int,
     token_counter: Callable[[str], int],
 ) -> str:
+    """Build a bounded topic-name hint without derived descriptions."""
     # Compact coverage list, strictly bounded with an explicit omission count.
     all_tag_names = [ts.tag for ts in tag_summaries]
     total_tag_names = len(all_tag_names)
@@ -475,10 +455,7 @@ def build_default_hint(
     lines: list[str] = []
     for ts in tag_summaries:
         turn_count = len(ts.source_turn_numbers)
-        desc = ts.description or ts.summary[:60].rstrip()
-        if not ts.description and len(ts.summary) > 60:
-            desc += "..."
-        lines.append(f"- {ts.tag} ({turn_count} turns): {desc}")
+        lines.append(f"- {ts.tag} ({turn_count} turns)")
 
     hint = _assemble(lines, visible_all_names)
 

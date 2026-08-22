@@ -183,18 +183,44 @@ _SPEAKER_KEYS = (
 
 
 class TestGateOffByteIdentity:
-    def test_gate_off_with_context_is_byte_identical_to_legacy(self, engine):
+    def test_gate_off_parity_excludes_summary_safety_boundary(self, engine):
         assert engine.config.search.speaker_annotations_enabled is False
         for name, tool_input in _TOOL_CALLS:
             legacy = execute_vc_tool(engine, name, dict(tool_input))
             gated = execute_vc_tool(
                 engine, name, dict(tool_input), speaker_context=_ctx(),
             )
-            assert gated == legacy, name
+            if name == "vc_search_summaries":
+                legacy_payload = json.loads(legacy)
+                gated_payload = json.loads(gated)
+                assert legacy_payload["found"] is False
+                assert gated_payload["found"] is False
+                assert "audience authority is unproved" in legacy_payload["message"]
+                assert "No matches" in gated_payload["message"]
+            elif name == "vc_query_facts":
+                # Fact reads now require proved request authority regardless
+                # of the independent annotation display gate.
+                legacy_payload = json.loads(legacy)
+                gated_payload = json.loads(gated)
+                assert legacy_payload["count"] == 0
+                assert legacy_payload["request_scope"] == "ineligible"
+                assert gated_payload["count"] == 4
+                assert gated_payload["fact_content_withheld"] is True
+            elif name == "vc_find_quote":
+                # Candidate authorization is independent of the annotation
+                # display gate.  Missing authority fails closed; proved
+                # authority reads the exact audience without adding labels.
+                legacy_payload = json.loads(legacy)
+                gated_payload = json.loads(gated)
+                assert legacy_payload["found"] is False
+                assert "authority is unproved" in legacy_payload["message"]
+                assert gated_payload["found"] is True
+            else:
+                assert gated == legacy, name
             for key in _SPEAKER_KEYS:
                 assert f'"{key}"' not in legacy, (name, key)
 
-    def test_gate_on_ineligible_context_is_byte_identical_to_legacy(self, engine):
+    def test_gate_on_ineligible_context_refuses_summary_search_only(self, engine):
         baseline = {
             name: execute_vc_tool(engine, name, dict(tool_input))
             for name, tool_input in _TOOL_CALLS
@@ -206,11 +232,16 @@ class TestGateOffByteIdentity:
                 speaker_context=INELIGIBLE_CTX,
             )
             absent = execute_vc_tool(engine, name, dict(tool_input))
-            assert unproved == baseline[name], name
+            if name == "vc_search_summaries":
+                payload = json.loads(unproved)
+                assert payload["found"] is False
+                assert "audience authority is unproved" in payload["message"]
+            else:
+                assert unproved == baseline[name], name
             assert absent == baseline[name], name
 
 
-class TestGateOnFactAnnotation:
+class TestFactModelBoundary:
     def _facts_by_id(self, engine, audience=GUILD):
         engine.config.search.speaker_annotations_enabled = True
         out = execute_vc_tool(
@@ -220,47 +251,33 @@ class TestGateOnFactAnnotation:
         payload = json.loads(out)
         for actor in CANARY_ACTORS:
             assert actor not in out
-        return {f["object"]: f for f in payload["facts"]}, out
+        return {f["id"]: f for f in payload["facts"]}, payload, out
 
-    def test_role_local_fact_gets_scoped_label_and_verified_attribution(self, engine):
-        facts, _ = self._facts_by_id(engine)
-        entry = facts["boston"]
-        assert entry["author_attribution_version"] == 2
-        assert entry["attribution_basis"] == "role_local"
-        assert entry["source_role"] == "requester"
-        assert entry["speaker_label"] == "Sania"
-        assert entry["speaker_handle"] == ""
-        assert entry["speaker_actor_known"] is True
-        assert entry["speaker_verified"] is True
+    def test_fact_rows_expose_only_opaque_structure(self, engine):
+        facts, payload, out = self._facts_by_id(engine)
 
-    def test_dm_label_never_surfaces_in_guild_fact_annotation(self, engine):
-        facts, out = self._facts_by_id(engine, audience=GUILD)
-        # The actor's NEWEST row overall carries the DM nickname; the guild
-        # audience still sees only the guild-scoped label.
-        assert facts["boston"]["speaker_label"] == "Sania"
-        assert "SnookieBear" not in out
-        # A DM-only author resolves no label at all in the guild audience.
-        dm_only = facts["museum"]
-        assert dm_only["attribution_basis"] == "role_local"
-        assert dm_only["speaker_label"] == ""
-        assert "Hidden Person" not in out
+        assert set(facts) == {
+            "fact-v2", "fact-v2-dm-only", "fact-v1", "fact-v0",
+        }
+        assert all(
+            set(entry) == {"id", "segment_ref", "tags"}
+            for entry in facts.values()
+        )
+        assert payload["fact_content_withheld"] is True
+        for prose in ("boston", "museum", "harbor", "airport"):
+            assert prose not in out.lower()
+        for key in _SPEAKER_KEYS:
+            assert f'"{key}"' not in out
 
-    def test_dm_audience_sees_its_own_labels(self, engine):
-        facts, _ = self._facts_by_id(engine, audience=DM)
-        assert facts["boston"]["speaker_label"] == "SnookieBear"
-        assert facts["museum"]["speaker_label"] == "Hidden Person"
+    def test_audience_labels_never_legitimize_generated_fact_prose(self, engine):
+        _, _, guild_out = self._facts_by_id(engine, audience=GUILD)
+        _, _, dm_out = self._facts_by_id(engine, audience=DM)
 
-    def test_model_assisted_and_historical_facts_stay_unproved(self, engine):
-        facts, _ = self._facts_by_id(engine)
-        v1 = facts["harbor"]
-        assert v1["author_attribution_version"] == 1
-        assert v1["attribution_basis"] == "model_assisted"
-        assert "speaker_label" not in v1
-        assert "speaker_verified" not in v1
-        v0 = facts["airport"]
-        assert v0["author_attribution_version"] == 0
-        assert v0["attribution_basis"] == "unattributed"
-        assert "speaker_label" not in v0
+        for output in (guild_out, dm_out):
+            assert "Sania" not in output
+            assert "SnookieBear" not in output
+            assert "Hidden Person" not in output
+            assert "user visited" not in output
 
 
 class TestGateOnAggregateAnnotation:
@@ -363,7 +380,7 @@ class TestGateOnAggregateAnnotation:
         assert "error" not in payload
         assert payload["speaker_scope"] == "unknown"
 
-    def test_related_facts_and_fact_segments_are_annotated(self, engine):
+    def test_related_facts_are_annotated(self, engine):
         engine.config.search.speaker_annotations_enabled = True
         out = execute_vc_tool(
             engine, "vc_find_quote", {"query": "Boston", "mode": "lookup"},
@@ -383,7 +400,7 @@ class TestGateOnAggregateAnnotation:
         for actor in CANARY_ACTORS:
             assert actor not in out
 
-    def test_fact_segment_enrichment_entries_expose_unknown_scope(self):
+    def test_find_quote_never_enriches_with_raw_fact_segment_full_text(self):
         engine = MagicMock()
         engine.config.conversation_id = OWNER
         engine.config.search = SearchConfig(
@@ -407,7 +424,10 @@ class TestGateOnAggregateAnnotation:
             ref="seg-1",
             conversation_id=OWNER,
             primary_tag="boston",
-            full_text="Long segment text about Boston.",
+            full_text=(
+                "BigTex: public Boston note. Kuw9239: private diagnosis. "
+                "actor:discord:internal-poison"
+            ),
             metadata=SegmentMetadata(turn_count=1, session_date="2026/01/10"),
         )
         out = execute_vc_tool(
@@ -419,8 +439,15 @@ class TestGateOnAggregateAnnotation:
             r for r in payload["results"]
             if isinstance(r, dict) and r.get("source") == "fact_segment"
         ]
-        assert segment_entries
-        assert all(e["speaker_scope"] == "unknown" for e in segment_entries)
+        assert segment_entries == []
+        assert payload["results"] == [{
+            "excerpt": "turn text",
+            "source_scope": "turn",
+        }]
+        assert "Kuw9239" not in out
+        assert "private diagnosis" not in out
+        assert "actor:discord:internal-poison" not in out
+        engine._store.get_segment.assert_not_called()
         related = payload["related_facts"]
         assert related[0]["attribution_basis"] == "role_local"
         # No admissible row was found, so the label fails open to empty —
@@ -515,9 +542,11 @@ class TestStatelessMCPExposure:
         assert entry["source_role"] == "requester"
         assert entry["attribution_basis"] == "role_local"
         assert entry["author_attribution_version"] == 2
-        # Stateless MCP supplies no request context: retrieval stays on
-        # the unconditioned path.
-        assert "speaker_context" not in engine.find_quote.call_args.kwargs
+        # Stateless MCP has no request authority, so it forwards an explicit
+        # ineligible sentinel instead of selecting unscoped history.
+        context = engine.find_quote.call_args.kwargs["speaker_context"]
+        assert isinstance(context, SpeakerRetrievalContext)
+        assert context.eligible is False
 
     def test_mcp_gate_off_is_byte_identical(self):
         from virtual_context.mcp import server as mcp_server
@@ -547,8 +576,10 @@ class TestStatelessMCPExposure:
             out = mcp_server.recall_all()
         payload = json.loads(out)
         assert payload["summaries"][0]["speaker_scope"] == "unknown"
+        assert "summary" not in payload["summaries"][0]
+        assert "description" not in payload["summaries"][0]
 
-    def test_mcp_recall_all_gate_off_is_byte_identical(self):
+    def test_mcp_recall_all_gate_off_still_strips_unproved_prose(self):
         from virtual_context.mcp import server as mcp_server
 
         raw = {
@@ -562,4 +593,5 @@ class TestStatelessMCPExposure:
         engine.recall_all.return_value = json.loads(json.dumps(raw))
         with patch.object(mcp_server, "_get_engine", return_value=engine):
             out = mcp_server.recall_all()
-        assert out == json.dumps(raw)
+        payload = json.loads(out)
+        assert payload["summaries"] == [{"tag": "boston", "tokens": 8}]

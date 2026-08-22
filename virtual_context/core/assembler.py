@@ -16,11 +16,15 @@ logger = logging.getLogger(__name__)
 _ASSEMBLE_BREAKDOWN_LOG_THRESHOLD_MS = 200.0
 _ASSEMBLE_BREAKDOWN_MAX_STAGES = 8
 
-from .llm_utils import format_code_ref
 from .speaker_roster import (
     build_speaker_roster,
     evict_least_recent,
     render_speaker_roster,
+)
+from .summary_identity import (
+    SUMMARY_ATTRIBUTION_QUARANTINE,
+    is_proved_summary_rendering,
+    render_summaries_for_model,
 )
 
 from ..types import (
@@ -40,11 +44,23 @@ from ..types import (
 )
 
 
+def _admitted_summary_rendering(candidate: object) -> str:
+    """Accept only this module's quarantine or a canonical transcript."""
+    if candidate == SUMMARY_ATTRIBUTION_QUARANTINE:
+        return SUMMARY_ATTRIBUTION_QUARANTINE
+    if isinstance(candidate, str) and is_proved_summary_rendering(candidate):
+        return candidate
+    return SUMMARY_ATTRIBUTION_QUARANTINE
+
+
 def format_tag_section(
     tag: str,
     summaries: list["StoredSummary"],
     store: "ContextStore | None" = None,
     conversation_id: str = "",
+    speaker_context: "SpeakerRetrievalContext | None" = None,
+    rendered_summary_by_object: dict[int, str] | None = None,
+    include_source_refs: bool = False,
 ) -> str:
     """Render a tag section in the canonical <virtual-context> format.
 
@@ -55,23 +71,48 @@ def format_tag_section(
         return ""
 
     summaries = sorted(summaries, key=lambda s: s.start_timestamp)
+    if rendered_summary_by_object is None:
+        rendered_summaries = render_summaries_for_model(
+            summaries,
+            store=store,
+            conversation_id=conversation_id,
+            speaker_context=speaker_context,
+        )
+    else:
+        rendered_summaries = [
+            _admitted_summary_rendering(
+                rendered_summary_by_object[id(summary)],
+            )
+            for summary in summaries
+        ]
 
     all_tags = sorted({t for s in summaries for t in s.tags})
     tags_attr = ", ".join(all_tags) if all_tags else tag
 
     total = len(summaries)
     summary_texts: list[str] = []
-    for idx, s in enumerate(summaries, 1):
+    for idx, (s, rendered_summary) in enumerate(
+        zip(summaries, rendered_summaries, strict=True), 1,
+    ):
         prefix = f"[{idx}/{total}]"
         session = s.metadata.session_date
         if session:
             prefix += f" [{session}]"
-        text = f"{prefix}\n{s.summary}"
-        code_refs = getattr(s.metadata, "code_refs", None) or []
-        if code_refs:
-            refs = [format_code_ref(ref) for ref in code_refs if ref.get("file")]
-            if refs:
-                text += f"\n[refs: {', '.join(refs)}]"
+        text = f"{prefix}\n{rendered_summary}"
+        if include_source_refs:
+            source_ref = json.dumps(
+                str(getattr(s, "ref", "") or ""), ensure_ascii=False,
+            )
+            source_ref = (
+                source_ref.replace("&", "\\u0026")
+                .replace("<", "\\u003c")
+                .replace(">", "\\u003e")
+            )
+            text += f"\n[source_ref: {source_ref}]"
+        # ``code_refs`` are LLM-derived metadata, not canonical source lanes.
+        # Appending them here would put unproved prose outside the transcript
+        # envelope (and let a crafted path close this XML wrapper), so summary
+        # presentation intentionally omits them.
         tool_tags = [t for t in s.tags if t.startswith("tool_")]
         if tool_tags:
             text += f'\n[tool output truncated — vc_expand_topic("{tool_tags[0]}") for full result]'
@@ -694,7 +735,40 @@ class ContextAssembler:
 
         pool = max(0, base_pool - card_tokens - roster_tokens)
         tag_cap = self.config.tag_context_max_tokens
-        facts_cap = self.config.facts_max_tokens
+        # Consolidated Facts are model-generated indexes, not source evidence.
+        # Their subject/verb/object/dimension prose may collapse speakers,
+        # modality, and time even when the row carries a real actor id.  Until
+        # a fact can be projected from exact request-scoped canonical human
+        # rows, the model-facing budget is therefore hard-zero.  Retrieval may
+        # still use facts for ranking internally, but no Fact prose competes
+        # with canonical source context or reaches the prompt.
+        configured_facts_cap = self.config.facts_max_tokens
+        facts_cap = 0
+
+        # Resolve every candidate summary in one request-local batch. Without
+        # this, each tag section performs its own exact-row hydration and
+        # audience-label scan, turning a safety boundary into two DB queries
+        # per tag on large group conversations.
+        identity_items: list[StoredSummary | StoredSegment] = list(
+            retrieval_result.summaries,
+        )
+        if full_segments:
+            identity_items.extend(
+                segment
+                for segments in full_segments.values()
+                for segment in segments
+            )
+        identity_items = list({id(item): item for item in identity_items}.values())
+        rendered_summary_by_object = dict(zip(
+            (id(item) for item in identity_items),
+            render_summaries_for_model(
+                identity_items,
+                store=getattr(self, "_store", None),
+                conversation_id=getattr(self, "_conversation_id", ""),
+                speaker_context=roster_context or speaker_context,
+            ),
+            strict=True,
+        ))
 
         # Build all tag section candidates
         _stage = time.monotonic()
@@ -708,15 +782,30 @@ class ContextAssembler:
                 logger.info("Tag '%s' SKIP (depth=NONE, hint-only)", tag)
                 continue
             if depth == DepthLevel.FULL and full_segments and tag in full_segments:
-                section = self._format_full_section(tag, full_segments[tag])
+                section = self._format_full_section(
+                    tag,
+                    full_segments[tag],
+                    speaker_context=speaker_context,
+                    rendered_summary_by_object=rendered_summary_by_object,
+                )
             elif depth == DepthLevel.SEGMENTS and full_segments and tag in full_segments:
-                section = self._format_segments_section(tag, full_segments[tag])
+                section = self._format_segments_section(
+                    tag,
+                    full_segments[tag],
+                    speaker_context=speaker_context,
+                    rendered_summary_by_object=rendered_summary_by_object,
+                )
             else:
                 sums = summaries_by_tag.get(tag, [])
                 if not sums:
                     logger.info("Tag '%s' SKIP (no summaries available)", tag)
                     continue
-                section = self._format_tag_section(tag, sums)
+                section = self._format_tag_section(
+                    tag,
+                    sums,
+                    speaker_context=speaker_context,
+                    rendered_summary_by_object=rendered_summary_by_object,
+                )
             _built_sections[tag] = section
             _section_tokens[tag] = self.token_counter(section)
         _note("build_tag_sections", _stage)
@@ -928,11 +1017,15 @@ class ContextAssembler:
         # instrument rather than left implicit, because a block that silently
         # drops selected lines is indistinguishable from one that fits.
         retrieval_result.retrieval_metadata["facts_block"] = {
+            "candidates": len(retrieval_result.facts),
             "selected": len(_ordered_indices) + _rendered_trimmed,
             "rendered": len(_ordered_indices),
             "trimmed": _rendered_trimmed,
+            "withheld": len(retrieval_result.facts),
             "tokens": facts_tokens_actual,
             "cap": facts_cap,
+            "configured_cap": configured_facts_cap,
+            "policy": "derived_fact_prose_not_model_evidence",
         }
         pool_used += facts_tokens_actual - facts_tokens
         facts_tokens = facts_tokens_actual
@@ -1177,7 +1270,7 @@ class ContextAssembler:
             actor_card_text=actor_card_text,
             speaker_roster_text=roster_text,
             speaker_roster_snapshot=roster_snapshot,
-            speaker_context=roster_context,
+            speaker_context=roster_context or speaker_context,
             prepend_text=prepend_text,
             recent_conversation_text=recent_conversation_text,
             recent_conversation_messages=recent_conversation_messages,
@@ -1218,67 +1311,72 @@ class ContextAssembler:
     def _format_facts_admitted(
         self, facts: list[Fact], max_tokens: int,
     ) -> tuple[str, int, int]:
-        """Render the block and report how many leading facts it holds.
+        """Withhold generated Fact prose from the model-facing prompt.
 
-        Measures the assembled block rather than summing per-line counts. The
-        per-line sum undercounts twice: the newline separators between lines are
-        never charged, and an estimator that divides characters truncates each
-        line's remainder independently, so the shortfall grows with the number
-        of lines. The block then ships over the budget the caller enforced, and
-        the excess comes out of whatever is allocated after it.
-
-        Adding a line to a newline-joined block cannot reduce its token count,
-        so the admitted prefix is found by bisection: O(log n) measurements of
-        the real block instead of one measurement per candidate line.
-
-        Returning the admitted count is what keeps the caller's record of
-        selected facts and the rendered block from disagreeing.
+        ``Fact`` rows remain available to retrieval and maintenance code, but
+        none of their generated semantic fields are evidence.  This helper has
+        no request-scoped canonical-row authority, so it fails closed even when
+        passed a positive budget.  The admitted count stays zero so callers do
+        not record a fact as presented when the model never received it.
         """
-        if not facts:
-            return "", 0, 0
-        lines = [fact.format_for_prompt() for fact in facts]
-        whole = self._facts_block(lines)
-        whole_tokens = self.token_counter(whole)
-        if whole_tokens <= max_tokens:
-            return whole, len(lines), whole_tokens
-        lo, hi = 0, len(lines)
-        lo_tokens = 0
-        while lo < hi:
-            mid = (lo + hi + 1) // 2
-            mid_tokens = self.token_counter(self._facts_block(lines[:mid]))
-            if mid_tokens <= max_tokens:
-                lo, lo_tokens = mid, mid_tokens
-            else:
-                hi = mid - 1
-        if lo == 0:
-            return "", 0, 0
-        # Report the count measured for the prefix that was accepted, rather
-        # than measuring the same string again: a second call is redundant, and
-        # it is the only place a counter that does not return the same value
-        # for the same input could put an over-cap total into the budget.
-        return self._facts_block(lines[:lo]), lo, lo_tokens
+        del facts, max_tokens
+        return "", 0, 0
 
-    def _format_tag_section(self, tag: str, summaries: list[StoredSummary]) -> str:
+    def _format_tag_section(
+        self,
+        tag: str,
+        summaries: list[StoredSummary],
+        *,
+        speaker_context: SpeakerRetrievalContext | None = None,
+        rendered_summary_by_object: dict[int, str] | None = None,
+    ) -> str:
         return format_tag_section(
             tag,
             summaries,
             store=getattr(self, "_store", None),
             conversation_id=getattr(self, "_conversation_id", ""),
+            speaker_context=speaker_context,
+            rendered_summary_by_object=rendered_summary_by_object,
         )
 
-    def _format_segments_section(self, tag: str, segments: list[StoredSegment]) -> str:
+    def _format_segments_section(
+        self,
+        tag: str,
+        segments: list[StoredSegment],
+        *,
+        speaker_context: SpeakerRetrievalContext | None = None,
+        rendered_summary_by_object: dict[int, str] | None = None,
+    ) -> str:
         if not segments:
             return ""
 
         # Sort chronologically so reader sees old → new progression
         segments = sorted(segments, key=lambda s: s.created_at)
+        if rendered_summary_by_object is None:
+            rendered_summaries = render_summaries_for_model(
+                segments,
+                store=getattr(self, "_store", None),
+                conversation_id=getattr(self, "_conversation_id", ""),
+                speaker_context=speaker_context,
+            )
+        else:
+            rendered_summaries = [
+                _admitted_summary_rendering(
+                    rendered_summary_by_object[id(segment)],
+                )
+                for segment in segments
+            ]
 
         parts: list[str] = []
-        for seg in segments:
+        for seg, rendered_summary in zip(
+            segments, rendered_summaries, strict=True,
+        ):
             all_tags = sorted(seg.tags) if seg.tags else [tag]
             tags_attr = ", ".join(all_tags)
             session_attr = f' session="{seg.metadata.session_date}"' if seg.metadata.session_date else ""
-            summary_text = self._maybe_append_tool_hint(seg.summary, seg.ref)
+            summary_text = self._maybe_append_tool_hint(
+                rendered_summary, seg.ref,
+            )
             parts.append(
                 f'<virtual-context tags="{tags_attr}" depth="segments" '
                 f'ref="{seg.ref}"{session_attr} created="{seg.created_at.isoformat()}">\n'
@@ -1287,18 +1385,45 @@ class ContextAssembler:
             )
         return "\n\n".join(parts)
 
-    def _format_full_section(self, tag: str, segments: list[StoredSegment]) -> str:
+    def _format_full_section(
+        self,
+        tag: str,
+        segments: list[StoredSegment],
+        *,
+        speaker_context: SpeakerRetrievalContext | None = None,
+        rendered_summary_by_object: dict[int, str] | None = None,
+    ) -> str:
         if not segments:
             return ""
 
         # Sort chronologically so reader sees old → new progression
         segments = sorted(segments, key=lambda s: s.created_at)
+        if rendered_summary_by_object is None:
+            rendered_summaries = render_summaries_for_model(
+                segments,
+                store=getattr(self, "_store", None),
+                conversation_id=getattr(self, "_conversation_id", ""),
+                speaker_context=speaker_context,
+            )
+        else:
+            rendered_summaries = [
+                _admitted_summary_rendering(
+                    rendered_summary_by_object[id(segment)],
+                )
+                for segment in segments
+            ]
 
         parts: list[str] = []
-        for seg in segments:
+        for seg, rendered_summary in zip(
+            segments, rendered_summaries, strict=True,
+        ):
             all_tags = sorted(seg.tags) if seg.tags else [tag]
             tags_attr = ", ".join(all_tags)
-            text = seg.full_text if seg.full_text else seg.summary
+            # Stored ``full_text`` is another derived blob; proving the source
+            # ids does not prove those bytes came from them. Full depth uses
+            # the same exact canonical-row projection as summary depth and
+            # never reintroduces generated or legacy segment prose.
+            text = rendered_summary
             session_attr = f' session="{seg.metadata.session_date}"' if seg.metadata.session_date else ""
             parts.append(
                 f'<virtual-context tags="{tags_attr}" depth="full" '

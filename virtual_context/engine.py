@@ -23,6 +23,7 @@ from .core.telemetry import TelemetryLedger
 from .core.monitor import ContextMonitor
 from .core.retriever import ContextRetriever
 from .core.segmenter import TopicSegmenter, pair_messages_into_turns
+from .core.summary_identity import sanitize_summary_payload_for_model
 from .core.tag_canonicalizer import TagCanonicalizer
 from .core.tag_generator import build_tag_generator, TagGenerator
 from .core.turn_tag_index import TurnTagIndex
@@ -4648,8 +4649,14 @@ class VirtualContextEngine:
     def transform(self, message: str, active_tags: list[str] | None = None, budget: int | None = None) -> str:
         return self._retrieval.transform(message, active_tags, budget)
 
-    def reassemble_context(self) -> str:
-        return self._retrieval.reassemble_context()
+    def reassemble_context(
+        self,
+        *,
+        speaker_context: "SpeakerRetrievalContext | None" = None,
+    ) -> str:
+        return self._retrieval.reassemble_context(
+            speaker_context=speaker_context,
+        )
 
     # ------------------------------------------------------------------
     # Paging API: expand / collapse / working set
@@ -4756,8 +4763,14 @@ class VirtualContextEngine:
         self,
         tag: str,
         conversation_history: list[Message] | None = None,
+        *,
+        speaker_context: "SpeakerRetrievalContext | None" = None,
     ) -> dict:
-        return self._search.get_turns_by_tag(tag, conversation_history)
+        return self._search.get_turns_by_tag(
+            tag,
+            conversation_history,
+            speaker_context=speaker_context,
+        )
 
     def search_summaries(
         self,
@@ -4766,6 +4779,8 @@ class VirtualContextEngine:
         intent_context: str = "",
         session_filter: str = "",
         mode: str = "lookup",
+        *,
+        speaker_context: "SpeakerRetrievalContext | None" = None,
     ) -> dict:
         return self._search.search_summaries(
             query,
@@ -4773,6 +4788,7 @@ class VirtualContextEngine:
             intent_context=intent_context,
             session_filter=session_filter,
             mode=mode,
+            speaker_context=speaker_context,
         )
 
     def _parse_session_date(self, raw: str) -> date | None:
@@ -4791,13 +4807,21 @@ class VirtualContextEngine:
         max_results: int | None = None,
         mode: str = "auto",
         intent_context: str = "",
+        *,
+        speaker_context: "SpeakerRetrievalContext | None" = None,
     ) -> dict:
-        return self._temporal.remember_when(
+        resolved_context = speaker_context or SpeakerRetrievalContext.ineligible()
+        result = self._temporal.remember_when(
             query,
             time_range,
             max_results,
             mode=mode,
             intent_context=intent_context,
+            speaker_context=resolved_context,
+        )
+        return sanitize_summary_payload_for_model(
+            result,
+            allow_proved_renderings=resolved_context.eligible,
         )
 
     # ------------------------------------------------------------------

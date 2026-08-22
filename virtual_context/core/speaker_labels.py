@@ -8,8 +8,9 @@ This module owns two read-side jobs:
   with a deterministic physical tiebreak. Tenant-global
   ``actor_profiles.display_name`` is never consulted: a DM may have most
   recently refreshed it with a private nickname, so the profile name is not
-  audience-safe. A missing scoped label stays empty rather than falling back
-  anywhere.
+  audience-safe. The shared human-label policy rejects internal/generic
+  identities; a missing or unsafe scoped label stays empty rather than
+  falling back anywhere.
 
 * **Source-class projection.** The ``project_*`` helpers build the
   model-visible attribution fields for each source class. They are
@@ -30,6 +31,7 @@ import logging
 from typing import TYPE_CHECKING, Iterable
 
 from ..types import AUDIENCE_ATTRIBUTION_VERSION, SpeakerRetrievalContext
+from .summary_identity import is_safe_human_label
 
 if TYPE_CHECKING:
     from ..types import Fact, SourceProvenance
@@ -124,8 +126,9 @@ def resolve_speaker_labels(
     The scan reads recent rows under the alias-resolved owner and never
     consults tenant-global actor profiles. Failures and misses fail open to
     an empty label; they never widen scope or fall back to another source.
-    The returned dict contains only actors that resolved a non-empty label,
-    so ``labels.get(actor, "")`` is the read idiom.
+    The returned dict contains only actors that resolved a non-empty label
+    admitted by the shared human-label policy, so ``labels.get(actor, "")``
+    is the read idiom.
     """
     wanted = {actor for actor in (actor_ids or ()) if actor}
     if not wanted:
@@ -180,7 +183,11 @@ def resolve_speaker_labels(
         )
         return {}
 
-    return {actor: label for actor, (_, label) in best.items() if label}
+    return {
+        actor: label
+        for actor, (_, label) in best.items()
+        if label and is_safe_human_label(label, actor)
+    }
 
 
 def fact_attribution_basis(fact: "Fact") -> str:
@@ -246,7 +253,12 @@ def project_fact_speaker_fields(
         fields["source_role"] = role
     if basis == ATTRIBUTION_BASIS_ROLE_LOCAL:
         actor = getattr(fact, "author_actor_id", "") or ""
-        fields["speaker_label"] = (labels or {}).get(actor, "")
+        label = (labels or {}).get(actor, "")
+        fields["speaker_label"] = (
+            label
+            if isinstance(label, str) and is_safe_human_label(label, actor)
+            else ""
+        )
         fields["speaker_handle"] = ""
         fields["speaker_actor_known"] = True
         fields["speaker_verified"] = True
@@ -264,8 +276,9 @@ def project_quote_speaker_fields(
     construction. A requester lane speaks through ``sender_actor_id``, a
     subject lane through ``reply_subject_actor_id``, and an assistant lane
     through the reserved engine identity. An unresolved subject keeps empty
-    singular fields; its raw stored reply label surfaces only as
-    ``claimed_speaker_label`` with ``speaker_verified=false``. Mixed and
+    singular fields; its stored reply label surfaces only when the shared
+    human-label policy admits it, as ``claimed_speaker_label`` with
+    ``speaker_verified=false``. Mixed and
     unattributed text is never assigned one human speaker — it exposes a
     ``speaker_scope`` instead. A result with no provenance gets nothing.
 
@@ -282,7 +295,12 @@ def project_quote_speaker_fields(
     if role in _ROLE_LOCAL_HUMAN_ROLES:
         actor = getattr(provenance, "actor_id", "") or ""
         if actor:
-            fields["speaker_label"] = (labels or {}).get(actor, "")
+            label = (labels or {}).get(actor, "")
+            fields["speaker_label"] = (
+                label
+                if isinstance(label, str) and is_safe_human_label(label, actor)
+                else ""
+            )
             fields["speaker_handle"] = (handles or {}).get(actor, "")
             fields["speaker_actor_known"] = True
             fields["speaker_verified"] = True
@@ -293,7 +311,10 @@ def project_quote_speaker_fields(
             fields["speaker_verified"] = False
             if role == "subject":
                 claimed = getattr(provenance, "claimed_subject_label", "") or ""
-                if claimed:
+                if (
+                    isinstance(claimed, str)
+                    and is_safe_human_label(claimed)
+                ):
                     fields["claimed_speaker_label"] = claimed
     elif role == "assistant":
         fields["speaker_label"] = ASSISTANT_SPEAKER_LABEL

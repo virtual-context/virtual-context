@@ -48,6 +48,10 @@ def _make_segment(
 class TestSQLiteStore:
     def test_store_and_retrieve_segment(self, store):
         seg = _make_segment()
+        seg.metadata.source_speaker_labels = ["BigTex"]
+        seg.metadata.source_speaker_identity_count = 1
+        seg.metadata.source_speaker_identity_fingerprint = "opaque-proof"
+        seg.metadata.source_audience_fingerprint = "audience-proof"
         ref = store.store_segment(seg)
         assert ref == "test-ref-1"
 
@@ -56,6 +60,17 @@ class TestSQLiteStore:
         assert retrieved.primary_tag == "legal"
         assert retrieved.summary == "Test summary about legal matters"
         assert retrieved.tags == ["legal"]
+        assert retrieved.metadata.source_speaker_labels == ["BigTex"]
+        assert retrieved.metadata.source_speaker_identity_count == 1
+        assert retrieved.metadata.source_speaker_identity_fingerprint == "opaque-proof"
+        assert retrieved.metadata.source_audience_fingerprint == "audience-proof"
+
+        lightweight = store.get_summary("test-ref-1")
+        assert lightweight is not None
+        assert lightweight.metadata.source_speaker_labels == ["BigTex"]
+        assert lightweight.metadata.source_speaker_identity_count == 1
+        assert lightweight.metadata.source_speaker_identity_fingerprint == "opaque-proof"
+        assert lightweight.metadata.source_audience_fingerprint == "audience-proof"
 
     def test_get_segment_not_found(self, store):
         result = store.get_segment("nonexistent")

@@ -2431,6 +2431,75 @@ class CompactionPipeline:
                     ordered.append(cid)
         return ordered, complete
 
+    @staticmethod
+    def _source_human_identity_keys(
+        source_ids: list[str],
+        physical_by_id: dict[str, "CanonicalTurnRow"],
+    ) -> set[tuple[str, ...]] | None:
+        """Exact human identities for a fully resolved canonical source map.
+
+        A human row must carry its durable actor id. Display labels are
+        presentation data: two people can share one and one person can change
+        theirs, so a normalized-name fallback is not identity proof for a
+        destructive stored-segment merge. Assistant-only sources return an
+        empty set and are therefore ineligible for a merge that requires one
+        exact actor+audience+channel key.
+        """
+        if not source_ids:
+            return None
+
+        from ..types import AUDIENCE_ATTRIBUTION_VERSION
+
+        identities: set[tuple[str, ...]] = set()
+        for canonical_id in source_ids:
+            row = physical_by_id.get(canonical_id)
+            if row is None:
+                return None
+
+            user_text = (getattr(row, "user_content", "") or "").strip()
+            assistant_text = (
+                getattr(row, "assistant_content", "") or ""
+            ).strip()
+            if not user_text and not assistant_text:
+                return None
+            if not user_text:
+                continue
+
+            actor_id = (getattr(row, "sender_actor_id", "") or "").strip()
+            audience = (
+                getattr(row, "audience_conversation_id", "") or ""
+            ).strip()
+            channel = (getattr(row, "origin_channel_id", "") or "").strip()
+            attribution_version = int(
+                getattr(row, "audience_attribution_version", 0) or 0
+            )
+            if (
+                not actor_id
+                or not audience
+                or attribution_version != AUDIENCE_ATTRIBUTION_VERSION
+            ):
+                return None
+            identities.add(("actor_scope", actor_id, audience, channel))
+
+            # A quoted physical human is a source speaker too.  Counting the
+            # reply subject prevents a requester-only key from authorizing a
+            # destructive merge that silently folds another person's words
+            # into the same summary.  An unresolved quoted subject fails
+            # closed; assistant-quote suppression happens later at the roster
+            # boundary where configured/ledger identity is available.
+            quote = (getattr(row, "reply_target_body", "") or "").strip()
+            if quote:
+                subject_actor = (
+                    getattr(row, "reply_subject_actor_id", "") or ""
+                ).strip()
+                if not subject_actor:
+                    return None
+                identities.add((
+                    "actor_scope", subject_actor, audience, channel,
+                ))
+
+        return identities
+
     # Outcomes of the agent-authored quote check. THREE states, not two:
     # "this is not the agent" and "I cannot tell" both decline to suppress and
     # are NOT the same answer. Collapsing them makes an unconfigured guard
@@ -2695,10 +2764,8 @@ class CompactionPipeline:
                             getattr(candidate, "audience_conversation_id", "") or ""
                         ).strip() == audience
                         and (
-                            not channel
-                            or (getattr(candidate, "origin_channel_id", "") or "").strip()
-                            == channel
-                        )
+                            getattr(candidate, "origin_channel_id", "") or ""
+                        ).strip() == channel
                         and (getattr(candidate, "user_content", "") or "").strip()
                     ]
                     target_present = len(target_candidates) == 1
@@ -2776,75 +2843,110 @@ class CompactionPipeline:
         )
         by_group = self._physical_rows_by_group()
         messages: list[Message] = []
-        for row in rows:
-            raw_group = getattr(row, "turn_group_number", -1)
-            group = int(raw_group if raw_group is not None else -1)
-            backing = by_group.get(group, [])
-            # Split the backing physical rows by which side actually carries
-            # content. A legacy combined row carries both, and may therefore
-            # legitimately supply the same id to both messages.
-            user_ids = [
-                r.canonical_turn_id for r in backing if (r.user_content or "").strip()
-            ]
-            assistant_ids = [
-                r.canonical_turn_id
-                for r in backing
-                if (r.assistant_content or "").strip()
-            ]
+        seen_groups: set[int] = set()
 
-            # ``_format_conversation`` labels a message with
-            # ``get_sender_name(metadata) or role.capitalize()``. Carry the
-            # stored sender in metadata, never in content: content feeds
-            # hashes, excerpts, and the summary text itself. Only the user
-            # half is attributed; a legacy row may carry the logical-turn
-            # sender on both halves, and the assistant is not that speaker.
-            #
-            # The source ids ride alongside under a reserved key so each
-            # segment's roster can be rebuilt from real rows instead of a
-            # positional cursor. The session splitter copies Message.metadata
-            # into both halves of a split, so the ids survive splits and
-            # noncontiguous topic grouping.
-            user_metadata: dict | None = None
-            if (row.sender or "").strip() and (row.user_content or "").strip():
-                user_metadata = {"sender": {"name": row.sender}}
-            if user_ids:
-                user_metadata = dict(user_metadata or {})
-                user_metadata[SOURCE_CANONICAL_TURN_IDS_KEY] = list(user_ids)
-            assistant_metadata: dict | None = None
-            if assistant_ids:
-                assistant_metadata = {
-                    SOURCE_CANONICAL_TURN_IDS_KEY: list(assistant_ids)
-                }
-            timestamp = None
+        def _timestamp_for(source_row) -> datetime | None:
             for raw_timestamp in (
-                row.first_seen_at,
-                row.last_seen_at,
-                row.created_at,
-                row.updated_at,
+                getattr(source_row, "first_seen_at", None),
+                getattr(source_row, "last_seen_at", None),
+                getattr(source_row, "created_at", None),
+                getattr(source_row, "updated_at", None),
             ):
                 if not raw_timestamp:
                     continue
                 try:
-                    timestamp = datetime.fromisoformat(
+                    return datetime.fromisoformat(
                         str(raw_timestamp).replace("Z", "+00:00")
                     )
-                    break
                 except (TypeError, ValueError):
                     continue
-            if (row.user_content or "").strip():
-                messages.append(Message(
-                    role="user",
-                    content=row.user_content,
-                    timestamp=timestamp,
-                    metadata=user_metadata,
-                ))
-            if (row.assistant_content or "").strip():
-                messages.append(Message(
-                    role="assistant",
-                    content=row.assistant_content,
-                    timestamp=timestamp,
-                    metadata=assistant_metadata,
-                ))
+            return None
+
+        for row in rows:
+            raw_group = getattr(row, "turn_group_number", -1)
+            group = int(raw_group if raw_group is not None else -1)
+            if group >= 0:
+                if group in seen_groups:
+                    continue
+                seen_groups.add(group)
+
+            # The store's uncompacted seam returns one LOGICAL row per group.
+            # That representation is lossy for authorship: one merged string
+            # can be backed by multiple physical human rows. Reconstruct each
+            # message from its exact physical row so topic grouping sees one
+            # durable actor and one source id at a time. A store without the
+            # physical seam falls back to the logical row but carries no false
+            # multi-row proof.
+            backing = (
+                list(by_group.get(group, []))
+                if group >= 0 else []
+            ) or [row]
+            backing.sort(key=lambda source: (
+                float(getattr(source, "sort_key", 0.0) or 0.0),
+                int(
+                    getattr(source, "turn_number", -1)
+                    if getattr(source, "turn_number", None) is not None
+                    else -1
+                ),
+                str(getattr(source, "canonical_turn_id", "") or ""),
+            ))
+            physical_proof = group >= 0 and bool(by_group.get(group))
+            for source in backing:
+                timestamp = _timestamp_for(source)
+                canonical_id = str(
+                    getattr(source, "canonical_turn_id", "") or ""
+                ).strip()
+                source_ids = [canonical_id] if physical_proof and canonical_id else []
+
+                if (source.user_content or "").strip():
+                    user_metadata: dict = {}
+                    if (source.sender or "").strip():
+                        user_metadata["sender"] = {"name": source.sender}
+                    if source_ids:
+                        user_metadata[SOURCE_CANONICAL_TURN_IDS_KEY] = source_ids
+                    messages.append(Message(
+                        role="user",
+                        content=source.user_content,
+                        timestamp=timestamp,
+                        metadata=user_metadata or None,
+                        source_actor_id=(source.sender_actor_id or "").strip(),
+                        source_logical_turn_number=int(
+                            getattr(row, "turn_number", -1) or 0
+                        ),
+                        source_audience_conversation_id=str(getattr(
+                            source, "audience_conversation_id", "",
+                        ) or ""),
+                        source_origin_channel_id=str(getattr(
+                            source, "origin_channel_id", "",
+                        ) or ""),
+                        source_audience_attribution_version=int(getattr(
+                            source, "audience_attribution_version", 0,
+                        ) or 0),
+                    ))
+
+                if (source.assistant_content or "").strip():
+                    assistant_metadata = (
+                        {SOURCE_CANONICAL_TURN_IDS_KEY: source_ids}
+                        if source_ids else None
+                    )
+                    messages.append(Message(
+                        role="assistant",
+                        content=source.assistant_content,
+                        timestamp=timestamp,
+                        metadata=assistant_metadata,
+                        source_logical_turn_number=int(
+                            getattr(row, "turn_number", -1) or 0
+                        ),
+                        source_audience_conversation_id=str(getattr(
+                            source, "audience_conversation_id", "",
+                        ) or ""),
+                        source_origin_channel_id=str(getattr(
+                            source, "origin_channel_id", "",
+                        ) or ""),
+                        source_audience_attribution_version=int(getattr(
+                            source, "audience_attribution_version", 0,
+                        ) or 0),
+                    ))
         return rows, messages
 
     def _refresh_compaction_watermark(self) -> None:
@@ -3816,9 +3918,25 @@ class CompactionPipeline:
             # could merge into an existing segment and overwrite
             # content owned by other operations.
             if merge_lookback > 0 and not disable_replacement_passes:
-                candidates = self._store.get_segments_by_tags(
-                    tags=seg.tags, min_overlap=1, limit=merge_lookback,
-                    conversation_id=self._config.conversation_id,
+                new_ids, new_mapping_complete = self._segment_source_ids(seg)
+                new_identity_keys = (
+                    self._source_human_identity_keys(new_ids, physical_by_id)
+                    if new_mapping_complete
+                    else None
+                )
+                merge_identity_eligible = bool(
+                    new_mapping_complete
+                    and new_ids
+                    and new_identity_keys is not None
+                    and len(new_identity_keys) == 1
+                )
+                candidates = (
+                    self._store.get_segments_by_tags(
+                        tags=seg.tags, min_overlap=1, limit=merge_lookback,
+                        conversation_id=self._config.conversation_id,
+                    )
+                    if merge_identity_eligible
+                    else []
                 )
                 seg_tags = set(seg.tags)
                 seg_text = " ".join(m.content for m in seg.messages)[:2000]
@@ -3831,8 +3949,31 @@ class CompactionPipeline:
                         pass
                 best_score = 0.0
                 best_candidate = None
+                best_candidate_source_ids: list[str] = []
 
                 for candidate in candidates:
+                    candidate_meta = candidate.metadata
+                    candidate_source_ids = list(
+                        getattr(candidate_meta, "canonical_turn_ids", []) or []
+                    )
+                    if not (
+                        candidate_meta
+                        and getattr(
+                            candidate_meta, "source_mapping_complete", False,
+                        )
+                        and candidate_source_ids
+                    ):
+                        continue
+                    candidate_identity_keys = self._source_human_identity_keys(
+                        candidate_source_ids, physical_by_id,
+                    )
+                    if (
+                        candidate_identity_keys is None
+                        or len(candidate_identity_keys) > 1
+                        or candidate_identity_keys != new_identity_keys
+                    ):
+                        continue
+
                     combined_tokens = candidate.full_tokens + seg.token_count
                     if combined_tokens > max_seg_tokens:
                         continue
@@ -3857,52 +3998,60 @@ class CompactionPipeline:
                     if combined_score > best_score:
                         best_score = combined_score
                         best_candidate = candidate
+                        best_candidate_source_ids = candidate_source_ids
 
                 if best_candidate is not None:
                     # Combine turns: prepend existing segment's messages
-                    old_meta = best_candidate.metadata
-                    old_ids = list(
-                        getattr(old_meta, "canonical_turn_ids", []) or []
-                    )
-                    old_complete = bool(
-                        old_meta
-                        and getattr(old_meta, "source_mapping_complete", False)
-                        and old_ids
-                        and all(cid in physical_by_id for cid in old_ids)
-                    )
-                    if old_complete:
-                        candidate_messages = []
-                        for cid in old_ids:
-                            old_row = physical_by_id[cid]
-                            if (old_row.user_content or "").strip():
-                                metadata = {
+                    candidate_messages = []
+                    for cid in best_candidate_source_ids:
+                        old_row = physical_by_id[cid]
+                        if (old_row.user_content or "").strip():
+                            metadata = {
+                                SOURCE_CANONICAL_TURN_IDS_KEY: [cid],
+                            }
+                            if (old_row.sender or "").strip():
+                                metadata["sender"] = {"name": old_row.sender}
+                            candidate_messages.append(Message(
+                                role="user",
+                                content=old_row.user_content,
+                                metadata=metadata,
+                                source_actor_id=(
+                                    old_row.sender_actor_id or ""
+                                ).strip(),
+                                source_logical_turn_number=int(
+                                    getattr(old_row, "turn_number", -1) or 0
+                                ),
+                                source_audience_conversation_id=(
+                                    old_row.audience_conversation_id or ""
+                                ).strip(),
+                                source_origin_channel_id=(
+                                    old_row.origin_channel_id or ""
+                                ).strip(),
+                                source_audience_attribution_version=int(
+                                    old_row.audience_attribution_version or 0
+                                ),
+                            ))
+                        if (old_row.assistant_content or "").strip():
+                            candidate_messages.append(Message(
+                                role="assistant",
+                                content=old_row.assistant_content,
+                                metadata={
                                     SOURCE_CANONICAL_TURN_IDS_KEY: [cid],
-                                }
-                                if (old_row.sender or "").strip():
-                                    metadata["sender"] = {"name": old_row.sender}
-                                candidate_messages.append(Message(
-                                    role="user",
-                                    content=old_row.user_content,
-                                    metadata=metadata,
-                                ))
-                            if (old_row.assistant_content or "").strip():
-                                candidate_messages.append(Message(
-                                    role="assistant",
-                                    content=old_row.assistant_content,
-                                    metadata={
-                                        SOURCE_CANONICAL_TURN_IDS_KEY: [cid],
-                                    },
-                                ))
-                    else:
-                        candidate_messages = [
-                            Message(
-                                role=m.get("role", "user"),
-                                content=m.get("content", ""),
-                                metadata=(m.get("metadata") or None),
-                            )
-                            for m in best_candidate.messages
-                        ]
-                    merged_mapping_prereqs[seg.id] = old_complete
+                                },
+                                source_logical_turn_number=int(
+                                    getattr(old_row, "turn_number", -1) or 0
+                                ),
+                                source_audience_conversation_id=(
+                                    old_row.audience_conversation_id or ""
+                                ).strip(),
+                                source_origin_channel_id=(
+                                    old_row.origin_channel_id or ""
+                                ).strip(),
+                                source_audience_attribution_version=int(
+                                    old_row.audience_attribution_version or 0
+                                ),
+                            ))
+                    merged_mapping_prereqs[seg.id] = True
                     seg.messages = candidate_messages + list(seg.messages)
                     seg.merge_ref = best_candidate.ref
                     seg.token_count += best_candidate.full_tokens

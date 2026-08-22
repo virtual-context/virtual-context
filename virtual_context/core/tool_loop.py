@@ -34,6 +34,11 @@ from .speaker_labels import (
     project_fact_speaker_fields,
     resolve_speaker_labels,
 )
+from .summary_identity import (
+    contains_ambiguous_human_referent,
+    is_proved_summary_rendering,
+    sanitize_summary_payload_for_model,
+)
 from .tool_guard import guard_tool_execution
 
 # Re-exported for existing importers
@@ -966,6 +971,7 @@ def _attach_related_facts(
     *,
     annotation_context: SpeakerRetrievalContext | None = None,
     speaker_conditioning: SpeakerConditioning | None = None,
+    summary_speaker_context: SpeakerRetrievalContext | None = None,
 ) -> object:
     """Search facts by the find_quote query and attach matching ones.
 
@@ -975,16 +981,20 @@ def _attach_related_facts(
     ``annotation_context`` is the already-routed annotation authority
     (gate on AND proved audience) or ``None``. When present, each related
     fact discloses its attribution version/basis and, for role-local
-    facts, the audience-scoped speaker fields; fact-backed segment
-    excerpts are marked with an honest aggregate speaker scope. ``None``
-    leaves the serialization byte-identical.
+    facts, the audience-scoped speaker fields. ``None`` leaves the fact
+    serialization byte-identical.
+
+    A non-``None`` ``summary_speaker_context`` marks a model-facing summary
+    result. Generated fact prose is withheld entirely on that path: durable
+    author/source metadata cannot prove that a generated ``what`` sentence
+    preserved modality, time, or coreference. Exact canonical human turns
+    remain the only evidence admitted by summary tools.
 
     A valid ``speaker_only`` selection is also a boundary for every
     enrichment added after quote search.  Related facts therefore survive
     only when their durable role-local author exactly matches the selected
-    actor.  Aggregate fact segments and reverse-supersession summaries are
-    omitted in that mode because neither is a role-local excerpt.  Without
-    an active filter this function preserves its legacy behavior.
+    actor. Reverse-supersession summaries are omitted in that mode because
+    they are not role-local excerpts.
 
     TODO: session_date is currently resolved via a JOIN from
     fact.segment_ref → segments.metadata_json at query time.  This is
@@ -996,6 +1006,8 @@ def _attach_related_facts(
     if not isinstance(result, dict) or not result.get("found"):
         return result
     if not query.strip():
+        return result
+    if summary_speaker_context is not None:
         return result
 
     try:
@@ -1091,54 +1103,6 @@ def _attach_related_facts(
 
     result["related_facts"] = fact_entries
     result["related_facts_count"] = len(fact_entries)
-
-    # Pull source excerpts for facts whose segments aren't already in
-    # the find_quote results.  This ensures the model sees the raw
-    # conversation backing each fact — even when the original query
-    # didn't surface that segment.
-    existing_results = result.get("results", [])
-    existing_session_topics = {
-        (r.get("session", ""), r.get("topic", ""))
-        for r in existing_results if isinstance(r, dict)
-    }
-    if not speaker_filter_active:
-        try:
-            seen_refs: set[str] = set()
-            for f in facts:
-                if not f.segment_ref or f.segment_ref in seen_refs:
-                    continue
-                seen_refs.add(f.segment_ref)
-                seg = engine._store.get_segment(
-                    f.segment_ref,
-                    conversation_id=engine.config.conversation_id,
-                )
-                if not seg or not seg.full_text:
-                    continue
-                # Derive session label from segment metadata
-                meta = seg.metadata
-                session_label = (
-                    getattr(meta, "session_date", "") if meta else ""
-                )
-                if (session_label, seg.primary_tag) in existing_session_topics:
-                    continue  # already have an excerpt from this session+topic
-                # Truncate to a reasonable size
-                text = seg.full_text
-                if len(text) > 800:
-                    text = text[:800] + "..."
-                segment_entry: dict[str, object] = {
-                    "excerpt": text,
-                    "topic": seg.primary_tag,
-                    "session": session_label,
-                    "source": "fact_segment",
-                }
-                if annotation_context is not None:
-                    # Segment text spans sources with no per-speaker
-                    # provenance; disclose the scope instead of guessing.
-                    annotate_aggregate_entry(segment_entry)
-                existing_results.append(segment_entry)
-                existing_session_topics.add((session_label, seg.primary_tag))
-        except Exception:
-            pass  # non-critical enrichment
 
     # Track these facts so they won't be repeated in subsequent calls.
     if presented_fact_ids is not None:
@@ -1273,6 +1237,153 @@ def execute_vc_tool(
     annotation_ctx = annotation_speaker_context(
         getattr(engine, "config", None), speaker_context,
     )
+    # Summary-derived prose never gets a legacy no-authority branch.  A
+    # missing request context is explicit ineligibility so model-facing tools
+    # refuse or return structural metadata instead of owner-wide prose.
+    summary_speaker_context = (
+        speaker_context or SpeakerRetrievalContext.ineligible()
+    )
+
+    _DERIVED_PROSE_KEYS = frozenset({
+        "summary", "description", "excerpt", "summary_text",
+        "point", "supporting_point", "points", "what",
+    })
+    def _prune_unsafe_derived_entries(
+        value: object,
+        *,
+        derived_field: bool = False,
+        require_proof: bool = False,
+    ) -> object | None:
+        """Remove result/milestone records sourced from unsafe prose."""
+        if isinstance(value, str):
+            if derived_field:
+                # Canonical transcript envelopes can legitimately contain
+                # first-person source text (``I stopped ...``).  Validate the
+                # envelope before applying the free-prose ambiguity detector;
+                # the latter must never inspect the JSON payload as though it
+                # were an unowned generated sentence.
+                if require_proof and is_proved_summary_rendering(value):
+                    return value
+                if contains_ambiguous_human_referent(value):
+                    return None
+                if require_proof and not is_proved_summary_rendering(value):
+                    return None
+            return value
+        if isinstance(value, list):
+            cleaned = [
+                cleaned_item
+                for item in value
+                if (cleaned_item := _prune_unsafe_derived_entries(
+                    item,
+                    derived_field=derived_field,
+                    require_proof=require_proof,
+                )) is not None
+            ]
+            return cleaned
+        if not isinstance(value, dict):
+            return value
+
+        cleaned_dict: dict = {}
+        for key, item in value.items():
+            is_derived = key in _DERIVED_PROSE_KEYS
+            cleaned_item = _prune_unsafe_derived_entries(
+                item,
+                derived_field=is_derived,
+                require_proof=require_proof,
+            )
+            if cleaned_item is None:
+                # A singular derived field is the provenance-bearing content
+                # of this result/milestone. Suppress the record, not merely
+                # the phrase, so sibling numbers and hints cannot survive it.
+                return None
+            if is_derived and isinstance(item, list) and not cleaned_item:
+                return None
+            cleaned_dict[key] = cleaned_item
+        return cleaned_dict
+
+    def _sanitize_summary_tool_payload(
+        raw: object,
+        *,
+        search_bundle: bool = False,
+        require_proof: bool = False,
+    ) -> object:
+        """Final model boundary for summary-backed tool payloads."""
+        cloned = copy.deepcopy(raw)
+        unsafe_search_source = False
+        if search_bundle and isinstance(cloned, dict):
+            for item in cloned.get("results") or []:
+                if not isinstance(item, dict):
+                    continue
+                if any(
+                    contains_ambiguous_human_referent(item.get(key, ""))
+                    for key in ("summary", "description", "excerpt", "summary_text")
+                ):
+                    unsafe_search_source = True
+                    break
+
+        pruned = _prune_unsafe_derived_entries(
+            cloned,
+            require_proof=require_proof,
+        )
+        if pruned is None:
+            pruned = {}
+        if unsafe_search_source and isinstance(pruned, dict):
+            # These values are synthesized from the selected summary result.
+            # Once any selected source is rejected, their provenance is no
+            # longer separable, so discard the full derived bundle.
+            for key in (
+                "reader_hint",
+                "value_candidates",
+                "exact_value_candidates",
+                "chosen_exact_value_candidate",
+                "conflicting_exact_value_candidates",
+                "coverage_summary",
+                "coverage_value_candidates",
+                "chosen_preference_anchor",
+                "anchor_example_calculation",
+                "shared_value_candidates",
+                "aggregate_total_candidates",
+                "ambiguity_detected",
+                "ambiguity_reason",
+                "competing_aggregate_totals",
+                "chosen_aggregate_total",
+            ):
+                pruned.pop(key, None)
+            results = pruned.get("results")
+            if isinstance(results, list):
+                pruned["found"] = bool(results)
+        if search_bundle and require_proof and isinstance(pruned, dict):
+            # Numeric anchors and synthesized state bundles shed the source
+            # wrapper that proves which historical human they belong to. The
+            # proved result excerpts remain available, so omit these lossy
+            # derivatives rather than relabeling them as requester state.
+            for key in (
+                "reader_hint",
+                "value_candidates",
+                "exact_value_candidates",
+                "chosen_exact_value_candidate",
+                "conflicting_exact_value_candidates",
+                "coverage_summary",
+                "coverage_value_candidates",
+                "chosen_preference_anchor",
+                "anchor_example_calculation",
+                "shared_value_candidates",
+                "aggregate_total_candidates",
+                "ambiguity_detected",
+                "ambiguity_reason",
+                "competing_aggregate_totals",
+                "chosen_aggregate_total",
+            ):
+                pruned.pop(key, None)
+        sanitized = sanitize_summary_payload_for_model(
+            pruned,
+            allow_proved_renderings=require_proof,
+        )
+        final_pruned = _prune_unsafe_derived_entries(
+            sanitized,
+            require_proof=require_proof,
+        )
+        return final_pruned if final_pruned is not None else {}
 
     def _trim_find_quote_payload(raw: object) -> object:
         """Return only model-relevant find_quote fields for tool output."""
@@ -1618,14 +1729,15 @@ def execute_vc_tool(
                     speaker_handles=_fq_handles,
                 )
             else:
-                # The context is forwarded only when the caller derived one,
-                # so the legacy call shape stays byte-identical and engine
-                # doubles predating the argument keep working. The handle
-                # map is likewise forwarded only when this request bound a
-                # live snapshot.
-                _fq_kwargs: dict = {}
-                if speaker_context is not None:
-                    _fq_kwargs["speaker_context"] = speaker_context
+                # Model-facing quote search always carries explicit request
+                # authority.  Absence is an ineligible sentinel, never an
+                # invitation to select the owner-wide legacy branch.
+                _fq_kwargs: dict = {
+                    "speaker_context": (
+                        speaker_context
+                        or SpeakerRetrievalContext.ineligible()
+                    ),
+                }
                 if _fq_handles is not None:
                     _fq_kwargs["speaker_handles"] = _fq_handles
                 result = engine.find_quote(
@@ -1647,46 +1759,89 @@ def execute_vc_tool(
             fq_query = tool_input.get("query", "")
             fq_mode = tool_input.get("mode", "lookup")
             _fq_max = engine.config.search.find_quote_max_results
+            _summary_kwargs = {
+                "speaker_context": summary_speaker_context,
+            }
             result = engine.search_summaries(
                 query=fq_query,
                 max_results=_fq_max,
                 intent_context=intent_context,
                 mode=fq_mode,
+                **_summary_kwargs,
+            )
+            result = _sanitize_summary_tool_payload(
+                result,
+                search_bundle=True,
+                require_proof=True,
             )
             result = _suppress_presented_segments(result, presented_segment_refs)
             result = _trim_find_quote_payload(result)
             result = _attach_related_facts(
                 engine, result, fq_query, presented_fact_ids,
                 annotation_context=annotation_ctx,
+                summary_speaker_context=summary_speaker_context,
+            )
+            result = _sanitize_summary_tool_payload(
+                result,
+                search_bundle=True,
+                require_proof=True,
             )
         elif name == "vc_find_session":
             _fq_max = engine.config.search.find_quote_max_results
+            _summary_kwargs = {
+                "speaker_context": summary_speaker_context,
+            }
             result = engine.search_summaries(
                 query=tool_input.get("query", ""),
                 max_results=_fq_max,
                 intent_context=intent_context,
                 session_filter=tool_input.get("session", ""),
                 mode="lookup",
+                **_summary_kwargs,
+            )
+            result = _sanitize_summary_tool_payload(
+                result,
+                search_bundle=True,
+                require_proof=True,
             )
             result = _suppress_presented_segments(result, presented_segment_refs)
             result = _trim_find_quote_payload(result)
         elif name == "vc_recall_all":
             result = engine.recall_all()
+            result = _sanitize_summary_tool_payload(
+                result,
+                require_proof=True,
+            )
             # Every recall-all topic is a cross-source rollup; none has a
             # singular speaker.
             if annotation_ctx is not None and isinstance(result, dict):
                 for _summary_entry in result.get("summaries") or []:
                     annotate_aggregate_entry(_summary_entry)
         elif name == "vc_query_facts":
-            meta = engine.query_facts(
-                subject=tool_input.get("subject"),
-                verb=tool_input.get("verb"),
-                object_contains=tool_input.get("object_contains"),
-                status=tool_input.get("status"),
-                fact_type=tool_input.get("fact_type"),
-                _return_meta=True,
-                _intent_context=intent_context,
-            )
+            # Facts are generated indexes, not source evidence.  A durable
+            # actor id can support internal selection but cannot prove that a
+            # generated subject/verb/object sentence preserved the speaker's
+            # meaning.  With no proved request audience, do not even perform
+            # the owner-wide read; with an eligible audience, return only
+            # structural references and counts after the existing filters.
+            _qf_request_eligible = summary_speaker_context.eligible
+            if _qf_request_eligible:
+                meta = engine.query_facts(
+                    subject=tool_input.get("subject"),
+                    verb=tool_input.get("verb"),
+                    object_contains=tool_input.get("object_contains"),
+                    status=tool_input.get("status"),
+                    fact_type=tool_input.get("fact_type"),
+                    _return_meta=True,
+                    _intent_context=intent_context,
+                )
+            else:
+                meta = {
+                    "facts": [],
+                    "linked_facts": [],
+                    "total_all_statuses": None,
+                    "all_statuses": {},
+                }
             facts = meta["facts"]
             # Speaker selection is resolved with the SAME validated helper the
             # quote path uses, so a handle can only ever name an actor this
@@ -1755,37 +1910,20 @@ def execute_vc_tool(
             meta["linked_facts"] = _qf_linked
             fact_entries: list[dict] = [
                 {
-                    "subject": f.subject,
-                    "verb": f.verb,
-                    "object": f.object,
-                    "status": f.status,
-                    "fact_type": f.fact_type,
-                    "what": f.what,
-                    "who": f.who,
-                    "when": f.when_date,
-                    "where": f.where,
-                    "why": f.why,
-                    "conversation_id": f.conversation_id,
-                    "tags": f.tags,
+                    "id": getattr(f, "id", ""),
+                    "segment_ref": getattr(f, "segment_ref", ""),
+                    "tags": list(getattr(f, "tags", None) or []),
                 }
                 for f in facts
             ]
-            _fact_labels: dict[str, str] = {}
-            if annotation_ctx is not None:
-                _linked = meta.get("linked_facts") or []
-                _fact_labels = resolve_speaker_labels(
-                    engine._store,
-                    collect_fact_author_actor_ids(
-                        list(facts) + [lf.fact for lf in _linked],
-                    ),
-                    speaker_context=annotation_ctx,
-                )
-                for f, _entry in zip(facts, fact_entries):
-                    _entry.update(project_fact_speaker_fields(f, _fact_labels))
             result = {
                 "count": len(facts),
                 "facts": fact_entries,
+                "fact_content_withheld": True,
+                "content_policy": "derived_fact_prose_not_model_evidence",
             }
+            if not _qf_request_eligible:
+                result["request_scope"] = "ineligible"
             # Disclose the selection outcome whenever one was attempted, so a
             # filter that could not be applied is visible rather than implied.
             if _qf_conditioning is not None and (
@@ -1806,58 +1944,38 @@ def execute_vc_tool(
                     result["speaker_hint"] = "unresolved"
                 if _qf_note:
                     result["speaker_selection_note"] = _qf_note
-            # Status breakdown from the filtered results
-            status_counts: dict[str, int] = {}
-            for f in facts:
-                s = f.status or "unknown"
-                status_counts[s] = status_counts.get(s, 0) + 1
-            if status_counts:
-                result["by_status"] = status_counts
-            # When a status filter was used, show the total across ALL
-            # statuses so the reader can see the grand total without
-            # making separate per-status calls.
-            if (
-                not _qf_speaker_only
-                and meta.get("total_all_statuses") is not None
-            ):
-                result["total_all_statuses"] = meta["total_all_statuses"]
-                result["all_statuses_breakdown"] = meta["all_statuses"]
-            # Annotate so the reader knows what broadening happened
-            notes = []
-            if meta.get("expanded_verbs"):
-                notes.append(f"verb expanded to match: {meta['expanded_verbs']}")
-            if meta.get("semantic_note"):
-                notes.append(meta["semantic_note"])
-            if notes:
-                result["search_notes"] = "; ".join(notes)
-            # Include linked facts when graph_links is enabled
+            # Preserve graph reachability only as opaque structural refs. The
+            # linked Fact prose and generated relation label/confidence are not
+            # evidence and therefore do not cross the model boundary.
             if meta.get("linked_facts"):
                 linked_entries: list[dict] = [
                     {
-                        "subject": lf.fact.subject,
-                        "verb": lf.fact.verb,
-                        "object": lf.fact.object,
-                        "status": lf.fact.status,
-                        "what": lf.fact.what,
-                        "_linked_via": f"{lf.relation_type} from '{lf.linked_from_fact_id[:8]}'",
-                        "_confidence": lf.confidence,
+                        "id": getattr(lf.fact, "id", ""),
+                        "segment_ref": getattr(lf.fact, "segment_ref", ""),
+                        "tags": list(getattr(lf.fact, "tags", None) or []),
+                        "linked_from_fact_id": getattr(
+                            lf, "linked_from_fact_id", "",
+                        ),
                     }
                     for lf in meta["linked_facts"]
                 ]
-                if annotation_ctx is not None:
-                    for lf, _entry in zip(meta["linked_facts"], linked_entries):
-                        _entry.update(
-                            project_fact_speaker_fields(lf.fact, _fact_labels),
-                        )
                 result["linked_facts"] = linked_entries
         elif name == "vc_remember_when":
             max_results = tool_input.get("max_results")
+            _remember_kwargs = {
+                "speaker_context": summary_speaker_context,
+            }
             result = engine.remember_when(
                 query=tool_input.get("query", ""),
                 time_range=tool_input.get("time_range", {}),
                 max_results=max_results,
                 mode=tool_input.get("mode", "auto"),
                 intent_context=intent_context,
+                **_remember_kwargs,
+            )
+            result = _sanitize_summary_tool_payload(
+                result,
+                require_proof=True,
             )
             result = _trim_remember_when_payload(result)
         elif name == "vc_restore_tool":
@@ -2271,7 +2389,11 @@ def run_tool_loop(
             used_names = {tc["name"] for tc in vc_tools}
             needs_reassemble = bool(used_names & _WORKING_SET_TOOLS)
 
-            new_prepend = engine.reassemble_context() if needs_reassemble else ""
+            new_prepend = (
+                engine.reassemble_context(speaker_context=speaker_context)
+                if needs_reassemble
+                else ""
+            )
 
             # Build continuation request
             cont_body = adapter.build_continuation(

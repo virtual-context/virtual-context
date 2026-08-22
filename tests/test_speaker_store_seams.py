@@ -42,6 +42,9 @@ def _row(
     reply_target_body: str = "",
     reply_subject_actor_id: str = "",
     conv: str = "c",
+    audience: str = "c",
+    audience_version: int = 1,
+    channel: str = "",
 ) -> None:
     store.save_canonical_turn(
         conv, -1, user_content, assistant_content,
@@ -52,6 +55,9 @@ def _row(
         tags=["chat"],
         reply_target_body=reply_target_body,
         reply_subject_actor_id=reply_subject_actor_id,
+        audience_conversation_id=audience,
+        audience_attribution_version=audience_version,
+        origin_channel_id=channel,
     )
 
 
@@ -223,11 +229,13 @@ class TestPhysicalRowLookup:
             "c", -1, "user half", "",
             canonical_turn_id="ct-u", sort_key=1000.0, turn_hash="h-u",
             turn_group_number=0,
+            audience_conversation_id="c", audience_attribution_version=1,
         )
         store.save_canonical_turn(
             "c", -1, "", "assistant half",
             canonical_turn_id="ct-a", sort_key=1001.0, turn_hash="h-a",
             turn_group_number=0,
+            audience_conversation_id="c", audience_attribution_version=1,
         )
         rows = store.get_canonical_turn_rows_by_id(
             [("c", "ct-u"), ("c", "ct-a")], speaker_context=_ctx(),
@@ -285,5 +293,4 @@ class TestSpeakerSemanticOnRealStore:
         assert manager.semantic_canonical_turn_search(
             "boston trip", conversation_id="c",
         ) == []
-
 

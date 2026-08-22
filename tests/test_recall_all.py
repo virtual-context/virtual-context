@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-import pytest
-
 from virtual_context.core.tool_loop import (
     VC_TOOL_NAMES,
     execute_vc_tool,
@@ -58,18 +56,22 @@ class TestEngineRecallAll:
         assert result["found"] is False
         assert "message" in result
 
-    def test_recall_all_returns_summaries(self, tmp_path):
-        """Returns all tag summaries when they fit in budget."""
+    def test_recall_all_returns_structure_but_quarantines_tag_summary_prose(
+        self, tmp_path,
+    ):
+        """Layer-2 prose never crosses the stateless recall-all boundary."""
         engine = self._make_engine(tmp_path)
         now = datetime(2026, 1, 15, 10, 0, tzinfo=timezone.utc)
 
         engine._store.save_tag_summary(TagSummary(
             tag="legal", summary="Legal overview.", summary_tokens=20,
+            description="BigTex discussed a legal case.",
             source_segment_refs=["seg-1"], covers_through_turn=5,
             created_at=now, updated_at=now,
         ), conversation_id=engine.config.conversation_id)
         engine._store.save_tag_summary(TagSummary(
             tag="medical", summary="Medical overview.", summary_tokens=20,
+            description="Stopped the medication.",
             source_segment_refs=["seg-2"], covers_through_turn=5,
             created_at=now, updated_at=now,
         ), conversation_id=engine.config.conversation_id)
@@ -81,6 +83,15 @@ class TestEngineRecallAll:
         tags = [s["tag"] for s in result["summaries"]]
         assert "legal" in tags
         assert "medical" in tags
+        assert all("summary" not in entry for entry in result["summaries"])
+        assert all("description" not in entry for entry in result["summaries"])
+        assert {tuple(entry["source_segment_refs"]) for entry in result["summaries"]} == {
+            ("seg-1",),
+            ("seg-2",),
+        }
+        assert "Legal overview." not in str(result)
+        assert "BigTex discussed a legal case." not in str(result)
+        assert "Stopped the medication." not in str(result)
 
     def test_recall_all_respects_token_budget(self, tmp_path):
         """Stops adding summaries when budget is exceeded."""

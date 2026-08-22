@@ -5,11 +5,13 @@ from datetime import datetime, timezone
 import pytest
 
 from virtual_context.core.assembler import ContextAssembler, format_tag_section
+from virtual_context.core.summary_identity import SUMMARY_ATTRIBUTION_QUARANTINE
 from virtual_context.types import (
     AssemblerConfig,
     Message,
     RetrievalResult,
     SegmentMetadata,
+    StoredSegment,
     StoredSummary,
     TagPromptRule,
 )
@@ -77,7 +79,7 @@ def test_assemble_xml_tags(assembler, retrieval_result):
     assert "</virtual-context>" in section
 
 
-def test_format_tag_section_renders_code_refs():
+def test_format_tag_section_omits_unproved_code_refs():
     now = datetime.now(timezone.utc)
     section = format_tag_section(
         "backend",
@@ -102,9 +104,9 @@ def test_format_tag_section_renders_code_refs():
         ],
     )
 
-    assert "[refs:" in section
-    assert "virtual_context/proxy/formats.py:1312 inject_context" in section
-    assert "virtual_context/core/provider_adapters.py AnthropicAdapter" in section
+    assert "[refs:" not in section
+    assert "virtual_context/proxy/formats.py" not in section
+    assert "virtual_context/core/provider_adapters.py" not in section
 
 
 def test_trim_conversation(assembler):
@@ -284,3 +286,44 @@ def test_budget_cap_logs_error(caplog):
         )
     assert any("exceeds token_budget" in r.message for r in caplog.records)
     assert any("tag_context_max_tokens" in r.message for r in caplog.records)
+
+
+def test_full_depth_does_not_bypass_quarantined_summary(assembler):
+    """A rejected source scope cannot reappear through the raw full text."""
+    segment = StoredSegment(
+        ref="private-ref",
+        primary_tag="health",
+        tags=["health"],
+        summary="BigTex discussed a private treatment.",
+        full_text="BigTex: private treatment details",
+    )
+
+    section = assembler._format_full_section(
+        "health",
+        [segment],
+        rendered_summary_by_object={id(segment): SUMMARY_ATTRIBUTION_QUARANTINE},
+    )
+
+    assert SUMMARY_ATTRIBUTION_QUARANTINE in section
+    assert "private treatment details" not in section
+
+
+def test_full_depth_never_trusts_stored_full_text_after_scope_admission(assembler):
+    """Source-id proof does not prove a legacy full_text blob's bytes."""
+    segment = StoredSegment(
+        ref="admitted-ref",
+        primary_tag="health",
+        tags=["health"],
+        summary="BigTex discussed treatment timing.",
+        full_text="BigTex: treatment timing was discussed",
+    )
+
+    section = assembler._format_full_section(
+        "health",
+        [segment],
+        rendered_summary_by_object={id(segment): "proved historical speaker: BigTex"},
+    )
+
+    assert "BigTex: treatment timing was discussed" not in section
+    assert "proved historical speaker: BigTex" not in section
+    assert SUMMARY_ATTRIBUTION_QUARANTINE in section

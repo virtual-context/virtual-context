@@ -14,6 +14,7 @@ from virtual_context.types import (
     Message,
     PagingConfig,
     RetrievalResult,
+    SpeakerRetrievalContext,
     StoredSegment,
     StoredSummary,
     TagSummary,
@@ -168,7 +169,7 @@ class TestAssemblerPagingDepths:
         )
 
     def test_summary_depth_default(self):
-        """Without working_set, tags render at SUMMARY depth."""
+        """Unproved summary depth keeps structure but withholds prose."""
         asm = self._make_assembler()
         summary = self._make_summary("database")
         result = asm.assemble(
@@ -179,7 +180,8 @@ class TestAssemblerPagingDepths:
         )
         assert "database" in result.tag_sections
         assert "virtual-context" in result.tag_sections["database"]
-        assert "Summary text" in result.tag_sections["database"]
+        assert "Summary text" not in result.tag_sections["database"]
+        assert "summary withheld" in result.tag_sections["database"]
 
     def test_segments_depth_with_working_set(self):
         """SEGMENTS depth renders individual segment summaries."""
@@ -203,7 +205,7 @@ class TestAssemblerPagingDepths:
         assert 'depth="segments"' in result.tag_sections["api"]
 
     def test_full_depth_with_working_set(self):
-        """FULL depth renders full_text from StoredSegment."""
+        """FULL depth cannot bypass proof through stored full_text."""
         asm = self._make_assembler()
         summary = self._make_summary("auth")
         full_text = "Complete authentication implementation discussion with all details."
@@ -223,7 +225,8 @@ class TestAssemblerPagingDepths:
         )
         assert "auth" in result.tag_sections
         assert 'depth="full"' in result.tag_sections["auth"]
-        assert full_text in result.tag_sections["auth"]
+        assert full_text not in result.tag_sections["auth"]
+        assert "summary withheld" in result.tag_sections["auth"]
 
     def test_none_depth_skips_tag(self):
         """NONE depth skips the tag entirely (hint only)."""
@@ -973,8 +976,8 @@ class TestContextHintModes:
         assert hint.startswith("<context-topics>")
         assert calls <= 24, f"large hint used {calls} full token-count passes"
 
-    def test_autonomous_hint_includes_description(self, tmp_path):
-        """Autonomous hint includes ts.description when available."""
+    def test_autonomous_hint_omits_unowned_description(self, tmp_path):
+        """Autonomous hints expose tag structure, not rollup prose."""
         engine = self._make_engine(tmp_path, paging_enabled=True)
         engine._store.save_tag_summary(TagSummary(
             tag="cycle-tracking",
@@ -984,7 +987,8 @@ class TestContextHintModes:
             source_turn_numbers=[0, 1, 2],
         ), conversation_id=engine.config.conversation_id)
         hint = engine._retrieval._build_context_hint(paging_mode="autonomous")
-        assert "Sania's cycle tracking via Mira" in hint
+        assert "Sania's cycle tracking via Mira" not in hint
+        assert "cycle-tracking" in hint
 
     def test_autonomous_hint_omits_description_when_empty(self, tmp_path):
         """Autonomous hint does not include ' — ' when description is empty."""
@@ -1003,8 +1007,8 @@ class TestContextHintModes:
         db_line = [line for line in hint.split("\n") if "database" in line][0]
         assert " — " not in db_line
 
-    def test_supervised_hint_includes_description(self, tmp_path):
-        """Supervised hint includes ts.description for available tags."""
+    def test_supervised_hint_omits_unowned_description(self, tmp_path):
+        """Supervised hints expose tag structure, not rollup prose."""
         engine = self._make_engine(tmp_path, paging_enabled=True)
         engine._store.save_tag_summary(TagSummary(
             tag="meal-planning",
@@ -1014,10 +1018,11 @@ class TestContextHintModes:
             source_turn_numbers=[0, 1, 2],
         ), conversation_id=engine.config.conversation_id)
         hint = engine._retrieval._build_context_hint(paging_mode="supervised")
-        assert "Weekly meal prep and grocery optimization" in hint
+        assert "Weekly meal prep and grocery optimization" not in hint
+        assert "meal-planning" in hint
 
-    def test_default_hint_uses_description(self, tmp_path):
-        """Default hint (no paging) uses ts.description when available."""
+    def test_default_hint_omits_unowned_description(self, tmp_path):
+        """Default hints expose tag structure, not rollup prose."""
         engine = self._make_engine(tmp_path, paging_enabled=False)
         engine._store.save_tag_summary(TagSummary(
             tag="fitness",
@@ -1027,8 +1032,8 @@ class TestContextHintModes:
             source_turn_numbers=[0, 1, 2, 3],
         ), conversation_id=engine.config.conversation_id)
         hint = engine._retrieval._build_context_hint()
-        # Default hint uses description when available instead of summary[:60]
-        assert "Interval training and HR zone programming" in hint
+        assert "Interval training and HR zone programming" not in hint
+        assert "fitness" in hint
 
     def test_context_hint_reuses_cached_render_when_state_unchanged(self, tmp_path):
         engine = self._make_engine(tmp_path, paging_enabled=True)
@@ -1272,7 +1277,7 @@ class TestReassembleContext:
         assert "database" in text.lower() or "PostgreSQL" in text.lower()
 
     def test_reflects_expanded_depth(self, tmp_path):
-        """After expand_topic, reassemble includes expanded content."""
+        """Expansion cannot bypass missing canonical source authority."""
         engine = self._make_engine(tmp_path)
         history = [
             Message(role="user", content="Tell me about databases"),
@@ -1286,11 +1291,89 @@ class TestReassembleContext:
         # Expand to FULL
         engine.expand_topic("database", "full")
 
-        # Re-assemble should now include full text
+        # Re-assembly may change depth, but cannot trust stored full_text.
         expanded = engine.reassemble_context()
-        assert "B-tree indexes" in expanded  # full_text content
+        assert "B-tree indexes" not in expanded
+        assert "summary withheld" in expanded
         # Initial (summary) should NOT have had the full text
         assert "B-tree indexes" not in initial
+
+    def test_reassembly_is_bound_to_the_request_speaker_context(self, tmp_path):
+        """A stale request cannot reuse a later request's cached authority."""
+        engine = self._make_engine(tmp_path)
+        history = [
+            Message(role="user", content="Tell me about databases"),
+            Message(role="assistant", content="Sure, PostgreSQL..."),
+        ]
+        context_a = SpeakerRetrievalContext(
+            tenant_id="tenant",
+            owner_conversation_id="owner",
+            audience_conversation_id="guild-a",
+            audience_channel_id="channel-a",
+            requester_actor_id="actor-a",
+        )
+        context_b = SpeakerRetrievalContext(
+            tenant_id="tenant",
+            owner_conversation_id="owner",
+            audience_conversation_id="dm-b",
+            requester_actor_id="actor-b",
+        )
+
+        engine.on_message_inbound(
+            "First request", history, speaker_context=context_a,
+        )
+        assembled_b = engine.on_message_inbound(
+            "Second request", history, speaker_context=context_b,
+        )
+
+        # The global cache now belongs to request B.  Neither request A nor a
+        # missing/newly-created ineligible context may inherit it.
+        assert engine.reassemble_context(speaker_context=context_a) == ""
+        assert engine.reassemble_context() == ""
+        assert engine.reassemble_context(
+            speaker_context=SpeakerRetrievalContext.ineligible(),
+        ) == ""
+
+        current = engine.reassemble_context(speaker_context=context_b)
+        assert current
+        assert current == assembled_b.prepend_text
+
+    def test_reassembly_reads_one_atomic_request_snapshot(self, tmp_path):
+        """A partial publication cannot pair new data with old authority."""
+        engine = self._make_engine(tmp_path)
+        history = [
+            Message(role="user", content="Tell me about databases"),
+            Message(role="assistant", content="Sure, PostgreSQL..."),
+        ]
+        context_a = SpeakerRetrievalContext(
+            tenant_id="tenant",
+            owner_conversation_id="owner",
+            audience_conversation_id="guild-a",
+            audience_channel_id="channel-a",
+            requester_actor_id="actor-a",
+        )
+        context_b = SpeakerRetrievalContext(
+            tenant_id="tenant",
+            owner_conversation_id="owner",
+            audience_conversation_id="dm-b",
+            requester_actor_id="actor-b",
+        )
+        assembled_a = engine.on_message_inbound(
+            "First request", history, speaker_context=context_a,
+        )
+
+        # Simulate request B being pre-empted after updating the old
+        # compatibility fields but before its atomic snapshot publication.
+        engine._retrieval._last_retrieval_result = RetrievalResult(
+            tags_matched=["other"],
+        )
+        engine._retrieval._last_speaker_context = context_b
+
+        assert (
+            engine.reassemble_context(speaker_context=context_a)
+            == assembled_a.prepend_text
+        )
+        assert engine.reassemble_context(speaker_context=context_b) == ""
 
 
 # ---------------------------------------------------------------------------

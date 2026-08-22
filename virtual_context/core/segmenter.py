@@ -14,10 +14,14 @@ logger = logging.getLogger(__name__)
 from .tag_generator import TagGenerator
 from ..types import (
     Message,
+    AUDIENCE_ATTRIBUTION_VERSION,
+    SOURCE_CANONICAL_TURN_IDS_KEY,
     SegmenterConfig,
     TaggedSegment,
     TagResult,
     TurnPair,
+    get_actor_id,
+    get_sender_name,
 )
 
 _SESSION_RE = re.compile(r'\[Session from ([^\]]+)\]')
@@ -47,6 +51,68 @@ def _earliest_timestamp(pair: TurnPair) -> datetime | None:
     return min(timestamps) if timestamps else None
 
 
+def _known_human_identities(pair: TurnPair) -> set[tuple[str, ...]]:
+    """Typed known identities on the human side of one logical turn.
+
+    Durable actor ids win. Display labels are a legacy fallback only; typing
+    the key prevents an actor id and an identical-looking label from being
+    treated as the same proof.
+    """
+    identities: set[tuple[str, ...]] = set()
+    for message in pair.messages:
+        if message.role != "user":
+            continue
+        source_ids = list(
+            (message.metadata or {}).get(SOURCE_CANONICAL_TURN_IDS_KEY) or []
+        )
+        actor = (
+            getattr(message, "source_actor_id", "")
+            or get_actor_id(message.metadata)
+            or ""
+        ).strip()
+        if source_ids:
+            audience = str(getattr(
+                message, "source_audience_conversation_id", "",
+            ) or "").strip()
+            channel = str(getattr(
+                message, "source_origin_channel_id", "",
+            ) or "").strip()
+            attribution_version = int(getattr(
+                message, "source_audience_attribution_version", 0,
+            ) or 0)
+            if (
+                actor
+                and audience
+                and attribution_version == AUDIENCE_ATTRIBUTION_VERSION
+            ):
+                identities.add(("actor_scope", actor, audience, channel))
+                continue
+            # A physical row without complete actor+audience proof is
+            # unresolved, even if it has a mutable display label. Keying it to
+            # the exact source isolates it while letting a session split of
+            # that same row rejoin itself.
+            identities.update(
+                ("unresolved_source", str(source_id))
+                for source_id in source_ids
+                if source_id
+            )
+            continue
+        if actor:
+            identities.add(("actor", actor))
+            continue
+        sender = get_sender_name(message.metadata)
+        normalized = sender.strip().casefold() if isinstance(sender, str) else ""
+        if normalized:
+            identities.add(("sender", normalized))
+            continue
+        # Legacy callers that provide neither durable identity nor physical
+        # provenance historically represent one logical conversation user.
+        # Preserve that behavior; production physical rows always carry their
+        # canonical source id and therefore take the fail-closed branch above.
+        identities.add(("legacy_unscoped", ""))
+    return identities
+
+
 def split_session_boundary_messages(messages: list[Message]) -> list[Message]:
     """Split messages that contain a mid-content ``[Session from ...]`` header."""
     out: list[Message] = []
@@ -62,12 +128,26 @@ def split_session_boundary_messages(messages: list[Message]) -> list[Message]:
                 content=parts[0].strip(),
                 timestamp=msg.timestamp,
                 metadata=msg.metadata,
+                source_actor_id=msg.source_actor_id,
+                source_logical_turn_number=msg.source_logical_turn_number,
+                source_audience_conversation_id=msg.source_audience_conversation_id,
+                source_origin_channel_id=msg.source_origin_channel_id,
+                source_audience_attribution_version=(
+                    msg.source_audience_attribution_version
+                ),
             ))
             out.append(Message(
                 role=msg.role,
                 content=f"[Session from {parts[1]}]{parts[2]}",
                 timestamp=msg.timestamp,
                 metadata=msg.metadata,
+                source_actor_id=msg.source_actor_id,
+                source_logical_turn_number=msg.source_logical_turn_number,
+                source_audience_conversation_id=msg.source_audience_conversation_id,
+                source_origin_channel_id=msg.source_origin_channel_id,
+                source_audience_attribution_version=(
+                    msg.source_audience_attribution_version
+                ),
             ))
         else:
             out.append(msg)
@@ -203,7 +283,17 @@ class TopicSegmenter:
                 continue
 
             # Check index first — avoid redundant LLM call
-            global_turn = turn_offset + i
+            source_turns = {
+                int(getattr(message, "source_logical_turn_number", -1))
+                for message in pair.messages
+                if message.role == "user"
+                and int(getattr(message, "source_logical_turn_number", -1)) >= 0
+            }
+            global_turn = (
+                next(iter(source_turns))
+                if len(source_turns) == 1
+                else turn_offset + i
+            )
             entry = self._turn_tag_index.get_tags_for_logical_turn(global_turn) if self._turn_tag_index else None
             if entry:
                 tag_result = TagResult(
@@ -232,14 +322,23 @@ class TopicSegmenter:
         # If a turn matches an existing segment, it's appended there. Otherwise, a new
         # segment is created. This handles A-B-A-B topic interleaving correctly.
         #
-        # Segment library: list of (group, group_session, anchor_tags, group_tokens)
+        # Segment library: list of
+        # (group, group_session, anchor_tags, group_tokens, known identities)
         # where group is the accumulating list of (TurnPair, TagResult) pairs.
         # ``anchor_tags`` deliberately stays fixed to the first turn.  Growing
         # it with every appended turn allows bridge tags to walk a segment
         # across unrelated topics (A↔B, then B↔C, even when A and C have no
         # relationship).  The final segment still unions every turn's tags in
         # ``_build_segment``; the fixed set is only the admission boundary.
-        segment_library: list[tuple[list[tuple[TurnPair, TagResult]], str, set[str], int]] = []
+        segment_library: list[
+            tuple[
+                list[tuple[TurnPair, TagResult]],
+                str,
+                set[str],
+                int,
+                set[tuple[str, ...]],
+            ]
+        ] = []
         running_session: str = ""
         last_assigned_seg_idx = -1
         max_seg_tokens = self.config.max_segment_turns * 200 if self.config.max_segment_turns > 0 else 999_999
@@ -264,6 +363,7 @@ class TopicSegmenter:
 
             curr_tags = set(result.tags)
             meaningful_curr = {t for t in curr_tags if t != "_general"}
+            curr_senders = _known_human_identities(pair)
             turn_text = " ".join(m.content for m in pair.messages)
             turn_tokens = self.token_counter(turn_text)
 
@@ -273,7 +373,13 @@ class TopicSegmenter:
             best_reason = ""
             candidate_total = max(len(segment_library), 1)
 
-            for seg_idx, (group, group_session, anchor_tags, group_tokens) in enumerate(segment_library):
+            for seg_idx, (
+                group,
+                group_session,
+                anchor_tags,
+                group_tokens,
+                group_senders,
+            ) in enumerate(segment_library):
                 _emit_progress(
                     grouped_turns,
                     total_group_turns,
@@ -292,6 +398,17 @@ class TopicSegmenter:
 
                 # Skip if max turn count exceeded
                 if self.config.max_segment_turns > 0 and len(group) >= self.config.max_segment_turns:
+                    continue
+
+                # A shared topic is not speaker proof. Only the same complete
+                # known identity may reuse a segment; an unresolved human turn
+                # is isolated instead of being silently absorbed by whichever
+                # named speaker happened to share its tag.
+                if (
+                    not curr_senders
+                    or not group_senders
+                    or curr_senders != group_senders
+                ):
                     continue
 
                 # Skip if different session (session boundaries are hard splits)
@@ -346,9 +463,21 @@ class TopicSegmenter:
 
             if best_seg_idx >= 0:
                 # Append to existing segment
-                group, group_session, group_tags, group_tokens = segment_library[best_seg_idx]
+                (
+                    group,
+                    group_session,
+                    group_tags,
+                    group_tokens,
+                    group_senders,
+                ) = segment_library[best_seg_idx]
                 group.append((pair, result))
-                segment_library[best_seg_idx] = (group, group_session, group_tags, group_tokens + turn_tokens)
+                segment_library[best_seg_idx] = (
+                    group,
+                    group_session,
+                    group_tags,
+                    group_tokens + turn_tokens,
+                    group_senders | curr_senders,
+                )
                 last_assigned_seg_idx = best_seg_idx
                 logger.debug(
                     "SEGMENT turn=%d APPEND to seg#%d (%s, %d turns, %s)",
@@ -363,6 +492,7 @@ class TopicSegmenter:
                     running_session,
                     new_tags,
                     turn_tokens,
+                    curr_senders,
                 ))
                 last_assigned_seg_idx = len(segment_library) - 1
                 logger.debug(
@@ -397,7 +527,13 @@ class TopicSegmenter:
             force=True,
             segments_built=len(segment_library),
         )
-        for group, group_session, group_tags, group_tokens in segment_library:
+        for (
+            group,
+            group_session,
+            group_tags,
+            group_tokens,
+            _group_senders,
+        ) in segment_library:
             if group:
                 seg = self._build_segment(group, group_session)
                 segments.append(seg)

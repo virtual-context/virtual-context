@@ -242,6 +242,35 @@ class TestConsolidateTags:
         written_aliases = {call.args[0] for call in alias_calls}
         assert written_aliases == {"model-kit", "model-tanks"}
 
+    def test_llm_prompt_uses_only_tag_names(self):
+        """No layer-2 or orphan segment prose reaches the stateless LLM."""
+        tags = [TagStats(tag="protocol-history"), TagStats(tag="travel-plans")]
+        store = _make_store(
+            tags=tags,
+            tag_summaries=[TagSummary(
+                tag="protocol-history",
+                summary="BigTex stopped tesamorelin.",
+                description="BigTex experienced side effects.",
+            )],
+        )
+        store.get_orphan_tag_snippets.return_value = [{
+            "tag": "travel-plans",
+            "snippet": "Kuw9239 booked a flight.",
+        }]
+        llm = _MockLLM('{"groups": []}')
+
+        consolidate_tags(store, llm, dry_run=True)
+
+        assert len(llm.calls) == 1
+        prompt = llm.calls[0]["user"]
+        assert "- protocol-history" in prompt
+        assert "- travel-plans" in prompt
+        assert "BigTex stopped tesamorelin." not in prompt
+        assert "BigTex experienced side effects." not in prompt
+        assert "Kuw9239 booked a flight." not in prompt
+        store.get_all_tag_summaries.assert_not_called()
+        store.get_orphan_tag_snippets.assert_not_called()
+
     def test_existing_aliases_not_rewritten(self):
         """Aliases that already exist in the store are not written again."""
         tags = [TagStats(tag="a"), TagStats(tag="b")]

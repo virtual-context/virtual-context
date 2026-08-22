@@ -5,6 +5,7 @@ Pure functions — no ProxyState dependency. Extracted from proxy/server.py.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import logging
@@ -13,6 +14,7 @@ import time
 from bisect import bisect_left
 from collections.abc import Callable
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 from ..core.turn_tag_index import TurnTagIndex
@@ -27,6 +29,168 @@ logger = logging.getLogger(__name__)
 
 _CHAIN_COLLAPSE_BREAKDOWN_LOG_THRESHOLD_MS = 200.0
 _CHAIN_COLLAPSE_BREAKDOWN_MAX_STAGES = 8
+
+
+def _chain_contains_vc_tool_interaction(messages: list[dict]) -> bool:
+    """Return whether *messages* contains any VC tool call or named result.
+
+    Chain snapshots are request-history artifacts, not an authority-bearing
+    retrieval surface.  A VC result captured there may contain generated
+    summary prose produced under an older request, so it must never be
+    replayed later.  Detect every provider shape supported by the proxy,
+    including the legacy OpenClaw shape retained in old snapshots.
+    """
+    from ..core.tool_loop import VC_TOOL_NAMES
+
+    def _is_vc_name(value: object) -> bool:
+        return isinstance(value, str) and value in VC_TOOL_NAMES
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+
+        # OpenAI Responses bare function-call/output items.  Some legacy
+        # output items also retained the tool name, which lets us reject them
+        # even if the matching call is absent.
+        if (
+            msg.get("type") in ("function_call", "function_call_output")
+            and _is_vc_name(msg.get("name"))
+        ):
+            return True
+
+        # OpenAI Chat and normalized OpenClaw calls.
+        tool_calls = msg.get("tool_calls", [])
+        if isinstance(tool_calls, list):
+            for call in tool_calls:
+                if not isinstance(call, dict):
+                    continue
+                function = call.get("function", {})
+                if isinstance(function, dict) and _is_vc_name(function.get("name")):
+                    return True
+
+        # Anthropic calls plus pre-normalization OpenClaw toolCall blocks.
+        content = msg.get("content", [])
+        if isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if (
+                    block.get("type") in ("tool_use", "toolCall", "tool_result")
+                    and _is_vc_name(block.get("name"))
+                ):
+                    return True
+
+        # A legacy OpenClaw toolResult can carry its name on the message.
+        if (
+            msg.get("role") in ("tool", "toolResult")
+            and (_is_vc_name(msg.get("name")) or _is_vc_name(msg.get("toolName")))
+        ):
+            return True
+
+        # Gemini calls and responses both carry the function name directly.
+        parts = msg.get("parts", [])
+        if isinstance(parts, list):
+            for part in parts:
+                if not isinstance(part, dict):
+                    continue
+                for key in ("functionCall", "functionResponse"):
+                    function = part.get(key, {})
+                    if isinstance(function, dict) and _is_vc_name(function.get("name")):
+                        return True
+
+    return False
+
+
+def _chain_has_orphaned_tool_result(messages: list[dict]) -> bool:
+    """Return whether a tool result lacks a call inside the same snapshot."""
+    call_ids: set[str] = set()
+    gemini_call_names: set[str] = set()
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("type") == "function_call":
+            call_id = msg.get("call_id")
+            if isinstance(call_id, str) and call_id:
+                call_ids.add(call_id)
+        tool_calls = msg.get("tool_calls", [])
+        if isinstance(tool_calls, list):
+            for call in tool_calls:
+                if not isinstance(call, dict):
+                    continue
+                call_id = call.get("id")
+                if isinstance(call_id, str) and call_id:
+                    call_ids.add(call_id)
+        content = msg.get("content", [])
+        if isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") in ("tool_use", "toolCall"):
+                    call_id = block.get("id")
+                    if isinstance(call_id, str) and call_id:
+                        call_ids.add(call_id)
+        parts = msg.get("parts", [])
+        if isinstance(parts, list):
+            for part in parts:
+                if not isinstance(part, dict):
+                    continue
+                function = part.get("functionCall", {})
+                if isinstance(function, dict):
+                    name = function.get("name")
+                    if isinstance(name, str) and name:
+                        gemini_call_names.add(name)
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("type") == "function_call_output":
+            call_id = msg.get("call_id")
+            if not isinstance(call_id, str) or call_id not in call_ids:
+                return True
+        if msg.get("role") in ("tool", "toolResult"):
+            call_id = msg.get("tool_call_id", msg.get("toolCallId"))
+            if not isinstance(call_id, str) or call_id not in call_ids:
+                return True
+        content = msg.get("content", [])
+        if isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_result":
+                    continue
+                call_id = block.get("tool_use_id")
+                if not isinstance(call_id, str) or call_id not in call_ids:
+                    return True
+        parts = msg.get("parts", [])
+        if isinstance(parts, list):
+            for part in parts:
+                if not isinstance(part, dict) or "functionResponse" not in part:
+                    continue
+                function = part.get("functionResponse", {})
+                name = function.get("name") if isinstance(function, dict) else None
+                if not isinstance(name, str) or name not in gemini_call_names:
+                    return True
+
+    return False
+
+
+def sanitize_chain_snapshot_messages(messages: list[dict]) -> list[dict]:
+    """Return a replay-safe copy of messages destined for a chain snapshot.
+
+    Ordinary, non-VC tool chains retain their historical behavior.  If a
+    chain contains any VC tool interaction, however, only exact human/user
+    source messages are retained.  Removing just the call/result pair is not
+    sufficient: the following assistant message may repeat a false clause
+    from generated summary prose.  The same function is applied both before
+    persistence and when reading legacy snapshots.
+    """
+    if not isinstance(messages, list):
+        return []
+    if (
+        not _chain_contains_vc_tool_interaction(messages)
+        and not _chain_has_orphaned_tool_result(messages)
+    ):
+        return copy.deepcopy(messages)
+    return _sanitize_restored_turn(messages)
 
 
 def _is_tool_result_only_user(msg: dict) -> bool:
@@ -1913,8 +2077,22 @@ def collapse_turn_chains(
 
             _pf_used.update(pf_chain)
 
-            # c. Serialize chain snapshot from pre-filter body
-            pf_msgs = [pre_filter_messages[pi] for pi in pf_chain]
+            # c. Serialize a replay-safe chain snapshot from the pre-filter
+            # body. VC retrieval output is request-scoped and may contain
+            # unowned generated summary prose; persist exact user source only
+            # for those chains. The restore boundary applies the same rule to
+            # legacy snapshots already at rest.
+            pf_msgs = sanitize_chain_snapshot_messages(
+                [pre_filter_messages[pi] for pi in pf_chain]
+            )
+            if not pf_msgs:
+                logger.warning(
+                    "CHAIN-COLLAPSE: refusing empty sanitized snapshot "
+                    "conversation=%s turn=%d",
+                    conversation_id,
+                    canonical_turn,
+                )
+                continue
             chain_json = json.dumps(pf_msgs, default=str)
 
             # d. Generate composite ref
@@ -2963,15 +3141,33 @@ def fill_pass(
         and getattr(assembled.retrieval_result, "overflow_summaries", None)
     ):
         from ..core.assembler import format_tag_section
+        from ..core.summary_identity import render_summaries_for_model
+        from ..types import SpeakerRetrievalContext
 
-        for summary in assembled.retrieval_result.overflow_summaries:
+        overflow = list(assembled.retrieval_result.overflow_summaries)
+        rendered_overflow = render_summaries_for_model(
+            overflow,
+            store=store,
+            conversation_id=conversation_id,
+            speaker_context=(
+                getattr(assembled, "speaker_context", None)
+                or SpeakerRetrievalContext.ineligible()
+            ),
+        )
+        for summary, rendered_summary in zip(
+            overflow, rendered_overflow, strict=True,
+        ):
             if summary.primary_tag in covered_tags:
                 continue
             if summary.ref in presented_refs:
                 continue
             # Don't pass store — tool hint enrichment would add vc_restore_tool
             # references, but the fill pass runs after tool injection decisions.
-            text = format_tag_section(summary.primary_tag, [summary])
+            text = format_tag_section(
+                summary.primary_tag,
+                [summary],
+                rendered_summary_by_object={id(summary): rendered_summary},
+            )
             tokens = len(text) // 4  # rough estimate
             if tokens_used + tokens > summary_budget:
                 continue
@@ -3007,13 +3203,56 @@ def fill_pass(
 
     if turn_budget > 200:
         if client_truncated and store is not None:
-            # Store-backed: restore from canonical persisted turns.
+            # Store-backed recovery is a retrieval surface, not a replay of
+            # provider roles. The owner inventory is only a source of opaque
+            # canonical ids/ordinals; exact text must be re-hydrated through
+            # the same request-scoped source renderer used by summaries.
             import hashlib as _hl
-            store_rows = store.get_all_canonical_turns(conversation_id)
-            store_turns = [
-                (row.turn_number, row.user_content, row.assistant_content)
-                for row in store_rows[-200:]
-            ]
+            from ..core.summary_identity import (
+                is_proved_summary_rendering,
+                render_summaries_for_model,
+            )
+            from ..types import SegmentMetadata
+
+            speaker_context = (
+                getattr(assembled, "speaker_context", None)
+                if assembled is not None
+                else None
+            )
+            exact_request_authority = bool(
+                speaker_context is not None
+                and getattr(speaker_context, "eligible", False)
+                and conversation_id
+                and str(getattr(
+                    speaker_context, "owner_conversation_id", "",
+                ) or "").strip() == conversation_id
+                and str(getattr(
+                    speaker_context, "requester_actor_id", "",
+                ) or "").strip()
+            )
+
+            # Do not even enumerate owner rows without exact request
+            # authority. In particular, ``None`` is never repaired to a
+            # permissive default and a resolved owner is not an audience.
+            if exact_request_authority:
+                try:
+                    # The bounded inventory carries no disclosure authority;
+                    # it only identifies recent physical rows to re-hydrate.
+                    store_rows = sorted(
+                        list(store.get_recent_canonical_turns(
+                            conversation_id, limit=200,
+                        )),
+                        key=lambda row: (
+                            float(getattr(row, "sort_key", 0.0) or 0.0),
+                            str(getattr(row, "canonical_turn_id", "") or ""),
+                        ),
+                    )
+                except Exception:
+                    # Recovery is optional. A failed owner inventory cannot be
+                    # distinguished from incomplete proof, so expose nothing.
+                    store_rows = []
+            else:
+                store_rows = []
 
             # Build set of canonical turn numbers already in the payload
             # using hash lookup (same approach as collapse_turn_chains)
@@ -3037,9 +3276,18 @@ def fill_pass(
                         if entry is not None:
                             _payload_canonical_turns.add(entry.turn_number)
 
-            # Restore newest first
-            for turn_num, user_text, asst_text in reversed(store_turns):
-                if not user_text.strip():
+            candidates: list[tuple[int, object]] = []
+            seen_canonical_ids: set[str] = set()
+            for row in store_rows:
+                canonical_id = getattr(row, "canonical_turn_id", "")
+                turn_num = getattr(row, "turn_number", None)
+                if (
+                    type(canonical_id) is not str
+                    or not canonical_id.strip()
+                    or canonical_id in seen_canonical_ids
+                    or type(turn_num) is not int
+                    or turn_num < 0
+                ):
                     continue
                 # Skip turns already in the payload
                 if turn_num in _payload_canonical_turns:
@@ -3050,39 +3298,61 @@ def fill_pass(
                     if tool_refs:
                         continue
                 except Exception:
-                    pass
-                # Build format-appropriate message pair
-                _fname = fmt.name
-                if _fname == "gemini":
-                    turn_msgs = [
-                        {"role": "user", "parts": [{"text": user_text}]},
-                        {"role": "model", "parts": [{"text": asst_text}]},
-                    ]
-                elif _fname == "openai_responses":
-                    turn_msgs = [
-                        {"role": "user", "content": user_text},
-                        {"role": "assistant", "content": [{"type": "output_text", "text": asst_text}]},
-                    ]
-                else:
-                    turn_msgs = [
-                        {"role": "user", "content": user_text},
-                        {"role": "assistant", "content": [{"type": "text", "text": asst_text}]},
-                    ]
-                turn_text = json.dumps(turn_msgs, default=str)
-                turn_tokens = len(turn_text) // 4
-                if turn_tokens > turn_budget:
+                    # An unavailable chain classification is not permission
+                    # to reinterpret the row as an ordinary human turn.
                     continue
-                # Insert after system/developer prefix
-                cur_msgs = fmt.get_messages(body)
-                insert_at = 0
-                for i, m in enumerate(cur_msgs):
-                    if m.get("role") in ("system", "developer"):
-                        insert_at = i + 1
-                    else:
-                        break
-                fmt.insert_items(body, insert_at, turn_msgs)
-                turn_budget -= turn_tokens
-                turns_added += 1
+                seen_canonical_ids.add(canonical_id)
+                candidates.append((
+                    turn_num,
+                    # A one-row complete mapping makes each recovered source
+                    # independently fail closed while the renderer's batch
+                    # collision check still spans the whole candidate set.
+                    SimpleNamespace(
+                        metadata=SegmentMetadata(
+                            canonical_turn_ids=[canonical_id],
+                            source_mapping_complete=True,
+                        ),
+                    ),
+                ))
+
+            rendered_candidates = render_summaries_for_model(
+                [item for _, item in candidates],
+                store=store,
+                conversation_id=conversation_id,
+                speaker_context=speaker_context,
+            ) if candidates else []
+
+            # Prefer newest rows, but emit surviving envelopes in historical
+            # order. Budget whole escaped envelopes plus the single context
+            # wrapper; never slice a lane or insert a provider ``user`` role.
+            selected_newest_first: list[str] = []
+            selected_chars = 0
+            wrapper_chars = len("<system-reminder>\n\n</system-reminder>")
+            for _candidate, rendered in reversed(list(zip(
+                candidates, rendered_candidates, strict=True,
+            ))):
+                if not is_proved_summary_rendering(rendered):
+                    continue
+                separator_chars = 1 if selected_newest_first else 0
+                candidate_chars = (
+                    wrapper_chars
+                    + selected_chars
+                    + separator_chars
+                    + len(rendered)
+                )
+                candidate_tokens = max(1, candidate_chars // 4)
+                if candidate_tokens > turn_budget:
+                    continue
+                selected_newest_first.append(rendered)
+                selected_chars += separator_chars + len(rendered)
+
+            if selected_newest_first:
+                body = _append_to_context(
+                    body,
+                    fmt,
+                    "\n".join(reversed(selected_newest_first)),
+                )
+                turns_added = len(selected_newest_first)
 
         elif pre_filter_body is not None:
             # Normal path — restore from pre_filter_body snapshot
@@ -3098,6 +3368,8 @@ def fill_pass(
                         continue
                     turn_msgs = [pre_messages[i] for i in turn.indices if 0 <= i < len(pre_messages)]
                     turn_msgs = _sanitize_restored_turn(turn_msgs)
+                    if not turn_msgs:
+                        continue
                     turn_text = json.dumps(turn_msgs, default=str)
                     turn_tokens = len(turn_text) // 4
                     if turn_tokens > turn_budget:
@@ -3134,23 +3406,32 @@ def _append_to_context(body: dict, fmt: PayloadFormat, text: str) -> dict:
 
 def _format_breadth_section(ts) -> str:
     """Render a TagSummary breadth item as a simple tag section."""
+    from ..core.summary_identity import render_summary_for_model
+
     return (
         f'<virtual-context tags="{ts.tag}" type="breadth">\n'
-        f"{ts.summary}\n"
+        f"{render_summary_for_model(ts.summary, require_proved_scope=True)}\n"
         f"</virtual-context>"
     )
 
 
 def _sanitize_restored_turn(messages: list[dict]) -> list[dict]:
-    """Sanitize restored turn messages: strip thinking, media, and tool scaffolding.
+    """Return exact human source lanes from a restored historical turn.
 
-    Restored turns may contain tool_result blocks whose matching tool_use
-    is in a different (non-restored) turn.  Sending an orphaned tool_result
-    causes Anthropic API 400.  Strip all tool scaffolding from restored turns.
+    Assistant/model output is generated text and can repeat a false clause
+    from an unsafe summary result. It is therefore not admitted as restored
+    evidence. Tool-result carriers are transport scaffolding rather than
+    human turns and are removed as well. Text within genuine user/human
+    messages remains provider-native and byte-for-byte unchanged.
     """
     sanitized = []
-    for msg in messages:
-        msg = dict(msg)  # shallow copy
+    for original in messages:
+        if not isinstance(original, dict):
+            continue
+        if original.get("role") not in ("user", "human"):
+            continue
+
+        msg = copy.deepcopy(original)
         content = msg.get("content", "")
         if isinstance(content, list):
             cleaned = []
@@ -3159,36 +3440,43 @@ def _sanitize_restored_turn(messages: list[dict]) -> list[dict]:
                     cleaned.append(block)
                     continue
                 btype = block.get("type", "")
-                # Strip thinking blocks
+                # Strip thinking blocks and all tool scaffolding.
                 if btype == "thinking":
                     continue
-                # Strip tool_use and tool_result �� their partners may not be restored
-                if btype in ("tool_use", "tool_result"):
+                if btype in ("tool_use", "tool_result", "toolCall"):
                     continue
                 # Replace media with passive placeholder
-                if btype in ("image", "image_url") or block.get("source", {}).get("type") == "base64":
+                source = block.get("source", {})
+                if (
+                    btype in ("image", "image_url")
+                    or (isinstance(source, dict) and source.get("type") == "base64")
+                ):
                     cleaned.append({"type": "text", "text": "[image removed from restored turn]"})
                     continue
                 if btype == "input_image":
                     cleaned.append({"type": "input_text", "text": "[image removed from restored turn]"})
                     continue
                 cleaned.append(block)
-            # If stripping left no content, add a placeholder
             if not cleaned:
-                cleaned = [{"type": "text", "text": "[restored turn — tool content removed]"}]
+                continue
             msg["content"] = cleaned
-        # Strip OpenAI tool_calls from assistant messages
         msg.pop("tool_calls", None)
-        if msg.get("role") == "tool":
-            continue  # skip entire tool-role messages
         parts = msg.get("parts", [])
         if isinstance(parts, list) and parts:
             cleaned_parts = []
             for part in parts:
-                if isinstance(part, dict) and "inlineData" in part:
+                if isinstance(part, dict) and (
+                    "functionCall" in part or "functionResponse" in part
+                ):
+                    continue
+                if isinstance(part, dict) and (
+                    "inlineData" in part or "inline_data" in part
+                ):
                     cleaned_parts.append({"text": "[image removed from restored turn]"})
                 else:
                     cleaned_parts.append(part)
+            if not cleaned_parts:
+                continue
             msg["parts"] = cleaned_parts
         sanitized.append(msg)
     return sanitized

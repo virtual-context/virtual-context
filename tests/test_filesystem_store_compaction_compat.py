@@ -96,6 +96,38 @@ def test_store_segment_works_without_guard_kwargs(tmp_path):
     assert store.get_segment(seg.ref) is not None
 
 
+def test_store_segment_roundtrips_compaction_provenance(tmp_path):
+    store = _make_store(tmp_path)
+    seg = _make_segment()
+    seg.ref = "seg-provenance"
+    seg.metadata.canonical_turn_ids = ["ct-1", "ct-2"]
+    seg.metadata.source_mapping_complete = True
+    seg.metadata.source_speaker_labels = ["BigTex", "Optics"]
+    seg.metadata.source_speaker_identity_count = 2
+    seg.metadata.source_speaker_identity_fingerprint = "speaker-set-proof"
+    seg.metadata.source_audience_fingerprint = "audience-channel-proof"
+
+    store.store_segment(seg)
+
+    loaded = store.get_segment(seg.ref)
+    assert loaded is not None
+    assert loaded.metadata.canonical_turn_ids == ["ct-1", "ct-2"]
+    assert loaded.metadata.source_mapping_complete is True
+    assert loaded.metadata.source_speaker_labels == ["BigTex", "Optics"]
+    assert loaded.metadata.source_speaker_identity_count == 2
+    assert (
+        loaded.metadata.source_speaker_identity_fingerprint
+        == "speaker-set-proof"
+    )
+    assert loaded.metadata.source_audience_fingerprint == "audience-channel-proof"
+
+    summary = store.get_summary(seg.ref)
+    assert summary is not None
+    assert summary.metadata.source_speaker_labels == ["BigTex", "Optics"]
+    assert summary.metadata.source_speaker_identity_count == 2
+    assert summary.metadata.source_audience_fingerprint == "audience-channel-proof"
+
+
 # ---------------------------------------------------------------------------
 # save_tag_summary
 # ---------------------------------------------------------------------------

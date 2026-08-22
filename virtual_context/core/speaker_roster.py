@@ -20,11 +20,13 @@ see, in what order, under which handles, and how the block is rendered.
   durable handles yields no roster at all — identity fails closed while
   retrieval is untouched.
 
-* **Presentation** is a fixed, versioned wrapper around one standard-JSON
-  payload. Every scalar is encoded atomically and angle brackets are emitted
-  as ``\\u003c``/``\\u003e`` escapes, so a malicious display name cannot add
-  an entry, close the wrapper, or open a new system section. No actor id
-  appears anywhere in the rendered block.
+* **Presentation** admits display names through the shared human-label policy,
+  then uses a fixed, versioned wrapper around one standard-JSON payload.
+  Unsafe names become empty; they are never replaced with an actor id. Every
+  scalar is encoded atomically and angle brackets are emitted as
+  ``\\u003c``/``\\u003e`` escapes, so a name cannot add an entry, close the
+  wrapper, or open a new system section. No actor id appears anywhere in the
+  rendered block.
 
 * **The snapshot is immutable.** ``snapshot_id`` is created exactly once per
   request and assigned into the request's ``SpeakerRetrievalContext`` at that
@@ -52,6 +54,7 @@ from ..types import (
     is_valid_speaker_handle,
     normalize_speaker_handle_base,
 )
+from .summary_identity import is_safe_human_label
 
 logger = logging.getLogger(__name__)
 
@@ -111,17 +114,26 @@ def render_speaker_roster(snapshot: SpeakerRosterSnapshot | None) -> str:
     The payload is one standard-JSON line: handles, audience-scoped names,
     and the truncation boolean — nothing else, and no actor ids. JSON
     escaping alone is NOT enough: the encoder leaves ``<`` and ``>``
-    untouched, so a name containing a literal ``</speaker-roster>`` would
-    close the wrapper. Angle brackets are therefore emitted as ``\\u003c`` /
-    ``\\u003e`` escapes: a JSON parser round-trips the exact name while the
-    rendered characters can no longer terminate the wrapper.
+    untouched, so a name containing markup could close the wrapper. Unsafe
+    human labels are blanked first; angle brackets in admitted labels are
+    then emitted as ``\\u003c`` / ``\\u003e`` escapes, so rendered characters
+    cannot terminate the wrapper.
     """
     if snapshot is None or not snapshot.entries:
         return ""
     payload = json.dumps(
         {
             "speakers": [
-                {"handle": e.handle, "name": e.name} for e in snapshot.entries
+                {
+                    "handle": e.handle,
+                    "name": (
+                        e.name
+                        if isinstance(e.name, str)
+                        and is_safe_human_label(e.name, e.actor_id)
+                        else ""
+                    ),
+                }
+                for e in snapshot.entries
             ],
             "truncated": bool(snapshot.truncated),
         },
@@ -236,16 +248,22 @@ def build_speaker_roster(
                 getattr(row, "canonical_turn_id", "") or "",
             )
             entry = members.get(actor)
+            raw_label = (getattr(row, "sender", "") or "").strip()
+            label = (
+                raw_label
+                if is_safe_human_label(raw_label, actor)
+                else ""
+            )
             if entry is None:
                 members[actor] = {
                     "last": key,
                     "first": key,
-                    "label": (getattr(row, "sender", "") or "").strip(),
+                    "label": label,
                 }
             else:
                 if key > entry["last"]:
                     entry["last"] = key
-                    entry["label"] = (getattr(row, "sender", "") or "").strip()
+                    entry["label"] = label
                 if key < entry["first"]:
                     entry["first"] = key
     except Exception:
@@ -317,7 +335,13 @@ def build_speaker_roster(
     # id from here on. No second authority context is created — this is the
     # same frozen object with one field assigned.
     bound_context = dataclasses.replace(
-        speaker_context, roster_snapshot_id=snapshot_id,
+        speaker_context,
+        roster_snapshot_id=snapshot_id,
+        roster_label_actor_pairs=tuple(
+            (entry.name, entry.actor_id)
+            for entry in surviving.entries
+            if entry.name and entry.actor_id
+        ),
     )
     return SpeakerRosterBuild(
         text=text,

@@ -309,6 +309,82 @@ def test_normalize_request_turn_sequences_works_without_executemany(monkeypatch)
     )
 
 
+def test_segment_compaction_provenance_serializes_and_hydrates(monkeypatch):
+    import json
+    from datetime import datetime, timezone
+
+    from virtual_context.storage import postgres as pg
+    from virtual_context.types import SegmentMetadata, StoredSegment
+
+    _FakePool.instances.clear()
+    monkeypatch.setattr(pg, "ConnectionPool", _FakePool)
+    store = pg.PostgresStore("postgresql://example")
+    conn = _FakePool.instances[0].conn
+    conn.executed.clear()
+    now = datetime(2026, 8, 22, tzinfo=timezone.utc)
+    segment = StoredSegment(
+        ref="seg-provenance",
+        conversation_id="conv",
+        primary_tag="medical",
+        tags=["medical"],
+        summary="Exact source summary.",
+        summary_tokens=4,
+        full_text="Exact source text.",
+        full_tokens=4,
+        metadata=SegmentMetadata(
+            canonical_turn_ids=["ct-1"],
+            source_mapping_complete=True,
+            source_speaker_labels=["BigTex"],
+            source_speaker_identity_count=1,
+            source_speaker_identity_fingerprint="speaker-proof",
+            source_audience_fingerprint="audience-proof",
+        ),
+        created_at=now,
+        start_timestamp=now,
+        end_timestamp=now,
+    )
+
+    store.store_segment(segment)
+
+    insert_params = next(
+        params for sql, params in conn.executed
+        if "INSERT INTO segments" in sql
+    )
+    stored_metadata = json.loads(insert_params[6])
+    assert stored_metadata["canonical_turn_ids"] == ["ct-1"]
+    assert stored_metadata["source_mapping_complete"] is True
+    assert stored_metadata["source_speaker_labels"] == ["BigTex"]
+    assert stored_metadata["source_speaker_identity_count"] == 1
+    assert stored_metadata["source_speaker_identity_fingerprint"] == "speaker-proof"
+    assert stored_metadata["source_audience_fingerprint"] == "audience-proof"
+
+    row = {
+        "ref": segment.ref,
+        "conversation_id": segment.conversation_id,
+        "primary_tag": segment.primary_tag,
+        "summary": segment.summary,
+        "summary_tokens": segment.summary_tokens,
+        "full_text": segment.full_text,
+        "full_tokens": segment.full_tokens,
+        "messages_json": "[]",
+        "metadata_json": json.dumps(stored_metadata),
+        "created_at": now.isoformat(),
+        "start_timestamp": now.isoformat(),
+        "end_timestamp": now.isoformat(),
+        "compaction_model": "test",
+        "compression_ratio": 1.0,
+    }
+    hydrated = pg._row_to_segment(row, ["medical"])
+    lightweight = pg._row_to_summary(row, ["medical"])
+    for value in (hydrated, lightweight):
+        assert value.metadata.canonical_turn_ids == ["ct-1"]
+        assert value.metadata.source_mapping_complete is True
+        assert value.metadata.source_speaker_labels == ["BigTex"]
+        assert value.metadata.source_speaker_identity_count == 1
+        assert value.metadata.source_speaker_identity_fingerprint == "speaker-proof"
+        assert value.metadata.source_audience_fingerprint == "audience-proof"
+
+
 # ---------------------------------------------------------------------------
 # fact_embeddings schema bootstrap (real Postgres; DSN-gated, run -n0)
 # ---------------------------------------------------------------------------

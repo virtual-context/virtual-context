@@ -21,7 +21,9 @@ import os
 import re
 import shlex
 import sys
+from collections import Counter
 from datetime import datetime, timezone
+from typing import Mapping
 
 from ..core.canonical_turns import STRIP_WHITESPACE
 
@@ -48,6 +50,239 @@ _SELECT_COLUMNS = (
     "(SELECT COALESCE(array_agg(tag ORDER BY tag), ARRAY[]::text[]) "
     " FROM segment_tags st WHERE st.segment_ref = segments.ref) AS tags"
 )
+
+
+def _identity_selection_sql(
+    since: str | None,
+    until: str | None,
+    after_ref: str | None,
+) -> str:
+    """Select the identity-audit population without changing prefix repair.
+
+    Identity damage is not a SQL text shape: subjectless prose can be unsafe,
+    while a summary containing a person's name can be safe.  The command must
+    therefore read the conversation's candidate population and classify it in
+    Python with the same detector used at model-visible read boundaries.
+    """
+    clauses = ["conversation_id = %(conversation_id)s"]
+    if since:
+        clauses.append("created_at::timestamptz >= %(since)s::timestamptz")
+    if until:
+        clauses.append("created_at::timestamptz < %(until)s::timestamptz")
+    if after_ref:
+        clauses.append("ref > %(after_ref)s")
+    return (
+        f"SELECT {_SELECT_COLUMNS} FROM segments "
+        f"WHERE {' AND '.join(clauses)} ORDER BY ref ASC"
+    )
+
+
+_GENERIC_SPEAKER_LABELS = frozenset({
+    "user", "member", "person", "patient", "client", "participant",
+    "requester", "speaker", "someone", "individual", "customer",
+    "assistant",
+})
+
+
+def _metadata_object(raw: object) -> tuple[dict, bool]:
+    """Return metadata and whether its stored representation was valid."""
+    if isinstance(raw, dict):
+        return raw, True
+    if not isinstance(raw, str):
+        return {}, False
+    try:
+        parsed = json.loads(raw or "{}")
+    except (TypeError, ValueError):
+        return {}, False
+    return (parsed, True) if isinstance(parsed, dict) else ({}, False)
+
+
+def _actor_fingerprint(actors: set[str]) -> str:
+    if not actors:
+        return ""
+    payload = b"vc-summary-speaker-set-v1\0" + b"\0".join(
+        actor.encode("utf-8") for actor in sorted(actors)
+    )
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _audience_fingerprint(scopes: set[tuple[str, str]]) -> str:
+    if len(scopes) != 1:
+        return ""
+    audience, channel = next(iter(scopes))
+    return hashlib.sha256(
+        ("vc-summary-audience-v1\0" + audience + "\0" + channel).encode(
+            "utf-8",
+        ),
+    ).hexdigest()
+
+
+def classify_identity_violation(
+    row: Mapping[str, object],
+    source_rows_by_id: Mapping[str, Mapping[str, object]] | None = None,
+) -> tuple[str, ...]:
+    """Return deterministic reasons an existing segment needs identity repair.
+
+    The lexical detector is only a secondary alarm.  A subjectless or passive
+    summary still needs positive proof: complete canonical-row mapping, one
+    durable human actor, at least one non-generic exact display label, and the
+    opaque actor/audience fingerprints emitted by current compaction.
+    """
+    from ..core.summary_identity import (
+        SUMMARY_ATTRIBUTION_QUARANTINE,
+        contains_ambiguous_human_referent,
+    )
+
+    reasons: list[str] = []
+    summary = row.get("summary")
+    summary_text = summary if isinstance(summary, str) else ""
+    if contains_ambiguous_human_referent(summary_text):
+        reasons.append("summary_ambiguous_human_referent")
+    if summary_text.strip() == SUMMARY_ATTRIBUTION_QUARANTINE:
+        reasons.append("summary_quarantined")
+
+    from ..types import (
+        AUDIENCE_ATTRIBUTION_VERSION,
+        strict_segment_identity_metadata,
+    )
+
+    metadata, valid_metadata = _metadata_object(row.get("metadata_json"))
+    if not valid_metadata:
+        reasons.append("metadata_invalid")
+    identity_metadata = strict_segment_identity_metadata(metadata)
+
+    if identity_metadata["source_mapping_complete"] is not True:
+        reasons.append("source_mapping_incomplete")
+    canonical_ids = identity_metadata["canonical_turn_ids"]
+    if not canonical_ids:
+        reasons.append("canonical_turn_ids_missing")
+
+    identity_count = identity_metadata["source_speaker_identity_count"]
+    if not identity_count:
+        reasons.append("speaker_identity_count_unproved")
+    elif identity_count != 1:
+        reasons.append("speaker_identity_not_single")
+
+    labels = identity_metadata["source_speaker_labels"]
+    valid_labels = [
+        value.strip()
+        for value in labels
+        if value.strip().casefold() not in _GENERIC_SPEAKER_LABELS
+    ]
+    if not valid_labels:
+        reasons.append("speaker_labels_missing_or_generic")
+
+    actor_proof = identity_metadata["source_speaker_identity_fingerprint"]
+    if not actor_proof.strip():
+        reasons.append("speaker_identity_fingerprint_missing")
+    audience_proof = identity_metadata["source_audience_fingerprint"]
+    if not audience_proof.strip():
+        reasons.append("audience_fingerprint_missing")
+
+    # Self-reported metadata is inventory input, not proof. Recompute the
+    # actor, label, and audience sets from the exact canonical source rows.
+    if source_rows_by_id is None:
+        reasons.append("canonical_source_proof_unavailable")
+        return tuple(dict.fromkeys(reasons))
+
+    actors: set[str] = set()
+    physical_labels: set[str] = set()
+    scopes: set[tuple[str, str]] = set()
+    physical_complete = bool(canonical_ids)
+    for canonical_id in canonical_ids:
+        source = source_rows_by_id.get(canonical_id)
+        if source is None:
+            physical_complete = False
+            continue
+        has_user = source.get("has_user_content") is True
+        has_assistant = source.get("has_assistant_content") is True
+        if not has_user and not has_assistant:
+            physical_complete = False
+            continue
+        audience = source.get("audience_conversation_id")
+        channel = source.get("origin_channel_id")
+        version = source.get("audience_attribution_version")
+        if (
+            type(audience) is not str
+            or not audience.strip()
+            or type(channel) is not str
+            or type(version) is not int
+            or version != AUDIENCE_ATTRIBUTION_VERSION
+        ):
+            physical_complete = False
+        else:
+            scopes.add((audience.strip(), channel.strip()))
+
+        if has_user:
+            actor = source.get("sender_actor_id")
+            label = source.get("sender")
+            if (
+                type(actor) is not str
+                or not actor.strip()
+            ):
+                physical_complete = False
+            else:
+                actors.add(actor.strip())
+                if (
+                    type(label) is str
+                    and label.strip()
+                    and label.strip().casefold() not in _GENERIC_SPEAKER_LABELS
+                ):
+                    physical_labels.add(label.strip())
+        if source.get("has_reply_target_body") is True:
+            subject_actor = source.get("reply_subject_actor_id")
+            subject_label = source.get("reply_subject_label")
+            if type(subject_actor) is not str or not subject_actor.strip():
+                physical_complete = False
+            else:
+                actors.add(subject_actor.strip())
+                if (
+                    type(subject_label) is str
+                    and subject_label.strip()
+                    and subject_label.strip().casefold()
+                    not in _GENERIC_SPEAKER_LABELS
+                ):
+                    physical_labels.add(subject_label.strip())
+
+    if not physical_complete:
+        reasons.append("canonical_source_mapping_incomplete")
+    if len(actors) != 1:
+        reasons.append("canonical_source_identity_not_single")
+    if not physical_labels:
+        reasons.append("canonical_source_labels_missing")
+    if len(scopes) != 1:
+        reasons.append("canonical_source_scope_not_single")
+    if identity_count != len(actors):
+        reasons.append("speaker_identity_count_mismatch")
+    if actor_proof != _actor_fingerprint(actors):
+        reasons.append("speaker_identity_fingerprint_mismatch")
+    if audience_proof != _audience_fingerprint(scopes):
+        reasons.append("audience_fingerprint_mismatch")
+    if set(valid_labels) != physical_labels:
+        reasons.append("speaker_labels_mismatch")
+    return tuple(reasons)
+
+
+def _json_string_list(raw: object) -> list[str]:
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw or "[]")
+        except (TypeError, ValueError):
+            return []
+    if not isinstance(raw, list):
+        return []
+    return [value for value in raw if isinstance(value, str) and value]
+
+
+def classify_tag_summary_identity_violation(
+    row: Mapping[str, object],
+) -> tuple[str, ...]:
+    """Name every populated unowned prose field in a tag summary."""
+    return tuple(
+        field
+        for field in ("summary", "description")
+        if isinstance(row.get(field), str) and str(row.get(field)).strip()
+    )
 
 
 def _selection_sql(include_short: bool, since: str | None, until: str | None,
@@ -204,7 +439,11 @@ def _fsync_parent_dir(path: str) -> None:
 def _checksums(conn, conversation_id: str) -> dict:
     seg = conn.execute(
         "SELECT count(*) AS n, "
-        "md5(COALESCE(string_agg(ref || summary, '' ORDER BY ref), '')) AS digest "
+        "md5(COALESCE(string_agg(concat_ws(chr(31), ref, summary, "
+        "metadata_json::text, (SELECT COALESCE(string_agg(tag, chr(30) "
+        "ORDER BY tag), '') FROM segment_tags st "
+        "WHERE st.segment_ref = segments.ref)), '' ORDER BY ref), '')) "
+        "AS digest "
         "FROM segments WHERE conversation_id = %s",
         (conversation_id,),
     ).fetchone()
@@ -217,6 +456,173 @@ def _checksums(conn, conversation_id: str) -> dict:
         "segments": {"count": seg["n"], "md5": seg["digest"]},
         "conversations": {"count": conv["n"], "max_updated": conv["max_updated"]},
     }
+
+
+def _identity_checksums(conn, conversation_id: str) -> dict:
+    """Checksums for every table read by the identity audit."""
+    checksums = _checksums(conn, conversation_id)
+    tags = conn.execute(
+        "SELECT count(*) AS n, "
+        "md5(COALESCE(string_agg(concat_ws(chr(31), tag, summary, "
+        "description, source_segment_refs::text), '' ORDER BY tag), '')) "
+        "AS digest "
+        "FROM tag_summaries WHERE conversation_id = %s",
+        (conversation_id,),
+    ).fetchone()
+    checksums["tag_summaries"] = {
+        "count": tags["n"], "md5": tags["digest"],
+    }
+    return checksums
+
+
+def _identity_dry_run(args) -> None:
+    """Read-only inventory of segment and rollup identity violations."""
+    dsn = _resolve_dsn(args)
+    if not dsn:
+        _fail("resolve_dsn", "no Postgres DSN (--postgres-dsn or DATABASE_URL)",
+              args.conversation_id)
+    sql = _identity_selection_sql(
+        getattr(args, "since", None),
+        getattr(args, "until", None),
+        getattr(args, "after_ref", None),
+    )
+    params = _params(args)
+    try:
+        with _connect(dsn, read_only=True) as conn:
+            before = _identity_checksums(conn, args.conversation_id)
+            rows = conn.execute(sql, params).fetchall()
+            source_ids: list[str] = []
+            for row in rows:
+                metadata, _valid = _metadata_object(row.get("metadata_json"))
+                source_ids.extend(
+                    strict_id
+                    for strict_id in _json_string_list(
+                        metadata.get("canonical_turn_ids"),
+                    )
+                )
+            source_rows = []
+            if source_ids:
+                source_rows = conn.execute(
+                    "SELECT canonical_turn_id, sender_actor_id, sender, "
+                    "audience_conversation_id, origin_channel_id, "
+                    "audience_attribution_version, reply_subject_actor_id, "
+                    "reply_subject_label, "
+                    "btrim(COALESCE(user_content, ''), %s) <> '' "
+                    "AS has_user_content, "
+                    "btrim(COALESCE(assistant_content, ''), %s) <> '' "
+                    "AS has_assistant_content, "
+                    "btrim(COALESCE(reply_target_body, ''), %s) <> '' "
+                    "AS has_reply_target_body "
+                    "FROM canonical_turns WHERE conversation_id = %s "
+                    "AND canonical_turn_id = ANY(%s)",
+                    (
+                        STRIP_WHITESPACE,
+                        STRIP_WHITESPACE,
+                        STRIP_WHITESPACE,
+                        args.conversation_id,
+                        list(dict.fromkeys(source_ids)),
+                    ),
+                ).fetchall()
+            tag_rows = conn.execute(
+                "SELECT tag, summary, description, source_segment_refs "
+                "FROM tag_summaries WHERE conversation_id = %s ORDER BY tag",
+                (args.conversation_id,),
+            ).fetchall()
+            after = _identity_checksums(conn, args.conversation_id)
+    except Exception as exc:  # noqa: BLE001
+        _fail("identity_violations_dry_run", repr(exc), args.conversation_id)
+
+    reason_counts: Counter[str] = Counter()
+    candidates: list[dict] = []
+    candidate_refs: set[str] = set()
+    affected_tags: set[str] = set()
+    source_rows_by_id = {
+        str(row.get("canonical_turn_id") or ""): row
+        for row in source_rows
+        if row.get("canonical_turn_id")
+    }
+    for row in rows:
+        reasons = classify_identity_violation(row, source_rows_by_id)
+        if not reasons:
+            continue
+        ref = str(row["ref"])
+        tags = sorted({
+            str(value) for value in (row.get("tags") or []) if value
+        })
+        candidates.append({"ref": ref, "tags": tags, "reasons": list(reasons)})
+        candidate_refs.add(ref)
+        affected_tags.update(tags)
+        reason_counts.update(reasons)
+
+    field_counts: Counter[str] = Counter()
+    affected_prose_field_counts: Counter[str] = Counter()
+    tag_reports: list[dict] = []
+    linked_count = 0
+    violation_count = 0
+    affected_tag_count = 0
+    for row in tag_rows:
+        tag = str(row.get("tag") or "")
+        source_refs = set(_json_string_list(row.get("source_segment_refs")))
+        linked = bool(source_refs & candidate_refs)
+        on_affected_tag = tag in affected_tags
+        violation_fields = classify_tag_summary_identity_violation(row)
+        affected_prose_fields = tuple(
+            field
+            for field in ("summary", "description")
+            if (linked or on_affected_tag)
+            and isinstance(row.get(field), str)
+            and str(row.get(field)).strip()
+        )
+        if linked:
+            linked_count += 1
+        if on_affected_tag:
+            affected_tag_count += 1
+        if violation_fields:
+            violation_count += 1
+            field_counts.update(violation_fields)
+        affected_prose_field_counts.update(affected_prose_fields)
+        if linked or on_affected_tag or violation_fields:
+            tag_reports.append({
+                "tag": tag,
+                "linked_to_selected_segment": linked,
+                "on_affected_tag": on_affected_tag,
+                "affected_prose_fields": list(affected_prose_fields),
+                "violation_fields": list(violation_fields),
+            })
+
+    print(json.dumps({
+        "status": "dry_run",
+        "mode": "identity_violations",
+        "conversation_id": args.conversation_id,
+        "server_enforced_read_only": True,
+        "scanned_segments": len(rows),
+        "selected": len(candidates),
+        "reason_counts": dict(sorted(reason_counts.items())),
+        "first_ref": candidates[0]["ref"] if candidates else None,
+        "last_ref": candidates[-1]["ref"] if candidates else None,
+        "segments": candidates,
+        "affected_tags": sorted(affected_tags),
+        "tag_summaries": {
+            "scanned": len(tag_rows),
+            "linked_to_selected_segments": linked_count,
+            "on_affected_tags": affected_tag_count,
+            "rows_with_field_violations": violation_count,
+            "field_violation_counts": dict(sorted(field_counts.items())),
+            "affected_prose_field_counts": dict(sorted(
+                affected_prose_field_counts.items()
+            )),
+            "rows": tag_reports,
+        },
+        "checksums_before": before,
+        "checksums_after": after,
+        "checksums_stable": before == after,
+        "apply_supported": False,
+        "note": (
+            "This mode inventories identity damage only. Safe apply requires "
+            "reconstructing exact audience-scoped canonical source rows and "
+            "actor rosters before regeneration; this build refuses to guess."
+        ),
+    }, indent=2))
 
 
 def _dry_run(args) -> None:
@@ -350,6 +756,20 @@ def _print_cascade_runbook(conversation_id: str, tags: list[str]) -> None:
 
 
 def cmd_admin_resummarize_segments(args) -> None:
+    if getattr(args, "identity_violations", False):
+        if args.apply:
+            _fail(
+                "identity_violations_apply",
+                "safe identity repair apply is not implemented: regeneration "
+                "must reconstruct exact audience-scoped canonical source rows "
+                "and actor rosters, then pass the current compactor identity "
+                "validator before CAS+journal writes; rerun without --apply "
+                "for the server-enforced read-only inventory",
+                args.conversation_id,
+            )
+        _identity_dry_run(args)
+        return
+
     if not args.apply:
         _dry_run(args)
         return

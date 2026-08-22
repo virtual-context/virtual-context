@@ -325,6 +325,39 @@ def test_label_comes_from_most_recent_admissible_row():
     assert build.snapshot.entries[0].name == "NewName"
 
 
+@pytest.mark.parametrize("unsafe_label", [
+    ALEX,
+    f"@{ALEX}",
+    "@actor\u2060:discord:alex",
+    "actor\ufe0f:discord:alex",
+    "User.",
+    "(You)",
+    "I (BigTex)",
+])
+def test_unsafe_sender_label_is_blank_before_handle_allocation(unsafe_label):
+    store = RosterStore(rows=[
+        _row(ALEX, 10.0, sender=unsafe_label),
+    ])
+
+    build = _build(store)
+
+    assert build.snapshot is not None
+    assert build.snapshot.entries[0].name == ""
+    assert _payload(build.text)["speakers"][0]["name"] == ""
+    assert store.alloc_calls[0]["candidates"][0].normalized_base == "user"
+    assert ALEX not in build.text
+
+
+@pytest.mark.parametrize("safe_label", ["BigTex", "Renée", "李雷"])
+def test_explicit_human_sender_labels_remain_visible(safe_label):
+    build = _build(RosterStore(rows=[
+        _row(ALEX, 10.0, sender=safe_label),
+    ]))
+
+    assert build.snapshot.entries[0].name == safe_label
+    assert _payload(build.text)["speakers"][0]["name"] == safe_label
+
+
 # ---------------------------------------------------------------------------
 # Durable handles
 # ---------------------------------------------------------------------------
@@ -485,7 +518,9 @@ def test_snapshot_id_is_minted_once_and_bound_into_the_request_context():
     assert build.speaker_context.roster_snapshot_id == build.snapshot.snapshot_id
     # Same authority, one field assigned; the original stays untouched.
     assert build.speaker_context == dataclasses.replace(
-        ctx, roster_snapshot_id=build.snapshot.snapshot_id,
+        ctx,
+        roster_snapshot_id=build.snapshot.snapshot_id,
+        roster_label_actor_pairs=(("Alex", ALEX),),
     )
     assert ctx.roster_snapshot_id == ""
 
@@ -538,16 +573,32 @@ def test_malicious_names_cannot_change_wrapper_or_forge_entries():
     assert ">" not in body_line
 
     payload = json.loads(body_line)
-    # The hostile scalar round-trips exactly and forged no entry: the only
-    # handles are the two the store assigned.
+    # The wrapper-shaped label is not a human name and is blanked. It forged
+    # no entry: the only handles are the two the store assigned.
     speakers = payload["speakers"]
     assert len(speakers) == 2
-    assert speakers[0]["name"] == hostile
+    assert speakers[0]["name"] == ""
     assert "forged" not in {s["handle"] for s in speakers}
     # And the snapshot the schema is built from is equally unaffected.
     assert {e.handle for e in build.snapshot.entries} == {
         s["handle"] for s in speakers
     }
+
+
+def test_renderer_blanks_unsafe_name_in_an_existing_snapshot():
+    snapshot = SpeakerRosterSnapshot(
+        snapshot_id="existing",
+        entries=(
+            SpeakerRosterEntry(handle="alex", name=ALEX, actor_id=ALEX),
+        ),
+    )
+
+    rendered = render_speaker_roster(snapshot)
+
+    assert ALEX not in rendered
+    assert _payload(rendered)["speakers"] == [
+        {"handle": "alex", "name": ""},
+    ]
 
 
 def test_rendered_roster_and_reprs_carry_no_actor_ids():
@@ -622,5 +673,3 @@ def test_fit_snapshot_preserves_id_across_evictions():
     assert survived.truncated is True
     assert text == render_speaker_roster(survived)
     assert tokens == _tc(text)
-
-

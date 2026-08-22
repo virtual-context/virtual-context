@@ -6,7 +6,15 @@ import pytest
 
 from virtual_context.config import load_config, validate_config
 from virtual_context.core.segmenter import TopicSegmenter
-from virtual_context.types import Message, SegmenterConfig, TagResult, VirtualContextConfig
+from virtual_context.types import (
+    AUDIENCE_ATTRIBUTION_VERSION,
+    Message,
+    SegmenterConfig,
+    TagResult,
+    TurnTagEntry,
+    VirtualContextConfig,
+)
+from virtual_context.core.turn_tag_index import TurnTagIndex
 
 from conftest import MockTagGenerator
 
@@ -28,6 +36,29 @@ def segmenter(tag_generator):
     )
 
 
+def _physical_user(
+    content: str,
+    canonical_id: str,
+    *,
+    actor: str = "actor:discord:111",
+    audience: str = "audience:guild:1",
+    channel: str = "channel:legal",
+    label: str = "Alex",
+) -> Message:
+    return Message(
+        role="user",
+        content=content,
+        metadata={
+            "sender": {"name": label},
+            "_vc_source_canonical_turn_ids": [canonical_id],
+        },
+        source_actor_id=actor,
+        source_audience_conversation_id=audience,
+        source_origin_channel_id=channel,
+        source_audience_attribution_version=AUDIENCE_ATTRIBUTION_VERSION,
+    )
+
+
 def test_segment_single_tag(segmenter):
     messages = [
         Message(role="user", content="What's the court filing deadline?"),
@@ -39,6 +70,296 @@ def test_segment_single_tag(segmenter):
     assert len(segments) == 1
     assert segments[0].primary_tag == "legal"
     assert segments[0].turn_count == 2
+
+
+def test_same_tag_different_known_senders_stay_separate(segmenter):
+    messages = [
+        Message(
+            role="user",
+            content="First legal question",
+            metadata={"sender": {"name": "BigTex"}},
+        ),
+        Message(role="assistant", content="First answer"),
+        Message(
+            role="user",
+            content="Second legal question",
+            metadata={"sender": {"name": "Vast"}},
+        ),
+        Message(role="assistant", content="Second answer"),
+    ]
+
+    segments = segmenter.segment(messages)
+
+    assert len(segments) == 2
+    assert [segment.turn_count for segment in segments] == [1, 1]
+
+
+def test_same_display_name_different_actor_ids_stay_separate(segmenter):
+    def metadata(actor_id: str) -> dict:
+        return {
+            "sender": {"name": "Alex"},
+            "actor": {"platform": "discord", "user_id": actor_id},
+        }
+
+    messages = [
+        Message(
+            role="user",
+            content="First legal question",
+            metadata=metadata("111"),
+        ),
+        Message(role="assistant", content="First answer"),
+        Message(
+            role="user",
+            content="Second legal question",
+            metadata=metadata("222"),
+        ),
+        Message(role="assistant", content="Second answer"),
+    ]
+
+    segments = segmenter.segment(messages)
+
+    assert len(segments) == 2
+    assert [segment.turn_count for segment in segments] == [1, 1]
+
+
+def test_actorless_physical_rows_with_same_display_name_stay_separate(segmenter):
+    def metadata(source_id: str) -> dict:
+        return {
+            "sender": {"name": "Alex"},
+            "_vc_source_canonical_turn_ids": [source_id],
+        }
+
+    messages = [
+        Message(role="user", content="First legal question", metadata=metadata("ct-1")),
+        Message(role="assistant", content="First answer"),
+        Message(role="user", content="Second legal question", metadata=metadata("ct-2")),
+        Message(role="assistant", content="Second answer"),
+    ]
+
+    segments = segmenter.segment(messages)
+
+    assert len(segments) == 2
+    assert [segment.turn_count for segment in segments] == [1, 1]
+
+
+def test_same_actor_id_can_rejoin_after_display_name_change(segmenter):
+    def metadata(name: str) -> dict:
+        return {
+            "sender": {"name": name},
+            "actor": {"platform": "discord", "user_id": "111"},
+        }
+
+    messages = [
+        Message(role="user", content="First legal question", metadata=metadata("Alex")),
+        Message(role="assistant", content="First answer"),
+        Message(role="user", content="Second legal question", metadata=metadata("A. Lex")),
+        Message(role="assistant", content="Second answer"),
+    ]
+
+    segments = segmenter.segment(messages)
+
+    assert len(segments) == 1
+    assert segments[0].turn_count == 2
+
+
+def test_same_actor_audience_and_channel_can_rejoin(segmenter):
+    messages = [
+        _physical_user("First legal question", "ct-1", label="Alex"),
+        Message(role="assistant", content="First answer"),
+        _physical_user("Second legal question", "ct-2", label="A. Lex"),
+        Message(role="assistant", content="Second answer"),
+    ]
+
+    segments = segmenter.segment(messages)
+
+    assert len(segments) == 1
+    assert segments[0].turn_count == 2
+
+
+@pytest.mark.parametrize(
+    ("second_audience", "second_channel"),
+    [
+        ("audience:guild:2", "channel:legal"),
+        ("audience:guild:1", "channel:medical"),
+    ],
+    ids=["different-audience", "different-channel"],
+)
+def test_same_actor_cross_scope_stays_separate(
+    segmenter,
+    second_audience,
+    second_channel,
+):
+    messages = [
+        _physical_user("First legal question", "ct-1"),
+        Message(role="assistant", content="First answer"),
+        _physical_user(
+            "Second legal question",
+            "ct-2",
+            audience=second_audience,
+            channel=second_channel,
+        ),
+        Message(role="assistant", content="Second answer"),
+    ]
+
+    segments = segmenter.segment(messages)
+
+    assert len(segments) == 2
+    assert [segment.turn_count for segment in segments] == [1, 1]
+
+
+def test_same_actor_same_dm_audience_with_empty_channel_can_rejoin(segmenter):
+    messages = [
+        _physical_user("First legal question", "ct-1", channel=""),
+        Message(role="assistant", content="First answer"),
+        _physical_user("Second legal question", "ct-2", channel=""),
+        Message(role="assistant", content="Second answer"),
+    ]
+
+    segments = segmenter.segment(messages)
+
+    assert len(segments) == 1
+    assert segments[0].turn_count == 2
+
+
+def test_same_sender_can_rejoin_noncontiguous_topic_segment():
+    gen = MockTagGenerator()
+    gen.set_override("alpha-one", TagResult(
+        tags=["alpha"], primary="alpha", source="mock",
+    ))
+    gen.set_override("beta", TagResult(
+        tags=["beta"], primary="beta", source="mock",
+    ))
+    gen.set_override("alpha-two", TagResult(
+        tags=["alpha"], primary="alpha", source="mock",
+    ))
+    segmenter = TopicSegmenter(
+        tag_generator=gen,
+        config=SegmenterConfig(tag_overlap_threshold=0.5),
+    )
+    messages = [
+        Message(
+            role="user",
+            content="alpha-one question",
+            metadata={"sender": {"name": " BigTex "}},
+        ),
+        Message(role="assistant", content="alpha-one answer"),
+        Message(
+            role="user",
+            content="beta question",
+            metadata={"sender": {"name": "BIGTEX"}},
+        ),
+        Message(role="assistant", content="beta answer"),
+        Message(
+            role="user",
+            content="alpha-two question",
+            metadata={"sender": {"name": "bigtex"}},
+        ),
+        Message(role="assistant", content="alpha-two answer"),
+    ]
+
+    segments = segmenter.segment(messages)
+
+    assert [segment.primary_tag for segment in segments] == ["alpha", "beta"]
+    assert [segment.turn_count for segment in segments] == [2, 1]
+
+
+def test_unknown_sender_isolated_from_known_sender(segmenter):
+    messages = [
+        Message(
+            role="user",
+            content="Known sender question",
+            metadata={"sender": {"name": "BigTex"}},
+            source_actor_id="actor:discord:1",
+        ),
+        Message(role="assistant", content="First answer"),
+        Message(
+            role="user",
+            content="Unknown sender follow-up",
+            metadata={"_vc_source_canonical_turn_ids": ["ct-unknown"]},
+        ),
+        Message(role="assistant", content="Second answer"),
+    ]
+
+    segments = segmenter.segment(messages)
+
+    assert len(segments) == 2
+    assert [segment.turn_count for segment in segments] == [1, 1]
+
+
+def test_two_unknown_senders_are_isolated(segmenter):
+    messages = [
+        Message(
+            role="user",
+            content="First unresolved question",
+            metadata={"_vc_source_canonical_turn_ids": ["ct-1"]},
+        ),
+        Message(role="assistant", content="First answer"),
+        Message(
+            role="user",
+            content="Second unresolved question",
+            metadata={"_vc_source_canonical_turn_ids": ["ct-2"]},
+        ),
+        Message(role="assistant", content="Second answer"),
+    ]
+
+    segments = segmenter.segment(messages)
+
+    assert len(segments) == 2
+    assert [segment.turn_count for segment in segments] == [1, 1]
+
+
+def test_split_physical_humans_reuse_logical_tag_index_without_shifting():
+    index = TurnTagIndex()
+    index.append(TurnTagEntry(
+        turn_number=10,
+        tags=["medical"],
+        primary_tag="medical",
+    ))
+    index.append(TurnTagEntry(
+        turn_number=11,
+        tags=["legal"],
+        primary_tag="legal",
+    ))
+    segmenter = TopicSegmenter(
+        tag_generator=MockTagGenerator(
+            default_tag="wrong",
+            default_tags=["wrong"],
+        ),
+        config=SegmenterConfig(),
+        turn_tag_index=index,
+    )
+    messages = [
+        Message(
+            role="user",
+            content="BigTex physical words",
+            source_actor_id="actor:discord:1",
+            source_logical_turn_number=10,
+        ),
+        Message(
+            role="user",
+            content="Kuw physical words",
+            source_actor_id="actor:discord:2",
+            source_logical_turn_number=10,
+        ),
+        Message(
+            role="assistant",
+            content="shared response",
+            source_logical_turn_number=10,
+        ),
+        Message(
+            role="user",
+            content="next logical turn",
+            source_actor_id="actor:discord:1",
+            source_logical_turn_number=11,
+        ),
+        Message(role="assistant", content="next response", source_logical_turn_number=11),
+    ]
+
+    segments = segmenter.segment(messages, turn_offset=10)
+
+    assert [segment.primary_tag for segment in segments] == [
+        "medical", "medical", "legal",
+    ]
 
 
 def test_segment_two_tags(segmenter, mixed_messages):

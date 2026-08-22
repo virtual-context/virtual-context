@@ -54,6 +54,9 @@ def _qr(
             canonical_turn_id=canonical_turn_id,
             source_role=source_role,
             actor_id=actor_id,
+            audience_conversation_id="c",
+            audience_attribution_version=1,
+            origin_channel_id="",
         )
     return qr
 
@@ -157,16 +160,16 @@ class TestSpeakerBranchPhysicalDedupe:
         results = _candidates(store, _SemanticStub(), speaker_context=ctx)
         assert [r.text for r in results] == ["requester lane", "subject lane"]
 
-    def test_candidates_without_provenance_fall_back_to_the_turn_key(self):
-        # A source that projected no physical provenance may only ever
-        # collapse MORE, never surface duplicates it cannot distinguish.
+    def test_candidates_without_provenance_fail_closed(self):
+        # A speaker-aware source that projected no physical provenance has
+        # not proved request scope and cannot surface either candidate.
         ctx = _context()
         store = _LexStore([
             _qr("first", 4),
             _qr("second", 4),
         ])
         results = _candidates(store, _SemanticStub(), speaker_context=ctx)
-        assert [r.text for r in results] == ["first"]
+        assert results == []
 
 
 class TestFindQuoteThreading:

@@ -4,6 +4,7 @@ import pytest
 from unittest.mock import MagicMock, patch
 from datetime import datetime, timezone
 
+from virtual_context.core.summary_identity import SUMMARY_ATTRIBUTION_QUARANTINE
 from virtual_context.types import (
     CompactionReport,
     RetrievalResult,
@@ -34,6 +35,16 @@ class TestMCPServerTools:
                          summary="Test summary", summary_tokens=50,
                          created_at=datetime(2024, 1, 1, tzinfo=timezone.utc)),
         ]
+        engine.retrieve.return_value = RetrievalResult(summaries=[
+            StoredSummary(
+                ref="seg-1",
+                primary_tag="database",
+                tags=["database"],
+                summary="Test summary",
+                summary_tokens=50,
+                created_at=datetime(2024, 1, 1, tzinfo=timezone.utc),
+            ),
+        ])
         return engine
 
     @patch("virtual_context.mcp.server._get_engine")
@@ -43,6 +54,9 @@ class TestMCPServerTools:
         from virtual_context.mcp.server import recall_context
         result = recall_context("What about the database?")
         assert "virtual-context" in result
+        assert "Test summary" not in result
+        assert SUMMARY_ATTRIBUTION_QUARANTINE in result
+        assert 'source_ref: "seg-1"' in result
 
     @patch("virtual_context.mcp.server._get_engine")
     def test_recall_context_with_active_tags(self, mock_get_engine):
@@ -51,7 +65,37 @@ class TestMCPServerTools:
 
         from virtual_context.mcp.server import recall_context
         recall_context("database query", active_tags=["database"])
-        engine.transform.assert_called_with("database query", active_tags=["database"])
+        engine.retrieve.assert_called_with("database query", active_tags=["database"])
+
+    @patch("virtual_context.mcp.server._get_engine")
+    def test_recall_context_quarantines_named_and_passive_summary_prose(
+        self, mock_get_engine,
+    ):
+        engine = self._mock_engine()
+        engine.retrieve.return_value = RetrievalResult(summaries=[
+            StoredSummary(
+                ref="seg-named",
+                primary_tag="health",
+                tags=["health"],
+                summary="BigTex stopped tesamorelin.",
+            ),
+            StoredSummary(
+                ref="seg-passive",
+                primary_tag="health",
+                tags=["health"],
+                summary="Stopped tesamorelin after side effects.",
+            ),
+        ])
+        mock_get_engine.return_value = engine
+
+        from virtual_context.mcp.server import recall_context
+        result = recall_context("tesamorelin")
+
+        assert "BigTex stopped tesamorelin." not in result
+        assert "Stopped tesamorelin after side effects." not in result
+        assert result.count(SUMMARY_ATTRIBUTION_QUARANTINE) == 2
+        assert 'source_ref: "seg-named"' in result
+        assert 'source_ref: "seg-passive"' in result
 
     @patch("virtual_context.mcp.server._get_engine")
     def test_compact_context(self, mock_get_engine):
@@ -104,7 +148,10 @@ class TestMCPServerTools:
 
         from virtual_context.mcp.server import get_domain_summaries
         result = get_domain_summaries("database")
-        assert "Test summary" in result
+        assert "Test summary" not in result
+        assert SUMMARY_ATTRIBUTION_QUARANTINE in result
+        assert "## seg-1" in result
+        assert "Tags: database" in result
 
     @patch("virtual_context.mcp.server._get_engine")
     def test_get_domain_summaries_empty(self, mock_get_engine):

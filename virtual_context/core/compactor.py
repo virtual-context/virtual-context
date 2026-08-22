@@ -3,18 +3,22 @@
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import json
 import logging
 import time
-from typing import Callable, NamedTuple
+from typing import TYPE_CHECKING, Callable, NamedTuple
 
 from ..types import (
+    AUTHOR_ROLE_ASSISTANT,
     CompactionResult,
     CompactorConfig,
     Fact,
     FactSignal,
     LLMProvider,
     Message,
+    AUDIENCE_ATTRIBUTION_VERSION,
+    SOURCE_CANONICAL_TURN_IDS_KEY,
     SegmentMetadata,
     StoredSummary,
     TaggedSegment,
@@ -24,9 +28,300 @@ from ..types import (
     get_sender_name,
 )
 from .llm_utils import format_code_ref, normalize_code_refs, normalize_tag, parse_llm_json
+from .summary_identity import (
+    SUMMARY_ATTRIBUTION_QUARANTINE,
+    contains_ambiguous_human_referent,
+    human_label_collision_key,
+    is_safe_human_label,
+)
 from .telemetry import TelemetryLedger
 
+if TYPE_CHECKING:
+    from ..types import ActorRoster
+
 logger = logging.getLogger(__name__)
+
+
+_SEGMENT_IDENTITY_CONTRACT = """\
+SUMMARY SPEAKER IDENTITY CONTRACT (applies only to the JSON "summary" value):
+- The exact display labels for named human speakers in this segment are: {labels}.
+- An empty list means no exact human display label was proved. When labels are
+  present, refer to those humans only by those exact display labels.
+- Never assign a personal statement to a generic singular label formed from
+  user, member, or person. If no exact label is proved, describe the topic
+  without assigning the statement to a generic or guessed human.
+- Do not invent, normalize, or substitute a display label. "Assistant" remains
+  the assistant role and is not one of the named human speakers.
+This contract does not change the separate structured-fact schema."""
+
+
+_TAG_IDENTITY_CONTRACT = """\
+SPEAKER IDENTITY CONTRACT:
+- In both "summary" and "description", retain exact source display labels for
+  personal statements. Do not replace a named human with a generic singular
+  label formed from user, member, or person.
+- If a source has no display label, describe the topic without assigning its
+  personal statements to a generic or guessed human."""
+
+
+_TAG_SUMMARY_IDENTITY_QUARANTINE = (
+    "[tag summary withheld: source prose lacks explicit speaker attribution]"
+)
+
+
+def _complete_roster_actor_ids(roster: object | None) -> frozenset[str]:
+    """Durable human actors proved by a complete physical-row roster.
+
+    This identity set is control-plane data only. It is used for admission and
+    context selection and is never formatted into an LLM request or persisted.
+    """
+    if (
+        roster is None
+        or not getattr(roster, "complete", False)
+        or getattr(roster, "has_unidentified_user_row", False)
+    ):
+        return frozenset()
+
+    actors: set[str] = set()
+    saw_human_lane = False
+    for lane in list(getattr(roster, "lanes", []) or []):
+        if getattr(lane, "role", "") == AUTHOR_ROLE_ASSISTANT:
+            continue
+        if not str(getattr(lane, "text", "") or "").strip():
+            continue
+        saw_human_lane = True
+        actor = str(getattr(lane, "actor_id", "") or "").strip()
+        if not actor:
+            return frozenset()
+        actors.add(actor)
+    return frozenset(actors) if saw_human_lane else frozenset()
+
+
+def _named_complete_roster_labels(roster: object | None) -> tuple[str, ...]:
+    """Exact human display labels proved by one complete compaction roster.
+
+    Actor ids are read only to reject a display-label collision; they are never
+    formatted or returned. A partially named roster cannot describe the
+    complete set of humans whose words the segment contains.
+    """
+    if not _complete_roster_actor_ids(roster):
+        return ()
+
+    labels_by_key: dict[str, str] = {}
+    actors_by_label: dict[str, set[str]] = {}
+    saw_human_lane = False
+    for lane in list(getattr(roster, "lanes", []) or []):
+        if getattr(lane, "role", "") == AUTHOR_ROLE_ASSISTANT:
+            continue
+        if not str(getattr(lane, "text", "") or "").strip():
+            continue
+        saw_human_lane = True
+        raw_label = getattr(lane, "speaker_label", "")
+        if not isinstance(raw_label, str):
+            return ()
+        label = raw_label.strip()
+        actor = str(getattr(lane, "actor_id", "") or "").strip()
+        if not actor or not is_safe_human_label(label, actor):
+            return ()
+        label_key = human_label_collision_key(label)
+        actors_by_label.setdefault(label_key, set()).add(actor)
+        if len(actors_by_label[label_key]) > 1:
+            return ()
+        labels_by_key.setdefault(label_key, label)
+    return tuple(labels_by_key.values()) if saw_human_lane else ()
+
+
+def _roster_actor_fingerprint(roster: object | None) -> str:
+    """Opaque equality proof for a complete actor set, never model-facing."""
+    actors = _complete_roster_actor_ids(roster)
+    if not actors:
+        return ""
+    payload = b"vc-summary-speaker-set-v1\0" + b"\0".join(
+        actor.encode("utf-8") for actor in sorted(actors)
+    )
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _segment_source_scope_keys(segment: TaggedSegment) -> frozenset[tuple[str, str]]:
+    """Complete audience/channel scopes carried by physical user messages."""
+    scopes: set[tuple[str, str]] = set()
+    saw_user = False
+    for message in segment.messages:
+        if message.role != "user" or not message.content.strip():
+            continue
+        saw_user = True
+        source_ids = list(
+            (message.metadata or {}).get(SOURCE_CANONICAL_TURN_IDS_KEY) or []
+        )
+        audience = str(getattr(
+            message, "source_audience_conversation_id", "",
+        ) or "").strip()
+        channel = str(getattr(
+            message, "source_origin_channel_id", "",
+        ) or "").strip()
+        version = int(getattr(
+            message, "source_audience_attribution_version", 0,
+        ) or 0)
+        if (
+            not source_ids
+            or not audience
+            or version != AUDIENCE_ATTRIBUTION_VERSION
+        ):
+            return frozenset()
+        scopes.add((audience, channel))
+    return frozenset(scopes) if saw_user else frozenset()
+
+
+def _segment_scope_fingerprint(segment: TaggedSegment) -> str:
+    scopes = _segment_source_scope_keys(segment)
+    if len(scopes) != 1:
+        return ""
+    audience, channel = next(iter(scopes))
+    payload = (
+        "vc-summary-audience-v1\0" + audience + "\0" + channel
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _metadata_value(metadata: object, key: str) -> object:
+    if isinstance(metadata, dict):
+        return metadata.get(key)
+    return getattr(metadata, key, None)
+
+
+def _summary_source_labels(summary: StoredSummary) -> tuple[str, ...]:
+    """Read optional, model-independent display labels from segment metadata."""
+    metadata = getattr(summary, "metadata", None)
+    if metadata is None:
+        return ()
+
+    labels_by_key: dict[str, str] = {}
+    for key in (
+        "source_speaker_labels",
+        "speaker_labels",
+        "source_speakers",
+        "speaker_label",
+    ):
+        raw = _metadata_value(metadata, key)
+        if isinstance(raw, set):
+            values = sorted(raw, key=str)
+        elif isinstance(raw, (list, tuple)):
+            values = raw
+        else:
+            values = [raw]
+        for value in values:
+            if value is None:
+                continue
+            if not isinstance(value, str):
+                return ()
+            label = value.strip()
+            if not label:
+                continue
+            if not is_safe_human_label(label):
+                return ()
+            label_key = human_label_collision_key(label)
+            prior = labels_by_key.get(label_key)
+            if prior is not None and prior != label:
+                # Stored summary metadata has no actor-to-label mapping. Two
+                # compatibility-equivalent spellings therefore cannot prove
+                # whether one actor changed presentation or two actors share
+                # an indistinguishable name; fail closed.
+                return ()
+            labels_by_key.setdefault(label_key, label)
+    return tuple(labels_by_key.values())
+
+
+def _format_tag_rollup_source(summary: StoredSummary) -> str:
+    labels = _summary_source_labels(summary)
+    source_suffix = (
+        ", source display labels: "
+        + json.dumps(list(labels), ensure_ascii=False)
+        if labels else ""
+    )
+    text = (
+        f"[Segment {summary.ref}, tags: {', '.join(summary.tags)}"
+        f"{source_suffix}]\n{summary.summary}"
+    )
+    code_refs = getattr(summary.metadata, "code_refs", None) or []
+    if code_refs:
+        text += "\nRefs: " + ", ".join(
+            format_code_ref(ref) for ref in code_refs
+        )
+    return text
+
+
+def _safe_tag_rollup_fallback(summaries: list[StoredSummary]) -> str:
+    safe_parts = [
+        _format_tag_rollup_source(summary)
+        for summary in summaries
+        if not contains_ambiguous_human_referent(summary.summary)
+    ]
+    if not safe_parts:
+        return _TAG_SUMMARY_IDENTITY_QUARANTINE
+    fallback = "\n\n---\n\n".join(safe_parts)[:4000]
+    return (
+        fallback
+        if not contains_ambiguous_human_referent(fallback)
+        else _TAG_SUMMARY_IDENTITY_QUARANTINE
+    )
+
+
+def _ambiguous_tag_rollup_fields(parsed: dict) -> tuple[str, ...]:
+    return tuple(
+        field
+        for field in ("summary", "description")
+        if contains_ambiguous_human_referent(parsed.get(field, ""))
+    )
+
+
+def _single_proved_tag_rollup_label(
+    summaries: list[StoredSummary],
+) -> str:
+    """One exact human label shared by every source, or an empty string.
+
+    A multi-human rollup cannot be semantically attribution-validated with a
+    lexical detector: a model could move a claim between two real allowed
+    names and produce no forbidden phrase. Missing legacy label provenance is
+    equally unprovable. Both cases therefore bypass generative synthesis and
+    use the bounded, source-separated fallback.
+    """
+    if not summaries:
+        return ""
+    labels: set[str] = set()
+    fingerprints: set[str] = set()
+    scope_fingerprints: set[str] = set()
+    for summary in summaries:
+        metadata = getattr(summary, "metadata", None)
+        if int(_metadata_value(
+            metadata,
+            "source_speaker_identity_count",
+        ) or 0) != 1:
+            return ""
+        fingerprint = str(_metadata_value(
+            metadata,
+            "source_speaker_identity_fingerprint",
+        ) or "").strip()
+        if not fingerprint:
+            return ""
+        fingerprints.add(fingerprint)
+        if len(fingerprints) > 1:
+            return ""
+        scope_fingerprint = str(_metadata_value(
+            metadata,
+            "source_audience_fingerprint",
+        ) or "").strip()
+        if not scope_fingerprint:
+            return ""
+        scope_fingerprints.add(scope_fingerprint)
+        if len(scope_fingerprints) > 1:
+            return ""
+        source_labels = _summary_source_labels(summary)
+        if not source_labels:
+            return ""
+        labels.update(source_labels)
+        if len(labels) > 1:
+            return ""
+    return next(iter(labels)) if len(labels) == 1 else ""
 
 
 class SegmentSummaryRequest(NamedTuple):
@@ -56,15 +351,15 @@ preserves all key decisions, action items, entities, and names.
 Keep the chronological progression. The summary should be comprehensive enough
 that someone could resume the conversation from it.
 
-Preserve the emotional and conversational tone across sessions — if the user was excited about
-a breakthrough, frustrated with a problem, or casually exploring, that texture should survive
-the rollup. A summary that reads like a dry changelog loses the human context that makes
-retrieval feel natural.
+Preserve the emotional and conversational tone across sessions — excitement about
+a breakthrough, frustration with a problem, or casual exploration should survive
+the rollup. A summary that reads like a dry changelog loses the human context that
+makes retrieval feel natural. Retain the exact source display label for every named speaker.
 
-IMPORTANT: When a segment mentions something personal the user disclosed about
-themselves (experiences, preferences, life events, possessions, relationships),
-ALWAYS preserve that disclosure in the summary even if it is tangential to the
-tag's main topic. Personal disclosures are high-value context that must survive rollup.
+IMPORTANT: Preserve personal disclosures (experiences, preferences, life events,
+possessions, relationships) even when tangential to the tag's main topic, and
+attribute each disclosure to its exact named source when that label is present.
+Personal disclosures are high-value context that must survive rollup.
 
 CRITICAL — Any text involving numbers is mandatory and absolutely essential to the summary, always include them exactly as in the source.
 Dates, prices, any number is important and should not be modified.
@@ -78,7 +373,7 @@ Any text involving numbers is mandatory and absolutely essential to the descript
 Dates, prices, any number is important and should not be modified.
 Never round, approximate, or paraphrase a number (e.g. "2 hours" must stay "2 hours", not
 "about an hour"; "$45" must stay "$45", not "around $50").
-Always preserve the user's role and relationship to the topic — phrases like
+Always preserve each named speaker's role and relationship to the topic — phrases like
 "I led", "my project", "solo project", "I built", "I'm responsible for" are
 critical personal context. Never paraphrase these into passive voice or drop them
 in favor of technical details.
@@ -140,9 +435,10 @@ Dates, prices, any number is important and should not be modified.
 Never round, approximate, or paraphrase a number (e.g. "2 hours" must stay "2 hours", not
 "about an hour"; "$45" must stay "$45", not "around $50").
 
-When the user states what they are doing, have done, or where they keep/store something,
-preserve that as a direct assertion, not as a plan or intention. Conversely, when the conversation
-is about a future activity the summary must clearly indicate this is planning/discussion, not a completed activity.
+When a named speaker states what they are doing, have done, or where they keep/store something,
+preserve that as a direct assertion with the exact speaker label, not as a plan or intention.
+Conversely, when the conversation is about a future activity the summary must clearly indicate
+this is planning/discussion, not a completed activity.
 
 Preserve polarity, negation, intent, and causal rationale exactly. Never turn "does not want",
 "wants to remain infertile", "did not happen", or similar negative statements into their
@@ -150,17 +446,17 @@ positive opposites. If the segment is only a greeting, acknowledgement, or short
 only that content; do not infer or import the topic, recommendation, or outcome from nearby context.
 
 Capture the tone and texture of the conversation — was it casual/playful, urgent/stressed,
-analytical/technical, emotional/vulnerable, collaborative/brainstorming? Preserve the user's
-voice: if they were sarcastic, enthusiastic, frustrated, or reflective, that should come
+analytical/technical, emotional/vulnerable, collaborative/brainstorming? Preserve each named
+speaker's voice: if they were sarcastic, enthusiastic, frustrated, or reflective, that should come
 through in the summary, not be flattened into neutral reportage.
 
-Always preserve the user's role and relationship to the topic — phrases like
+Always preserve each named speaker's role and relationship to the topic — phrases like
 "I led", "my project", "solo project", "I built", "I'm responsible for" are
 critical personal context. Never paraphrase these into passive voice or drop them
 in favor of technical details.
 
-When speakers are identified by name in the conversation (e.g. "Alice (14:30):"), always use their
-actual name in the summary. Never replace a named speaker with "User" or "the user".
+When speakers are identified by a display label in the conversation, always use that exact
+label in the summary. Never replace a named speaker with "User" or "the user".
 "Assistant" is a valid speaker label — do not replace it with a person's name from elsewhere.
 
 Be concise but retain enough detail that the conversation could be resumed from this summary.
@@ -188,7 +484,7 @@ Also extract facts from the RAW CONVERSATION TEXT above (not from your summary).
 The summary may omit details — facts must capture ALL substantive information
 from every speaker in the conversation, even details not included in the summary.
 For each fact:
-- "subject": who — use the actual name when conversation metadata identifies the sender (e.g. if metadata shows sender "Bob", the subject is "Bob", not "user"). When no name is available, use "user". For people mentioned but not speaking, use their name.
+- "subject": who — use the exact display label when conversation metadata identifies the sender. When no name is available, use "user". For people mentioned but not speaking, use their name.
 - "verb": the EXACT action verb from the conversation text (e.g. "led", "built", "prefers", "lives in", "ordered")
   VERB RULE: Use the verb that matches the actual event described.
   When someone says "we were given X", the verb is "were given" — NOT "mentioned" or "discussed".
@@ -459,16 +755,30 @@ class DomainCompactor:
             "Compacting %d segments (%d workers)...",
             len(segments), min(self.config.max_concurrent_summaries, len(segments)),
         )
-        # Build preceding-conversation context for pronoun resolution.
-        # Each segment gets the raw text of the preceding segments (up to
-        # ~5000 chars) so the compactor can resolve pronouns like "we",
-        # "they", "he/she" using nearby conversational context.
+        # Build preceding-conversation context for pronoun resolution. Raw
+        # context is admitted only across segments that independently prove
+        # the same sole physical actor. In a group conversation, adjacent
+        # topical segments can belong to different people; giving one human's
+        # words to another segment's summarizer enabled named claim transfer
+        # that no generic-referent detector can catch.
         _MAX_CONTEXT_CHARS = 5000
-        prev_contexts: list[str] = [""]  # first segment has no predecessor
-        for i in range(1, len(segments)):
+        prev_contexts: list[str] = []
+        for i, segment in enumerate(segments):
+            current_actors = _complete_roster_actor_ids(rosters.get(segment.id))
+            current_scopes = _segment_source_scope_keys(segment)
+            if len(current_actors) != 1 or len(current_scopes) != 1:
+                prev_contexts.append("")
+                continue
             parts: list[str] = []
             total_chars = 0
             for j in range(i - 1, -1, -1):
+                prior_actors = _complete_roster_actor_ids(
+                    rosters.get(segments[j].id)
+                )
+                if prior_actors != current_actors:
+                    continue
+                if _segment_source_scope_keys(segments[j]) != current_scopes:
+                    continue
                 part = self._format_conversation(segments[j].messages)
                 if total_chars + len(part) > _MAX_CONTEXT_CHARS:
                     # Add truncated tail of this segment to fill remaining budget
@@ -556,15 +866,59 @@ class DomainCompactor:
                         # Create a fallback result
                         segment = segments[idx]
                         conversation_text = self._format_conversation(segment.messages)
+                        fallback_summary = conversation_text[:2000]
+                        roster = rosters.get(segment.id)
+                        if (
+                            contains_ambiguous_human_referent(fallback_summary)
+                            or len(_complete_roster_actor_ids(roster)) != 1
+                            or not _named_complete_roster_labels(roster)
+                            or len(_segment_source_scope_keys(segment)) != 1
+                        ):
+                            fallback_summary = SUMMARY_ATTRIBUTION_QUARANTINE
                         results[idx] = CompactionResult(
                             segment_id=segment.id,
                             primary_tag=segment.primary_tag,
                             tags=segment.tags,
-                            summary=conversation_text[:2000],
-                            summary_tokens=self.token_counter(conversation_text[:2000]),
+                            summary=fallback_summary,
+                            summary_tokens=self.token_counter(fallback_summary),
                             original_tokens=self.token_counter(conversation_text),
                             compression_ratio=0.0,
+                            metadata=SegmentMetadata(
+                                turn_count=segment.turn_count,
+                                source_speaker_labels=list(
+                                    _named_complete_roster_labels(roster)
+                                ),
+                                source_speaker_identity_count=len(
+                                    _complete_roster_actor_ids(roster)
+                                ),
+                                source_speaker_identity_fingerprint=(
+                                    _roster_actor_fingerprint(roster)
+                                ),
+                                source_audience_fingerprint=(
+                                    _segment_scope_fingerprint(segment)
+                                ),
+                                time_span=(
+                                    segment.start_timestamp,
+                                    segment.end_timestamp,
+                                ),
+                                session_date=segment.session_date,
+                            ),
                             full_text=conversation_text,
+                            messages=[
+                                {
+                                    "role": message.role,
+                                    "content": message.content,
+                                    "timestamp": (
+                                        message.timestamp.isoformat()
+                                        if message.timestamp else None
+                                    ),
+                                    **(
+                                        {"metadata": message.metadata}
+                                        if message.metadata else {}
+                                    ),
+                                }
+                                for message in segment.messages
+                            ],
                             timestamp=segment.start_timestamp,
                         )
                     logger.info(
@@ -595,6 +949,7 @@ class DomainCompactor:
         code_refs: list[dict] | None = None,
         prev_context: str = "",
         conversation_text: str | None = None,
+        roster: "ActorRoster | None" = None,
     ) -> "SegmentSummaryRequest":
         """The exact summarize request compaction would issue for *segment*.
 
@@ -712,6 +1067,14 @@ class DomainCompactor:
             if getattr(self.config, "code_mode", False):
                 prompt += CODE_FACT_EXTRACTION_PROMPT
 
+        # Post-template by design: generic, code-mode, and custom tag prompts
+        # receive the same speaker contract.  Only exact display labels from
+        # durable roster lanes are exposed; actor ids are never read here.
+        roster_labels = _named_complete_roster_labels(roster)
+        prompt += "\n\n" + _SEGMENT_IDENTITY_CONTRACT.format(
+            labels=json.dumps(list(roster_labels), ensure_ascii=False),
+        )
+
         system = (
             "You are a conversation summarizer. Output valid JSON only. "
             "No markdown fences, no extra text. Preserve negation and intent exactly. "
@@ -746,6 +1109,7 @@ class DomainCompactor:
             fact_signals=fact_signals,
             code_refs=code_refs,
             prev_context=prev_context,
+            roster=roster,
         )
         conversation_text = request.conversation_text
         original_tokens = request.original_tokens
@@ -761,6 +1125,7 @@ class DomainCompactor:
             conversation_text[:300].replace("\n", "\\n"),
         )
 
+        used_source_fallback = False
         try:
             t0 = time.time()
             response_text, usage = self.llm.complete(
@@ -771,8 +1136,8 @@ class DomainCompactor:
             duration_ms = (time.time() - t0) * 1000
             self._log_usage("segment_summarize", duration_ms=duration_ms, usage=usage)
             parsed = self._parse_response(response_text)
-            _reject_reason = self._unusable_reason(
-                parsed.get("summary", ""), conversation_text,
+            _reject_reason = self._segment_summary_reject_reason(
+                parsed.get("summary", ""), conversation_text, roster,
             )
             if _reject_reason is not None:
                 # A tiny acknowledgement whose generated "summary" is longer
@@ -797,6 +1162,7 @@ class DomainCompactor:
                         "date_references": [],
                         "refined_tags": segment.tags,
                     }
+                    used_source_fallback = True
                 else:
                     logger.warning(
                         "Unusable LLM summary for segment %s (reason=%s); retrying once",
@@ -813,6 +1179,13 @@ class DomainCompactor:
                               "present; otherwise summarize only the supplied conversation. Do not "
                               "import prior context, invert negation or intent, or make the summary "
                               "longer than the source segment."
+                            + (
+                                " Your previous summary used an ambiguous generic human referent. "
+                                "Rewrite every human reference with an exact display label listed "
+                                "in the speaker identity contract."
+                                if _reject_reason == "ambiguous_human_referent"
+                                else ""
+                            )
                         ),
                         user=prompt,
                         max_tokens=(
@@ -826,8 +1199,8 @@ class DomainCompactor:
                         usage=usage,
                     )
                     parsed = self._parse_response(response_text)
-                    _retry_reason = self._unusable_reason(
-                        parsed.get("summary", ""), conversation_text,
+                    _retry_reason = self._segment_summary_reject_reason(
+                        parsed.get("summary", ""), conversation_text, roster,
                     )
                     if _retry_reason is not None:
                         logger.warning(
@@ -844,6 +1217,7 @@ class DomainCompactor:
                             "date_references": [],
                             "refined_tags": segment.tags,
                         }
+                        used_source_fallback = True
         except Exception as e:
             logger.warning(f"LLM summarization failed for segment {segment.id}: {e}")
             parsed = {
@@ -854,8 +1228,47 @@ class DomainCompactor:
                 "date_references": [],
                 "refined_tags": segment.tags,
             }
+            used_source_fallback = True
 
         summary = parsed.get("summary", "")
+        # Final storage boundary. Source-text fallback is normally the safest
+        # recovery because it preserves exact source bytes. A transcript that
+        # lacks a complete named roster uses the neutral ``Source`` prefix;
+        # that avoids inventing a human label but still cannot prove who said
+        # the words. Retain it in ``full_text``/``messages`` and quarantine
+        # only its derived summary field.
+        if contains_ambiguous_human_referent(summary):
+            logger.error(
+                "Unsafe segment summary reached final storage gate for %s; "
+                "withholding derived prose",
+                segment.id,
+            )
+            summary = SUMMARY_ATTRIBUTION_QUARANTINE
+            parsed["summary"] = summary
+        if used_source_fallback and not (
+            len(_complete_roster_actor_ids(roster)) == 1
+            and len(_named_complete_roster_labels(roster)) >= 1
+            and len(_segment_source_scope_keys(segment)) == 1
+        ):
+            logger.error(
+                "Source fallback lacks one complete actor+audience scope for %s; "
+                "withholding derived prose",
+                segment.id,
+            )
+            summary = SUMMARY_ATTRIBUTION_QUARANTINE
+            parsed["summary"] = summary
+        if roster is not None and not (
+            len(_complete_roster_actor_ids(roster)) == 1
+            and len(_named_complete_roster_labels(roster)) >= 1
+            and len(_segment_source_scope_keys(segment)) == 1
+        ):
+            logger.error(
+                "Segment summary lacks one complete actor+audience scope for %s; "
+                "withholding derived prose",
+                segment.id,
+            )
+            summary = SUMMARY_ATTRIBUTION_QUARANTINE
+            parsed["summary"] = summary
         summary_tokens = self.token_counter(summary)
 
         # DIAGNOSTIC: log compactor output
@@ -885,6 +1298,12 @@ class DomainCompactor:
             date_references=parsed.get("date_references", []),
             code_refs=parsed_code_refs,
             turn_count=segment.turn_count,
+            source_speaker_labels=list(_named_complete_roster_labels(roster)),
+            source_speaker_identity_count=len(
+                _complete_roster_actor_ids(roster)
+            ),
+            source_speaker_identity_fingerprint=_roster_actor_fingerprint(roster),
+            source_audience_fingerprint=_segment_scope_fingerprint(segment),
             time_span=(segment.start_timestamp, segment.end_timestamp),
             session_date=segment.session_date,
         )
@@ -1002,11 +1421,8 @@ class DomainCompactor:
           Attribution then comes from the lane's canonical row or reply edge.
         """
         from ..types import (
-            AUTHOR_ROLE_ASSISTANT,
             AUTHOR_ROLE_REQUESTER,
-            AUTHOR_ROLE_SUBJECT,
             AUTHOR_ROLE_UNATTRIBUTED,
-            AUTHOR_VERSION_REPLY_LANE,
             AUTHOR_VERSION_SOLE_ACTOR,
         )
 
@@ -1049,7 +1465,6 @@ class DomainCompactor:
         """
         from ..types import (
             AUTHOR_ROLE_ASSISTANT,
-            AUTHOR_ROLE_SUBJECT,
             AUTHOR_VERSION_REPLY_LANE,
         )
 
@@ -1205,6 +1620,43 @@ class DomainCompactor:
                     if block.get("type") == "tool_use" and "id" in block:
                         tool_name_map[block["id"]] = block.get("name", "")
 
+        # A label can be individually well-formed yet still be ambiguous in
+        # this transcript (for example ``Alex`` and fullwidth ``Ａｌｅｘ`` on two
+        # actors).  Build one normalized ownership map before formatting so
+        # the raw conversation and the identity contract enforce the same
+        # collision boundary.  Missing actor proof is never repaired from the
+        # display string.
+        actors_by_label: dict[str, set[str]] = {}
+        canonical_label_by_key: dict[str, str] = {}
+        unresolved_labels: set[str] = set()
+        for message in messages:
+            if message.role != "user":
+                continue
+            sender_name = get_sender_name(message.metadata)
+            if not isinstance(sender_name, str):
+                continue
+            label = sender_name.strip()
+            if not is_safe_human_label(label):
+                continue
+            label_key = human_label_collision_key(label)
+            canonical_label_by_key.setdefault(label_key, label)
+            actor = str(message.source_actor_id or "").strip()
+            if not actor:
+                # A display string is not identity proof.  If any occurrence
+                # of this normalized label lacks an actor, no occurrence may
+                # claim the label for this transcript.
+                unresolved_labels.add(label_key)
+                continue
+            actors_by_label.setdefault(label_key, set()).add(actor)
+            if not is_safe_human_label(label, actor):
+                # This exact string is an actor id for at least one row.  Do
+                # not let a second row make the same visible label printable.
+                unresolved_labels.add(label_key)
+        colliding_labels = {
+            label_key for label_key, actors in actors_by_label.items()
+            if len(actors) > 1
+        } | unresolved_labels
+
         lines: list[str] = []
         # Prepend session date header from the first timestamped message
         first_ts = next((m.timestamp for m in messages if m.timestamp), None)
@@ -1214,7 +1666,26 @@ class DomainCompactor:
             ts = ""
             if m.timestamp:
                 ts = f" ({m.timestamp.strftime('%H:%M')})"
-            label = get_sender_name(m.metadata) or m.role.capitalize()
+            if m.role == "user":
+                sender_name = get_sender_name(m.metadata)
+                actor = str(m.source_actor_id or "").strip()
+                if (
+                    isinstance(sender_name, str)
+                    and actor
+                    and is_safe_human_label(sender_name, actor)
+                ):
+                    label_key = human_label_collision_key(sender_name)
+                    label = (
+                        canonical_label_by_key[label_key]
+                        if label_key not in colliding_labels
+                        else "Source"
+                    )
+                else:
+                    label = "Source"
+            else:
+                # Sender metadata is meaningful only for a physical human
+                # lane. Other roles keep their fixed protocol label.
+                label = m.role.capitalize()
             if m.raw_content:
                 parts = self._render_raw_content(m.raw_content, tool_name_map)
                 lines.append(f"{label}{ts}: {parts}")
@@ -1317,6 +1788,22 @@ class DomainCompactor:
     def _is_unusable_summary(cls, summary: object, source_text: str) -> bool:
         """Reject malformed summaries and obvious context-import overshoot."""
         return cls._unusable_reason(summary, source_text) is not None
+
+    @classmethod
+    def _segment_summary_reject_reason(
+        cls,
+        summary: object,
+        source_text: str,
+        roster: "ActorRoster | None",
+    ) -> str | None:
+        """Fail closed on generic people even when provenance is incomplete."""
+        # ``roster`` remains explicit in this boundary because it controls the
+        # companion prompt contract; acceptance itself must not become fail-open
+        # merely because an old row lacks complete identity metadata.
+        _ = roster
+        if contains_ambiguous_human_referent(summary):
+            return "ambiguous_human_referent"
+        return cls._unusable_reason(summary, source_text)
 
     @classmethod
     def _unusable_reason(cls, summary: object, source_text: str) -> str | None:
@@ -1443,7 +1930,7 @@ class DomainCompactor:
                     tag = tags_to_build[idx]
                     logger.error(f"Tag summary build failed for '{tag}': {e}")
                     summaries = tag_to_summaries.get(tag, [])
-                    fallback_text = "\n\n".join(s.summary for s in summaries)[:4000]
+                    fallback_text = _safe_tag_rollup_fallback(summaries)
                     results[idx] = TagSummary(
                         tag=tag,
                         summary=fallback_text,
@@ -1477,16 +1964,7 @@ class DomainCompactor:
         generated_by_turn_id: str = "",
     ) -> TagSummary:
         combined = "\n\n---\n\n".join(
-            (
-                f"[Segment {s.ref}, tags: {', '.join(s.tags)}]\n"
-                f"{s.summary}"
-                + (
-                    "\nRefs: " + ", ".join(format_code_ref(ref) for ref in s.metadata.code_refs)
-                    if getattr(s.metadata, "code_refs", None)
-                    else ""
-                )
-            )
-            for s in summaries
+            _format_tag_rollup_source(summary) for summary in summaries
         )
         combined_tokens = self.token_counter(combined)
         target_tokens = max(
@@ -1505,12 +1983,38 @@ class DomainCompactor:
             target_tokens=target_tokens,
             segment_summaries=combined,
         )
+        prompt += "\n\n" + _TAG_IDENTITY_CONTRACT
 
         system = (
             "You are a conversation summarizer. Output valid JSON only. "
             "No markdown fences, no extra text."
         )
 
+        fallback_text = _safe_tag_rollup_fallback(summaries)
+        if not _single_proved_tag_rollup_label(summaries):
+            logger.info(
+                "Skipping generative tag rollup for '%s': source speaker "
+                "provenance is missing or not single-human",
+                tag,
+            )
+            return TagSummary(
+                tag=tag,
+                summary=fallback_text,
+                description="",
+                summary_tokens=self.token_counter(fallback_text),
+                source_segment_refs=[s.ref for s in summaries],
+                source_turn_numbers=sorted(set(turn_numbers)),
+                source_canonical_turn_ids=list(dict.fromkeys(canonical_turn_ids or [])),
+                code_refs=_collect_code_refs(
+                    *[getattr(s.metadata, "code_refs", []) for s in summaries]
+                ),
+                covers_through_turn=max_turn,
+                covers_through_canonical_turn_id=(
+                    list(dict.fromkeys(canonical_turn_ids or []))[-1]
+                    if canonical_turn_ids else ""
+                ),
+                generated_by_turn_id=generated_by_turn_id,
+            )
         try:
             t0 = time.time()
             response_text, usage = self.llm.complete(
@@ -1521,12 +2025,65 @@ class DomainCompactor:
             duration_ms = (time.time() - t0) * 1000
             self._log_usage("tag_rollup", duration_ms=duration_ms, usage=usage)
             parsed = self._parse_response(response_text)
+            ambiguous_fields = _ambiguous_tag_rollup_fields(parsed)
+            if ambiguous_fields:
+                logger.warning(
+                    "Ambiguous human referent in tag rollup '%s' fields=%s; "
+                    "retrying once",
+                    tag,
+                    ",".join(ambiguous_fields),
+                )
+                retry_started = time.time()
+                response_text, usage = self.llm.complete(
+                    system=(
+                        system
+                        + " Your previous response used an ambiguous generic human "
+                          "referent in: "
+                        + ", ".join(ambiguous_fields)
+                        + ". Rewrite both summary and description using only exact "
+                          "source display labels. If no label is supplied, omit the "
+                          "personal attribution rather than guessing."
+                    ),
+                    user=prompt,
+                    max_tokens=(
+                        self.config.max_summary_tokens
+                        + self.config.llm_token_overhead
+                    ),
+                )
+                self._log_usage(
+                    "tag_rollup_retry",
+                    duration_ms=(time.time() - retry_started) * 1000,
+                    usage=usage,
+                )
+                parsed = self._parse_response(response_text)
+                retry_fields = _ambiguous_tag_rollup_fields(parsed)
+                if retry_fields:
+                    logger.warning(
+                        "Ambiguous human referent persisted in tag rollup '%s' "
+                        "fields=%s; using safe source fallback",
+                        tag,
+                        ",".join(retry_fields),
+                    )
+                    parsed = {"summary": fallback_text, "description": ""}
         except Exception as e:
             logger.warning(f"LLM tag summary rollup failed for '{tag}': {e}")
-            parsed = {"summary": combined[:4000]}
+            parsed = {"summary": fallback_text, "description": ""}
 
         summary_text = parsed.get("summary", "")
         description = parsed.get("description", "")
+        # Final storage boundary: no control-flow or parsing change above may
+        # turn an unsafe retry into persisted prose.
+        if (
+            contains_ambiguous_human_referent(summary_text)
+            or contains_ambiguous_human_referent(description)
+        ):
+            logger.error(
+                "Unsafe tag rollup reached final storage gate for '%s'; "
+                "using safe source fallback",
+                tag,
+            )
+            summary_text = fallback_text
+            description = ""
         code_refs = _collect_code_refs(
             parsed.get("code_refs"),
             *[getattr(s.metadata, "code_refs", []) for s in summaries],

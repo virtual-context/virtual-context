@@ -68,6 +68,7 @@ from ..types import (
     WorkingSetEntry,
     channel_excerpt_prefix,
     strip_channel_hash,
+    strict_segment_identity_metadata,
     CARD_CROSS_CONTEXT_KINDS,
     CARD_KINDS,
     CARD_SCOPES,
@@ -609,6 +610,51 @@ def _escape_like(text: str) -> str:
     return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+def _speaker_canonical_scope_sql(
+    speaker_context: SpeakerRetrievalContext,
+    conversation_id: str | None,
+    *,
+    prefix: str = "",
+) -> tuple[str, list[object]] | None:
+    """Return the exact request-owned canonical-row predicate.
+
+    This is the PostgreSQL mirror of SQLite's physical candidate gate.  It
+    is intentionally independent of model tool arguments and is composed
+    into each query before ordering or limiting.
+    """
+    if not getattr(speaker_context, "eligible", False):
+        return None
+    owner = (speaker_context.owner_conversation_id or "").strip()
+    audience = (speaker_context.audience_conversation_id or "").strip()
+    if not owner or not audience:
+        return None
+    if conversation_id is not None and (conversation_id or "").strip() != owner:
+        return None
+
+    column = f"{prefix}." if prefix else ""
+    sql = (
+        f" AND {column}conversation_id = %s"
+        f" AND {column}audience_conversation_id = %s"
+        f" AND {column}audience_attribution_version = %s"
+    )
+    params: list[object] = [
+        owner, audience, AUDIENCE_ATTRIBUTION_VERSION,
+    ]
+    channel_scope = (
+        speaker_context.audience_channel_scope or "channel"
+    ).strip()
+    if channel_scope == "conversation":
+        if not (speaker_context.request_origin_channel_id or "").strip():
+            return None
+        sql += f" AND BTRIM(COALESCE({column}origin_channel_id, '')) <> ''"
+    elif channel_scope == "channel":
+        sql += f" AND COALESCE({column}origin_channel_id, '') = %s"
+        params.append((speaker_context.audience_channel_id or "").strip())
+    else:
+        return None
+    return sql, params
+
+
 # Normative SQL for the compaction-backlog detection query per
 # ``specs/compaction-backlog-sweeper.md`` §3.1. Declared at module
 # level so the inspector and the test bundle can pin it without
@@ -812,6 +858,7 @@ def _build_turn_excerpt(
 
 def _row_to_segment(row: dict, tags: list[str]) -> StoredSegment:
     metadata_raw = json.loads(row["metadata_json"])
+    identity_metadata = strict_segment_identity_metadata(metadata_raw)
     return StoredSegment(
         ref=row["ref"],
         conversation_id=row["conversation_id"],
@@ -829,14 +876,22 @@ def _row_to_segment(row: dict, tags: list[str]) -> StoredSegment:
             date_references=metadata_raw.get("date_references", []),
             code_refs=metadata_raw.get("code_refs", []),
             turn_count=metadata_raw.get("turn_count", 0),
-            canonical_turn_ids=metadata_raw.get("canonical_turn_ids", []),
+            canonical_turn_ids=identity_metadata["canonical_turn_ids"],
+            source_speaker_labels=identity_metadata["source_speaker_labels"],
+            source_speaker_identity_count=identity_metadata[
+                "source_speaker_identity_count"
+            ],
+            source_speaker_identity_fingerprint=identity_metadata[
+                "source_speaker_identity_fingerprint"
+            ],
+            source_audience_fingerprint=identity_metadata[
+                "source_audience_fingerprint"
+            ],
             start_turn_number=metadata_raw.get("start_turn_number", -1),
             end_turn_number=metadata_raw.get("end_turn_number", -1),
             generated_by_turn_id=metadata_raw.get("generated_by_turn_id", ""),
             session_date=metadata_raw.get("session_date", ""),
-            source_mapping_complete=bool(
-                metadata_raw.get("source_mapping_complete", False)
-            ),
+            source_mapping_complete=identity_metadata["source_mapping_complete"],
         ),
         created_at=_str_to_dt(row["created_at"]),
         start_timestamp=_str_to_dt(row["start_timestamp"]),
@@ -848,6 +903,7 @@ def _row_to_segment(row: dict, tags: list[str]) -> StoredSegment:
 
 def _row_to_summary(row: dict, tags: list[str]) -> StoredSummary:
     metadata_raw = json.loads(row["metadata_json"])
+    identity_metadata = strict_segment_identity_metadata(metadata_raw)
     return StoredSummary(
         ref=row["ref"],
         primary_tag=row["primary_tag"],
@@ -862,14 +918,22 @@ def _row_to_summary(row: dict, tags: list[str]) -> StoredSummary:
             date_references=metadata_raw.get("date_references", []),
             code_refs=metadata_raw.get("code_refs", []),
             turn_count=metadata_raw.get("turn_count", 0),
-            canonical_turn_ids=metadata_raw.get("canonical_turn_ids", []),
+            canonical_turn_ids=identity_metadata["canonical_turn_ids"],
+            source_speaker_labels=identity_metadata["source_speaker_labels"],
+            source_speaker_identity_count=identity_metadata[
+                "source_speaker_identity_count"
+            ],
+            source_speaker_identity_fingerprint=identity_metadata[
+                "source_speaker_identity_fingerprint"
+            ],
+            source_audience_fingerprint=identity_metadata[
+                "source_audience_fingerprint"
+            ],
             start_turn_number=metadata_raw.get("start_turn_number", -1),
             end_turn_number=metadata_raw.get("end_turn_number", -1),
             generated_by_turn_id=metadata_raw.get("generated_by_turn_id", ""),
             session_date=metadata_raw.get("session_date", ""),
-            source_mapping_complete=bool(
-                metadata_raw.get("source_mapping_complete", False)
-            ),
+            source_mapping_complete=identity_metadata["source_mapping_complete"],
         ),
         created_at=_str_to_dt(row["created_at"]),
         start_timestamp=_str_to_dt(row["start_timestamp"]),
@@ -3618,6 +3682,18 @@ class PostgresStore(ContextStore):
                 "code_refs": getattr(segment.metadata, "code_refs", []),
                 "turn_count": segment.metadata.turn_count,
                 "canonical_turn_ids": getattr(segment.metadata, "canonical_turn_ids", []),
+                "source_speaker_labels": getattr(
+                    segment.metadata, "source_speaker_labels", [],
+                ),
+                "source_speaker_identity_count": int(getattr(
+                    segment.metadata, "source_speaker_identity_count", 0,
+                ) or 0),
+                "source_speaker_identity_fingerprint": str(getattr(
+                    segment.metadata, "source_speaker_identity_fingerprint", "",
+                ) or ""),
+                "source_audience_fingerprint": str(getattr(
+                    segment.metadata, "source_audience_fingerprint", "",
+                ) or ""),
                 "start_turn_number": getattr(segment.metadata, "start_turn_number", -1),
                 "end_turn_number": getattr(segment.metadata, "end_turn_number", -1),
                 "generated_by_turn_id": getattr(segment.metadata, "generated_by_turn_id", ""),
@@ -8288,6 +8364,12 @@ class PostgresStore(ContextStore):
         Every candidate carries ``SourceProvenance`` projected from the exact
         physical row that matched, before dedupe, merging, or reranking.
         """
+        request_scope = _speaker_canonical_scope_sql(
+            speaker_context, conversation_id,
+        )
+        if request_scope is None:
+            return []
+        scope_sql, scope_params = request_scope
         _sc = getattr(self, "search_config", None)
         _ctx_chars = _sc.excerpt_context_chars if _sc else 200
         pattern = f"%{query}%"
@@ -8359,9 +8441,8 @@ class PostgresStore(ContextStore):
                             OR (sender ILIKE %s ESCAPE '\\'
                                 AND BTRIM(COALESCE(user_content, '')) <> ''))"""
             params: list[object] = [pattern, pattern, sender_pattern]
-            if conversation_id is not None:
-                sql += " AND conversation_id = %s"
-                params.append(conversation_id)
+            sql += scope_sql
+            params.extend(scope_params)
             chan_sql, chan_params = _channel_filter()
             sql += chan_sql
             params.extend(chan_params)
@@ -8442,9 +8523,8 @@ class PostgresStore(ContextStore):
                      WHERE reply_target_body ILIKE %s
                        AND BTRIM(COALESCE(reply_target_body, '')) <> ''"""
             params = [pattern]
-            if conversation_id is not None:
-                sql += " AND conversation_id = %s"
-                params.append(conversation_id)
+            sql += scope_sql
+            params.extend(scope_params)
             chan_sql, chan_params = _channel_filter()
             sql += chan_sql
             params.extend(chan_params)
@@ -8678,23 +8758,21 @@ class PostgresStore(ContextStore):
         is deliberately not projected here (``-1``): the physical hydration
         lookup supplies presentation ordinals from the row itself.
         """
-        owner = speaker_context.owner_conversation_id or ""
-        if owner:
-            if conversation_id is not None and conversation_id != owner:
-                return []
-            scope_id: str | None = owner
-        else:
-            scope_id = conversation_id
+        request_scope = _speaker_canonical_scope_sql(
+            speaker_context, conversation_id, prefix="ct",
+        )
+        if request_scope is None:
+            return []
+        scope_sql, scope_params = request_scope
         sql = """SELECT ctc.conversation_id, ctc.canonical_turn_id, ctc.side,
                         ctc.chunk_index, ctc.text, ctc.embedding_json
                  FROM canonical_turn_chunks ctc
                  JOIN canonical_turns ct
                    ON ct.conversation_id = ctc.conversation_id
-                  AND ct.canonical_turn_id = ctc.canonical_turn_id"""
-        params: list[object] = []
-        if scope_id is not None:
-            sql += " WHERE ctc.conversation_id = %s"
-            params.append(scope_id)
+                  AND ct.canonical_turn_id = ctc.canonical_turn_id
+                 WHERE 1 = 1"""
+        sql += scope_sql
+        params = list(scope_params)
         sql += " ORDER BY ctc.conversation_id, ct.sort_key, ctc.side, ctc.chunk_index"
         with self.pool.connection() as conn:
             rows = conn.execute(sql, params).fetchall()
@@ -9593,6 +9671,12 @@ class PostgresStore(ContextStore):
         audience = (speaker_context.audience_conversation_id or "").strip()
         if not audience:
             return []
+        request_scope = _speaker_canonical_scope_sql(
+            speaker_context, conversation_id,
+        )
+        if request_scope is None:
+            return []
+        scope_sql, scope_params = request_scope
 
         _sc = getattr(self, "search_config", None)
         _ctx_chars = _sc.excerpt_context_chars if _sc else 200
@@ -9605,15 +9689,9 @@ class PostgresStore(ContextStore):
                         audience_conversation_id, audience_attribution_version
                  FROM canonical_turns_ordinal
                  WHERE sender_actor_id = %s
-                   AND TRIM(COALESCE(user_content, '')) <> ''
-                   AND audience_conversation_id = %s
-                   AND audience_attribution_version = %s"""
-        params: list[object] = [
-            actor, audience, AUDIENCE_ATTRIBUTION_VERSION,
-        ]
-        if conversation_id:
-            sql += " AND conversation_id = %s"
-            params.append(conversation_id)
+                   AND TRIM(COALESCE(user_content, '')) <> ''"""
+        sql += scope_sql
+        params: list[object] = [actor, *scope_params]
         # The cast is guarded INSIDE a CASE rather than beside the regex in
         # the same AND chain: SQL does not promise predicate evaluation
         # order, so a sibling ``CAST(... AS BIGINT)`` may be evaluated
@@ -11900,7 +11978,13 @@ class PostgresStore(ContextStore):
         """
         if not keys:
             return {}
-        owner = speaker_context.owner_conversation_id or ""
+        request_scope = _speaker_canonical_scope_sql(
+            speaker_context, None,
+        )
+        if request_scope is None:
+            return {}
+        scope_sql, scope_params = request_scope
+        owner = (speaker_context.owner_conversation_id or "").strip()
         by_conversation: dict[str, list[str]] = {}
         for conversation_id, canonical_turn_id in keys:
             if not conversation_id or not canonical_turn_id:
@@ -11916,7 +12000,7 @@ class PostgresStore(ContextStore):
         with self.pool.connection() as conn:
             for conversation_id, turn_ids in by_conversation.items():
                 rows = conn.execute(
-                    """SELECT canonical_turn_id, conversation_id, turn_number, turn_group_number,
+                    f"""SELECT canonical_turn_id, conversation_id, turn_number, turn_group_number,
                               sort_key, turn_hash, hash_version,
                               normalized_user_text, normalized_assistant_text,
                               user_content, assistant_content,
@@ -11932,8 +12016,9 @@ class PostgresStore(ContextStore):
                               source_batch_id, created_at, updated_at
                        FROM canonical_turns_ordinal
                        WHERE conversation_id = %s
-                         AND canonical_turn_id = ANY(%s)""",
-                    (conversation_id, turn_ids),
+                         AND canonical_turn_id = ANY(%s)
+                       {scope_sql}""",
+                    (conversation_id, turn_ids, *scope_params),
                 ).fetchall()
                 for row in rows:
                     parsed = _row_to_canonical_turn(row)
