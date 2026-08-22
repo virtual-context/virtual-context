@@ -4207,7 +4207,10 @@ class CompactionPipeline:
                             _deleted, _inserted, result.primary_tag, _seg_ref,
                         )
                     else:
-                        logger.info("  Stored %d facts for segment %s", _inserted, result.primary_tag)
+                        logger.info(
+                            "  Stored %d facts for segment %s ref=%s",
+                            _inserted, result.primary_tag, _seg_ref,
+                        )
                     # Embed-on-write: only for facts actually inserted. The
                     # DELETE half of replace_facts_for_segment cascades old
                     # vectors via the FK. A (0, 0) return (guard mismatch at
