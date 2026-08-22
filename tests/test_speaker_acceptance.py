@@ -294,7 +294,7 @@ def test_dm_handle_namespace_is_separate(rig):
         == ["sania", "omar", "yursil"]
 
 
-def test_speaker_only_with_stale_snapshot_degrades_with_warning(rig):
+def test_speaker_only_with_stale_snapshot_fails_closed(rig):
     import dataclasses
 
     stale = dataclasses.replace(rig.snapshot, snapshot_id="snap-stale")
@@ -305,9 +305,12 @@ def test_speaker_only_with_stale_snapshot_degrades_with_warning(rig):
         roster_snapshot=stale,
     )
     got = json.loads(out)
-    assert got["found"] is True
+    assert got["found"] is False
+    assert got["results"] == []
     assert got["filter_applied"] is False
-    assert "no attribution filter" in got["warning"].lower()
+    assert got["speaker_hint"] == "unresolved"
+    assert "current speaker roster" in got["warning"].lower()
+    assert got["message"] == "No exact speaker-filtered search was performed."
     assert "pre_filter_matching_count" not in got
     assert "excluded_other_speakers" not in got
     assert "excluded_unknown_speaker" not in got

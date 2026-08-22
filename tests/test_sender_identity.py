@@ -235,8 +235,8 @@ class TestTurnTagEntrySender:
 
 
 class TestEndToEndSenderIdentity:
-    def test_format_conversation_with_real_envelope(self):
-        """Full pipeline: envelope with sender -> compactor sees real name."""
+    def test_format_conversation_with_unproved_envelope_uses_neutral_source(self):
+        """An untrusted envelope label is not durable speaker proof."""
         from virtual_context.proxy._envelope import _extract_envelope_metadata
         from virtual_context.core.compactor import DomainCompactor
         from virtual_context.types import CompactorConfig, get_sender_name
@@ -254,7 +254,8 @@ class TestEndToEndSenderIdentity:
 
         compactor = DomainCompactor(llm_provider=None, config=CompactorConfig())
         formatted = compactor._format_conversation([msg, asst])
-        assert "Sania" in formatted
+        assert "Sania" not in formatted
+        assert formatted.startswith("Source: What about charlotte")
         assert "User:" not in formatted
         assert "charlotte tilbury" in formatted
         assert get_sender_name(meta) == "Sania"
@@ -343,7 +344,8 @@ class TestEnvelopeTimestamps:
 
         ts = datetime(2026, 3, 17, 0, 35, tzinfo=timezone.utc)
         msg = Message(role="user", content="Hello", timestamp=ts,
-                      metadata={"sender": {"name": "Sania"}})
+                      metadata={"sender": {"name": "Sania"}},
+                      source_actor_id="actor:discord:sania")
         asst = Message(role="assistant", content="Hi", timestamp=ts)
         compactor = DomainCompactor(llm_provider=None, config=CompactorConfig())
         formatted = compactor._format_conversation([msg, asst])
