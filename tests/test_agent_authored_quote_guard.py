@@ -481,3 +481,79 @@ def test_a_non_mapping_config_value_is_ignored_not_crashed_on():
     from virtual_context.config import load_config
     cfg = load_config(config_dict={"agent_actor_ids": "actor:discord:1485"})
     assert cfg.agent_actor_ids == {}
+
+
+# ---------------------------------------------------------------------------
+# Can the not_agent branch fire through the PRODUCTION entry point?
+#
+# The unit test above calls _quote_is_agent_output directly, which bypasses
+# the `if not target_present:` gate at the call site. These drive
+# _build_actor_roster instead, which is what compaction actually calls.
+# ---------------------------------------------------------------------------
+
+def _target_row(message_id: str = "m-1"):
+    """A row that IS the quoted message, so target_present becomes True."""
+    return CanonicalTurnRow(
+        conversation_id=CONV, canonical_turn_id="target",
+        user_content="I take 500mg of berberine daily",
+        sender_actor_id=MEMBER,
+        source_message_id=message_id,
+        audience_conversation_id="guild", origin_channel_id=CHAN,
+    )
+
+
+def test_not_agent_fires_through_build_actor_roster():
+    """OUTCOME 1: the branch is reachable by the production entry point."""
+    segment, rows = _reply_quoting_actor(MEMBER)
+    pipeline = _pipeline(_Ledger(known=set()))
+    pipeline._config.agent_actor_ids = AGENT_MAP
+    roster = pipeline._build_actor_roster(segment, rows, {"discord": AGENT})
+    counts = pipeline._agent_quote_counts
+    assert counts[CompactionPipeline.QUOTE_NOT_AGENT] == 1, counts
+    assert counts[CompactionPipeline.QUOTE_AGENT_AUTHORED] == 0, counts
+    # and it declines to suppress: the member's words survive
+    assert len(_subject_lanes(roster)) == 1
+
+
+def test_negative_control_the_same_harness_still_suppresses_the_agent():
+    """The harness must not report not_agent for ANY input.
+
+    Identical construction, only the quoted subject changes. If this also
+    reported not_agent the test above would prove nothing.
+    """
+    segment, rows = _reply_quoting_actor(AGENT)
+    pipeline = _pipeline(_Ledger(known=set()))
+    pipeline._config.agent_actor_ids = AGENT_MAP
+    roster = pipeline._build_actor_roster(segment, rows, {"discord": AGENT})
+    counts = pipeline._agent_quote_counts
+    assert counts[CompactionPipeline.QUOTE_AGENT_AUTHORED] == 1, counts
+    assert counts[CompactionPipeline.QUOTE_NOT_AGENT] == 0, counts
+    assert _subject_lanes(roster) == []
+
+
+def test_an_unconfigured_platform_is_unknown_not_a_denial():
+    """Claiming "not the agent" for a platform we never checked is a lie."""
+    segment, rows = _reply_quoting_actor("actor:slack:someone")
+    pipeline = _pipeline(_Ledger(known=set()))
+    pipeline._config.agent_actor_ids = AGENT_MAP
+    pipeline._build_actor_roster(segment, rows, {"discord": AGENT})
+    counts = pipeline._agent_quote_counts
+    assert counts[CompactionPipeline.QUOTE_IDENTITY_UNKNOWN] == 1, counts
+    assert counts[CompactionPipeline.QUOTE_NOT_AGENT] == 0, counts
+
+
+def test_the_guard_is_not_consulted_when_the_quoted_row_is_present():
+    """THE STRUCTURAL LIMIT, and the reason a production zero is expected.
+
+    The call site is gated on `if not target_present`. When the conversation
+    holds the quoted message the guard never runs at all, so the outcome
+    tally records NOTHING -- not a decline, not an unknown. Every quote whose
+    target we already have is invisible to this counter.
+    """
+    segment, rows = _reply_quoting_actor(MEMBER)
+    rows["target"] = _target_row("m-1")
+    pipeline = _pipeline(_Ledger(known=set()))
+    pipeline._config.agent_actor_ids = AGENT_MAP
+    pipeline._build_actor_roster(segment, rows, {"discord": AGENT})
+    counts = getattr(pipeline, "_agent_quote_counts", None)
+    assert counts is None or sum(counts.values()) == 0, counts
