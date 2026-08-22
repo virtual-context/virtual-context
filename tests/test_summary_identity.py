@@ -31,6 +31,7 @@ from virtual_context.types import (
     AUDIENCE_ATTRIBUTION_VERSION,
     DepthLevel,
     SegmentMetadata,
+    STRUCTURED_SUMMARY_MAX_EXCERPT_CHARS,
     StructuredSummary,
     SummaryClaim,
     SummarySource,
@@ -1096,6 +1097,168 @@ def test_v1_missing_or_invalid_critical_lane_falls_back_to_complete_sources(
     assert stopped in section
 
 
+@pytest.mark.parametrize("include_invalid_ordinary", [False, True])
+def test_v1_missing_or_invalid_ordinary_lane_falls_back_to_complete_sources(
+    include_invalid_ordinary: bool,
+) -> None:
+    first = "I prefer concise technical explanations."
+    omitted = "I keep project notes in Markdown."
+    rows = [
+        _row("ct1", "actor-a", "BigTex", user_content=first),
+        _row("ct2", "actor-a", "BigTex", user_content=omitted),
+    ]
+    claims = [SummaryClaim(
+        text=first,
+        claim_type="conversation",
+        temporal_status="",
+        modality="asserted",
+        sources=(_source("ct1", "BigTex", first),),
+    )]
+    if include_invalid_ordinary:
+        claims.append(SummaryClaim(
+            text=omitted,
+            claim_type="conversation",
+            temporal_status="",
+            modality="asserted",
+            # The id alone cannot satisfy coverage: this source does not
+            # validate against the canonical speaker/provenance binding.
+            sources=(_source("ct2", "Kuw9239", omitted),),
+        ))
+    summary = _attach_structured(
+        _summary("seg-1", ["ct1", "ct2"], "retrieval-only synopsis"),
+        tuple(claims),
+        rows,
+    )
+
+    section = format_tag_section(
+        "technical",
+        [summary],
+        store=_Store(rows),
+        conversation_id="owner",
+        speaker_context=_context("actor-a"),
+    )
+
+    assert '"source":"structured_summary_v1"' not in section
+    assert '"source":"canonical_turns"' in section
+    assert first in section
+    assert omitted in section
+
+
+def test_v1_complete_reversed_ordinary_claims_render_in_physical_order() -> None:
+    first = "First ordinary physical lane."
+    second = "Second ordinary physical lane."
+    rows = [
+        _row("ct1", "actor-a", "BigTex", user_content=first),
+        _row("ct2", "actor-a", "BigTex", user_content=second),
+    ]
+    summary = _attach_structured(
+        _summary("seg-1", ["ct1", "ct2"], "retrieval-only synopsis"),
+        (
+            SummaryClaim(
+                text=second,
+                claim_type="conversation",
+                temporal_status="",
+                modality="asserted",
+                sources=(_source("ct2", "BigTex", second),),
+            ),
+            SummaryClaim(
+                text=first,
+                claim_type="conversation",
+                temporal_status="",
+                modality="asserted",
+                sources=(_source("ct1", "BigTex", first),),
+            ),
+        ),
+        rows,
+    )
+
+    section = format_tag_section(
+        "technical",
+        [summary],
+        store=_Store(rows),
+        conversation_id="owner",
+        speaker_context=_context("actor-a"),
+    )
+
+    assert '"source":"structured_summary_v1"' in section
+    assert section.index(first) < section.index(second)
+
+
+def test_v1_overlong_safety_critical_lane_uses_complete_source_fallback(
+) -> None:
+    ordinary = "I prefer concise technical explanations."
+    oversized_stop = "I stopped tesamorelin. " + (
+        "Additional exact source context. " * 32
+    )
+    assert len(oversized_stop) > STRUCTURED_SUMMARY_MAX_EXCERPT_CHARS
+    rows = [
+        _row("ct1", "actor-a", "BigTex", user_content=ordinary),
+        _row("ct2", "actor-a", "BigTex", user_content=oversized_stop),
+    ]
+    summary = _attach_structured(
+        _summary("seg-1", ["ct1", "ct2"], "retrieval-only synopsis"),
+        (SummaryClaim(
+            text=ordinary,
+            claim_type="conversation",
+            temporal_status="",
+            modality="asserted",
+            sources=(_source("ct1", "BigTex", ordinary),),
+        ),),
+        rows,
+    )
+
+    section = format_tag_section(
+        "health",
+        [summary],
+        store=_Store(rows),
+        conversation_id="owner",
+        speaker_context=_context("actor-a"),
+    )
+
+    assert '"source":"structured_summary_v1"' not in section
+    assert '"source":"canonical_turns"' in section
+    assert ordinary in section
+    assert oversized_stop.strip() in section
+
+
+def test_v1_claim_overflow_is_quarantined_without_partial_source_output(
+) -> None:
+    rows = [
+        _row(
+            f"ct-{index:03d}",
+            "actor-a",
+            "BigTex",
+            user_content=f"ordinary bounded lane {index}",
+        )
+        for index in range(257)
+    ]
+    summary = _summary(
+        "seg-overflow",
+        [row.canonical_turn_id for row in rows],
+        "retrieval-only synopsis",
+    )
+    summary.metadata.structured_summary = StructuredSummary(
+        schema_version=1,
+        claims=(),
+        source_digest=_segment_source_digest(rows),
+        generation_model="deterministic-extractive-v1",
+    )
+
+    section = format_tag_section(
+        "technical",
+        [summary],
+        store=_Store(rows),
+        conversation_id="owner",
+        speaker_context=_context("actor-a"),
+    )
+
+    assert SUMMARY_ATTRIBUTION_QUARANTINE in section
+    assert '"source":"structured_summary_v1"' not in section
+    assert '"source":"canonical_turns"' not in section
+    assert "ordinary bounded lane" not in section
+    assert not any(row.canonical_turn_id in section for row in rows)
+
+
 @pytest.mark.parametrize(
     "nonuse",
     [
@@ -1570,6 +1733,143 @@ def test_off_roster_name_and_internal_actor_id_in_generated_prose_never_render()
     assert "Kuw9239" not in section
     assert "actor:discord:999" not in section
     assert "I stopped tesamorelin." in section
+
+
+def test_internal_identity_in_exact_compressed_fallback_quarantines_projection(
+) -> None:
+    evidence = "Please inspect actor:discord:999 before continuing."
+    row = _row("ct1", "actor-a", "BigTex", user_content=evidence)
+    summary = _attach_structured(
+        _summary("seg-1", ["ct1"], "retrieval-only synopsis"),
+        (SummaryClaim(
+            text=evidence,
+            claim_type="conversation",
+            temporal_status="",
+            modality="asserted",
+            sources=(_source("ct1", "BigTex", evidence),),
+        ),),
+        [row],
+    )
+
+    section = format_tag_section(
+        "technical",
+        [summary],
+        store=_Store([row]),
+        conversation_id="owner",
+        speaker_context=_context("actor-a"),
+    )
+
+    assert SUMMARY_ATTRIBUTION_QUARANTINE in section
+    assert '"source":"structured_summary_v1"' not in section
+    assert '"source":"canonical_turns"' not in section
+    assert evidence not in section
+    assert "actor:discord:999" not in section
+
+
+@pytest.mark.parametrize(
+    ("first_lane", "forbidden"),
+    [
+        (
+            "I saw actor-b in the internal record.",
+            "actor-b",
+        ),
+        (
+            "Please inspect actor\u200b:discord:999 before continuing.",
+            "actor\u200b:discord:999",
+        ),
+    ],
+    ids=["different-admitted-actor", "invisible-internal-prefix"],
+)
+def test_structured_claim_identity_leak_quarantines_whole_source_projection(
+    first_lane: str,
+    forbidden: str,
+) -> None:
+    second_lane = "Ordinary second lane."
+    rows = [
+        _row("ct1", "actor-a", "BigTex", user_content=first_lane),
+        _row("ct2", "actor-b", "Kuw9239", user_content=second_lane),
+    ]
+    summary = _attach_structured(
+        _summary("seg-1", ["ct1", "ct2"], "retrieval-only synopsis"),
+        (
+            SummaryClaim(
+                text=first_lane,
+                claim_type="conversation",
+                temporal_status="",
+                modality="asserted",
+                sources=(_source("ct1", "BigTex", first_lane),),
+            ),
+            SummaryClaim(
+                text=second_lane,
+                claim_type="conversation",
+                temporal_status="",
+                modality="asserted",
+                sources=(
+                    _source(
+                        "ct2", "Kuw9239", second_lane, actor="actor-b",
+                    ),
+                ),
+            ),
+        ),
+        rows,
+    )
+
+    section = format_tag_section(
+        "technical",
+        [summary],
+        store=_Store(rows),
+        conversation_id="owner",
+        speaker_context=_context("actor-a"),
+    )
+
+    assert section.count(SUMMARY_ATTRIBUTION_QUARANTINE) == 1
+    assert '"source":"structured_summary_v1"' not in section
+    assert '"source":"canonical_turns"' not in section
+    assert forbidden not in section
+    assert first_lane not in section
+    assert second_lane not in section
+
+
+@pytest.mark.parametrize(
+    ("user_content", "assistant_content", "forbidden"),
+    [
+        (
+            "Please inspect tenant:secret before continuing.",
+            "The check is complete.",
+            "tenant:secret",
+        ),
+        (
+            "Please inspect the retrieval implementation.",
+            "The admitted human key is actor-a.",
+            "actor-a",
+        ),
+    ],
+    ids=["internal-syntax", "admitted-human-actor-id"],
+)
+def test_full_projection_quarantines_any_lane_with_internal_identity(
+    user_content: str,
+    assistant_content: str,
+    forbidden: str,
+) -> None:
+    row = _row(
+        "ct1",
+        "actor-a",
+        "BigTex",
+        user_content=user_content,
+        assistant_content=assistant_content,
+    )
+    rendered = render_summaries_for_model(
+        [_summary("seg-1", ["ct1"], "retrieval-only synopsis")],
+        store=_Store([row]),
+        conversation_id="owner",
+        speaker_context=_context("actor-a"),
+        depth="full",
+    )[0]
+
+    assert rendered == SUMMARY_ATTRIBUTION_QUARANTINE
+    assert forbidden not in rendered
+    assert user_content not in rendered
+    assert assistant_content not in rendered
 
 
 def test_historical_assistant_claim_cannot_become_summary_evidence() -> None:

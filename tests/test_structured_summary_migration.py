@@ -12,35 +12,41 @@ import pytest
 from virtual_context.cli.structured_summary_migration_cmd import (
     _CAS_UPDATE_SQL,
     _Inventory,
-    _ProviderProbe,
     _ResumeCursor,
     _Scope,
     _cache_action,
     _canonical_ids,
     _cas_tag_persist,
     _deterministic_tag_envelope,
+    _deterministic_tag_selection,
     _envelope_candidate_reason,
     _expected_source_digest,
     _has_bounded_claim_source,
+    _json_string_list,
+    _build_migration_actor_roster,
     _reconstruct_segment,
     _row_tags,
     _selection_sql,
     _source_validation_reasons,
+    _segment_migration_block_reason,
+    _structured_source_block_reason,
     _tag_claim_selection_digest,
     _tag_inventory,
     _tag_source_coordinates,
     _update_reason_counts,
     _validate_tag_result,
     _validate_envelope,
-    _valid_embedding_json,
     configure_parser,
 )
 from virtual_context.core.structured_summary import (
     structured_source_digest,
     structured_source_provenance_digest,
 )
+from virtual_context.core.compactor import build_deterministic_structured_summary
 from virtual_context.types import (
     AUDIENCE_ATTRIBUTION_VERSION,
+    STRUCTURED_SUMMARY_MAX_CLAIMS,
+    STRUCTURED_SUMMARY_MAX_EXCERPT_CHARS,
     STRUCTURED_SUMMARY_SCHEMA_VERSION,
     SegmentMetadata,
     StoredSummary,
@@ -151,9 +157,13 @@ def test_selection_never_loads_legacy_model_input():
     assert "s.ref > %(after_ref)s" in sql
 
 
-def test_cas_updates_both_summary_layers_without_source_rewrite():
-    assert "SET summary = %s, summary_tokens = %s" in _CAS_UPDATE_SQL
+def test_segment_cas_updates_only_structured_metadata():
+    assert "SET metadata_json = jsonb_set" in _CAS_UPDATE_SQL
     assert "'{structured_summary}'" in _CAS_UPDATE_SQL
+    assert "SET summary =" not in _CAS_UPDATE_SQL
+    assert "summary_tokens" not in _CAS_UPDATE_SQL
+    assert "compression_ratio" not in _CAS_UPDATE_SQL
+    assert "compaction_model" not in _CAS_UPDATE_SQL
     assert "xmin::text = %s" in _CAS_UPDATE_SQL
     assert "c.lifecycle_epoch = %s" in _CAS_UPDATE_SQL
     assert "cl.generation = %s" in _CAS_UPDATE_SQL
@@ -174,6 +184,53 @@ def test_reconstruction_uses_only_exact_canonical_lanes():
     assert segment.messages[0].source_actor_id == "actor:discord:123"
     assert segment.messages[0].source_audience_conversation_id == "guild-source"
     assert segment.messages[0].metadata["_vc_source_canonical_turn_ids"] == ["ct-1"]
+
+
+def test_migration_builds_deterministic_claims_without_provider_objects():
+    source = _source(assistant_content="")
+    segment = _reconstruct_segment(_segment_row(), {"ct-1": source})
+    roster = _build_migration_actor_roster(["ct-1"], {"ct-1": source})
+
+    envelope = build_deterministic_structured_summary(
+        roster=roster,
+        segment=segment,
+        generation_model="deterministic-extractive-migration-v1",
+    )
+
+    assert [claim.text for claim in envelope.claims] == [source["user_content"]]
+    assert envelope.claims[0].sources[0].canonical_turn_id == "ct-1"
+    assert envelope.generation_model == "deterministic-extractive-migration-v1"
+
+
+def test_source_shape_blocks_unrepresentable_segments_without_truncation():
+    overlong_ordinary = "ordinary " + (
+        "detail " * STRUCTURED_SUMMARY_MAX_EXCERPT_CHARS
+    )
+    overlong_critical = "I stopped tesamorelin. " + (
+        "detail " * STRUCTURED_SUMMARY_MAX_EXCERPT_CHARS
+    )
+
+    assert _structured_source_block_reason([
+        {"content": overlong_ordinary},
+    ]) is None
+    assert _structured_source_block_reason([
+        {"content": overlong_critical},
+    ]) == "critical_source_over_excerpt_limit"
+    assert _structured_source_block_reason([
+        {"content": f"bounded lane {index}"}
+        for index in range(STRUCTURED_SUMMARY_MAX_CLAIMS + 1)
+    ]) == "bounded_claim_overflow"
+    assert _segment_migration_block_reason(
+        ({"content": "bounded requester lane"},),
+        retrieval_synopsis_chars=0,
+    ) == "retrieval_synopsis_missing"
+    assert _segment_migration_block_reason(
+        (
+            {"content": "I saw actor-b in the record.", "actor_id": "actor-a"},
+            {"content": "ordinary lane", "actor_id": "actor-b"},
+        ),
+        retrieval_synopsis_chars=10,
+    ) == "internal_identity_in_source"
 
 
 def test_digest_matches_public_algorithm_and_binds_scope():
@@ -426,7 +483,148 @@ def test_envelope_requires_every_safety_critical_requester_lane(
         canonical_ids=["ct-old", "ct-new"],
         rows_by_id=rows,
         session_date="2026-08-18",
-    ) == "critical_source_claim_missing"
+    ) == "bounded_source_claim_missing"
+
+
+def test_envelope_requires_every_bounded_ordinary_requester_lane() -> None:
+    first = _source(
+        canonical_turn_id="ct-first",
+        user_content="I prefer concise technical explanations.",
+    )
+    omitted = _source(
+        canonical_turn_id="ct-omitted",
+        user_content="I keep project notes in Markdown.",
+    )
+    rows = {"ct-first": first, "ct-omitted": omitted}
+    digest = _expected_source_digest(
+        ["ct-first", "ct-omitted"], rows, session_date="2026-08-18",
+    )
+    first_only = StructuredSummary(
+        schema_version=STRUCTURED_SUMMARY_SCHEMA_VERSION,
+        source_digest=digest,
+        generation_model="test-model",
+        claims=(SummaryClaim(
+            text=first["user_content"],
+            claim_type="conversation",
+            temporal_status="",
+            modality="asserted",
+            sources=(SummarySource(
+                canonical_turn_id="ct-first",
+                source_role="requester",
+                speaker_label="BigTex",
+                evidence_excerpt=first["user_content"],
+                session_date=first["session_date"],
+                source_provenance_digest=_provenance_digest(first),
+            ),),
+        ),),
+    )
+
+    assert _validate_envelope(
+        first_only,
+        expected_digest=digest,
+        expected_model="test-model",
+        canonical_ids=["ct-first", "ct-omitted"],
+        rows_by_id=rows,
+        session_date="2026-08-18",
+    ) == "bounded_source_claim_missing"
+
+
+def test_envelope_rejects_another_admitted_actor_id_in_exact_evidence() -> None:
+    first = _source(
+        canonical_turn_id="ct-a",
+        user_content="I saw actor-b in the internal record.",
+        sender="Alice",
+        sender_actor_id="actor-a",
+    )
+    second = _source(
+        canonical_turn_id="ct-b",
+        user_content="I updated the project notes.",
+        sender="BigTex",
+        sender_actor_id="actor-b",
+    )
+    rows = {"ct-a": first, "ct-b": second}
+    digest = _expected_source_digest(
+        ["ct-a", "ct-b"], rows, session_date="2026-08-18",
+    )
+
+    def claim_for(source: dict) -> SummaryClaim:
+        return SummaryClaim(
+            text=source["user_content"],
+            claim_type="conversation",
+            temporal_status="",
+            modality="asserted",
+            sources=(SummarySource(
+                canonical_turn_id=source["canonical_turn_id"],
+                source_role="requester",
+                speaker_label=source["sender"],
+                evidence_excerpt=source["user_content"],
+                session_date=source["session_date"],
+                source_provenance_digest=_provenance_digest(source),
+            ),),
+        )
+
+    envelope = StructuredSummary(
+        schema_version=STRUCTURED_SUMMARY_SCHEMA_VERSION,
+        source_digest=digest,
+        generation_model="test-model",
+        claims=(claim_for(first), claim_for(second)),
+    )
+
+    assert _validate_envelope(
+        envelope,
+        expected_digest=digest,
+        expected_model="test-model",
+        canonical_ids=["ct-a", "ct-b"],
+        rows_by_id=rows,
+        session_date="2026-08-18",
+    ) == "internal_identity_in_claim"
+
+
+def test_envelope_rejects_provider_order_for_complete_ordinary_claims() -> None:
+    first = _source(
+        canonical_turn_id="ct-first",
+        user_content="I enjoy tea.",
+    )
+    second = _source(
+        canonical_turn_id="ct-second",
+        user_content="My cup is blue.",
+    )
+    rows = {"ct-first": first, "ct-second": second}
+    digest = _expected_source_digest(
+        ["ct-first", "ct-second"], rows, session_date="2026-08-18",
+    )
+
+    def claim_for(source: dict) -> SummaryClaim:
+        return SummaryClaim(
+            text=source["user_content"],
+            claim_type="conversation",
+            temporal_status="",
+            modality="asserted",
+            sources=(SummarySource(
+                canonical_turn_id=source["canonical_turn_id"],
+                source_role="requester",
+                speaker_label=source["sender"],
+                evidence_excerpt=source["user_content"],
+                session_date=source["session_date"],
+                source_provenance_digest=_provenance_digest(source),
+            ),),
+        )
+
+    envelope = StructuredSummary(
+        schema_version=STRUCTURED_SUMMARY_SCHEMA_VERSION,
+        source_digest=digest,
+        generation_model="old-provider-model",
+        claims=(claim_for(second), claim_for(first)),
+    )
+
+    assert _validate_envelope(
+        envelope,
+        expected_digest=digest,
+        expected_model="",
+        canonical_ids=["ct-first", "ct-second"],
+        rows_by_id=rows,
+        session_date="2026-08-18",
+    ) == "claim_order_mismatch"
 
 
 def test_envelope_rejects_unevidenced_state_and_session_event_time():
@@ -684,6 +882,106 @@ def _tag_source_row(ref: str, created_at: str, claim: SummaryClaim) -> dict:
     }
 
 
+def _current_segment_inventory(source_row: dict) -> _Inventory:
+    return _Inventory(
+        scanned=1,
+        candidates=[],
+        current_rows=[source_row],
+        skipped_rows=[],
+        current=1,
+        skipped_reason_counts=Counter(),
+        candidate_reason_counts=Counter(),
+        affected_tags={"health"},
+    )
+
+
+def test_tag_inventory_blocks_a_missing_tag_summary_instead_of_inserting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claim = _tag_claim("BigTex stopped tesamorelin.", "ct-1")
+    source_row = _tag_source_row(
+        "a", "2026-08-18T12:00:00+00:00", claim,
+    )
+    monkeypatch.setattr(
+        "virtual_context.cli.structured_summary_migration_cmd."
+        "_load_existing_tag_rows",
+        lambda _conn, _conversation_id, _tags: {},
+    )
+    monkeypatch.setattr(
+        "virtual_context.cli.structured_summary_migration_cmd._load_source_rows",
+        lambda _conn, _conversation_id, _ids, lock: [_source(
+            canonical_turn_id="ct-1",
+            user_content=claim.text,
+            assistant_content="",
+            turn_group_number=7,
+        )],
+    )
+
+    inventory = _tag_inventory(
+        object(),
+        SimpleNamespace(conversation_id="owner-1", after_tag=None),
+        _current_segment_inventory(source_row),
+    )
+
+    assert inventory.candidates == []
+    assert inventory.current == 0
+    assert inventory.blocked == [{
+        "tag": "health",
+        "reason": "tag_summary_missing",
+    }]
+    assert inventory.reason_counts == {"tag_summary_missing": 1}
+
+
+@pytest.mark.parametrize("embedding_json", [None, "not-json"])
+def test_tag_inventory_treats_embedding_health_as_nonstructural(
+    monkeypatch: pytest.MonkeyPatch,
+    embedding_json: object,
+) -> None:
+    claim = _tag_claim("BigTex stopped tesamorelin.", "ct-1")
+    source_row = _tag_source_row(
+        "a", "2026-08-18T12:00:00+00:00", claim,
+    )
+    expected = _deterministic_tag_envelope(
+        [source_row], generation_model="inventory",
+    )
+    structured = _deterministic_tag_selection(expected, ["ct-1"])
+    monkeypatch.setattr(
+        "virtual_context.cli.structured_summary_migration_cmd."
+        "_load_existing_tag_rows",
+        lambda _conn, _conversation_id, _tags: {
+            "health": {
+                "row_version": "11",
+                "source_segment_refs": '["a"]',
+                "source_turn_numbers": "[7]",
+                "source_canonical_turn_ids": '["ct-1"]',
+                "structured_summary_json": structured_summary_to_dict(structured),
+                "covers_through_turn": 7,
+                "covers_through_canonical_turn_id": "ct-1",
+                "embedding_json": embedding_json,
+            },
+        },
+    )
+    monkeypatch.setattr(
+        "virtual_context.cli.structured_summary_migration_cmd._load_source_rows",
+        lambda _conn, _conversation_id, _ids, lock: [_source(
+            canonical_turn_id="ct-1",
+            user_content=claim.text,
+            assistant_content="",
+            turn_group_number=7,
+        )],
+    )
+
+    inventory = _tag_inventory(
+        object(),
+        SimpleNamespace(conversation_id="owner-1", after_tag=None),
+        _current_segment_inventory(source_row),
+    )
+
+    assert inventory.current == 1
+    assert inventory.candidates == []
+    assert inventory.blocked == []
+
+
 def test_migration_rejects_duplicate_or_normalized_segment_source_ids():
     assert _canonical_ids({"canonical_turn_ids": ["ct-1", "ct-2"]}) == [
         "ct-1", "ct-2",
@@ -784,6 +1082,19 @@ def test_general_primary_tag_is_never_dropped():
     assert _row_tags({
         "primary_tag": "health", "tags": ["_general", "health"],
     }) == {"_general", "health"}
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        '["ct-1",""]',
+        '["ct-1","ct-1"]',
+        '["ct-1"," ct-2"]',
+        ["ct-1", "ct-2 "],
+    ],
+)
+def test_tag_coordinate_lists_reject_empty_duplicate_or_normalized_ids(raw):
+    assert _json_string_list(raw) is None
 
 
 def test_tag_source_coordinates_use_physical_turn_group_number():
@@ -978,14 +1289,17 @@ def test_tag_result_accepts_only_exact_ordered_subset_with_selected_digest():
 
 
 @pytest.mark.parametrize(
-    ("embedding_write_count", "expected_outcome", "expected_rollback"),
-    [(1, "accepted", False), (0, "tag_or_embedding_changed", True)],
+    ("embedding_row", "embedding_version", "embedding_md5"),
+    [
+        (None, None, ""),
+        ({"row_version": "12", "embedding_md5": "opaque"}, "12", "opaque"),
+    ],
 )
-def test_tag_summary_and_embedding_share_one_atomic_cas_transaction(
+def test_tag_metadata_cas_preserves_every_retrieval_artifact(
     monkeypatch,
-    embedding_write_count,
-    expected_outcome,
-    expected_rollback,
+    embedding_row,
+    embedding_version,
+    embedding_md5,
 ):
     claim = _tag_claim(
         "BigTex stopped tesamorelin.", "ct-1", temporal_status="ceased",
@@ -993,14 +1307,19 @@ def test_tag_summary_and_embedding_share_one_atomic_cas_transaction(
     source_row = _tag_source_row(
         "a", "2026-08-18T12:00:00+00:00", claim,
     )
-    expected = _deterministic_tag_envelope(
-        [source_row], generation_model="tag-model",
+    pool = _deterministic_tag_envelope(
+        [source_row], generation_model="inventory",
     )
+    expected = _deterministic_tag_selection(pool, ["ct-1"])
     result = TagSummary(
         tag="health",
-        summary="New retrieval synopsis.",
-        description="Health history",
-        summary_tokens=4,
+        # These deliberately differ from storage. Metadata-only persistence
+        # must never place them in SQL parameters.
+        summary="MUST NOT BE WRITTEN",
+        description="MUST NOT BE WRITTEN",
+        summary_tokens=999,
+        code_refs=[{"path": "MUST NOT BE WRITTEN"}],
+        generated_by_turn_id="MUST NOT BE WRITTEN",
         source_segment_refs=["a"],
         source_turn_numbers=[7],
         source_canonical_turn_ids=["ct-1"],
@@ -1049,17 +1368,30 @@ def test_tag_summary_and_embedding_share_one_atomic_cas_transaction(
 
         def execute(self, sql, params=()):
             if "FROM tag_summaries" in sql and "FOR UPDATE" in sql:
-                return Result({"row_version": "11"})
+                return Result({
+                    "row_version": "11",
+                    "summary_md5": "summary",
+                    "description_md5": "description",
+                    "retrieval_artifacts_md5": "retrieval",
+                })
             if "FROM tag_summary_embeddings" in sql and "FOR UPDATE" in sql:
-                return Result({"row_version": "12"})
+                return Result(embedding_row)
             if sql.startswith("UPDATE tag_summaries"):
                 assert self.active
+                set_clause = sql.split(" SET ", 1)[1].split(" WHERE ", 1)[0]
+                assert "summary =" not in set_clause
+                assert "description =" not in set_clause
+                assert "summary_tokens =" not in set_clause
+                assert "code_refs =" not in set_clause
+                assert "generated_by_turn_id =" not in set_clause
+                assert "created_at =" not in set_clause
+                assert "updated_at =" not in set_clause
                 self.writes.append("tag")
-                return Result(rowcount=1)
-            if sql.startswith("UPDATE tag_summary_embeddings"):
-                assert self.active
-                self.writes.append("embedding")
-                return Result(rowcount=embedding_write_count)
+                return Result({
+                    "summary_md5": "summary",
+                    "description_md5": "description",
+                    "retrieval_artifacts_md5": "retrieval",
+                }, rowcount=1)
             raise AssertionError(sql)
 
     monkeypatch.setattr(
@@ -1093,27 +1425,130 @@ def test_tag_summary_and_embedding_share_one_atomic_cas_transaction(
             "_source_rows": [source_row],
             "_existing": {
                 "row_version": "11",
-                "embedding_row_version": "12",
+                "embedding_row_version": embedding_version,
+                "old_summary_md5": "summary",
+                "old_description_md5": "description",
+                "old_retrieval_artifacts_md5": "retrieval",
+                "old_embedding_md5": embedding_md5,
             },
         },
         result=result,
-        embedding=[0.1, 0.2],
         journal=object(),
         run_id="run-1",
     )
 
-    assert outcome == expected_outcome
-    assert conn.writes == ["tag", "embedding"]
-    assert conn.rolled_back is expected_rollback
+    assert outcome == "accepted"
+    assert conn.writes == ["tag"]
+    assert conn.rolled_back is False
     assert journal_events[0]["event"] == "tag_prepared"
+    assert journal_events[0]["migration_mode"] == "deterministic_metadata_only_v1"
+    assert journal_events[0]["provider_calls"] == 0
+    assert journal_events[0]["old_retrieval_artifacts_md5"] == "retrieval"
+    assert journal_events[0]["new_retrieval_artifacts_md5"] == "retrieval"
+    assert journal_events[0]["old_embedding_md5"] == embedding_md5
+    assert journal_events[0]["new_embedding_md5"] == embedding_md5
 
 
-def test_embedding_validation_rejects_empty_boolean_and_nonfinite_vectors():
-    assert _valid_embedding_json([0.1, -2.5]) is True
-    assert _valid_embedding_json("[0.1, -2.5]") is True
-    assert _valid_embedding_json([]) is False
-    assert _valid_embedding_json([True]) is False
-    assert _valid_embedding_json([float("nan")]) is False
+def test_tag_metadata_cas_rejects_embedding_checksum_race(monkeypatch):
+    claim = _tag_claim("BigTex stopped tesamorelin.", "ct-1")
+    source_row = _tag_source_row(
+        "a", "2026-08-18T12:00:00+00:00", claim,
+    )
+    expected = _deterministic_tag_selection(
+        _deterministic_tag_envelope([source_row], generation_model="inventory"),
+        ["ct-1"],
+    )
+    result = TagSummary(
+        tag="health",
+        source_segment_refs=["a"],
+        source_turn_numbers=[7],
+        source_canonical_turn_ids=["ct-1"],
+        covers_through_turn=7,
+        covers_through_canonical_turn_id="ct-1",
+        structured_summary=expected,
+    )
+    scope = _Scope("tenant-1", "owner-1", 3, 4, "active", 0)
+
+    class Result:
+        def __init__(self, row):
+            self._row = row
+
+        def fetchone(self):
+            return self._row
+
+    class Transaction:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class Connection:
+        def __init__(self):
+            self.writes = []
+
+        def transaction(self):
+            return Transaction()
+
+        def execute(self, sql, params=()):
+            if "FROM tag_summaries" in sql and "FOR UPDATE" in sql:
+                return Result({
+                    "row_version": "11",
+                    "summary_md5": "summary",
+                    "description_md5": "description",
+                    "retrieval_artifacts_md5": "retrieval",
+                })
+            if "FROM tag_summary_embeddings" in sql and "FOR UPDATE" in sql:
+                return Result({
+                    "row_version": "12",
+                    "embedding_md5": "changed",
+                })
+            if sql.startswith("UPDATE"):
+                self.writes.append(sql)
+            raise AssertionError(sql)
+
+    monkeypatch.setattr(
+        "virtual_context.cli.structured_summary_migration_cmd._preflight",
+        lambda conn, args, lock: scope,
+    )
+    monkeypatch.setattr(
+        "virtual_context.cli.structured_summary_migration_cmd."
+        "_locked_current_tag_sources",
+        lambda conn, args, tag, expected_rows: (None, [source_row]),
+    )
+    monkeypatch.setattr(
+        "virtual_context.cli.structured_summary_migration_cmd._load_source_rows",
+        lambda conn, conversation_id, canonical_ids, lock: [_source(
+            canonical_turn_id="ct-1",
+            user_content=claim.text,
+            assistant_content="",
+            turn_group_number=7,
+        )],
+    )
+    conn = Connection()
+    outcome = _cas_tag_persist(
+        conn,
+        argparse.Namespace(tenant_id="tenant-1", conversation_id="owner-1"),
+        initial_scope=scope,
+        candidate={
+            "tag": "health",
+            "_source_rows": [source_row],
+            "_existing": {
+                "row_version": "11",
+                "embedding_row_version": "12",
+                "old_summary_md5": "summary",
+                "old_description_md5": "description",
+                "old_retrieval_artifacts_md5": "retrieval",
+                "old_embedding_md5": "original",
+            },
+        },
+        result=result,
+        journal=object(),
+        run_id="run-1",
+    )
+
+    assert outcome == "tag_or_embedding_changed"
+    assert conn.writes == []
 
 
 def test_cache_action_escapes_conversation_id_in_redis_glob():
@@ -1128,18 +1563,6 @@ def test_resume_cursor_freezes_before_undecided_row():
     cursor.on_decided("seg-2")
     assert cursor.ref == "seg-1"
     assert cursor.frozen is True
-
-
-def test_provider_probe_preserves_exception_and_records_calls():
-    class Provider:
-        def complete(self, *args, **kwargs):
-            raise TimeoutError("down")
-
-    probe = _ProviderProbe(Provider())
-    with pytest.raises(TimeoutError):
-        probe.complete(system="s", user="u", max_tokens=1)
-    assert probe.calls == 1
-    assert len(probe.exceptions) == 1
 
 
 def test_parser_defaults_to_dry_run_and_positive_limits():
@@ -1158,7 +1581,6 @@ def test_parser_defaults_to_dry_run_and_positive_limits():
     ])
     assert args.apply is False
     assert args.phase == "all"
-    assert args.max_consecutive_provider_failures == 5
     with pytest.raises(SystemExit):
         parser.parse_args([
             "migrate-structured-summaries", "owner-1",

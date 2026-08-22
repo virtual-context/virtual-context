@@ -3370,7 +3370,7 @@ def main():
                 "  virtual-context admin reattribute-audience <conversation_id> <from_audience> <to_audience> --tenant-id <id> [--apply] [--limit N]\n"
                 "  virtual-context admin rebuild-derived-data <conversation_id> --tenant-id <id> [--apply]\n"
                 "  virtual-context admin resummarize-segments <conversation_id> --tenant-id <id> [--identity-violations] [--apply] [--include-short] [--limit N] [--after-ref <ref>] [--since <ts>] [--until <ts>] [--journal <path>] [--max-consecutive-provider-failures N] [--postgres-dsn <dsn>]\n"
-                "  virtual-context admin migrate-structured-summaries <conversation_id> --tenant-id <id> [--apply] [--phase segments|tags|all] [--limit N] [--after-ref <ref>] [--after-tag <tag>] [--journal <path>] [--max-consecutive-provider-failures N] [--postgres-dsn <dsn>]\n"
+                "  virtual-context admin migrate-structured-summaries <conversation_id> --tenant-id <id> [--apply] [--phase segments|tags|all] [--limit N] [--after-ref <ref>] [--after-tag <tag>] [--journal <path>] [--postgres-dsn <dsn>]\n"
                 "  virtual-context admin resequence-canonical-turns <conversation_id> --tenant-id <id> [--apply]\n"
                 "  virtual-context admin normalize-canonical-actor-ids <conversation_id> --tenant-id <id> --platform <platform> [--apply]\n"
                 "  virtual-context admin reindex-canonical-turn-embeddings [<conversation_id>] [--tenant-id <id>] [--all-convs-for-tenant] [--apply] [--limit N]\n"

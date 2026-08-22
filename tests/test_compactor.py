@@ -322,6 +322,36 @@ def _structured_segment_and_roster() -> tuple[TaggedSegment, ActorRoster]:
     return segment, roster
 
 
+def _append_structured_requester(
+    segment: TaggedSegment,
+    roster: ActorRoster,
+    text: str,
+    *,
+    canonical_id: str,
+    actor: str = "actor:discord:bigtex",
+    label: str = "BigTex",
+    session_date: str = "2026-08-18",
+) -> None:
+    roster.lanes.append(FactLane(
+        role=AUTHOR_ROLE_REQUESTER,
+        text=text,
+        canonical_turn_id=canonical_id,
+        actor_id=actor,
+        speaker_label=label,
+        session_date=session_date,
+        audience_conversation_id="audience:guild:1",
+        origin_channel_id="channel:medical",
+        audience_attribution_version=AUDIENCE_ATTRIBUTION_VERSION,
+    ))
+    segment.messages.append(_scoped_user_message(
+        text,
+        canonical_id=canonical_id,
+        actor=actor,
+        label=label,
+    ))
+    segment.turn_count += 1
+
+
 @pytest.fixture
 def legal_segment(ts):
     return TaggedSegment(
@@ -537,7 +567,7 @@ def test_valid_unicode_roster_labels_enter_every_segment_prompt(
     assert '["BigTex", "Renée", "李雷"]' in request.prompt
 
 
-def test_structured_claim_prompt_uses_ephemeral_refs_and_no_durable_ids():
+def test_segment_prompt_does_not_delegate_structured_claims_to_provider():
     segment, roster = _structured_segment_and_roster()
     compactor = DomainCompactor(
         llm_provider=MockLLMProvider(),
@@ -546,9 +576,10 @@ def test_structured_claim_prompt_uses_ephemeral_refs_and_no_durable_ids():
 
     request = compactor.build_segment_summary_request(segment, roster=roster)
 
-    assert "SOURCE-BACKED SUMMARY CLAIMS CONTRACT" in request.prompt
-    assert '"source_ref":"src_1"' in request.prompt
-    assert '"speaker":"BigTex"' in request.prompt
+    assert "SOURCE-BACKED SUMMARY CLAIMS CONTRACT" not in request.prompt
+    assert "summary_claims" not in request.prompt
+    assert "summary_claims" not in request.system
+    assert "BigTex" in request.prompt
     assert "I stopped tesamorelin" in request.prompt
     assert "ct-bigtex-1" not in request.prompt
     assert "actor:discord:bigtex" not in request.prompt
@@ -851,6 +882,172 @@ def test_structured_claim_safety_floor_orders_newer_correction_before_old_state(
     assert [claim.temporal_status for claim in structured.claims] == ["", ""]
 
 
+def test_provider_selected_subset_cannot_omit_an_ordinary_requester_lane():
+    segment, roster = _structured_segment_and_roster()
+    first = "I enjoy tea."
+    second = "My cup is blue."
+    segment.messages[0].content = first
+    roster.lanes[0].text = first
+    _append_structured_requester(
+        segment, roster, second, canonical_id="ct-bigtex-2",
+    )
+    compactor = DomainCompactor(
+        MockLLMProvider(), CompactorConfig(code_mode=False), model_name="test-model",
+    )
+
+    structured = compactor.build_structured_summary({
+        "summary_claims": [{
+            "text": first,
+            "claim_type": "conversation",
+            "temporal_status": "",
+            "modality": "asserted",
+            "event_time": "",
+            "sources": [{
+                "source_ref": "src_1",
+                "evidence_excerpt": first,
+            }],
+        }],
+    }, roster=roster, segment=segment)
+
+    assert [claim.text for claim in structured.claims] == [first, second]
+
+
+def test_arbitrary_newer_correction_survives_with_older_active_lane():
+    segment, roster = _structured_segment_and_roster()
+    old = "I take tesamorelin every morning."
+    correction = (
+        "The tesamorelin entry in my record is wrong; please correct it."
+    )
+    segment.messages[0].content = old
+    roster.lanes[0].text = old
+    _append_structured_requester(
+        segment, roster, correction, canonical_id="ct-bigtex-2",
+    )
+    compactor = DomainCompactor(
+        MockLLMProvider(), CompactorConfig(code_mode=False), model_name="test-model",
+    )
+
+    structured = compactor.build_structured_summary({
+        # Provider output deliberately knows about only the older state.  The
+        # correction is not dependent on a safety-keyword regex to survive.
+        "summary_claims": [{
+            "text": old,
+            "sources": [{"source_ref": "src_1", "evidence_excerpt": old}],
+        }],
+    }, roster=roster, segment=segment)
+
+    assert [claim.text for claim in structured.claims] == [old, correction]
+
+
+def test_structured_claim_order_is_critical_newest_then_physical_ordinary():
+    segment, roster = _structured_segment_and_roster()
+    ordinary_one = "I enjoy tea."
+    critical_one = "I stopped tesamorelin yesterday."
+    ordinary_two = "My cup is blue."
+    critical_two = "I don't take sermorelin."
+    segment.messages[0].content = ordinary_one
+    roster.lanes[0].text = ordinary_one
+    _append_structured_requester(
+        segment, roster, critical_one, canonical_id="ct-bigtex-2",
+    )
+    _append_structured_requester(
+        segment, roster, ordinary_two, canonical_id="ct-bigtex-3",
+    )
+    _append_structured_requester(
+        segment, roster, critical_two, canonical_id="ct-bigtex-4",
+    )
+    compactor = DomainCompactor(
+        MockLLMProvider(), CompactorConfig(code_mode=False), model_name="test-model",
+    )
+
+    first = compactor.build_structured_summary(
+        {}, roster=roster, segment=segment,
+    )
+    second = compactor.build_structured_summary(
+        {"summary_claims": "provider noise"}, roster=roster, segment=segment,
+    )
+
+    expected = [critical_two, critical_one, ordinary_one, ordinary_two]
+    assert [claim.text for claim in first.claims] == expected
+    assert second == first
+
+
+def test_deterministic_builder_override_stamps_non_model_provenance():
+    segment, roster = _structured_segment_and_roster()
+    compactor = DomainCompactor(
+        MockLLMProvider(), CompactorConfig(code_mode=False), model_name="online-model",
+    )
+
+    structured = compactor.build_structured_summary(
+        roster=roster,
+        segment=segment,
+        generation_model_override="deterministic-extractive-v1",
+    )
+
+    assert structured.generation_model == "deterministic-extractive-v1"
+    assert len(structured.claims) == 1
+
+
+def test_segment_writer_rejects_cross_lane_internal_actor_id_atomically():
+    segment, roster = _structured_segment_and_roster()
+    first = "I saw actor:discord:bob in the internal record."
+    segment.messages[0].content = first
+    roster.lanes[0].text = first
+    _append_structured_requester(
+        segment,
+        roster,
+        "I updated the project notes.",
+        canonical_id="ct-bob-2",
+        actor="actor:discord:bob",
+        label="Bob",
+    )
+    roster.actor_ids.add("actor:discord:bob")
+    roster.labels["bob"] = {"actor:discord:bob"}
+    compactor = DomainCompactor(
+        MockLLMProvider(), CompactorConfig(code_mode=False), model_name="test-model",
+    )
+
+    structured = compactor.build_structured_summary(
+        {}, roster=roster, segment=segment,
+    )
+
+    assert structured.claims == ()
+    assert len(structured.source_digest) == 64
+    assert "actor:discord:bob" not in repr(structured.claims)
+
+
+def test_segment_writer_claim_overflow_is_atomic_fail_closed_quarantine():
+    segment, roster = _structured_segment_and_roster()
+    segment.messages[0].content = "ordinary bounded lane 0"
+    roster.lanes[0].text = "ordinary bounded lane 0"
+    for index in range(1, 257):
+        _append_structured_requester(
+            segment,
+            roster,
+            f"ordinary bounded lane {index}",
+            canonical_id=f"ct-overflow-{index:03d}",
+        )
+    compactor = DomainCompactor(
+        MockLLMProvider(), CompactorConfig(code_mode=False), model_name="test-model",
+    )
+
+    structured = compactor.build_structured_summary(
+        {
+            "summary_claims": [{
+                "text": "provider-selected partial lane",
+                "sources": [{"source_ref": "src_1"}],
+            }],
+        },
+        roster=roster,
+        segment=segment,
+    )
+
+    assert structured.claims == ()
+    assert len(structured.source_digest) == 64
+    assert structured.generation_model == "test-model"
+    assert "provider-selected partial lane" not in repr(structured)
+
+
 @pytest.mark.parametrize(
     "nonuse",
     [
@@ -1001,7 +1198,7 @@ def test_structured_claim_does_not_bind_unrelated_literal_event_time():
     assert structured.claims[0].event_time == ""
 
 
-def test_structured_claim_rejects_multiple_sources_even_for_one_speaker():
+def test_provider_multi_source_claim_cannot_combine_exact_requester_lanes():
     segment, roster = _structured_segment_and_roster()
     first = "I enjoy tea."
     second = "I prefer coffee."
@@ -1046,7 +1243,8 @@ def test_structured_claim_rejects_multiple_sources_even_for_one_speaker():
         }],
     }, roster=roster, segment=segment)
 
-    assert structured.claims == ()
+    assert [claim.text for claim in structured.claims] == [first, second]
+    assert all(len(claim.sources) == 1 for claim in structured.claims)
 
 
 def test_assistant_personal_state_is_dropped_without_losing_valid_human_claim():
@@ -1095,6 +1293,66 @@ def test_assistant_personal_state_is_dropped_without_losing_valid_human_claim():
     assert [claim.text for claim in structured.claims] == [
         "I stopped tesamorelin after edema and have not restarted it.",
     ]
+
+
+def test_only_bounded_safe_noncolliding_requester_lanes_become_claims():
+    segment, roster = _structured_segment_and_roster()
+    admitted = "I enjoy tea."
+    segment.messages[0].content = admitted
+    roster.lanes[0].text = admitted
+    roster.lanes.extend([
+        FactLane(
+            role=AUTHOR_ROLE_ASSISTANT,
+            text="You take tesamorelin.",
+            canonical_turn_id="ct-assistant",
+            speaker_label="Assistant",
+        ),
+        FactLane(
+            role=AUTHOR_ROLE_SUBJECT,
+            text="I stopped tesamorelin.",
+            canonical_turn_id="ct-reply-subject",
+            actor_id="actor:discord:subject",
+            speaker_label="ReplySubject",
+        ),
+    ])
+    overlong = "x" * 801
+    _append_structured_requester(
+        segment, roster, overlong, canonical_id="ct-overlong",
+    )
+    _append_structured_requester(
+        segment,
+        roster,
+        "Unsafe generic label disclosure.",
+        canonical_id="ct-unsafe-label",
+        actor="actor:discord:unsafe",
+        label="User",
+    )
+    _append_structured_requester(
+        segment,
+        roster,
+        "First colliding disclosure.",
+        canonical_id="ct-collision-1",
+        actor="actor:discord:alex-1",
+        label="Alex",
+    )
+    _append_structured_requester(
+        segment,
+        roster,
+        "Second colliding disclosure.",
+        canonical_id="ct-collision-2",
+        actor="actor:discord:alex-2",
+        label="Ａｌｅｘ",
+    )
+    compactor = DomainCompactor(
+        MockLLMProvider(), CompactorConfig(code_mode=False), model_name="test-model",
+    )
+
+    structured = compactor.build_structured_summary(
+        {}, roster=roster, segment=segment,
+    )
+
+    assert [claim.text for claim in structured.claims] == [admitted]
+    assert overlong not in [claim.text for claim in structured.claims]
 
 
 def test_summarize_segment_strict_retries_malformed_then_succeeds():
@@ -1192,21 +1450,40 @@ def test_empty_model_selection_cannot_omit_direct_correction_variants(source):
     assert structured.claims[0].temporal_status == ""
 
 
-def test_summarize_segment_strict_rejects_persistently_missing_claims():
+@pytest.mark.parametrize(
+    ("include_claim_field", "claim_value"),
+    [
+        (False, None),
+        (True, []),
+        (True, "malformed provider claim list"),
+    ],
+    ids=["missing", "empty", "malformed"],
+)
+def test_summarize_segment_strict_ignores_provider_claim_list(
+    include_claim_field: bool,
+    claim_value: object,
+):
     segment, roster = _structured_segment_and_roster()
     segment.messages[0].content = "I enjoy tea."
     roster.lanes[0].text = "I enjoy tea."
-    empty = json.dumps({
-        "summary": "Enjoys tea.",
-        "summary_claims": [],
-    })
-    provider = _SequenceProvider(empty, empty)
+    _append_structured_requester(
+        segment,
+        roster,
+        "My cup is blue.",
+        canonical_id="ct-bigtex-2",
+    )
+    payload: dict[str, object] = {"summary": "Enjoys tea."}
+    if include_claim_field:
+        payload["summary_claims"] = claim_value
+    provider = _SequenceProvider(json.dumps(payload))
     compactor = DomainCompactor(provider, CompactorConfig(code_mode=False))
 
-    with pytest.raises(SegmentSummaryGenerationError, match="no admissible"):
-        compactor.summarize_segment(segment, roster=roster)
+    result = compactor.summarize_segment(segment, roster=roster)
 
-    assert len(provider.calls) == 2
+    assert len(provider.calls) == 1
+    assert [
+        claim.text for claim in result.metadata.structured_summary.claims
+    ] == ["I enjoy tea.", "My cup is blue."]
 
 
 def test_summarize_segment_strict_never_turns_provider_failure_into_v1_row():

@@ -249,12 +249,12 @@ an engine nor a store. Apply mode reconstructs each segment only from the exact
 canonical turn IDs in a proved-complete source mapping; it never reads the
 stored `summary`, `full_text`, or `messages_json` as model input (only an
 in-database checksum of the old synopsis is selected for the journal). It then
-runs the normal strict segment summarizer and atomically writes the newly
-generated retrieval synopsis, its token/model metadata, and
-`metadata_json.structured_summary`. The Postgres summary-FTS trigger refreshes
-`summary_tsv` in that same write; full-text chunk embeddings are unchanged
-because their canonical source text is unchanged. Each write is preceded by an
-`fsync`'d JSONL journal entry containing old/new synopsis checksums and the
+builds the structured envelope deterministically from exact requester lanes;
+no summarization provider is called. The compare-and-set changes only
+`metadata_json.structured_summary`. Existing retrieval synopsis bytes,
+`summary_tokens`, compression/model metadata, `summary_tsv`, and full-text
+chunk embeddings remain unchanged. Each write is preceded by an `fsync`'d
+JSONL journal entry containing the preserved synopsis checksum and the new
 structured-envelope checksum, and is guarded by segment `xmin`, tenant,
 lifecycle epoch, lifecycle generation, active-operation, canonical-source
 digest, and retained source-alias checks.
@@ -263,25 +263,35 @@ Schema v1 admits requester evidence only. Every persisted excerpt must equal
 the complete trimmed canonical `user_content` lane and carry its exact actor,
 speaker, audience, channel, date, and canonical-turn provenance. Assistant
 output, reply-target copies, partial substrings, and legacy summary prose are
-never admitted as evidence.
+never admitted as evidence. Every admissible requester lane within the bounded
+excerpt size becomes a claim. Safety-critical corrections are ordered newest
+first, followed by the remaining lanes in deterministic physical order. An
+overlong safety-critical lane uses the exact canonical fallback when it fits
+the bounded projection; claim-cap overflow quarantines the compressed artifact
+rather than truncating or presenting a partial source set.
 
 The tag phase runs only after a full, unbounded segment inventory proves that
 every eligible source segment has a current non-empty claim envelope. It copies
-and deduplicates those exact claims newest-first (up to 256), then calls the
-strict normal tag rollup only to regenerate the free retrieval synopsis. It
-never supplies the old tag synopsis to the model. The tag row and the embedding
-of its new synopsis are written in one transaction after the lifecycle, source
-set, segment `xmin` values, canonical source digests, and existing tag/embedding
-row versions are revalidated under locks. If provider generation, embedding,
-or any compare-and-set fails, neither row is changed. The tag `source_digest`
-is a deterministic claim-set integrity/idempotency checksum; serving performs
-the independent canonical-row rehydration that authorizes each claim.
+and deduplicates those exact claims, applies the deterministic safety floor,
+and stores a bounded ordered selection. No tag summarizer or embedding provider
+is called. For an existing tag row, the transaction changes only its source
+coordinates and `structured_summary_json`; its synopsis, description, token
+metadata, code references, generation metadata, timestamps, and embedding bytes
+are preserved exactly. Lifecycle, source set, segment `xmin`, canonical source
+digests, and existing tag/embedding row versions are revalidated under locks.
+A missing tag row is reported as blocked and uses the exact SEGMENTS fallback;
+the emergency migration never invents a retrieval synopsis or embedding. The
+tag `source_digest` authenticates the ordered selected claims and complete
+source coordinates; serving independently rehydrates the canonical rows that
+authorize every claim.
 
-`--limit` caps attempted candidates (and therefore model cost), not successful
-writes in each selected phase. A provider failure or concurrent change freezes
-that phase's `resume_after_ref` or `resume_after_tag` so the undecided item is
-retried. Resume with the reported value, then finish each phase with one run
-without its cursor; already-current rows are skipped without a model call.
+`--limit` caps attempted candidates, not successful writes. A concurrent
+lifecycle/source/row-version change freezes that phase's `resume_after_ref` or
+`resume_after_tag` so the undecided item is retried. Resume with the reported
+value, then finish each phase with one run without its cursor; already-current
+rows are skipped without any provider call. The JSONL journal records
+`migration_mode=deterministic_metadata_only_v1` so it cannot be confused with
+an older provider-backed run.
 
 After any accepted tag write, the JSON result reports a required serving-cache
 action. Delete `vc:tag_summary_embeddings:<conversation>`,

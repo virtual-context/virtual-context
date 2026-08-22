@@ -8,14 +8,13 @@ The migration is deliberately narrower than the ordinary compaction path:
   segment's proved source mapping -- legacy ``full_text``, ``messages_json``
   and ``summary`` text are never selected (the database emits only an opaque
   checksum of the old retrieval synopsis for the journal);
-* writes change the newly generated retrieval synopsis and
-  ``metadata_json.structured_summary`` in one ``xmin`` compare-and-set, with
-  lifecycle and canonical-source revalidation;
+* writes add only the deterministic ``metadata_json.structured_summary``
+  envelope; existing retrieval synopsis bytes and their indexes are preserved;
 * a crash-durable write-ahead journal makes every committed write auditable;
 * tag rollups select an ordered bounded subset of strict segment claims and
   copy those claim objects exactly without model-authored factual prose;
-  their regenerated retrieval synopsis and embedding are committed together
-  only after the complete source set is revalidated under row locks.
+  existing tag synopsis/description/embedding bytes remain untouched while
+  the source coordinates and structured envelope are revalidated under locks.
 
 The command is Postgres-only because ``xmin`` is the row-version fence used by
 the online store.
@@ -25,7 +24,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import os
 import re
 import uuid
@@ -47,15 +45,22 @@ from ..core.structured_summary import (
     structured_tag_claim_digest,
     validate_tag_rollup_inputs,
 )
+from ..core.compactor import build_deterministic_structured_summary
+from ..core.summary_identity import structured_claims_contain_internal_identity
 from ..types import (
     AUDIENCE_ATTRIBUTION_VERSION,
+    AUTHOR_ROLE_REQUESTER,
+    ActorRoster,
+    FactLane,
     SOURCE_CANONICAL_TURN_IDS_KEY,
+    STRUCTURED_SUMMARY_MAX_CLAIMS,
     STRUCTURED_SUMMARY_SCHEMA_VERSION,
     STRUCTURED_SUMMARY_MAX_EXCERPT_CHARS,
     Message,
     SegmentMetadata,
     StoredSummary,
     StructuredSummary,
+    TagSummary,
     TaggedSegment,
     strict_structured_summary,
     structured_summary_to_dict,
@@ -101,9 +106,7 @@ origin_conversation_id
 
 
 _CAS_UPDATE_SQL = """\
-UPDATE segments SET summary = %s, summary_tokens = %s,
-compression_ratio = %s, compaction_model = %s,
-metadata_json = jsonb_set(metadata_json::jsonb,
+UPDATE segments SET metadata_json = jsonb_set(metadata_json::jsonb,
 '{structured_summary}', %s::jsonb, true)::text
 WHERE ref = %s AND conversation_id = %s AND xmin::text = %s
 AND EXISTS (SELECT 1 FROM conversations c
@@ -120,6 +123,9 @@ AND NOT EXISTS (SELECT 1 FROM compaction_operation co
 WHERE co.conversation_id = %s AND co.lifecycle_epoch = %s
 AND co.status IN ('queued','running'))
 """
+
+_DETERMINISTIC_GENERATION_MODEL = "deterministic-extractive-migration-v1"
+_MIGRATION_MODE = "deterministic_metadata_only_v1"
 
 
 class MigrationError(RuntimeError):
@@ -177,34 +183,6 @@ class _ResumeCursor:
             self.ref = ref
 
 
-class _ProviderProbe:
-    """Observe calls/usage without changing the configured provider."""
-
-    def __init__(self, delegate):
-        self._delegate = delegate
-        self.begin()
-
-    def begin(self) -> None:
-        self.calls = 0
-        self.usage: list[dict] = []
-        self.exceptions: list[BaseException] = []
-
-    def complete(self, *args, **kwargs):
-        self.calls += 1
-        try:
-            value = self._delegate.complete(*args, **kwargs)
-        except BaseException as exc:  # record, then preserve provider semantics
-            self.exceptions.append(exc)
-            raise
-        if isinstance(value, tuple) and len(value) >= 2:
-            usage = value[1]
-            self.usage.append(usage if isinstance(usage, dict) else {})
-        return value
-
-    def __getattr__(self, name):
-        return getattr(self._delegate, name)
-
-
 def configure_parser(admin_sub, positive_int) -> None:
     """Register the dedicated admin subcommand on an argparse subparser."""
     parser = admin_sub.add_parser(
@@ -219,7 +197,7 @@ def configure_parser(admin_sub, positive_int) -> None:
     )
     parser.add_argument(
         "--limit", type=positive_int, default=None,
-        help="Cap attempted candidates per selected phase (and model cost)",
+        help="Cap attempted candidates per selected phase",
     )
     parser.add_argument(
         "--after-ref", help="Resume strictly after this segment ref",
@@ -230,10 +208,6 @@ def configure_parser(admin_sub, positive_int) -> None:
     parser.add_argument(
         "--phase", choices=("segments", "tags", "all"), default="all",
         help="Migration layer to run (default: all)",
-    )
-    parser.add_argument(
-        "--max-consecutive-provider-failures", type=positive_int, default=5,
-        help="Abort after this many consecutive provider exceptions",
     )
     parser.add_argument(
         "--journal",
@@ -457,6 +431,65 @@ def _has_bounded_claim_source(records: Iterable[Mapping[str, object]]) -> bool:
         <= STRUCTURED_SUMMARY_MAX_EXCERPT_CHARS
         for record in records
     )
+
+
+def _structured_source_block_reason(
+    records: Iterable[Mapping[str, object]],
+) -> str | None:
+    """Return why deterministic v1 cannot represent this source snapshot.
+
+    The aggregate digest can bind an overlong ordinary lane while the compact
+    layer omits it. A safety-critical correction cannot be omitted, however,
+    and no claim may be substring-truncated. Likewise, exceeding the schema's
+    atomic claim capacity must use canonical fallback rather than persisting a
+    partial envelope that could hide one source lane.
+    """
+    bounded_count = 0
+    for record in records:
+        content = str(record.get("content", "") or "").strip()
+        if not content:
+            continue
+        if len(content) <= STRUCTURED_SUMMARY_MAX_EXCERPT_CHARS:
+            bounded_count += 1
+            continue
+        if is_safety_critical_personal_evidence(content):
+            return "critical_source_over_excerpt_limit"
+    if bounded_count > STRUCTURED_SUMMARY_MAX_CLAIMS:
+        return "bounded_claim_overflow"
+    return None
+
+
+def _segment_migration_block_reason(
+    records: Iterable[Mapping[str, object]],
+    *,
+    retrieval_synopsis_chars: int,
+) -> str | None:
+    """Return a source/retrieval defect metadata-only repair cannot fix."""
+    materialized = tuple(records)
+    if structured_claims_contain_internal_identity(
+        (
+            SimpleNamespace(sources=(SimpleNamespace(
+                evidence_excerpt=str(record.get("content", "") or ""),
+            ),))
+            for record in materialized
+        ),
+        admitted_actor_ids=(
+            record.get("actor_id", "") for record in materialized
+        ),
+    ):
+        return "internal_identity_in_source"
+    source_reason = _structured_source_block_reason(materialized)
+    if source_reason is not None:
+        return source_reason
+    if not _has_bounded_claim_source(materialized):
+        return "no_bounded_structured_claim_source"
+    if retrieval_synopsis_chars < 1:
+        # This command deliberately never invents or rewrites retrieval prose.
+        # Leaving this as a candidate would produce an endless apply loop and
+        # let tag preflight mistake an unavailable lower layer for repairable
+        # work. Keep it explicit and on canonical fallback instead.
+        return "retrieval_synopsis_missing"
+    return None
 
 
 def _envelope_candidate_reason(
@@ -781,10 +814,16 @@ def _inventory(conn, args) -> tuple[_Scope, _Inventory, dict[str, str]]:
         admissible_records = _admissible_requester_records(
             ids or (), source_by_id, session_date=session_date,
         )
-        if not _has_bounded_claim_source(admissible_records):
-            skipped["no_bounded_structured_claim_source"] += 1
+        migration_block_reason = _segment_migration_block_reason(
+            admissible_records,
+            retrieval_synopsis_chars=int(
+                row.get("retrieval_synopsis_chars") or 0,
+            ),
+        )
+        if migration_block_reason is not None:
+            skipped[migration_block_reason] += 1
             copied = dict(row)
-            copied["_skip_reasons"] = ("no_bounded_structured_claim_source",)
+            copied["_skip_reasons"] = (migration_block_reason,)
             skipped_rows.append(copied)
             affected_tags.update(_row_tags(row))
             continue
@@ -805,8 +844,6 @@ def _inventory(conn, args) -> tuple[_Scope, _Inventory, dict[str, str]]:
             )
             if stored_rejection is not None:
                 reason = "stored_" + stored_rejection
-        if reason is None and int(row.get("retrieval_synopsis_chars") or 0) < 1:
-            reason = "retrieval_synopsis_missing"
         if reason is None:
             copied = dict(row)
             copied["_metadata"] = metadata
@@ -935,6 +972,25 @@ def _deterministic_tag_envelope(
     )
 
 
+def _deterministic_tag_selection(
+    expected_pool: StructuredSummary,
+    source_canonical_turn_ids: Iterable[str],
+) -> StructuredSummary:
+    """Choose a bounded exact tag layer without provider-authored content."""
+    selected = tuple(apply_tag_claim_safety_floor(
+        expected_pool.claims,
+        expected_pool.claims[:_MAX_TAG_SELECTED_CLAIMS],
+        limit=_MAX_TAG_SELECTED_CLAIMS,
+    ))
+    source_ids = tuple(source_canonical_turn_ids)
+    return StructuredSummary(
+        schema_version=STRUCTURED_SUMMARY_SCHEMA_VERSION,
+        claims=selected,
+        source_digest=structured_tag_claim_digest(selected, source_ids),
+        generation_model=_DETERMINISTIC_GENERATION_MODEL,
+    )
+
+
 _MAX_TAG_SELECTED_CLAIMS = 16
 
 
@@ -984,27 +1040,18 @@ def _json_string_list(raw: object) -> list[str] | None:
             raw = json.loads(raw)
         except (TypeError, ValueError):
             return None
-    if not isinstance(raw, list) or any(type(value) is not str for value in raw):
-        return None
-    return [value for value in raw if value]
-
-
-def _valid_embedding_json(raw: object) -> bool:
-    if isinstance(raw, str):
-        try:
-            raw = json.loads(raw)
-        except (TypeError, ValueError):
-            return False
-    return bool(
-        isinstance(raw, list)
-        and raw
-        and all(
-            isinstance(value, (int, float))
-            and not isinstance(value, bool)
-            and math.isfinite(float(value))
+    if (
+        not isinstance(raw, list)
+        or any(
+            type(value) is not str
+            or not value
+            or value != value.strip()
             for value in raw
         )
-    )
+        or len(set(raw)) != len(raw)
+    ):
+        return None
+    return list(raw)
 
 
 def _load_existing_tag_rows(
@@ -1015,11 +1062,16 @@ def _load_existing_tag_rows(
     if not tags:
         return {}
     rows = conn.execute(
-        "SELECT ts.tag, ts.source_segment_refs, ts.source_canonical_turn_ids, "
-        "ts.structured_summary_json, ts.xmin::text AS row_version, "
+        "SELECT ts.tag, ts.source_segment_refs, ts.source_turn_numbers, "
+        "ts.source_canonical_turn_ids, ts.structured_summary_json, "
+        "ts.covers_through_turn, ts.covers_through_canonical_turn_id, "
+        "ts.xmin::text AS row_version, "
         "md5(ts.summary) AS old_summary_md5, "
         "md5(ts.description) AS old_description_md5, "
-        "e.embedding_json, e.xmin::text AS embedding_row_version, "
+        "md5(jsonb_build_array(ts.summary, ts.description, ts.summary_tokens, "
+        "ts.code_refs, ts.generated_by_turn_id, ts.created_at, "
+        "ts.updated_at)::text) AS old_retrieval_artifacts_md5, "
+        "e.xmin::text AS embedding_row_version, "
         "md5(e.embedding_json) AS old_embedding_md5 "
         "FROM tag_summaries ts LEFT JOIN tag_summary_embeddings e "
         "ON e.tag = ts.tag AND e.conversation_id = ts.conversation_id "
@@ -1028,7 +1080,7 @@ def _load_existing_tag_rows(
     ).fetchall()
     result = {str(row["tag"]): dict(row) for row in rows}
     embedding_rows = conn.execute(
-        "SELECT tag, embedding_json, xmin::text AS embedding_row_version, "
+        "SELECT tag, xmin::text AS embedding_row_version, "
         "md5(embedding_json) AS old_embedding_md5 "
         "FROM tag_summary_embeddings WHERE conversation_id = %s "
         "AND tag = ANY(%s)",
@@ -1040,15 +1092,29 @@ def _load_existing_tag_rows(
             "tag": tag,
             "row_version": None,
             "source_segment_refs": None,
+            "source_turn_numbers": None,
             "source_canonical_turn_ids": None,
             "structured_summary_json": None,
+            "covers_through_turn": None,
+            "covers_through_canonical_turn_id": None,
             "old_summary_md5": "",
             "old_description_md5": "",
+            "old_retrieval_artifacts_md5": "",
         })
-        target["embedding_json"] = row.get("embedding_json")
         target["embedding_row_version"] = row.get("embedding_row_version")
         target["old_embedding_md5"] = row.get("old_embedding_md5")
     return result
+
+
+def _json_int_list(raw: object) -> list[int] | None:
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(raw, list) or any(type(value) is not int for value in raw):
+        return None
+    return list(raw)
 
 
 def _tag_inventory(
@@ -1083,6 +1149,23 @@ def _tag_inventory(
     if after_tag:
         all_tags = [tag for tag in all_tags if tag > after_tag]
     existing = _load_existing_tag_rows(conn, args.conversation_id, all_tags)
+    all_source_ids = list(dict.fromkeys(
+        canonical_id
+        for row in segment_inventory.current_rows
+        for canonical_id in (
+            _canonical_ids(
+                row.get("_metadata")
+                if isinstance(row.get("_metadata"), dict)
+                else (_metadata_object(row.get("metadata_json")) or {}),
+            ) or []
+        )
+    ))
+    physical_by_id = {
+        str(row["canonical_turn_id"]): row
+        for row in _load_source_rows(
+            conn, args.conversation_id, all_source_ids, lock=False,
+        )
+    }
 
     candidates: list[dict] = []
     blocked: list[dict] = []
@@ -1119,10 +1202,25 @@ def _tag_inventory(
             blocked.append({"tag": tag, "reason": "no_current_segment_claims"})
             reasons["no_current_segment_claims"] += 1
             continue
+        deterministic = _deterministic_tag_selection(
+            expected, _tag_source_canonical_ids(sources),
+        )
+        if not deterministic.claims:
+            blocked.append({
+                "tag": tag,
+                "reason": "tag_claim_safety_floor_overflow",
+            })
+            reasons["tag_claim_safety_floor_overflow"] += 1
+            continue
         old = existing.get(tag)
         reason = ""
         if old is None or old.get("row_version") is None:
-            reason = "tag_summary_missing"
+            blocked.append({
+                "tag": tag,
+                "reason": "tag_summary_missing",
+            })
+            reasons["tag_summary_missing"] += 1
+            continue
         else:
             structured_raw = old.get("structured_summary_json")
             if isinstance(structured_raw, str):
@@ -1132,11 +1230,20 @@ def _tag_inventory(
                     structured_raw = None
             structured = strict_structured_summary(structured_raw)
             refs = _json_string_list(old.get("source_segment_refs"))
+            turns = _json_int_list(old.get("source_turn_numbers"))
             source_ids = _json_string_list(
                 old.get("source_canonical_turn_ids"),
             )
             expected_refs = [str(row["ref"]) for row in sources]
-            expected_source_ids = _tag_source_canonical_ids(sources)
+            expected_turns, expected_source_ids, expected_max_turn = (
+                _tag_source_coordinates(
+                    [_stored_summary_from_row(row) for row in sources],
+                    physical_by_id,
+                )
+            )
+            expected_cover_id = (
+                expected_source_ids[-1] if expected_source_ids else ""
+            )
             if structured.schema_version != STRUCTURED_SUMMARY_SCHEMA_VERSION:
                 reason = "tag_structured_schema_missing_or_invalid"
             elif not structured.claims:
@@ -1160,8 +1267,15 @@ def _tag_inventory(
                 reason = "tag_source_segment_set_stale"
             elif source_ids != expected_source_ids:
                 reason = "tag_source_id_set_stale"
-            elif not _valid_embedding_json(old.get("embedding_json")):
-                reason = "tag_embedding_missing_or_invalid"
+            elif turns != expected_turns:
+                reason = "tag_source_turn_set_stale"
+            elif old.get("covers_through_turn") != expected_max_turn:
+                reason = "tag_covers_through_turn_stale"
+            elif (
+                old.get("covers_through_canonical_turn_id")
+                != expected_cover_id
+            ):
+                reason = "tag_covers_through_id_stale"
             else:
                 current += 1
                 continue
@@ -1172,6 +1286,7 @@ def _tag_inventory(
             "_source_rows": sources,
             "_source_refs": [str(row["ref"]) for row in sources],
             "_expected_structured": expected,
+            "_deterministic_structured": deterministic,
             "_existing": old,
         })
         reasons[reason] += 1
@@ -1287,6 +1402,65 @@ def _reconstruct_segment(row: Mapping[str, object], rows_by_id: Mapping[str, obj
         turn_count=turn_count,
         session_date=session_date,
     )
+
+
+def _build_migration_actor_roster(
+    canonical_ids: Iterable[str],
+    rows_by_id: Mapping[str, object],
+) -> ActorRoster:
+    """Build the requester-only physical roster needed by the pure writer.
+
+    The migration has already proved mapping completeness and source scope.
+    Rebuilding this small DTO directly avoids constructing an Engine, store,
+    summarization provider, or embedding provider during historical repair.
+    """
+    ids = list(canonical_ids)
+    roster = ActorRoster(complete=bool(ids))
+    for canonical_id in ids:
+        row = rows_by_id.get(canonical_id)
+        if row is None:
+            roster.complete = False
+            continue
+        content = str(_mapping_value(row, "user_content", "") or "").strip()
+        if not content:
+            continue
+        actor = str(
+            _mapping_value(row, "sender_actor_id", "") or "",
+        ).strip()
+        label = str(_mapping_value(row, "sender", "") or "").strip()
+        if actor:
+            roster.actor_ids.add(actor)
+            if label:
+                roster.labels.setdefault(label.casefold(), set()).add(actor)
+        else:
+            roster.has_unidentified_user_row = True
+        roster.lanes.append(FactLane(
+            role=AUTHOR_ROLE_REQUESTER,
+            text=content,
+            actor_id=actor,
+            source_message_id=str(
+                _mapping_value(row, "source_message_id", "") or "",
+            ),
+            canonical_turn_id=str(canonical_id),
+            speaker_label=label,
+            session_date=str(
+                _mapping_value(row, "session_date", "") or "",
+            ).strip(),
+            audience_conversation_id=str(
+                _mapping_value(row, "audience_conversation_id", "") or "",
+            ).strip(),
+            origin_channel_id=str(
+                _mapping_value(row, "origin_channel_id", "") or "",
+            ).strip(),
+            audience_attribution_version=(
+                _mapping_value(row, "audience_attribution_version", 0)
+                if type(_mapping_value(
+                    row, "audience_attribution_version", 0,
+                )) is int
+                else 0
+            ),
+        ))
+    return roster
 
 
 def _load_summary_rows_by_refs(
@@ -1507,19 +1681,25 @@ def _validate_envelope(
             canonical_ids, rows_by_id, session_date=session_date,
         )
     }
+    if structured_claims_contain_internal_identity(
+        envelope.claims,
+        admitted_actor_ids=(
+            record.get("actor_id", "") for record in admissible_by_id.values()
+        ),
+    ):
+        return "internal_identity_in_claim"
     claimed_source_ids = {
         source.canonical_turn_id
         for claim in envelope.claims
         for source in claim.sources
     }
     for canonical_id, record in admissible_by_id.items():
+        content = str(record.get("content", "") or "").strip()
         if (
-            is_safety_critical_personal_evidence(
-                str(record.get("content", "") or "").strip(),
-            )
+            0 < len(content) <= STRUCTURED_SUMMARY_MAX_EXCERPT_CHARS
             and canonical_id not in claimed_source_ids
         ):
-            return "critical_source_claim_missing"
+            return "bounded_source_claim_missing"
     for claim in envelope.claims:
         requester_actors: set[str] = set()
         if claim.claim_type != "conversation":
@@ -1584,6 +1764,31 @@ def _validate_envelope(
             claim.event_time, [evidence], claim.sources[0].session_date,
         ):
             return "event_time_not_evidenced"
+    bounded_records = [
+        record for record in admissible_by_id.values()
+        if 0 < len(str(record.get("content", "") or "").strip())
+        <= STRUCTURED_SUMMARY_MAX_EXCERPT_CHARS
+    ]
+    critical_ids = [
+        str(record["canonical_turn_id"])
+        for record in reversed(bounded_records)
+        if is_safety_critical_personal_evidence(
+            str(record.get("content", "") or "").strip(),
+        )
+    ]
+    ordinary_ids = [
+        str(record["canonical_turn_id"])
+        for record in bounded_records
+        if not is_safety_critical_personal_evidence(
+            str(record.get("content", "") or "").strip(),
+        )
+    ]
+    actual_claim_ids = [
+        claim.sources[0].canonical_turn_id
+        for claim in envelope.claims
+    ]
+    if actual_claim_ids != critical_ids + ordinary_ids:
+        return "claim_order_mismatch"
     return None
 
 
@@ -1597,7 +1802,9 @@ def _fsync_parent_dir(path: str) -> None:
 
 
 def _journal_append(handle, payload: Mapping[str, object]) -> None:
-    handle.write(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
+    record = dict(payload)
+    record.setdefault("migration_mode", _MIGRATION_MODE)
+    handle.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
     handle.flush()
     os.fsync(handle.fileno())
 
@@ -1607,19 +1814,6 @@ def _journal_path(args) -> str:
         return args.journal
     safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", args.conversation_id).strip("_")
     return f"structured-summary-migration-{safe or 'conversation'}.jsonl"
-
-
-def _usage_add(totals: dict[str, int], probe: _ProviderProbe) -> None:
-    totals["calls"] += probe.calls
-    for usage in probe.usage:
-        for key in ("input_tokens", "prompt_tokens"):
-            if isinstance(usage.get(key), (int, float)):
-                totals["tokens_in"] += int(usage[key])
-                break
-        for key in ("output_tokens", "completion_tokens"):
-            if isinstance(usage.get(key), (int, float)):
-                totals["tokens_out"] += int(usage[key])
-                break
 
 
 def _same_scope(left: _Scope, right: _Scope) -> bool:
@@ -1639,13 +1833,15 @@ def _cas_persist(
     initial_scope: _Scope,
     row: Mapping[str, object],
     envelope: StructuredSummary,
-    synopsis: str,
-    synopsis_tokens: int,
-    compression_ratio: float,
     journal,
     run_id: str,
 ) -> str:
-    """Revalidate source/lifecycle and atomically store both summary layers."""
+    """Revalidate source/lifecycle and add only the structured layer.
+
+    The existing free-form segment synopsis remains the retrieval index.  It
+    is deliberately neither selected into this process nor rewritten by the
+    historical repair.
+    """
     metadata = row["_metadata"]
     ids = list(row["_canonical_ids"])
     expected_digest = str(row["_expected_source_digest"])
@@ -1721,16 +1917,13 @@ def _cas_persist(
             "structured_summary_sha256": hashlib.sha256(
                 encoded_json.encode("utf-8"),
             ).hexdigest(),
-            "retrieval_synopsis_sha256": hashlib.sha256(
-                synopsis.encode("utf-8"),
-            ).hexdigest(),
             "old_retrieval_synopsis_md5": str(
                 row.get("old_retrieval_synopsis_md5") or "",
             ),
-            "new_retrieval_synopsis_md5": hashlib.md5(
-                synopsis.encode("utf-8"), usedforsecurity=False,
-            ).hexdigest(),
-            "retrieval_synopsis_tokens": synopsis_tokens,
+            "new_retrieval_synopsis_md5": str(
+                row.get("old_retrieval_synopsis_md5") or "",
+            ),
+            "retrieval_synopsis_preserved": True,
             "generation_model": envelope.generation_model,
             "claim_count": len(envelope.claims),
         }
@@ -1741,8 +1934,7 @@ def _cas_persist(
         updated = conn.execute(
             _CAS_UPDATE_SQL,
             (
-                synopsis, synopsis_tokens, compression_ratio,
-                envelope.generation_model, encoded_json,
+                encoded_json,
                 row["ref"], args.conversation_id,
                 str(row["row_version"]), args.conversation_id, args.tenant_id,
                 initial_scope.lifecycle_epoch, args.conversation_id,
@@ -1871,21 +2063,23 @@ def _locked_current_tag_sources(
     return None, current
 
 
-def _tag_write_values(result, embedding: list[float]) -> dict[str, object]:
+def _tag_metadata_write_values(result: TagSummary) -> dict[str, str]:
+    """Encode only the source-bound fields this repair is allowed to change."""
     structured_json = json.dumps(
         structured_summary_to_dict(result.structured_summary),
         ensure_ascii=False, sort_keys=True, separators=(",", ":"),
     )
-    embedding_json = json.dumps(
-        embedding, ensure_ascii=False, separators=(",", ":"),
-    )
     return {
         "structured_json": structured_json,
-        "embedding_json": embedding_json,
-        "source_refs_json": json.dumps(result.source_segment_refs),
-        "turns_json": json.dumps(result.source_turn_numbers),
-        "canonical_ids_json": json.dumps(result.source_canonical_turn_ids),
-        "code_refs_json": json.dumps(result.code_refs, default=str),
+        "source_refs_json": json.dumps(
+            result.source_segment_refs, separators=(",", ":"),
+        ),
+        "turns_json": json.dumps(
+            result.source_turn_numbers, separators=(",", ":"),
+        ),
+        "canonical_ids_json": json.dumps(
+            result.source_canonical_turn_ids, separators=(",", ":"),
+        ),
     }
 
 
@@ -1895,15 +2089,15 @@ def _cas_tag_persist(
     *,
     initial_scope: _Scope,
     candidate: Mapping[str, object],
-    result,
-    embedding: list[float],
+    result: TagSummary,
     journal,
     run_id: str,
 ) -> str:
+    """CAS only tag provenance metadata; retrieval artifacts stay byte-identical."""
     tag = str(candidate["tag"])
     old = candidate.get("_existing")
     old = old if isinstance(old, Mapping) else {}
-    values = _tag_write_values(result, embedding)
+    values = _tag_metadata_write_values(result)
     try:
         with conn.transaction():
             try:
@@ -1968,30 +2162,65 @@ def _cas_tag_persist(
                 )
             ):
                 return "tag_structured_source_changed"
+            if (
+                result.structured_summary.generation_model
+                != _DETERMINISTIC_GENERATION_MODEL
+                or strict_structured_summary(structured_summary_to_dict(
+                    result.structured_summary,
+                )) != result.structured_summary
+            ):
+                return "tag_structured_source_changed"
 
             current_tag = conn.execute(
-                "SELECT xmin::text AS row_version FROM tag_summaries "
+                "SELECT xmin::text AS row_version, "
+                "md5(summary) AS summary_md5, "
+                "md5(description) AS description_md5, "
+                "md5(jsonb_build_array(summary, description, summary_tokens, "
+                "code_refs, generated_by_turn_id, created_at, updated_at)::text) "
+                "AS retrieval_artifacts_md5 FROM tag_summaries "
                 "WHERE tag = %s AND conversation_id = %s FOR UPDATE",
                 (tag, args.conversation_id),
             ).fetchone()
             current_embedding = conn.execute(
-                "SELECT xmin::text AS row_version FROM tag_summary_embeddings "
+                "SELECT xmin::text AS row_version, "
+                "md5(embedding_json) AS embedding_md5 "
+                "FROM tag_summary_embeddings "
                 "WHERE tag = %s AND conversation_id = %s FOR UPDATE",
                 (tag, args.conversation_id),
             ).fetchone()
             expected_tag_version = old.get("row_version")
             expected_embedding_version = old.get("embedding_row_version")
+            old_summary_md5 = str(old.get("old_summary_md5") or "")
+            old_description_md5 = str(old.get("old_description_md5") or "")
+            old_retrieval_md5 = str(
+                old.get("old_retrieval_artifacts_md5") or "",
+            )
+            old_embedding_md5 = str(old.get("old_embedding_md5") or "")
             if (
-                (current_tag is None) != (expected_tag_version is None)
+                current_tag is None
+                or expected_tag_version is None
+                or str(current_tag["row_version"]) != str(expected_tag_version)
+                or str(current_tag.get("summary_md5") or "") != old_summary_md5
                 or (
-                    current_tag is not None
-                    and str(current_tag["row_version"]) != str(expected_tag_version)
+                    str(current_tag.get("description_md5") or "")
+                    != old_description_md5
+                )
+                or (
+                    str(current_tag.get("retrieval_artifacts_md5") or "")
+                    != old_retrieval_md5
                 )
                 or (current_embedding is None) != (expected_embedding_version is None)
                 or (
                     current_embedding is not None
                     and str(current_embedding["row_version"])
                     != str(expected_embedding_version)
+                )
+                or (
+                    str((
+                        current_embedding.get("embedding_md5")
+                        if current_embedding is not None else ""
+                    ) or "")
+                    != old_embedding_md5
                 )
             ):
                 return "tag_or_embedding_changed"
@@ -2005,6 +2234,8 @@ def _cas_tag_persist(
                 "lifecycle_epoch": initial_scope.lifecycle_epoch,
                 "lifecycle_generation": initial_scope.lifecycle_generation,
                 "tag": tag,
+                "migration_mode": _MIGRATION_MODE,
+                "provider_calls": 0,
                 "source_set_digest": _tag_source_set_digest(locked_sources),
                 "source_coordinates_sha256": hashlib.sha256(
                     json.dumps(
@@ -2017,19 +2248,16 @@ def _cas_tag_persist(
                         separators=(",", ":"),
                     ).encode("utf-8"),
                 ).hexdigest(),
-                "old_summary_md5": str(old.get("old_summary_md5") or ""),
-                "new_summary_md5": hashlib.md5(
-                    result.summary.encode("utf-8"), usedforsecurity=False,
-                ).hexdigest(),
-                "old_description_md5": str(old.get("old_description_md5") or ""),
-                "new_description_md5": hashlib.md5(
-                    result.description.encode("utf-8"), usedforsecurity=False,
-                ).hexdigest(),
-                "old_embedding_md5": str(old.get("old_embedding_md5") or ""),
-                "new_embedding_md5": hashlib.md5(
-                    str(values["embedding_json"]).encode("utf-8"),
-                    usedforsecurity=False,
-                ).hexdigest(),
+                "old_summary_md5": old_summary_md5,
+                "new_summary_md5": old_summary_md5,
+                "old_description_md5": old_description_md5,
+                "new_description_md5": old_description_md5,
+                "old_retrieval_artifacts_md5": old_retrieval_md5,
+                "new_retrieval_artifacts_md5": old_retrieval_md5,
+                "old_embedding_md5": old_embedding_md5,
+                "new_embedding_md5": old_embedding_md5,
+                "retrieval_artifacts_preserved": True,
+                "embedding_preserved": True,
                 "structured_summary_sha256": hashlib.sha256(
                     str(values["structured_json"]).encode("utf-8"),
                 ).hexdigest(),
@@ -2037,67 +2265,35 @@ def _cas_tag_persist(
             }
             _journal_append(journal, prepared)
 
-            now = datetime.now(timezone.utc).isoformat()
-            if current_tag is None:
-                tag_write = conn.execute(
-                    "INSERT INTO tag_summaries "
-                    "(tag, conversation_id, summary, description, code_refs, "
-                    "summary_tokens, source_segment_refs, source_turn_numbers, "
-                    "source_canonical_turn_ids, structured_summary_json, "
-                    "covers_through_turn, covers_through_canonical_turn_id, "
-                    "generated_by_turn_id, created_at, updated_at) "
-                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
-                    "ON CONFLICT (tag, conversation_id) DO NOTHING",
-                    (
-                        tag, args.conversation_id, result.summary,
-                        result.description, values["code_refs_json"],
-                        result.summary_tokens, values["source_refs_json"],
-                        values["turns_json"], values["canonical_ids_json"],
-                        values["structured_json"], result.covers_through_turn,
-                        result.covers_through_canonical_turn_id,
-                        result.generated_by_turn_id, now, now,
-                    ),
-                ).rowcount
-            else:
-                tag_write = conn.execute(
-                    "UPDATE tag_summaries SET summary = %s, description = %s, "
-                    "code_refs = %s, summary_tokens = %s, source_segment_refs = %s, "
-                    "source_turn_numbers = %s, source_canonical_turn_ids = %s, "
-                    "structured_summary_json = %s, covers_through_turn = %s, "
-                    "covers_through_canonical_turn_id = %s, generated_by_turn_id = %s, "
-                    "updated_at = %s WHERE tag = %s AND conversation_id = %s "
-                    "AND xmin::text = %s",
-                    (
-                        result.summary, result.description, values["code_refs_json"],
-                        result.summary_tokens, values["source_refs_json"],
-                        values["turns_json"], values["canonical_ids_json"],
-                        values["structured_json"], result.covers_through_turn,
-                        result.covers_through_canonical_turn_id,
-                        result.generated_by_turn_id, now, tag,
-                        args.conversation_id, str(expected_tag_version),
-                    ),
-                ).rowcount
-            if tag_write != 1:
+            tag_write = conn.execute(
+                "UPDATE tag_summaries SET source_segment_refs = %s, "
+                "source_turn_numbers = %s, source_canonical_turn_ids = %s, "
+                "structured_summary_json = %s, covers_through_turn = %s, "
+                "covers_through_canonical_turn_id = %s "
+                "WHERE tag = %s AND conversation_id = %s AND xmin::text = %s "
+                "RETURNING md5(summary) AS summary_md5, "
+                "md5(description) AS description_md5, "
+                "md5(jsonb_build_array(summary, description, summary_tokens, "
+                "code_refs, generated_by_turn_id, created_at, updated_at)::text) "
+                "AS retrieval_artifacts_md5",
+                (
+                    values["source_refs_json"], values["turns_json"],
+                    values["canonical_ids_json"], values["structured_json"],
+                    result.covers_through_turn,
+                    result.covers_through_canonical_turn_id,
+                    tag, args.conversation_id, str(expected_tag_version),
+                ),
+            ).fetchone()
+            if tag_write is None:
                 raise _TagCASConflict("tag summary CAS failed")
-
-            if current_embedding is None:
-                embedding_write = conn.execute(
-                    "INSERT INTO tag_summary_embeddings "
-                    "(tag, conversation_id, embedding_json) VALUES (%s,%s,%s) "
-                    "ON CONFLICT (tag, conversation_id) DO NOTHING",
-                    (tag, args.conversation_id, values["embedding_json"]),
-                ).rowcount
-            else:
-                embedding_write = conn.execute(
-                    "UPDATE tag_summary_embeddings SET embedding_json = %s "
-                    "WHERE tag = %s AND conversation_id = %s AND xmin::text = %s",
-                    (
-                        values["embedding_json"], tag, args.conversation_id,
-                        str(expected_embedding_version),
-                    ),
-                ).rowcount
-            if embedding_write != 1:
-                raise _TagCASConflict("tag embedding CAS failed")
+            if (
+                str(tag_write.get("summary_md5") or "") != old_summary_md5
+                or str(tag_write.get("description_md5") or "")
+                != old_description_md5
+                or str(tag_write.get("retrieval_artifacts_md5") or "")
+                != old_retrieval_md5
+            ):
+                raise _TagCASConflict("tag retrieval artifacts changed")
     except _TagCASConflict:
         return "tag_or_embedding_changed"
     return "accepted"
@@ -2148,8 +2344,8 @@ def _dry_run(args) -> None:
             for row in planned
         ],
         "provider_call_estimate": {
-            "minimum": len(planned),
-            "maximum_with_retry": len(planned) * 2,
+            "minimum": 0,
+            "maximum_with_retry": 0,
         },
         "affected_tag_count": len(inventory.affected_tags),
         "checksums_before": before,
@@ -2159,8 +2355,8 @@ def _dry_run(args) -> None:
         "note": (
             "Apply re-reads canonical rows, rebuilds the ActorRoster, and "
             "revalidates xmin, lifecycle, aliases, and source_digest before "
-            "atomically replacing the retrieval synopsis and "
-            "metadata_json.structured_summary."
+            "atomically adding metadata_json.structured_summary. Existing "
+            "retrieval synopsis bytes and indexes are preserved."
         ),
     }, indent=2))
 
@@ -2230,9 +2426,10 @@ def _dry_run_tags(args) -> None:
         "blocked": len(tag_inventory.blocked),
         "reason_counts": dict(sorted(tag_inventory.reason_counts.items())),
         "provider_call_estimate": {
-            "minimum": len(planned),
-            "maximum_with_retry": len(planned) * 2,
+            "minimum": 0,
+            "maximum_with_retry": 0,
         },
+        "migration_mode": _MIGRATION_MODE,
         "first_tag": planned[0]["tag"] if planned else None,
         "last_tag": planned[-1]["tag"] if planned else None,
         "tags": [
@@ -2245,6 +2442,12 @@ def _dry_run_tags(args) -> None:
         "checksums_stable": before == after,
         "cache_action_after_apply": _cache_action(args.conversation_id),
         "apply_ready": segment_gate == 0 and before == after,
+        "note": (
+            "Tag apply copies deterministic exact segment claims and changes "
+            "only source coordinates plus structured_summary_json. Existing "
+            "tag synopsis, description, tokens, code refs, timestamps, and "
+            "embedding bytes are preserved without provider calls."
+        ),
     }, indent=2))
 
 
@@ -2253,8 +2456,8 @@ def _apply(args) -> None:
     if not dsn:
         _fail("resolve_dsn", "no Postgres DSN (--postgres-dsn or DATABASE_URL)", args)
 
-    # Inventory first with the same read-only construction as dry-run. Engine
-    # construction is deferred until there is proved work to perform.
+    # Inventory and generation use only direct database rows. Historical
+    # repair must not construct an Engine or any LLM/embedding provider.
     try:
         with _connect(dsn, read_only=True) as conn:
             scope, inventory, alias_graph = _inventory(conn, args)
@@ -2273,37 +2476,41 @@ def _apply(args) -> None:
             "conversation_id": args.conversation_id,
             "selected": 0,
             "accepted": 0,
+            "migration_mode": _MIGRATION_MODE,
+            "provider_calls": 0,
+            "usage": {"calls": 0, "tokens_in": 0, "tokens_out": 0},
             "tag_phase": "runs_after_segments_when_phase_all",
         }, indent=2))
         return
 
-    from .main import _apply_storage_overrides, load_config
-    from ..engine import VirtualContextEngine
-
+    selected_source_ids = list(dict.fromkeys(
+        canonical_id
+        for row in selected
+        for canonical_id in list(row["_canonical_ids"])
+    ))
     try:
-        config = load_config(args.config)
-        config.conversation_id = args.conversation_id
-        config.tenant_id = args.tenant_id
-        _apply_storage_overrides(config, args)
-        config.storage.backend = "postgres"
-        config.storage.postgres_dsn = dsn
+        with _connect(dsn, read_only=True) as source_conn:
+            physical_rows = _load_source_rows(
+                source_conn,
+                args.conversation_id,
+                selected_source_ids,
+                lock=False,
+            )
     except Exception as exc:  # noqa: BLE001
-        _fail("load_config", str(exc), args)
+        _fail("load_canonical_sources", str(exc), args)
+    physical_by_id = {
+        str(row["canonical_turn_id"]): row for row in physical_rows
+    }
 
-    engine = None
-    original_llm = None
     counts = Counter({
         "accepted": 0,
         "skipped_concurrent": 0,
-        "provider_failure": 0,
-        "malformed": 0,
         "rejected": 0,
     })
     rejected: Counter[str] = Counter()
     usage = {"calls": 0, "tokens_in": 0, "tokens_out": 0}
     affected_tags: set[str] = set()
     cursor = _ResumeCursor(args.after_ref)
-    consecutive_provider_failures = 0
     status = "completed"
     last_attempted_ref = None
 
@@ -2321,29 +2528,6 @@ def _apply(args) -> None:
                 "after_ref": args.after_ref,
                 "selected": len(selected),
             })
-
-            engine = VirtualContextEngine(config=config)
-            compactor = getattr(engine, "_compactor", None)
-            pipeline = getattr(engine, "_compaction", None)
-            if compactor is None or getattr(compactor, "llm", None) is None:
-                raise MigrationError("no summarization provider configured")
-            if not callable(getattr(compactor, "summarize_segment", None)):
-                raise MigrationError("strict public summarize_segment seam unavailable")
-            if pipeline is None:
-                raise MigrationError("compaction pipeline unavailable")
-
-            physical_rows = list(
-                engine._store.get_all_canonical_turns(args.conversation_id),
-            )
-            physical_by_id = {
-                str(row.canonical_turn_id): row
-                for row in physical_rows if row.canonical_turn_id
-            }
-            agent_actor_ids = pipeline._validated_agent_actor_ids(physical_by_id)
-
-            original_llm = compactor.llm
-            probe = _ProviderProbe(original_llm)
-            compactor.llm = probe
 
             with _connect(dsn, read_only=False) as write_conn:
                 for row in selected:
@@ -2374,8 +2558,8 @@ def _apply(args) -> None:
                         continue
 
                     segment = _reconstruct_segment(row, physical_by_id)
-                    roster = pipeline._build_actor_roster(
-                        segment, physical_by_id, agent_actor_ids,
+                    roster = _build_migration_actor_roster(
+                        ids, physical_by_id,
                     )
                     if not getattr(roster, "complete", False):
                         counts["skipped_concurrent"] += 1
@@ -2389,58 +2573,15 @@ def _apply(args) -> None:
                         })
                         continue
 
-                    probe.begin()
-                    try:
-                        result = compactor.summarize_segment(
-                            segment,
-                            roster=roster,
-                            fact_signals=None,
-                            code_refs=None,
-                            prev_context="",
-                        )
-                    except Exception as exc:  # strict seam distinguishes below
-                        _usage_add(usage, probe)
-                        try:
-                            from ..core.compactor import SegmentSummaryGenerationError
-                        except ImportError:  # compatibility during rolling deploy
-                            SegmentSummaryGenerationError = ()  # type: ignore
-                        if SegmentSummaryGenerationError and isinstance(
-                            exc, SegmentSummaryGenerationError,
-                        ):
-                            consecutive_provider_failures = 0
-                            counts["malformed"] += 1
-                            cursor.on_decided(str(row["ref"]))
-                            _journal_append(journal, {
-                                "event": "malformed",
-                                "ts": datetime.now(timezone.utc).isoformat(),
-                                "run_id": run_id,
-                                "ref": row["ref"],
-                            })
-                            continue
-                        if not probe.exceptions:
-                            raise
-                        counts["provider_failure"] += 1
-                        consecutive_provider_failures += 1
-                        cursor.freeze()
-                        _journal_append(journal, {
-                            "event": "provider_failure",
-                            "ts": datetime.now(timezone.utc).isoformat(),
-                            "run_id": run_id,
-                            "ref": row["ref"],
-                            "exception_type": type(probe.exceptions[-1]).__name__,
-                        })
-                        if consecutive_provider_failures >= args.max_consecutive_provider_failures:
-                            status = "aborted_provider_down"
-                            break
-                        continue
-
-                    _usage_add(usage, probe)
-                    consecutive_provider_failures = 0
-                    envelope = result.metadata.structured_summary
+                    envelope = build_deterministic_structured_summary(
+                        roster=roster,
+                        segment=segment,
+                        generation_model=_DETERMINISTIC_GENERATION_MODEL,
+                    )
                     rejection = _validate_envelope(
                         envelope,
                         expected_digest=str(row["_expected_source_digest"]),
-                        expected_model=str(getattr(compactor, "model_name", "") or ""),
+                        expected_model=_DETERMINISTIC_GENERATION_MODEL,
                         canonical_ids=ids,
                         rows_by_id=physical_by_id,
                         session_date=session_date,
@@ -2463,12 +2604,6 @@ def _apply(args) -> None:
                         initial_scope=scope,
                         row=row,
                         envelope=envelope,
-                        synopsis=result.summary,
-                        synopsis_tokens=int(result.summary_tokens),
-                        compression_ratio=(
-                            float(result.summary_tokens) / int(row["full_tokens"])
-                            if int(row.get("full_tokens") or 0) > 0 else 0.0
-                        ),
                         journal=journal,
                         run_id=run_id,
                     )
@@ -2485,10 +2620,10 @@ def _apply(args) -> None:
                             "old_retrieval_synopsis_md5": str(
                                 row.get("old_retrieval_synopsis_md5") or "",
                             ),
-                            "new_retrieval_synopsis_md5": hashlib.md5(
-                                result.summary.encode("utf-8"),
-                                usedforsecurity=False,
-                            ).hexdigest(),
+                            "new_retrieval_synopsis_md5": str(
+                                row.get("old_retrieval_synopsis_md5") or "",
+                            ),
+                            "retrieval_synopsis_preserved": True,
                             "structured_summary_sha256": hashlib.sha256(
                                 json.dumps(
                                     structured_summary_to_dict(envelope),
@@ -2510,14 +2645,6 @@ def _apply(args) -> None:
                         })
     except Exception as exc:  # noqa: BLE001
         _fail("apply", str(exc), args)
-    finally:
-        if engine is not None:
-            try:
-                if original_llm is not None and getattr(engine, "_compactor", None):
-                    engine._compactor.llm = original_llm
-                engine.close()
-            except Exception:  # noqa: BLE001
-                pass
 
     print(json.dumps({
         "status": status,
@@ -2530,6 +2657,8 @@ def _apply(args) -> None:
         "counts": dict(counts),
         "rejected": dict(sorted(rejected.items())),
         "usage": usage,
+        "migration_mode": _MIGRATION_MODE,
+        "provider_calls": 0,
         "journal": journal_path,
         "last_attempted_ref": last_attempted_ref,
         "resume_after_ref": cursor.ref,
@@ -2571,38 +2700,22 @@ def _apply_tags(args) -> None:
             "selected": 0,
             "accepted": 0,
             "cache_action_required": False,
+            "migration_mode": _MIGRATION_MODE,
+            "provider_calls": 0,
+            "usage": {"calls": 0, "tokens_in": 0, "tokens_out": 0},
         }, indent=2))
         return
 
-    from .main import _apply_storage_overrides, load_config
-    from ..engine import VirtualContextEngine
-
-    try:
-        config = load_config(args.config)
-        config.conversation_id = args.conversation_id
-        config.tenant_id = args.tenant_id
-        _apply_storage_overrides(config, args)
-        config.storage.backend = "postgres"
-        config.storage.postgres_dsn = dsn
-    except Exception as exc:  # noqa: BLE001
-        _fail("tag_load_config", str(exc), args)
-
     journal_path = _journal_path(args)
     run_id = str(uuid.uuid4())
-    engine = None
-    original_llm = None
     counts = Counter({
         "accepted": 0,
         "skipped_concurrent": 0,
-        "provider_failure": 0,
-        "malformed": 0,
-        "embedding_failure": 0,
         "rejected": 0,
     })
     rejected: Counter[str] = Counter()
     usage = {"calls": 0, "tokens_in": 0, "tokens_out": 0}
     cursor = _ResumeCursor(args.after_tag)
-    consecutive_provider_failures = 0
     status = "completed"
     last_attempted_tag = None
 
@@ -2619,31 +2732,9 @@ def _apply_tags(args) -> None:
                 "lifecycle_generation": scope.lifecycle_generation,
                 "after_tag": args.after_tag,
                 "selected": len(selected),
+                "migration_mode": _MIGRATION_MODE,
+                "provider_calls": 0,
             })
-            engine = VirtualContextEngine(config=config)
-            compactor = getattr(engine, "_compactor", None)
-            if (
-                compactor is None
-                or getattr(compactor, "llm", None) is None
-                or not callable(getattr(compactor, "summarize_tag", None))
-            ):
-                raise MigrationError("strict public summarize_tag seam unavailable")
-            semantic = getattr(engine, "_semantic", None)
-            embed_fn = semantic.get_embed_fn() if semantic is not None else None
-            if not callable(embed_fn):
-                raise MigrationError("configured tag-summary embedding seam unavailable")
-
-            physical_rows = list(
-                engine._store.get_all_canonical_turns(args.conversation_id),
-            )
-            physical_by_id = {
-                str(row.canonical_turn_id): row
-                for row in physical_rows if row.canonical_turn_id
-            }
-            original_llm = compactor.llm
-            probe = _ProviderProbe(original_llm)
-            compactor.llm = probe
-
             with _connect(dsn, read_only=False) as write_conn:
                 for candidate in selected:
                     tag = str(candidate["tag"])
@@ -2675,7 +2766,7 @@ def _apply_tags(args) -> None:
                     ordered_rows = list(_ordered_tag_sources(loaded))
                     expected = _deterministic_tag_envelope(
                         ordered_rows,
-                        generation_model=str(compactor.model_name or ""),
+                        generation_model=_DETERMINISTIC_GENERATION_MODEL,
                     )
                     candidate_expected = candidate["_expected_structured"]
                     if (
@@ -2686,6 +2777,18 @@ def _apply_tags(args) -> None:
                         cursor.freeze()
                         continue
                     summaries = [_stored_summary_from_row(row) for row in ordered_rows]
+                    physical_ids = list(dict.fromkeys(
+                        canonical_id
+                        for summary in summaries
+                        for canonical_id in summary.metadata.canonical_turn_ids
+                    ))
+                    physical_rows = _load_source_rows(
+                        write_conn, args.conversation_id, physical_ids, lock=False,
+                    )
+                    physical_by_id = {
+                        str(row["canonical_turn_id"]): row
+                        for row in physical_rows
+                    }
                     turn_numbers, canonical_ids, max_turn = _tag_source_coordinates(
                         summaries, physical_by_id,
                     )
@@ -2705,67 +2808,31 @@ def _apply_tags(args) -> None:
                             "reason": "source_segment_failed_physical_validation",
                         })
                         continue
-
-                    probe.begin()
-                    try:
-                        result = compactor.summarize_tag(
-                            tag,
-                            summaries,
-                            turn_numbers,
-                            canonical_ids,
-                            max_turn,
-                            generated_by_turn_id="",
-                            validated_tag_rollup_inputs=(
-                                validated_tag_rollup_inputs
-                            ),
-                        )
-                    except Exception as exc:
-                        _usage_add(usage, probe)
-                        try:
-                            from ..core.compactor import TagSummaryGenerationError
-                        except ImportError:
-                            TagSummaryGenerationError = ()  # type: ignore
-                        if TagSummaryGenerationError and isinstance(
-                            exc, TagSummaryGenerationError,
-                        ):
-                            consecutive_provider_failures = 0
-                            counts["malformed"] += 1
-                            cursor.on_decided(tag)
-                            _journal_append(journal, {
-                                "event": "tag_malformed",
-                                "ts": datetime.now(timezone.utc).isoformat(),
-                                "run_id": run_id,
-                                "tag": tag,
-                            })
-                            continue
-                        if not probe.exceptions:
-                            raise
-                        counts["provider_failure"] += 1
-                        consecutive_provider_failures += 1
-                        cursor.freeze()
-                        _journal_append(journal, {
-                            "event": "tag_provider_failure",
-                            "ts": datetime.now(timezone.utc).isoformat(),
-                            "run_id": run_id,
-                            "tag": tag,
-                            "exception_type": type(probe.exceptions[-1]).__name__,
-                        })
-                        if consecutive_provider_failures >= args.max_consecutive_provider_failures:
-                            status = "aborted_provider_down"
-                            break
-                        continue
-
-                    _usage_add(usage, probe)
-                    consecutive_provider_failures = 0
-                    rejection = _validate_tag_result(
-                        result,
-                        tag=tag,
-                        expected=expected,
-                        expected_model=str(compactor.model_name or ""),
-                        source_refs=[summary.ref for summary in summaries],
-                        turn_numbers=turn_numbers,
-                        canonical_ids=canonical_ids,
+                    structured = _deterministic_tag_selection(
+                        expected, canonical_ids,
                     )
+                    result = TagSummary(
+                        tag=tag,
+                        source_segment_refs=[summary.ref for summary in summaries],
+                        source_turn_numbers=turn_numbers,
+                        source_canonical_turn_ids=canonical_ids,
+                        covers_through_turn=max_turn,
+                        covers_through_canonical_turn_id=(
+                            canonical_ids[-1] if canonical_ids else ""
+                        ),
+                        structured_summary=structured,
+                    )
+                    rejection = _tag_claim_subset_reason(
+                        structured.claims, expected.claims,
+                    )
+                    if rejection is None and (
+                        not structured.claims
+                        or structured.source_digest
+                        != _tag_claim_selection_digest(
+                            structured.claims, canonical_ids,
+                        )
+                    ):
+                        rejection = "tag_structured_source_changed"
                     if rejection is not None:
                         counts["rejected"] += 1
                         rejected[rejection] += 1
@@ -2779,53 +2846,54 @@ def _apply_tags(args) -> None:
                         })
                         continue
 
-                    try:
-                        embedded = embed_fn([result.summary[:2000]])
-                        if not embedded:
-                            raise ValueError("embedding provider returned no rows")
-                        embedding = [float(value) for value in list(embedded[0])]
-                        if not _valid_embedding_json(embedding):
-                            raise ValueError("embedding provider returned invalid vector")
-                    except Exception as exc:  # no tag/embedding partial write
-                        counts["embedding_failure"] += 1
-                        cursor.freeze()
-                        status = "aborted_embedding_failure"
-                        _journal_append(journal, {
-                            "event": "tag_embedding_failure",
-                            "ts": datetime.now(timezone.utc).isoformat(),
-                            "run_id": run_id,
-                            "tag": tag,
-                            "exception_type": type(exc).__name__,
-                        })
-                        break
-
                     outcome = _cas_tag_persist(
                         write_conn, args,
                         initial_scope=scope,
                         candidate=candidate,
                         result=result,
-                        embedding=embedding,
                         journal=journal,
                         run_id=run_id,
                     )
                     if outcome == "accepted":
                         counts["accepted"] += 1
                         cursor.on_decided(tag)
-                        values = _tag_write_values(result, embedding)
+                        values = _tag_metadata_write_values(result)
+                        old = candidate.get("_existing")
+                        old = old if isinstance(old, Mapping) else {}
                         _journal_append(journal, {
                             "event": "tag_committed",
                             "ts": datetime.now(timezone.utc).isoformat(),
                             "run_id": run_id,
                             "tag": tag,
+                            "migration_mode": _MIGRATION_MODE,
+                            "provider_calls": 0,
                             "source_digest": result.structured_summary.source_digest,
-                            "new_summary_md5": hashlib.md5(
-                                result.summary.encode("utf-8"),
-                                usedforsecurity=False,
-                            ).hexdigest(),
-                            "new_embedding_md5": hashlib.md5(
-                                str(values["embedding_json"]).encode("utf-8"),
-                                usedforsecurity=False,
-                            ).hexdigest(),
+                            "old_summary_md5": str(
+                                old.get("old_summary_md5") or "",
+                            ),
+                            "new_summary_md5": str(
+                                old.get("old_summary_md5") or "",
+                            ),
+                            "old_description_md5": str(
+                                old.get("old_description_md5") or "",
+                            ),
+                            "new_description_md5": str(
+                                old.get("old_description_md5") or "",
+                            ),
+                            "old_retrieval_artifacts_md5": str(
+                                old.get("old_retrieval_artifacts_md5") or "",
+                            ),
+                            "new_retrieval_artifacts_md5": str(
+                                old.get("old_retrieval_artifacts_md5") or "",
+                            ),
+                            "old_embedding_md5": str(
+                                old.get("old_embedding_md5") or "",
+                            ),
+                            "new_embedding_md5": str(
+                                old.get("old_embedding_md5") or "",
+                            ),
+                            "retrieval_artifacts_preserved": True,
+                            "embedding_preserved": True,
                             "structured_summary_sha256": hashlib.sha256(
                                 str(values["structured_json"]).encode("utf-8"),
                             ).hexdigest(),
@@ -2855,14 +2923,6 @@ def _apply_tags(args) -> None:
             ),
         }))
         raise SystemExit(1) from exc
-    finally:
-        if engine is not None:
-            try:
-                if original_llm is not None and getattr(engine, "_compactor", None):
-                    engine._compactor.llm = original_llm
-                engine.close()
-            except Exception:  # noqa: BLE001
-                pass
 
     accepted = int(counts["accepted"])
     print(json.dumps({
@@ -2876,6 +2936,8 @@ def _apply_tags(args) -> None:
         "counts": dict(counts),
         "rejected": dict(sorted(rejected.items())),
         "usage": usage,
+        "migration_mode": _MIGRATION_MODE,
+        "provider_calls": 0,
         "journal": journal_path,
         "last_attempted_tag": last_attempted_tag,
         "resume_after_tag": cursor.ref,

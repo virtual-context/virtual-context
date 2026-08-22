@@ -37,15 +37,14 @@ from .summary_identity import (
     contains_ambiguous_human_referent,
     human_label_collision_key,
     is_safe_human_label,
+    structured_claims_contain_internal_identity,
 )
 from .structured_summary import (
     ValidatedTagRollupInputs,
     apply_tag_claim_safety_floor,
-    event_time_is_supported,
     infer_modality,
     infer_temporal_status,
     is_safety_critical_personal_evidence,
-    statuses_conflict,
     structured_claim_fingerprint,
     structured_source_digest,
     structured_source_provenance_digest,
@@ -86,70 +85,9 @@ _TAG_SUMMARY_IDENTITY_QUARANTINE = (
 )
 
 
-_STRUCTURED_SUMMARY_CONTRACT = """\
-SOURCE-BACKED SUMMARY CLAIMS CONTRACT:
-- In addition to the ordinary retrieval synopsis in "summary", return a
-  "summary_claims" JSON array. These claims are the compact summary that may
-  be shown to a future answering model.
-- The only available source lanes are the JSON objects below. Cite them by the
-  ephemeral "source_ref" value. Never emit a canonical id or actor id.
-- Every claim must cite exactly one source and copy a short, exact, contiguous
-  substring from that source's "content" into "evidence_excerpt".
-- Return at most 16 claims. Keep each claim under 240 characters and each
-  evidence excerpt under 240 characters.
-- Never combine multiple turns in one claim, even when they have the same
-  speaker. Split each separately supported statement into its own claim.
-  Assistant output is prior model text, not a structured evidence source;
-  retrieve FULL depth when it is needed.
-- "claim_type" must be one of: personal, world, decision, action, technical,
-  conversation.
-- "temporal_status" must be empty or one of: active, completed, ceased,
-  planned, abandoned, recurring. Use "ceased" for stopped/no-longer-active and
-  "planned" for intended but not begun. Never default an unclear state to
-  active.
-- "modality" must be one of: asserted, hypothetical, conditional, question,
-  recommendation, uncertain.
-- "event_time" must be empty or copied exactly from the cited evidence. The
-  source session date is utterance provenance, not proof of the event date.
-- "text" must be the same exact source substring as the first
-  "evidence_excerpt". The application re-stamps this field from admitted
-  evidence and binds the source speaker outside the claim text; it never trusts
-  a generated paraphrase as factual evidence.
-
-Available source lanes:
-{sources}
-
-The response object must include:
-"summary_claims": [
-  {{
-    "text": "same exact substring as the first evidence_excerpt",
-    "claim_type": "personal|world|decision|action|technical|conversation",
-    "temporal_status": "active|completed|ceased|planned|abandoned|recurring|",
-    "modality": "asserted|hypothetical|conditional|question|recommendation|uncertain",
-    "event_time": "",
-    "sources": [
-      {{"source_ref": "src_1", "evidence_excerpt": "exact source substring"}}
-    ]
-  }}
-]"""
-
-_SUMMARY_CLAIM_TYPES = frozenset({
-    "personal", "world", "decision", "action", "technical", "conversation",
-})
-_SUMMARY_MODALITIES = frozenset({
-    "asserted", "hypothetical", "conditional", "question",
-    "recommendation", "uncertain",
-})
-_SUMMARY_TEMPORAL_STATUSES = frozenset({
-    "", "active", "completed", "ceased", "planned", "abandoned", "recurring",
-})
-_MAX_GENERATED_SUMMARY_CLAIMS = 16
 _MAX_SUMMARY_CLAIMS = 256
 _MAX_TAG_SELECTED_CLAIMS = 16
-_MAX_CLAIM_SOURCES = 1
-_MAX_CLAIM_TEXT_CHARS = 1000
 _MAX_EVIDENCE_CHARS = 800
-_MAX_EVENT_TIME_CHARS = 128
 
 
 _TAG_CLAIM_SELECTION_CONTRACT = """\
@@ -291,23 +229,21 @@ def _segment_scope_fingerprint(segment: TaggedSegment) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def _structured_prompt_sources(
-    roster: object | None,
-    segment: TaggedSegment,
-) -> tuple[list[dict[str, str]], dict[str, object]]:
-    """Build ephemeral LLM source refs from exact compaction lanes.
+def _structured_requester_lanes(roster: object | None) -> tuple[object, ...]:
+    """Return safe, unique requester lanes in physical roster order.
 
-    Durable actor and canonical ids stay in the returned in-process mapping;
-    only ``src_N`` plus safe display data enters the prompt. Copied reply-edge
-    lanes are deliberately excluded because their body is not an independently
-    hydrated canonical source row.
+    The roster is built from hydrated canonical rows.  Assistant and copied
+    reply-edge lanes are deliberately excluded: neither is an independent
+    requester source for a schema-v1 segment claim.  Display-label collisions
+    quarantine every lane using that label rather than assigning one person's
+    words to another.
     """
     if roster is None or not getattr(roster, "complete", False):
-        return [], {}
+        return ()
 
-    candidates: list[tuple[object, str, str]] = []
+    candidates: list[tuple[object, str]] = []
     label_actors: dict[str, set[str]] = {}
-    seen_lanes: set[tuple[str, str]] = set()
+    seen_canonical_ids: set[str] = set()
     for lane in tuple(getattr(roster, "lanes", ()) or ()):
         lane_role = str(getattr(lane, "role", "") or "")
         if lane_role != AUTHOR_ROLE_REQUESTER:
@@ -318,11 +254,9 @@ def _structured_prompt_sources(
         ).strip()
         if not content or not canonical_id:
             continue
-        source_role = "requester"
-        dedupe_key = (source_role, canonical_id)
-        if dedupe_key in seen_lanes:
+        if canonical_id in seen_canonical_ids:
             continue
-        seen_lanes.add(dedupe_key)
+        seen_canonical_ids.add(canonical_id)
         actor = str(getattr(lane, "actor_id", "") or "").strip()
         label = str(getattr(lane, "speaker_label", "") or "").strip()
         if not actor or not is_safe_human_label(label, actor):
@@ -330,28 +264,15 @@ def _structured_prompt_sources(
         label_actors.setdefault(
             human_label_collision_key(label), set(),
         ).add(actor)
-        candidates.append((lane, source_role, label))
+        candidates.append((lane, label))
 
     colliding = {
         key for key, actors in label_actors.items() if len(actors) > 1
     }
-    prompt_sources: list[dict[str, str]] = []
-    source_map: dict[str, object] = {}
-    for lane, source_role, label in candidates:
-        if human_label_collision_key(label) in colliding:
-            continue
-        source_ref = f"src_{len(prompt_sources) + 1}"
-        source_map[source_ref] = lane
-        prompt_sources.append({
-            "source_ref": source_ref,
-            "role": source_role,
-            "speaker": label,
-            "session_date": str(
-                getattr(lane, "session_date", "") or segment.session_date or "",
-            ),
-            "content": str(getattr(lane, "text", "") or "").strip(),
-        })
-    return prompt_sources, source_map
+    return tuple(
+        lane for lane, label in candidates
+        if human_label_collision_key(label) not in colliding
+    )
 
 
 def _build_structured_summary(
@@ -361,15 +282,23 @@ def _build_structured_summary(
     *,
     generation_model: str = "",
 ) -> StructuredSummary:
-    """Validate model claims and stamp provenance from physical lanes.
+    """Materialize the v1 envelope deterministically from physical lanes.
 
-    Invalid claims are omitted independently.  The free-form synopsis remains
-    available for retrieval even when no claim survives; only these validated
-    claim objects are eligible for model-visible summary presentation.
+    ``parsed`` is accepted for API compatibility with the synopsis generation
+    path, but no provider-authored field controls structured claim membership,
+    content, metadata, or order.  The LLM owns only the private retrieval
+    synopsis.  Every admissible requester lane whose complete exact text fits
+    the evidence bound becomes one neutral conversation claim.  More bounded
+    lanes than schema v1 can represent produce an empty, digest-bound envelope
+    that the reader quarantines atomically; neither a partial claim set nor an
+    unbounded exact transcript is emitted.
     """
-    _prompt_sources, source_map = _structured_prompt_sources(roster, segment)
+    _ = parsed
+    requester_lanes = _structured_requester_lanes(roster)
     scope_by_id: dict[str, tuple[str, str, int]] = {}
     for message in segment.messages:
+        if message.role != "user":
+            continue
         for canonical_id in list(
             (message.metadata or {}).get(SOURCE_CANONICAL_TURN_IDS_KEY) or []
         ):
@@ -378,12 +307,18 @@ def _build_structured_summary(
                 str(message.source_origin_channel_id or ""),
                 int(message.source_audience_attribution_version or 0),
             )
+
     digest_records: list[dict[str, object]] = []
-    for lane in source_map.values():
+    bounded_sources: list[tuple[int, dict[str, object]]] = []
+    for source_index, lane in enumerate(requester_lanes):
         canonical_id = str(
             getattr(lane, "canonical_turn_id", "") or "",
         ).strip()
-        source_role = "requester"
+        actor = str(getattr(lane, "actor_id", "") or "").strip()
+        speaker_label = str(
+            getattr(lane, "speaker_label", "") or "",
+        ).strip()
+        canonical_evidence = str(getattr(lane, "text", "") or "").strip()
         fallback_audience, fallback_channel, fallback_version = scope_by_id.get(
             canonical_id, ("", "", 0),
         )
@@ -396,29 +331,53 @@ def _build_structured_summary(
             or fallback_channel or "",
         )
         attribution_version = getattr(
-            lane, "audience_attribution_version", fallback_version,
+            lane, "audience_attribution_version", 0,
         )
-        if type(attribution_version) is not int:
+        if attribution_version in (None, 0):
+            attribution_version = fallback_version
+        elif type(attribution_version) is not int:
             attribution_version = 0
         lane_session_date = str(
             getattr(lane, "session_date", "") or segment.session_date or "",
         )
-        digest_records.append({
+        record = {
             "canonical_turn_id": canonical_id,
-            "source_role": source_role,
-            "actor_id": str(getattr(lane, "actor_id", "") or ""),
-            "speaker_label": str(getattr(lane, "speaker_label", "") or ""),
-            "content": str(getattr(lane, "text", "") or "").strip(),
+            "source_role": "requester",
+            "actor_id": actor,
+            "speaker_label": speaker_label,
+            "content": canonical_evidence,
             "session_date": lane_session_date,
             "audience_conversation_id": audience,
             "origin_channel_id": channel,
             "audience_attribution_version": attribution_version,
-        })
+        }
+        digest_records.append(record)
+
+        # The aggregate digest binds every admitted requester source, including
+        # an over-limit lane.  Claims are stricter: a complete lane must fit the
+        # v1 evidence bound and carry a current audience proof.  Never slice an
+        # over-limit lane into a misleading partial claim.
+        if (
+            canonical_id not in scope_by_id
+            or not audience
+            or attribution_version != AUDIENCE_ATTRIBUTION_VERSION
+            or len(canonical_id) > 256
+            or len(speaker_label) > 256
+            or len(lane_session_date) > 128
+            or not canonical_evidence
+            or len(canonical_evidence) > _MAX_EVIDENCE_CHARS
+        ):
+            continue
+        bounded_sources.append((source_index, record))
+
     source_digest = (
         structured_source_digest(digest_records) if digest_records else ""
     )
-    raw_claims = parsed.get("summary_claims")
-    if not isinstance(raw_claims, list) or not source_map:
+    if len(bounded_sources) > _MAX_SUMMARY_CLAIMS:
+        # A partial envelope would violate the deterministic all-lanes
+        # contract. Preserve the digest and deliberately force fail-closed
+        # quarantine; the bounded canonical fallback cannot represent this
+        # many lanes either, and must not expose an arbitrary prefix.
         return StructuredSummary(
             schema_version=STRUCTURED_SUMMARY_SCHEMA_VERSION,
             claims=(),
@@ -426,281 +385,71 @@ def _build_structured_summary(
             generation_model=generation_model,
         )
 
-    claims: list[SummaryClaim] = []
-    for raw_claim in raw_claims[:_MAX_GENERATED_SUMMARY_CLAIMS]:
-        if not isinstance(raw_claim, dict):
-            continue
-        text = raw_claim.get("text")
-        claim_type = raw_claim.get("claim_type")
-        temporal_status = raw_claim.get("temporal_status")
-        modality = raw_claim.get("modality")
-        event_time = raw_claim.get("event_time")
-        raw_sources = raw_claim.get("sources")
-        if (
-            type(text) is not str
-            or not text.strip()
-            or len(text) > _MAX_CLAIM_TEXT_CHARS
-            or type(claim_type) is not str
-            or claim_type not in _SUMMARY_CLAIM_TYPES
-            or type(temporal_status) is not str
-            or temporal_status not in _SUMMARY_TEMPORAL_STATUSES
-            or type(modality) is not str
-            or modality not in _SUMMARY_MODALITIES
-            or type(event_time) is not str
-            or len(event_time) > _MAX_EVENT_TIME_CHARS
-            or not isinstance(raw_sources, list)
-            or len(raw_sources) != _MAX_CLAIM_SOURCES
-        ):
-            continue
-
-        stamped_sources: list[SummarySource] = []
-        source_roles: set[str] = set()
-        source_actors: set[str] = set()
-        excerpts: list[str] = []
-        valid = True
-        for raw_source in raw_sources:
-            if not isinstance(raw_source, dict):
-                valid = False
-                break
-            source_ref = raw_source.get("source_ref")
-            excerpt = raw_source.get("evidence_excerpt")
-            if (
-                type(source_ref) is not str
-                or type(excerpt) is not str
-                or not excerpt
-                or len(excerpt) > _MAX_EVIDENCE_CHARS
-            ):
-                valid = False
-                break
-            lane = source_map.get(source_ref)
-            lane_text = str(getattr(lane, "text", "") or "")
-            if lane is None or excerpt not in lane_text:
-                valid = False
-                break
-            source_role = "requester"
-            source_roles.add(source_role)
-            canonical_id = str(
-                getattr(lane, "canonical_turn_id", "") or "",
-            ).strip()
-            if not canonical_id:
-                valid = False
-                break
-            actor = str(getattr(lane, "actor_id", "") or "").strip()
-            speaker_label = str(
-                getattr(lane, "speaker_label", "") or "",
-            ).strip()
-            if not actor or not is_safe_human_label(speaker_label, actor):
-                valid = False
-                break
-            source_actors.add(actor)
-            # A model-selected substring is only a locator. Storing it alone
-            # can drop a negation from the same sentence (for example selecting
-            # ``currently taking`` from ``no longer currently taking``). V1
-            # therefore binds and presents the complete canonical human lane.
-            canonical_evidence = lane_text.strip()
-            if not canonical_evidence or len(canonical_evidence) > _MAX_EVIDENCE_CHARS:
-                valid = False
-                break
-            excerpts.append(canonical_evidence)
-            fallback_audience, fallback_channel, fallback_version = scope_by_id.get(
-                canonical_id, ("", "", 0),
-            )
-            audience = str(
-                getattr(lane, "audience_conversation_id", "")
-                or fallback_audience or "",
-            )
-            channel = str(
-                getattr(lane, "origin_channel_id", "")
-                or fallback_channel or "",
-            )
-            attribution_version = getattr(
-                lane, "audience_attribution_version", fallback_version,
-            )
-            if type(attribution_version) is not int:
-                attribution_version = 0
-            lane_session_date = str(
-                getattr(lane, "session_date", "") or segment.session_date or "",
-            )
-            stamped_sources.append(SummarySource(
-                canonical_turn_id=canonical_id,
-                source_role=source_role,
-                speaker_label=speaker_label,
-                evidence_excerpt=canonical_evidence,
-                session_date=lane_session_date,
-                source_provenance_digest=structured_source_provenance_digest({
-                    "canonical_turn_id": canonical_id,
-                    "source_role": source_role,
-                    "actor_id": actor,
-                    "speaker_label": speaker_label,
-                    "content": canonical_evidence,
-                    "session_date": lane_session_date,
-                    "audience_conversation_id": audience,
-                    "origin_channel_id": channel,
-                    "audience_attribution_version": attribution_version,
-                }),
-            ))
-
-        if (
-            not valid
-            or len(source_roles) != 1
-            or ("requester" in source_roles and len(source_actors) != 1)
-        ):
-            continue
-        evidence_text = "\n".join(excerpts)
-        evidenced_status = infer_temporal_status(evidence_text)
-        if statuses_conflict(temporal_status, evidenced_status):
-            continue
-        # Persist only a status deterministically present in the exact quote.
-        # The model-proposed value is useful as a contradiction alarm above,
-        # never as authority to upgrade an otherwise timeless excerpt into a
-        # current/planned/ceased state.
-        resolved_status = evidenced_status
-        resolved_modality = infer_modality(evidence_text)
-        if not event_time_is_supported(
-            event_time, excerpts, segment.session_date or "",
-        ):
-            event_time = ""
-
-        # Persist an extractive claim, not the model's paraphrase.  The LLM is
-        # useful for selecting an atomic source span and classifying it, but a
-        # generated sentence cannot be deterministically proven entailed by a
-        # quote.  This assignment is the hard boundary that prevents a model
-        # from citing "I stopped" while writing "still uses" in claim text.
-        extractive_text = excerpts[0].strip()
-        claims.append(SummaryClaim(
-            text=extractive_text,
-            # V1 does not treat a model-authored semantic class as proven
-            # metadata. A requester can quote or refute another speaker, and
-            # labeling that exact lane ``personal`` would still reframe the
-            # quoted assertion as the requester's state. The exact lane is a
-            # validated conversation claim; retrieval taxonomy remains in the
-            # non-presented synopsis/tags until a deterministic classifier is
-            # available.
-            claim_type="conversation",
-            temporal_status=resolved_status,
-            modality=resolved_modality,
-            event_time=event_time.strip(),
-            sources=tuple(stamped_sources),
-        ))
-
-    # The LLM may rank ordinary details, but it cannot be the sole authority
-    # deciding whether a correction or state transition exists. Otherwise a
-    # prompt-guard failure can omit a newer ``I stopped``/``I don't take`` lane
-    # and leave an older active claim as the only compressed memory. Add every
-    # bounded safety-critical requester lane deterministically when the model
-    # did not select it. The claim remains the complete exact lane with
-    # application-derived metadata; no generated sentence is introduced.
-    selected_canonical_ids = {
-        source.canonical_turn_id
-        for claim in claims
-        for source in claim.sources
-    }
-    for lane in source_map.values():
-        canonical_evidence = str(getattr(lane, "text", "") or "").strip()
-        canonical_id = str(
-            getattr(lane, "canonical_turn_id", "") or "",
-        ).strip()
-        if (
-            canonical_id in selected_canonical_ids
-            or not canonical_id
-            or not canonical_evidence
-            or len(canonical_evidence) > _MAX_EVIDENCE_CHARS
-            or not is_safety_critical_personal_evidence(canonical_evidence)
-        ):
-            continue
-        actor = str(getattr(lane, "actor_id", "") or "").strip()
-        speaker_label = str(
-            getattr(lane, "speaker_label", "") or "",
-        ).strip()
-        if not actor or not is_safe_human_label(speaker_label, actor):
-            continue
-        fallback_audience, fallback_channel, fallback_version = scope_by_id.get(
-            canonical_id, ("", "", 0),
-        )
-        audience = str(
-            getattr(lane, "audience_conversation_id", "")
-            or fallback_audience or "",
-        )
-        channel = str(
-            getattr(lane, "origin_channel_id", "")
-            or fallback_channel or "",
-        )
-        attribution_version = getattr(
-            lane, "audience_attribution_version", fallback_version,
-        )
-        if type(attribution_version) is not int:
-            attribution_version = 0
-        lane_session_date = str(
-            getattr(lane, "session_date", "") or segment.session_date or "",
-        )
+    claims_by_source_index: list[tuple[int, SummaryClaim]] = []
+    for source_index, record in bounded_sources:
+        canonical_evidence = str(record["content"])
         source = SummarySource(
-            canonical_turn_id=canonical_id,
+            canonical_turn_id=str(record["canonical_turn_id"]),
             source_role="requester",
-            speaker_label=speaker_label,
+            speaker_label=str(record["speaker_label"]),
             evidence_excerpt=canonical_evidence,
-            session_date=lane_session_date,
-            source_provenance_digest=structured_source_provenance_digest({
-                "canonical_turn_id": canonical_id,
-                "source_role": "requester",
-                "actor_id": actor,
-                "speaker_label": speaker_label,
-                "content": canonical_evidence,
-                "session_date": lane_session_date,
-                "audience_conversation_id": audience,
-                "origin_channel_id": channel,
-                "audience_attribution_version": attribution_version,
-            }),
+            session_date=str(record["session_date"]),
+            source_provenance_digest=structured_source_provenance_digest(record),
         )
-        claims.append(SummaryClaim(
+        claims_by_source_index.append((source_index, SummaryClaim(
             text=canonical_evidence,
             claim_type="conversation",
             temporal_status=infer_temporal_status(canonical_evidence),
             modality=infer_modality(canonical_evidence),
             event_time="",
             sources=(source,),
-        ))
-        selected_canonical_ids.add(canonical_id)
+        )))
 
-    # A provider-controlled claim list must not control the order in which a
-    # newer correction and an older state reach SEGMENTS.  Put mandatory
-    # safety lanes first in reverse physical source order (the roster follows
-    # ``canonical_turn_ids``), then retain the provider's order for ordinary
-    # exact claims. Also collapse duplicate selections of one physical lane.
-    source_order = {
-        str(getattr(lane, "canonical_turn_id", "") or ""): index
-        for index, lane in enumerate(source_map.values())
-    }
-    unique_claims: list[SummaryClaim] = []
-    seen_claim_sources: set[str] = set()
-    for claim in claims:
-        canonical_id = claim.sources[0].canonical_turn_id
-        if canonical_id in seen_claim_sources:
-            continue
-        seen_claim_sources.add(canonical_id)
-        unique_claims.append(claim)
-    mandatory_claims = sorted(
-        (
-            claim for claim in unique_claims
-            if is_safety_critical_personal_evidence(claim.text)
-        ),
-        key=lambda claim: source_order.get(
-            claim.sources[0].canonical_turn_id, -1,
-        ),
-        reverse=True,
-    )
-    mandatory_ids = {
-        claim.sources[0].canonical_turn_id for claim in mandatory_claims
-    }
-    claims = mandatory_claims + [
-        claim for claim in unique_claims
-        if claim.sources[0].canonical_turn_id not in mandatory_ids
+    # Safety-critical state/correction lanes lead newest-first so a bounded
+    # renderer cannot expose only an older active state.  Every remaining lane
+    # follows physical canonical order.  Provider output cannot affect either
+    # membership or ordering.
+    mandatory_claims = [
+        claim for _index, claim in reversed(claims_by_source_index)
+        if is_safety_critical_personal_evidence(claim.text)
     ]
+    ordinary_claims = [
+        claim for _index, claim in claims_by_source_index
+        if not is_safety_critical_personal_evidence(claim.text)
+    ]
+    claims = mandatory_claims + ordinary_claims
+    if structured_claims_contain_internal_identity(
+        claims,
+        admitted_actor_ids=(record["actor_id"] for record in digest_records),
+    ):
+        # Internal durable identities are control-plane data. Keep the source
+        # digest for staleness proof, but never persist a model-visible partial
+        # envelope after deleting or rewriting one exact lane.
+        claims = []
 
     return StructuredSummary(
         schema_version=STRUCTURED_SUMMARY_SCHEMA_VERSION,
         claims=tuple(claims),
         source_digest=source_digest,
         generation_model=generation_model,
+    )
+
+
+def build_deterministic_structured_summary(
+    *,
+    roster: object | None,
+    segment: TaggedSegment,
+    generation_model: str,
+) -> StructuredSummary:
+    """Build a source-bound segment envelope without an LLM provider.
+
+    Historical repair uses this public pure seam so availability or
+    credentials for a synopsis provider cannot affect evidence migration.
+    Online compaction calls the same builder after generating its private
+    retrieval synopsis.
+    """
+    return _build_structured_summary(
+        {}, roster, segment, generation_model=generation_model,
     )
 
 
@@ -1805,17 +1554,28 @@ class DomainCompactor:
 
     def build_structured_summary(
         self,
-        parsed: dict,
+        parsed: dict | None = None,
         *,
         roster: "ActorRoster | None",
         segment: TaggedSegment,
+        generation_model_override: str | None = None,
     ) -> StructuredSummary:
-        """Validate parsed claims using the normal compaction boundary."""
-        return _build_structured_summary(
-            parsed,
-            roster,
-            segment,
-            generation_model=self.model_name,
+        """Build the deterministic envelope from canonical requester lanes.
+
+        ``generation_model_override`` lets a non-LLM repair path stamp an
+        honest maintenance marker while online generation continues to use
+        this compactor's configured model name.  ``parsed`` is ignored by the
+        evidence builder and remains only for call-site compatibility.
+        """
+        _ = parsed
+        return build_deterministic_structured_summary(
+            roster=roster,
+            segment=segment,
+            generation_model=(
+                self.model_name
+                if generation_model_override is None
+                else generation_model_override
+            ),
         )
 
     def summarize_tag(
@@ -1979,19 +1739,13 @@ class DomainCompactor:
         prompt += "\n\n" + _SEGMENT_IDENTITY_CONTRACT.format(
             labels=json.dumps(list(roster_labels), ensure_ascii=False),
         )
-        prompt_sources, _source_map = _structured_prompt_sources(roster, segment)
-        prompt += "\n\n" + _STRUCTURED_SUMMARY_CONTRACT.format(
-            sources=json.dumps(
-                prompt_sources, ensure_ascii=False, separators=(",", ":"),
-            ),
-        )
 
         system = (
             "You are a conversation summarizer. Output valid JSON only. "
             "No markdown fences, no extra text. Preserve negation and intent exactly. "
-            "Every summary claim must be grounded in the segment being summarized. "
-            "The free-form summary is a retrieval synopsis; summary_claims are "
-            "the source-backed presentation record and must follow their schema exactly."
+            "The free-form summary is a private retrieval synopsis. The application "
+            "materializes its source-backed presentation record independently from "
+            "canonical requester lanes."
         )
         if prev_context:
             system += (
@@ -2032,26 +1786,6 @@ class DomainCompactor:
         normalized_refs = request.normalized_code_refs
         system = request.system
         prompt = request.prompt
-        structured_prompt_sources, _ = _structured_prompt_sources(roster, segment)
-        # Require a structured claim when at least one source lane can fit in
-        # the v1 exact-evidence envelope.  A provider that silently ignores the
-        # new field must not make canonical fallback the permanent normal path
-        # without even receiving the existing one-shot corrective retry.
-        structured_claim_expected = any(
-            0 < len(str(source.get("content", "")).strip()) <= _MAX_EVIDENCE_CHARS
-            for source in structured_prompt_sources
-        )
-
-        def _missing_required_structured_claims(candidate: dict) -> bool:
-            return bool(
-                structured_claim_expected
-                and not _build_structured_summary(
-                    candidate,
-                    roster,
-                    segment,
-                    generation_model=self.model_name,
-                ).claims
-            )
 
         # DIAGNOSTIC: log compactor input for each segment
         logger.info(
@@ -2084,11 +1818,6 @@ class DomainCompactor:
                 _reject_reason = self._segment_summary_reject_reason(
                     parsed.get("summary", ""), conversation_text, roster,
                 )
-            if (
-                _reject_reason is None
-                and _missing_required_structured_claims(parsed)
-            ):
-                _reject_reason = "missing_structured_claims"
             if _reject_reason is not None:
                 # A tiny acknowledgement whose generated "summary" is longer
                 # than its full transcript is the production signature of
@@ -2096,7 +1825,6 @@ class DomainCompactor:
                 # second call: preserve the exact source immediately.
                 if (
                     not fail_closed
-                    and not structured_claim_expected
                     and len(conversation_text.strip()) < 256
                     and self._summary_overshoots_source(
                         parsed.get("summary", ""), conversation_text,
@@ -2137,13 +1865,6 @@ class DomainCompactor:
                                 if _reject_reason == "ambiguous_human_referent"
                                 else ""
                             )
-                            + (
-                                " Your previous response contained no admissible source-backed "
-                                "summary claim. Return at least one summary_claims item citing "
-                                "exactly one available source_ref and an exact evidence substring."
-                                if _reject_reason == "missing_structured_claims"
-                                else ""
-                            )
                         ),
                         user=prompt,
                         max_tokens=(
@@ -2168,11 +1889,6 @@ class DomainCompactor:
                     _retry_reason = self._segment_summary_reject_reason(
                         parsed.get("summary", ""), conversation_text, roster,
                     )
-                    if (
-                        _retry_reason is None
-                        and _missing_required_structured_claims(parsed)
-                    ):
-                        _retry_reason = "missing_structured_claims"
                     if _retry_reason is not None:
                         if _retry_reason == "ambiguous_human_referent":
                             # The free-form synopsis is an internal retrieval
@@ -2183,21 +1899,6 @@ class DomainCompactor:
                             logger.warning(
                                 "Generic referent persisted in retrieval synopsis "
                                 "for segment %s; retaining index text only",
-                                segment.id,
-                            )
-                        elif _retry_reason == "missing_structured_claims":
-                            if fail_closed:
-                                raise SegmentSummaryGenerationError(
-                                    f"segment {segment.id} returned no admissible "
-                                    "structured claims after retry"
-                                )
-                            # Keep the generated text as a private retrieval
-                            # synopsis, but leave the structured envelope empty
-                            # so every presentation surface uses the exact
-                            # canonical fallback and migration will select it.
-                            logger.warning(
-                                "No admissible structured claims after retry for "
-                                "segment %s; retaining synopsis for retrieval only",
                                 segment.id,
                             )
                         else:
@@ -2743,13 +2444,13 @@ class DomainCompactor:
 
     @staticmethod
     def _parse_structured_response_strict(response: str) -> dict | None:
-        """Parse the migration/writer contract without a prose fallback.
+        """Parse the synopsis contract without a prose fallback.
 
         Normal online compaction may preserve source text when a provider is
         unavailable.  A repair migration cannot: doing so and stamping a v1
         digest would make provider failure indistinguishable from a completed
-        structured regeneration.  Require the two top-level fields owned by
-        this writer and let claim-local validation handle their contents.
+        synopsis regeneration. Require only a non-empty JSON ``summary``;
+        structured claims are materialized separately from canonical lanes.
         """
         result = parse_llm_json(response)
         if not isinstance(result, dict):
@@ -2757,8 +2458,6 @@ class DomainCompactor:
         if type(result.get("summary")) is not str:
             return None
         if not result["summary"].strip():
-            return None
-        if not isinstance(result.get("summary_claims"), list):
             return None
         return result
 

@@ -26,6 +26,7 @@ from typing import Iterable, TYPE_CHECKING
 
 from ..types import (
     AUDIENCE_ATTRIBUTION_VERSION,
+    STRUCTURED_SUMMARY_MAX_EXCERPT_CHARS,
     STRUCTURED_SUMMARY_SCHEMA_VERSION,
 )
 from .structured_summary import (
@@ -635,6 +636,77 @@ class SummarySourceProjection:
 
     lanes: tuple[HistoricalSourceLane, ...] = ()
     complete: bool = False
+
+
+def _projection_contains_internal_identity(
+    projection: SummarySourceProjection,
+) -> bool:
+    """Whether exact projection text would disclose control-plane identity.
+
+    The decision is projection-atomic.  Rewriting or slicing an exact lane
+    would destroy its provenance semantics, so one internal identity marker or
+    one admitted human actor id quarantines the complete projection.  Actor ids
+    are collected before scanning so an assistant lane cannot echo a human
+    lane's internal id into FULL output.
+    """
+    actor_ids = {
+        lane.actor_id.strip()
+        for lane in projection.lanes
+        if lane.role == "historical_human" and lane.actor_id.strip()
+    }
+    return any(
+        _content_contains_internal_identity(
+            lane.content,
+            admitted_actor_ids=actor_ids,
+        )
+        for lane in projection.lanes
+    )
+
+
+def _content_contains_internal_identity(
+    content: object,
+    *,
+    admitted_actor_ids: Iterable[object],
+) -> bool:
+    """Detect control-plane identity after display-policy normalization."""
+    if type(content) is not str:
+        return False
+    normalized_content = _normalized_label_policy_text(content)
+    normalized_actor_ids = {
+        _normalized_label_policy_text(actor_id)
+        for actor_id in admitted_actor_ids
+        if type(actor_id) is str and _normalized_label_policy_text(actor_id)
+    }
+    return bool(
+        _INTERNAL_IDENTITY_LABEL_RE.search(normalized_content)
+        or any(actor_id in normalized_content for actor_id in normalized_actor_ids)
+    )
+
+
+def structured_claims_contain_internal_identity(
+    claims: Iterable[object],
+    *,
+    admitted_actor_ids: Iterable[object],
+) -> bool:
+    """Whether any structured evidence exposes an admitted internal identity.
+
+    This predicate is artifact-atomic: callers must reject the complete
+    structured envelope rather than deleting, rewriting, or slicing one claim.
+    It is public so historical migration applies the same content rule as the
+    runtime reader before classifying or persisting a v1 envelope.
+    """
+    actor_ids = tuple(admitted_actor_ids)
+    for claim in claims:
+        sources = getattr(claim, "sources", ())
+        if not isinstance(sources, (tuple, list)):
+            continue
+        for source in sources:
+            if _content_contains_internal_identity(
+                getattr(source, "evidence_excerpt", None),
+                admitted_actor_ids=actor_ids,
+            ):
+                return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -1646,15 +1718,17 @@ def _validated_structured_claims(
         return ()
     metadata = _metadata_for(item)
     is_tag_summary = metadata is None and hasattr(item, "tag")
-    required_critical_ids: set[str] = set()
+    required_source_ids: set[str] = set()
+    admitted_actor_ids: set[str] = set()
     segment_source_order: dict[str, int] = {}
     if metadata is not None:
         # Segment source_digest authenticates the full source snapshot, but it
-        # does not by itself prove that the claim list covers a newer
-        # correction. Reject an active-only v1 payload when an admitted exact
-        # requester row says ``stopped``/``off``/``don't take`` and is absent
-        # from its claims. Legacy/corrupt rows then use the canonical fallback
-        # instead of presenting the stale subset as complete memory.
+        # does not prove that the claim list covers that snapshot. Every exact
+        # requester lane that fits in one atomic claim must survive validation;
+        # otherwise an old/partial v1 payload could silently omit ordinary
+        # context or a newer correction. A safety-critical lane that is too
+        # large for the claim schema also makes the compressed layer unsafe:
+        # reject it so the caller uses the complete canonical fallback.
         canonical_ids = _canonical_ids_for(item)
         segment_source_order = {
             canonical_id: index
@@ -1678,10 +1752,15 @@ def _validated_structured_claims(
                 or not _source_row_is_admitted(row, speaker_context)
             ):
                 return ()
-            if (
-                is_safety_critical_personal_evidence(requester_text)
-            ):
-                required_critical_ids.add(canonical_id)
+            actor_id = str(
+                getattr(row, "sender_actor_id", "") or "",
+            ).strip()
+            if actor_id:
+                admitted_actor_ids.add(actor_id)
+            if len(requester_text) <= STRUCTURED_SUMMARY_MAX_EXCERPT_CHARS:
+                required_source_ids.add(canonical_id)
+            elif is_safety_critical_personal_evidence(requester_text):
+                return ()
     elif is_tag_summary:
         # The selected-claim digest proves only the compact layer-two
         # envelope. It cannot prove that selection retained a newer stop,
@@ -1716,6 +1795,11 @@ def _validated_structured_claims(
                 return ()
             if not _source_row_is_admitted(row, speaker_context):
                 continue
+            actor_id = str(
+                getattr(row, "sender_actor_id", "") or "",
+            ).strip()
+            if actor_id:
+                admitted_actor_ids.add(actor_id)
             requester_text = str(
                 getattr(row, "user_content", "") or "",
             ).strip()
@@ -1723,7 +1807,12 @@ def _validated_structured_claims(
                 requester_text
                 and is_safety_critical_personal_evidence(requester_text)
             ):
-                required_critical_ids.add(canonical_id)
+                required_source_ids.add(canonical_id)
+    if structured_claims_contain_internal_identity(
+        raw_claims,
+        admitted_actor_ids=admitted_actor_ids,
+    ):
+        return ()
     validated: list[tuple[str, ValidatedSummaryClaim]] = []
     validated_source_ids: set[str] = set()
     for claim in raw_claims:
@@ -1766,7 +1855,7 @@ def _validated_structured_claims(
                 validated_source_ids.add(canonical_id)
     if is_tag_summary and len(validated) != len(raw_claims):
         return ()
-    if required_critical_ids - validated_source_ids:
+    if required_source_ids - validated_source_ids:
         return ()
     if metadata is not None:
         # Validate and reconstruct every candidate before deciding which ones
@@ -1775,7 +1864,10 @@ def _validated_structured_claims(
         # claim occupy the bounded SUMMARY prefix while a newer exact stop is
         # pushed past it. The projection text is the whole canonical requester
         # lane; order critical projections by the digest-authenticated physical
-        # chronology and only then retain the ordinary validated order.
+        # chronology. Ordinary claims also use physical chronology: an older
+        # provider-built v1 envelope may contain every required lane while
+        # retaining a model-selected order, and persisted order is not source
+        # authority.
         critical = sorted(
             (
                 entry for entry in validated
@@ -1785,10 +1877,14 @@ def _validated_structured_claims(
             reverse=True,
         )
         critical_source_ids = {canonical_id for canonical_id, _ in critical}
-        validated = critical + [
-            entry for entry in validated
-            if entry[0] not in critical_source_ids
-        ]
+        ordinary = sorted(
+            (
+                entry for entry in validated
+                if entry[0] not in critical_source_ids
+            ),
+            key=lambda entry: segment_source_order[entry[0]],
+        )
+        validated = critical + ordinary
     return tuple(
         projection for _, projection in validated[
             :_STRUCTURED_SEGMENTS_MAX_CLAIMS
@@ -1953,6 +2049,8 @@ def render_full_source_projection_for_model(
     """Render the exact role-separated canonical transcript for FULL depth."""
     if projection is None or not projection.complete or not projection.lanes:
         return SUMMARY_ATTRIBUTION_QUARANTINE
+    if _projection_contains_internal_identity(projection):
+        return SUMMARY_ATTRIBUTION_QUARANTINE
     payload = {
         "source": "canonical_turns",
         "depth": "full",
@@ -1981,6 +2079,8 @@ def render_source_projection_for_model(
 ) -> str:
     """Serialize one canonical projection without generated prose or ids."""
     if projection is None or not projection.complete or not projection.lanes:
+        return SUMMARY_ATTRIBUTION_QUARANTINE
+    if _projection_contains_internal_identity(projection):
         return SUMMARY_ATTRIBUTION_QUARANTINE
     if len(projection.lanes) > _SOURCE_TRANSCRIPT_MAX_LANES:
         return SUMMARY_ATTRIBUTION_QUARANTINE
