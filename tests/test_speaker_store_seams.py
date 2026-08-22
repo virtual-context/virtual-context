@@ -207,6 +207,23 @@ class TestSpeakerChunkEnumeration:
 
 
 class TestPhysicalRowLookup:
+    def test_no_context_or_internal_authority_fails_closed(self, tmp_path: Path):
+        store = _store(tmp_path)
+        _row(store, ct_id="ct-1", sort_key=1000.0, user_content="first")
+        assert store.get_canonical_turn_rows_by_id([("c", "ct-1")]) == {}
+
+    def test_internal_validation_hydrates_only_literal_requested_keys(
+        self, tmp_path: Path,
+    ):
+        store = _store(tmp_path)
+        _row(store, ct_id="ct-wanted", sort_key=1000.0, user_content="wanted")
+        _row(store, ct_id="ct-unrelated", sort_key=2000.0, user_content="other")
+        rows = store.get_canonical_turn_rows_by_id(
+            [("c", "ct-wanted")], internal_validation=True,
+        )
+        assert set(rows) == {("c", "ct-wanted")}
+        assert rows[("c", "ct-wanted")].user_content == "wanted"
+
     def test_returns_physical_rows_keyed_by_canonical_id(self, tmp_path: Path):
         store = _store(tmp_path)
         _row(store, ct_id="ct-1", sort_key=1000.0, user_content="first")
@@ -293,4 +310,3 @@ class TestSpeakerSemanticOnRealStore:
         assert manager.semantic_canonical_turn_search(
             "boston trip", conversation_id="c",
         ) == []
-

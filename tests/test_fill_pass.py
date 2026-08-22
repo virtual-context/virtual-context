@@ -108,7 +108,7 @@ def test_fill_pass_no_op_when_over_target():
     assert turns == 0
 
 
-def test_fill_pass_adds_breadth_summaries():
+def test_fill_pass_skips_unproved_breadth_summaries():
     from virtual_context.proxy.message_filter import fill_pass
 
     body = _make_anthropic_body(["hello"])
@@ -134,15 +134,15 @@ def test_fill_pass_adds_breadth_summaries():
         store=mock_store, conversation_id="test",
         summary_ratio=1.0,
     )
-    assert summaries_added >= 1
+    assert summaries_added == 0
     mock_store.get_all_tag_summaries.assert_called_once_with(conversation_id="test")
     rendered = json.dumps(result)
     assert "Italian cooking" not in rendered
     assert "Bread baking" not in rendered
-    assert SUMMARY_ATTRIBUTION_QUARANTINE in rendered
+    assert SUMMARY_ATTRIBUTION_QUARANTINE not in rendered
 
 
-def test_fill_pass_quarantines_unscoped_overflow_segment_summary():
+def test_fill_pass_skips_unscoped_overflow_segment_summary():
     """A direct StoredSummary without attribution must fail closed."""
     from virtual_context.proxy.message_filter import fill_pass
 
@@ -177,10 +177,9 @@ def test_fill_pass_quarantines_unscoped_overflow_segment_summary():
     )
 
     rendered = json.dumps(result)
-    assert summaries_added == 1
-    assert "health" in rendered
+    assert summaries_added == 0
     assert "BigTex stopped tesamorelin." not in rendered
-    assert SUMMARY_ATTRIBUTION_QUARANTINE in rendered
+    assert SUMMARY_ATTRIBUTION_QUARANTINE not in rendered
 
 
 def test_presented_tags_from_segments_and_full_sections():
@@ -274,10 +273,10 @@ def test_fill_pass_accounting_summary_and_turns():
         summary_ratio=0.5,
     )
 
-    assert summaries_added >= 1
+    assert summaries_added == 0
     result_json = json.dumps(result_body)
     assert "Historical events discussed" not in result_json
-    assert SUMMARY_ATTRIBUTION_QUARANTINE in result_json
+    assert SUMMARY_ATTRIBUTION_QUARANTINE not in result_json
 
 
 def test_fill_pass_sanitizes_restored_turns():

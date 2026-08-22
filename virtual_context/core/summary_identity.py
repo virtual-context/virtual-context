@@ -8,9 +8,11 @@ is never treated as ownership proof: subjectless and passive summaries are
 common, so an audience-scoped canonical-row mapping is the primary control.
 
 The gate never guesses an owner and never treats a label as semantic proof.
-Generated prose is ranking-only. Model-facing summary surfaces either rebuild
-role-local human text from exact audience-scoped canonical rows or withhold the
-item; assistant output and copied reply bodies are not summary evidence.
+Free-form generated prose is ranking-only. Versioned structured summaries may
+select and classify exact excerpts, but presentation rebuilds their claim text
+from the admitted excerpt and independently checks identity, role, modality,
+time, and source integrity. Legacy rows fall back to exact human source text;
+FULL depth reconstructs the exact role-separated canonical transcript.
 """
 
 from __future__ import annotations
@@ -22,7 +24,21 @@ import unicodedata
 import uuid
 from typing import Iterable, TYPE_CHECKING
 
-from ..types import AUDIENCE_ATTRIBUTION_VERSION
+from ..types import (
+    AUDIENCE_ATTRIBUTION_VERSION,
+    STRUCTURED_SUMMARY_SCHEMA_VERSION,
+)
+from .structured_summary import (
+    event_time_is_supported,
+    infer_modality,
+    infer_temporal_status,
+    is_safety_critical_personal_evidence,
+    statuses_conflict,
+    structured_claim_fingerprint,
+    structured_source_digest,
+    structured_source_provenance_digest,
+    structured_tag_claim_digest,
+)
 
 if TYPE_CHECKING:
     from ..types import SpeakerRetrievalContext
@@ -199,16 +215,38 @@ SUMMARY_ATTRIBUTION_QUARANTINE = (
 )
 
 _SUMMARY_ATTRIBUTION_MARKER_RE = re.compile(
-    r"</?(?:summary-attribution|historical-source-transcript)\b",
+    r"</?(?:summary-attribution|historical-source-transcript|"
+    r"structured-summary|canonical-source-transcript)\b",
     re.IGNORECASE,
 )
 _SOURCE_TRANSCRIPT_OPEN = "<historical-source-transcript>\n"
 _SOURCE_TRANSCRIPT_CLOSE = "\n</historical-source-transcript>"
+_STRUCTURED_SUMMARY_OPEN = "<structured-summary>\n"
+_STRUCTURED_SUMMARY_CLOSE = "\n</structured-summary>"
+_FULL_TRANSCRIPT_OPEN = "<canonical-source-transcript>\n"
+_FULL_TRANSCRIPT_CLOSE = "\n</canonical-source-transcript>"
 _SOURCE_SPEAKER_REF_RE = re.compile(r"^historical_[0-9a-f]{16}$")
 # Bounds apply to the complete serialized JSON payload.  Oversized source
 # groups are withheld atomically; no lane or speaker binding is ever sliced.
 _SOURCE_TRANSCRIPT_MAX_LANES = 12
 _SOURCE_TRANSCRIPT_MAX_UTF8_BYTES = 16 * 1024
+_FULL_TRANSCRIPT_MAX_TURNS = 128
+_FULL_TRANSCRIPT_MAX_LANES = _FULL_TRANSCRIPT_MAX_TURNS * 2
+_FULL_TRANSCRIPT_MAX_UTF8_BYTES = 256 * 1024
+_STRUCTURED_SUMMARY_MAX_CLAIMS = 8
+_STRUCTURED_TAG_MAX_SELECTED_CLAIMS = 16
+_STRUCTURED_SEGMENTS_MAX_CLAIMS = 64
+_STRUCTURED_RENDER_MAX_UTF8_BYTES = 64 * 1024
+_STRUCTURED_CLAIM_TYPES = frozenset({
+    "personal", "world", "decision", "action", "technical", "conversation",
+})
+_STRUCTURED_MODALITIES = frozenset({
+    "asserted", "hypothetical", "conditional", "question",
+    "recommendation", "uncertain",
+})
+_STRUCTURED_TEMPORAL_STATUSES = frozenset({
+    "", "active", "completed", "ceased", "planned", "abandoned", "recurring",
+})
 
 _DERIVED_SOURCE_PROSE_FIELDS = frozenset({
     "summary",
@@ -223,6 +261,72 @@ _DERIVED_SOURCE_PROSE_FIELDS = frozenset({
     "evidence",
 })
 _DERIVED_INSTRUCTION_FIELDS = frozenset({"reader_hint"})
+
+
+_REQUEST_LOCAL_RENDERING_TOKEN = object()
+
+
+class _RequestLocalSummaryRendering(str):
+    """A rendering that survived canonical hydration in this process.
+
+    The serialized envelope remains deliberately self-describing, but its
+    syntax is not provenance.  This ephemeral subtype is retained only until
+    the model-boundary sanitizer runs; JSON serialization (or any ordinary
+    string reconstruction) drops the in-process proof, as it should.
+    """
+
+    def __new__(
+        cls,
+        value: str,
+        *,
+        speaker_context: "SpeakerRetrievalContext",
+        _token: object,
+    ) -> "_RequestLocalSummaryRendering":
+        if _token is not _REQUEST_LOCAL_RENDERING_TOKEN:
+            raise TypeError("request-local summary renderings are internal")
+        rendered = str.__new__(cls, value)
+        rendered._speaker_context = speaker_context
+        return rendered
+
+    def __copy__(self) -> "_RequestLocalSummaryRendering":
+        return self
+
+    def __deepcopy__(self, memo: dict) -> "_RequestLocalSummaryRendering":
+        memo[id(self)] = self
+        return self
+
+
+def _mark_request_local_summary_rendering(
+    text: str,
+    *,
+    speaker_context: "SpeakerRetrievalContext",
+) -> str:
+    """Carry successful exact-row proof to the next model boundary."""
+    if (
+        not getattr(speaker_context, "eligible", False)
+        or not is_proved_summary_rendering(text)
+    ):
+        return SUMMARY_ATTRIBUTION_QUARANTINE
+    return _RequestLocalSummaryRendering(
+        text,
+        speaker_context=speaker_context,
+        _token=_REQUEST_LOCAL_RENDERING_TOKEN,
+    )
+
+
+def _is_request_local_summary_rendering(
+    text: object,
+    *,
+    speaker_context: "SpeakerRetrievalContext | None",
+) -> bool:
+    """Require both the ephemeral proof carrier and a still-valid envelope."""
+    return bool(
+        type(text) is _RequestLocalSummaryRendering
+        and speaker_context is not None
+        and getattr(speaker_context, "eligible", False)
+        and getattr(text, "_speaker_context", None) is speaker_context
+        and is_proved_summary_rendering(text)
+    )
 
 
 def contains_ambiguous_human_referent(text: object) -> bool:
@@ -245,32 +349,210 @@ def contains_ambiguous_human_referent(text: object) -> bool:
     )
 
 
-def is_proved_summary_rendering(text: object) -> bool:
-    """Validate one canonical-source transcript projection.
-
-    Generated summary prose can neither prove its speaker nor preserve the
-    source's plan/ceased/current modality.  Consequently the only rendering
-    trusted by model-facing summary surfaces is a JSON envelope built from
-    exact, audience-admitted canonical rows.  Syntax alone is never authority;
-    callers may preserve a valid envelope only on an internal path that just
-    constructed it from those rows.
-    """
-    if not isinstance(text, str) or not text.startswith(_SOURCE_TRANSCRIPT_OPEN):
-        return False
-    remainder = text[len(_SOURCE_TRANSCRIPT_OPEN):]
-    if remainder.count(_SOURCE_TRANSCRIPT_CLOSE) != 1:
-        return False
-    payload_text, trailing = remainder.split(_SOURCE_TRANSCRIPT_CLOSE, 1)
+def _decode_rendered_envelope(
+    text: object,
+    opening: str,
+    closing: str,
+    max_bytes: int,
+) -> dict | None:
+    """Decode one internally constructed, exactly bounded JSON envelope."""
+    if not isinstance(text, str) or not text.startswith(opening):
+        return None
+    remainder = text[len(opening):]
+    if remainder.count(closing) != 1:
+        return None
+    payload_text, trailing = remainder.split(closing, 1)
     if (
         trailing.strip()
-        or len(payload_text.encode("utf-8")) > _SOURCE_TRANSCRIPT_MAX_UTF8_BYTES
+        or len(payload_text.encode("utf-8")) > max_bytes
         or _SUMMARY_ATTRIBUTION_MARKER_RE.search(payload_text)
     ):
-        return False
+        return None
     try:
         payload = json.loads(payload_text)
     except (TypeError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _valid_rendered_source(
+    source: object,
+    *,
+    allow_assistant: bool = False,
+) -> bool:
+    if not isinstance(source, dict) or set(source) != {
+        "display_name", "role", "evidence_excerpt", "session_date",
+        "current_requester_match",
+    }:
         return False
+    role = source.get("role")
+    display_name = source.get("display_name")
+    requester_match = source.get("current_requester_match")
+    if role == "historical_human":
+        if not isinstance(display_name, str) or not is_safe_human_label(display_name):
+            return False
+        if requester_match not in {
+            "proved_same", "proved_different", "unproved",
+        }:
+            return False
+    elif role == "historical_assistant":
+        if (
+            not allow_assistant
+            or display_name != "Assistant"
+            or requester_match != "not_applicable"
+        ):
+            return False
+    else:
+        return False
+    excerpt = source.get("evidence_excerpt")
+    session_date = source.get("session_date")
+    return bool(
+        isinstance(excerpt, str)
+        and excerpt.strip()
+        and len(excerpt) <= 800
+        and isinstance(session_date, str)
+        and len(session_date) <= 128
+    )
+
+
+def _is_proved_structured_rendering(text: object) -> bool:
+    payload = _decode_rendered_envelope(
+        text,
+        _STRUCTURED_SUMMARY_OPEN,
+        _STRUCTURED_SUMMARY_CLOSE,
+        _STRUCTURED_RENDER_MAX_UTF8_BYTES,
+    )
+    if not isinstance(payload, dict) or set(payload) != {
+        "source", "depth", "claims",
+    }:
+        return False
+    depth = payload.get("depth")
+    if payload.get("source") != "structured_summary_v1" or depth not in {
+        "summary", "segments",
+    }:
+        return False
+    claims = payload.get("claims")
+    if (
+        not isinstance(claims, list)
+        or not claims
+        or len(claims) > (
+            _STRUCTURED_SUMMARY_MAX_CLAIMS
+            if depth == "summary"
+            else _STRUCTURED_SEGMENTS_MAX_CLAIMS
+        )
+    ):
+        return False
+    for claim in claims:
+        if not isinstance(claim, dict):
+            return False
+        common = {
+            "text", "claim_type", "temporal_status", "modality",
+        }
+        expected = (
+            common | {
+                "display_name", "role", "evidence_excerpt", "session_date",
+                "current_requester_match",
+            }
+            if depth == "summary"
+            else common | {"event_time", "sources"}
+        )
+        if set(claim) != expected:
+            return False
+        claim_text = claim.get("text")
+        if (
+            not isinstance(claim_text, str)
+            or not claim_text.strip()
+            or len(claim_text) > 1000
+            or _INTERNAL_IDENTITY_LABEL_RE.search(claim_text)
+        ):
+            return False
+        if claim.get("claim_type") not in _STRUCTURED_CLAIM_TYPES:
+            return False
+        if claim.get("temporal_status") not in _STRUCTURED_TEMPORAL_STATUSES:
+            return False
+        if claim.get("modality") not in _STRUCTURED_MODALITIES:
+            return False
+        if depth == "summary":
+            if not _valid_rendered_source({
+                "display_name": claim.get("display_name"),
+                "role": claim.get("role"),
+                "evidence_excerpt": claim.get("evidence_excerpt"),
+                "session_date": claim.get("session_date"),
+                "current_requester_match": claim.get("current_requester_match"),
+            }):
+                return False
+            if claim_text != claim.get("evidence_excerpt"):
+                return False
+        else:
+            event_time = claim.get("event_time")
+            sources = claim.get("sources")
+            if (
+                not isinstance(event_time, str)
+                or len(event_time) > 128
+                or not isinstance(sources, list)
+                or len(sources) != 1
+                or not all(_valid_rendered_source(source) for source in sources)
+            ):
+                return False
+            if claim_text not in {
+                source.get("evidence_excerpt") for source in sources
+            }:
+                return False
+    return True
+
+
+def _is_proved_full_rendering(text: object) -> bool:
+    payload = _decode_rendered_envelope(
+        text,
+        _FULL_TRANSCRIPT_OPEN,
+        _FULL_TRANSCRIPT_CLOSE,
+        _FULL_TRANSCRIPT_MAX_UTF8_BYTES,
+    )
+    if not isinstance(payload, dict) or set(payload) != {
+        "source", "depth", "lanes",
+    }:
+        return False
+    if payload.get("source") != "canonical_turns" or payload.get("depth") != "full":
+        return False
+    lanes = payload.get("lanes")
+    if (
+        not isinstance(lanes, list)
+        or not lanes
+        or len(lanes) > _FULL_TRANSCRIPT_MAX_LANES
+    ):
+        return False
+    for lane in lanes:
+        if not isinstance(lane, dict) or set(lane) != {
+            "display_name", "role", "content", "session_date",
+            "current_requester_match",
+        }:
+            return False
+        source = {
+            "display_name": lane.get("display_name"),
+            "role": lane.get("role"),
+            "evidence_excerpt": lane.get("content"),
+            "session_date": lane.get("session_date"),
+            "current_requester_match": lane.get("current_requester_match"),
+        }
+        # Full source lanes are exact and may exceed the summary-excerpt bound.
+        content = source["evidence_excerpt"]
+        source["evidence_excerpt"] = str(content)[:800] if isinstance(content, str) else content
+        if (
+            not isinstance(content, str)
+            or not content.strip()
+            or not _valid_rendered_source(source, allow_assistant=True)
+        ):
+            return False
+    return True
+
+
+def _is_proved_legacy_source_rendering(text: object) -> bool:
+    payload = _decode_rendered_envelope(
+        text,
+        _SOURCE_TRANSCRIPT_OPEN,
+        _SOURCE_TRANSCRIPT_CLOSE,
+        _SOURCE_TRANSCRIPT_MAX_UTF8_BYTES,
+    )
     if not isinstance(payload, dict) or set(payload) != {
         "source", "generated_summary_prose_used", "lanes",
     }:
@@ -320,6 +602,21 @@ def is_proved_summary_rendering(text: object) -> bool:
     return True
 
 
+def is_proved_summary_rendering(text: object) -> bool:
+    """Validate one internally constructed model-facing memory envelope.
+
+    Syntax is not source authority.  Callers may preserve a valid envelope only
+    on the request-local path that just hydrated and checked its canonical rows.
+    This parser is the final shape/escaping guard shared by all three depth
+    renderers.
+    """
+    return bool(
+        _is_proved_legacy_source_rendering(text)
+        or _is_proved_structured_rendering(text)
+        or _is_proved_full_rendering(text)
+    )
+
+
 @dataclass(frozen=True)
 class HistoricalSourceLane:
     """One exact physical source lane safe to project to a model."""
@@ -338,6 +635,30 @@ class SummarySourceProjection:
 
     lanes: tuple[HistoricalSourceLane, ...] = ()
     complete: bool = False
+
+
+@dataclass(frozen=True)
+class ValidatedClaimSource:
+    """One claim-local source after exact-row validation."""
+
+    display_name: str
+    role: str
+    evidence_excerpt: str
+    session_date: str = ""
+    requester_match: str = "unproved"
+    actor_id: str = field(default="", repr=False)
+
+
+@dataclass(frozen=True)
+class ValidatedSummaryClaim:
+    """A generated claim whose identity, status, and evidence all survived."""
+
+    text: str
+    claim_type: str
+    temporal_status: str
+    modality: str
+    event_time: str = ""
+    sources: tuple[ValidatedClaimSource, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -368,6 +689,83 @@ def _metadata_for(item: object) -> object | None:
     return getattr(item, "metadata", None)
 
 
+def _context_owns_conversation(
+    speaker_context: "SpeakerRetrievalContext | None",
+    conversation_id: str,
+) -> bool:
+    expected_owner = str(
+        getattr(speaker_context, "owner_conversation_id", "") or "",
+    ).strip()
+    return bool(expected_owner and expected_owner == str(conversation_id or "").strip())
+
+
+def _structured_summary_for(item: object) -> object | None:
+    direct = getattr(item, "structured_summary", None)
+    if direct is not None:
+        return direct
+    return getattr(_metadata_for(item), "structured_summary", None)
+
+
+def _canonical_ids_for(item: object) -> list[str]:
+    """Return exact persisted source ids or fail empty on malformed shape."""
+    metadata = _metadata_for(item)
+    raw_ids = getattr(metadata, "canonical_turn_ids", None)
+    if raw_ids is None:
+        raw_ids = getattr(item, "source_canonical_turn_ids", None)
+    if not isinstance(raw_ids, list) or not all(
+        type(value) is str
+        and bool(value)
+        and value == value.strip()
+        for value in raw_ids
+    ):
+        return []
+    canonical_ids = list(raw_ids)
+    # Source order and cardinality are authorization inputs. Silently
+    # normalizing a duplicated persisted id would let a mutated tag/segment
+    # validate against the digest for its former shorter source list.
+    if len(set(canonical_ids)) != len(canonical_ids):
+        return []
+    return canonical_ids
+
+
+def _structured_source_ids_for(item: object) -> list[str]:
+    structured = _structured_summary_for(item)
+    if (
+        type(getattr(structured, "schema_version", None)) is not int
+        or getattr(structured, "schema_version", 0)
+        != STRUCTURED_SUMMARY_SCHEMA_VERSION
+    ):
+        return []
+    ids: list[str] = []
+    claims = getattr(structured, "claims", ())
+    if not isinstance(claims, tuple):
+        return []
+    for claim in claims:
+        sources = getattr(claim, "sources", ())
+        if not isinstance(sources, tuple):
+            continue
+        for source in sources:
+            canonical_id = getattr(source, "canonical_turn_id", None)
+            if type(canonical_id) is str and canonical_id.strip():
+                ids.append(canonical_id.strip())
+    return list(dict.fromkeys(ids))
+
+
+def _row_matches_exact_key(
+    row: object,
+    *,
+    conversation_id: str,
+    canonical_turn_id: str,
+) -> bool:
+    """Reject a store result mapped under a key its physical row does not own."""
+    return bool(
+        str(getattr(row, "conversation_id", "") or "").strip()
+        == conversation_id
+        and str(getattr(row, "canonical_turn_id", "") or "").strip()
+        == canonical_turn_id
+    )
+
+
 def resolve_summary_speaker_attributions(
     items: Iterable[object],
     *,
@@ -389,6 +787,7 @@ def resolve_summary_speaker_attributions(
         or not conversation_id
         or speaker_context is None
         or not getattr(speaker_context, "eligible", False)
+        or not _context_owns_conversation(speaker_context, conversation_id)
     ):
         return empty
 
@@ -649,6 +1048,8 @@ def resolve_summary_source_projections(
     store: object | None,
     conversation_id: str,
     speaker_context: "SpeakerRetrievalContext | None",
+    _preloaded_rows: dict[tuple[str, str], object] | None = None,
+    _known_colliding_labels: frozenset[str] = frozenset(),
 ) -> list[SummarySourceProjection]:
     """Reconstruct exact, role-separated canonical source for each item.
 
@@ -662,37 +1063,36 @@ def resolve_summary_source_projections(
     empty = [SummarySourceProjection() for _ in materialized]
     if (
         not materialized
-        or store is None
+        or (store is None and _preloaded_rows is None)
         or not conversation_id
         or speaker_context is None
         or not getattr(speaker_context, "eligible", False)
+        or not _context_owns_conversation(speaker_context, conversation_id)
     ):
-        return empty
-    getter = getattr(store, "get_canonical_turn_rows_by_id", None)
-    if not callable(getter):
         return empty
 
     ids_by_item: list[list[str]] = []
     keys: list[tuple[str, str]] = []
     for item in materialized:
-        metadata = _metadata_for(item)
-        raw_ids = getattr(metadata, "canonical_turn_ids", None)
-        if not isinstance(raw_ids, list) or not all(
-            type(value) is str and bool(value.strip()) for value in raw_ids
-        ):
-            ids: list[str] = []
-        else:
-            ids = list(dict.fromkeys(value.strip() for value in raw_ids))
-            if len(ids) > _SOURCE_TRANSCRIPT_MAX_LANES:
-                ids = []
+        ids = _canonical_ids_for(item)
+        if len(ids) > _SOURCE_TRANSCRIPT_MAX_LANES:
+            ids = []
         ids_by_item.append(ids)
         keys.extend((conversation_id, canonical_id) for canonical_id in ids)
     if not keys:
         return empty
-    try:
-        rows = getter(list(dict.fromkeys(keys)), speaker_context=speaker_context)
-    except Exception:
-        return empty
+    if _preloaded_rows is None:
+        getter = getattr(store, "get_canonical_turn_rows_by_id", None)
+        if not callable(getter):
+            return empty
+        try:
+            rows = getter(
+                list(dict.fromkeys(keys)), speaker_context=speaker_context,
+            )
+        except Exception:
+            return empty
+    else:
+        rows = _preloaded_rows
 
     requester_actor = str(
         getattr(speaker_context, "requester_actor_id", "") or "",
@@ -708,7 +1108,15 @@ def resolve_summary_source_projections(
     for item, canonical_ids in zip(materialized, ids_by_item, strict=True):
         metadata = _metadata_for(item)
         complete = bool(
-            getattr(metadata, "source_mapping_complete", False) is True
+            (
+                getattr(metadata, "source_mapping_complete", False) is True
+                or (
+                    metadata is None
+                    and isinstance(
+                        getattr(item, "source_canonical_turn_ids", None), list,
+                    )
+                )
+            )
             and canonical_ids
         )
         lanes: list[HistoricalSourceLane] = []
@@ -716,7 +1124,15 @@ def resolve_summary_source_projections(
 
         for canonical_id in canonical_ids:
             row = rows.get((conversation_id, canonical_id))
-            if row is None or not _source_row_is_admitted(row, speaker_context):
+            if (
+                row is None
+                or not _row_matches_exact_key(
+                    row,
+                    conversation_id=conversation_id,
+                    canonical_turn_id=canonical_id,
+                )
+                or not _source_row_is_admitted(row, speaker_context)
+            ):
                 complete = False
                 continue
             user_content = str(getattr(row, "user_content", "") or "").strip()
@@ -809,7 +1225,7 @@ def resolve_summary_source_projections(
             global_label_actors.setdefault(
                 human_label_collision_key(roster_label), set(),
             ).add(roster_actor.strip())
-    colliding = {
+    colliding = set(_known_colliding_labels) | {
         label for label, actors in global_label_actors.items()
         if len(actors) > 1
     }
@@ -825,6 +1241,739 @@ def resolve_summary_source_projections(
             for projection in projections
         ]
     return projections
+
+
+def _requester_match_for_actor(
+    actor_id: str,
+    speaker_context: "SpeakerRetrievalContext",
+) -> str:
+    requester_actor = str(
+        getattr(speaker_context, "requester_actor_id", "") or "",
+    ).strip()
+    if not requester_actor:
+        return "unproved"
+    return "proved_same" if actor_id == requester_actor else "proved_different"
+
+
+def _known_label_collisions(
+    rows: dict[tuple[str, str], object],
+    *,
+    store: object | None,
+    speaker_context: "SpeakerRetrievalContext",
+) -> frozenset[str]:
+    """Find display names that cannot safely stand for one source actor."""
+    actors_by_label: dict[str, set[str]] = {}
+    seen_rows: set[int] = set()
+    for row in rows.values():
+        if id(row) in seen_rows or not _source_row_is_admitted(
+            row, speaker_context,
+        ):
+            continue
+        seen_rows.add(id(row))
+        if not str(getattr(row, "user_content", "") or "").strip():
+            continue
+        actor = str(getattr(row, "sender_actor_id", "") or "").strip()
+        label = str(getattr(row, "sender", "") or "").strip()
+        if actor and is_safe_human_label(label, actor):
+            actors_by_label.setdefault(
+                human_label_collision_key(label), set(),
+            ).add(actor)
+
+    for roster_label, roster_actor in (
+        getattr(speaker_context, "roster_label_actor_pairs", ()) or ()
+    ):
+        if (
+            type(roster_label) is str
+            and roster_label.strip()
+            and type(roster_actor) is str
+            and roster_actor.strip()
+        ):
+            actors_by_label.setdefault(
+                human_label_collision_key(roster_label), set(),
+            ).add(roster_actor.strip())
+
+    requester_actor = str(
+        getattr(speaker_context, "requester_actor_id", "") or "",
+    ).strip()
+    if requester_actor and store is not None:
+        try:
+            from .speaker_labels import resolve_speaker_labels
+
+            requester_label = resolve_speaker_labels(
+                store,
+                [requester_actor],
+                speaker_context=speaker_context,
+            ).get(requester_actor, "").strip()
+        except Exception:
+            requester_label = ""
+        if requester_label:
+            actors_by_label.setdefault(
+                human_label_collision_key(requester_label), set(),
+            ).add(requester_actor)
+
+    return frozenset(
+        label for label, actors in actors_by_label.items()
+        if len(actors) > 1
+    )
+
+
+def _validate_structured_claim(
+    claim: object,
+    *,
+    rows: dict[tuple[str, str], object],
+    conversation_id: str,
+    speaker_context: "SpeakerRetrievalContext",
+    colliding_labels: frozenset[str],
+) -> ValidatedSummaryClaim | None:
+    """Validate one v1 claim against its exact current canonical source."""
+    text = getattr(claim, "text", None)
+    claim_type = getattr(claim, "claim_type", None)
+    temporal_status = getattr(claim, "temporal_status", None)
+    modality = getattr(claim, "modality", None)
+    event_time = getattr(claim, "event_time", None)
+    raw_sources = getattr(claim, "sources", None)
+    if (
+        type(text) is not str
+        or not text.strip()
+        or len(text) > 1000
+        or claim_type not in _STRUCTURED_CLAIM_TYPES
+        or temporal_status not in _STRUCTURED_TEMPORAL_STATUSES
+        or modality not in _STRUCTURED_MODALITIES
+        or type(event_time) is not str
+        or len(event_time) > 128
+        or not isinstance(raw_sources, tuple)
+        or len(raw_sources) != 1
+    ):
+        return None
+
+    sources: list[ValidatedClaimSource] = []
+    human_actors: set[str] = set()
+    evidence_excerpts: list[str] = []
+    source_session_dates: list[str] = []
+    source_roles: set[str] = set()
+
+    for source in raw_sources:
+        canonical_id = getattr(source, "canonical_turn_id", None)
+        source_role = getattr(source, "source_role", None)
+        speaker_label = getattr(source, "speaker_label", None)
+        evidence = getattr(source, "evidence_excerpt", None)
+        source_session_date = getattr(source, "session_date", None)
+        source_provenance_digest = getattr(
+            source, "source_provenance_digest", None,
+        )
+        if (
+            type(canonical_id) is not str
+            or not canonical_id.strip()
+            or len(canonical_id) > 256
+            or source_role != "requester"
+            or type(speaker_label) is not str
+            or not speaker_label.strip()
+            or len(speaker_label) > 256
+            or type(evidence) is not str
+            or not evidence
+            or len(evidence) > 800
+            or type(source_session_date) is not str
+            or len(source_session_date) > 128
+            or type(source_provenance_digest) is not str
+            or re.fullmatch(
+                r"[0-9a-f]{64}", source_provenance_digest,
+            ) is None
+        ):
+            return None
+        canonical_id = canonical_id.strip()
+        source_roles.add(source_role)
+        row = rows.get((conversation_id, canonical_id))
+        if (
+            row is None
+            or not _row_matches_exact_key(
+                row,
+                conversation_id=conversation_id,
+                canonical_turn_id=canonical_id,
+            )
+            or not _source_row_is_admitted(row, speaker_context)
+        ):
+            return None
+
+        row_session_date = str(
+            getattr(row, "session_date", "") or "",
+        ).strip()
+        if source_session_date.strip() != row_session_date:
+            return None
+
+        lane_content = str(getattr(row, "user_content", "") or "")
+        actor_id = str(
+            getattr(row, "sender_actor_id", "") or "",
+        ).strip()
+        canonical_label = str(getattr(row, "sender", "") or "").strip()
+        if (
+            not actor_id
+            or not is_safe_human_label(canonical_label, actor_id)
+            or speaker_label.strip() != canonical_label
+            or human_label_collision_key(canonical_label) in colliding_labels
+        ):
+            return None
+        human_actors.add(actor_id)
+        rendered_source = ValidatedClaimSource(
+            display_name=canonical_label,
+            role="historical_human",
+            evidence_excerpt=evidence,
+            session_date=row_session_date,
+            requester_match=_requester_match_for_actor(
+                actor_id, speaker_context,
+            ),
+            actor_id=actor_id,
+        )
+
+        # A selected substring can invert its containing sentence (for
+        # example ``currently taking`` inside ``no longer currently taking``).
+        # Structured evidence is therefore admitted only when it is the entire
+        # trimmed requester lane, byte-for-byte.
+        if not lane_content.strip() or evidence != lane_content.strip():
+            return None
+        if source_provenance_digest != structured_source_provenance_digest({
+            "canonical_turn_id": canonical_id,
+            "source_role": "requester",
+            "actor_id": actor_id,
+            "speaker_label": canonical_label,
+            "content": lane_content.strip(),
+            "session_date": row_session_date,
+            "audience_conversation_id": str(
+                getattr(row, "audience_conversation_id", "") or "",
+            ),
+            "origin_channel_id": str(
+                getattr(row, "origin_channel_id", "") or "",
+            ),
+            "audience_attribution_version": getattr(
+                row, "audience_attribution_version", 0,
+            ),
+        }):
+            return None
+        # Control-plane ids must never re-enter through exact evidence text.
+        if _INTERNAL_IDENTITY_LABEL_RE.search(evidence) or (
+            rendered_source.actor_id and rendered_source.actor_id in evidence
+        ):
+            return None
+
+        evidence_excerpts.append(evidence)
+        source_session_dates.append(row_session_date)
+        sources.append(rendered_source)
+
+    if len(source_roles) != 1 or len(human_actors) > 1:
+        return None
+    evidence_text = "\n".join(evidence_excerpts)
+    evidenced_status = infer_temporal_status(evidence_text)
+    if statuses_conflict(temporal_status, evidenced_status):
+        return None
+    if infer_modality(evidence_text) != modality:
+        return None
+    if event_time and not any(
+        event_time_is_supported(
+            event_time,
+            evidence_excerpts,
+            session_date,
+        )
+        for session_date in source_session_dates
+    ):
+        return None
+
+    return ValidatedSummaryClaim(
+        # ``claim.text`` is a generated selection/classification aid, never
+        # factual evidence. Reconstruct the model-visible claim extractively
+        # from the exact lane instead of trusting even a well-attributed
+        # paraphrase that could invert stopped/planned/current semantics.
+        text=evidence_excerpts[0],
+        # A model-selected taxonomy cannot prove that a quoted/refuted
+        # statement is the requester's personal state. V1 exposes every exact
+        # lane conservatively as conversation evidence.
+        claim_type="conversation",
+        # A model classification is never positive proof of current state. If
+        # the exact quote does not deterministically establish a status, render
+        # it as unspecified instead of manufacturing ``active`` by fallback.
+        temporal_status=evidenced_status,
+        modality=infer_modality(evidence_text),
+        event_time=event_time,
+        sources=tuple(sources),
+    )
+
+
+def _structured_source_digest_matches(
+    item: object,
+    *,
+    raw_claims: tuple[object, ...],
+    expected_digest: str,
+    rows: dict[tuple[str, str], object],
+    conversation_id: str,
+    speaker_context: "SpeakerRetrievalContext",
+) -> bool:
+    """Recompute the v1 source snapshot before trusting any of its claims."""
+    if re.fullmatch(r"[0-9a-f]{64}", expected_digest) is None:
+        return False
+
+    metadata = _metadata_for(item)
+    if metadata is None and hasattr(item, "tag"):
+        # Tag rollups copy lower-layer claims unchanged. Their digest is over
+        # selected claim fingerprints in presentation order. SUMMARY is
+        # prefix-bounded, so authenticating only an unordered set would allow
+        # an old active state to move ahead of a newer cessation.
+        fingerprints = [
+            structured_claim_fingerprint(claim) for claim in raw_claims
+        ]
+        if (
+            not fingerprints
+            or len(fingerprints) > _STRUCTURED_TAG_MAX_SELECTED_CLAIMS
+            or len(set(fingerprints)) != len(fingerprints)
+        ):
+            return False
+        return structured_tag_claim_digest(
+            raw_claims, _canonical_ids_for(item),
+        ) == expected_digest
+
+    canonical_ids = _canonical_ids_for(item)
+    if (
+        metadata is None
+        or getattr(metadata, "source_mapping_complete", False) is not True
+        or not canonical_ids
+    ):
+        return False
+    candidates: list[tuple[object, str, str, str]] = []
+    label_actors: dict[str, set[str]] = {}
+    for canonical_id in canonical_ids:
+        row = rows.get((conversation_id, canonical_id))
+        # Compressed v1 evidence is requester-only. Legacy assistant-only
+        # canonical rows can predate audience attribution and are therefore
+        # absent from scoped hydration in production; they neither contribute
+        # to nor invalidate the requester source digest. FULL independently
+        # requires every row and remains fail-closed below this path.
+        if row is None:
+            continue
+        requester_text = str(
+            getattr(row, "user_content", "") or "",
+        ).strip()
+        if not requester_text:
+            continue
+        if (
+            not _row_matches_exact_key(
+                row,
+                conversation_id=conversation_id,
+                canonical_turn_id=canonical_id,
+            )
+            or not _source_row_is_admitted(row, speaker_context)
+        ):
+            return False
+        actor_id = str(
+            getattr(row, "sender_actor_id", "") or "",
+        ).strip()
+        label = str(getattr(row, "sender", "") or "").strip()
+        if actor_id and is_safe_human_label(label, actor_id):
+            label_actors.setdefault(
+                human_label_collision_key(label), set(),
+            ).add(actor_id)
+            candidates.append((row, "requester", label, requester_text))
+
+    colliding = {
+        label for label, actors in label_actors.items() if len(actors) > 1
+    }
+    records: list[dict[str, object]] = []
+    for row, source_role, label, content in candidates:
+        if (
+            source_role == "requester"
+            and human_label_collision_key(label) in colliding
+        ):
+            continue
+        records.append({
+            "canonical_turn_id": str(
+                getattr(row, "canonical_turn_id", "") or "",
+            ).strip(),
+            "source_role": source_role,
+            "actor_id": (
+                str(getattr(row, "sender_actor_id", "") or "").strip()
+                if source_role == "requester"
+                else ""
+            ),
+            "speaker_label": label,
+            "content": content,
+            "session_date": str(
+                getattr(row, "session_date", "") or "",
+            ).strip(),
+            "audience_conversation_id": str(
+                getattr(row, "audience_conversation_id", "") or "",
+            ),
+            "origin_channel_id": str(
+                getattr(row, "origin_channel_id", "") or "",
+            ),
+            "audience_attribution_version": (
+                getattr(row, "audience_attribution_version", 0)
+                if type(getattr(row, "audience_attribution_version", 0)) is int
+                else 0
+            ),
+        })
+    return bool(
+        records
+        and structured_source_digest(records, namespace="segment")
+        == expected_digest
+    )
+
+
+def _validated_structured_claims(
+    item: object,
+    *,
+    rows: dict[tuple[str, str], object],
+    conversation_id: str,
+    speaker_context: "SpeakerRetrievalContext",
+    colliding_labels: frozenset[str],
+) -> tuple[ValidatedSummaryClaim, ...]:
+    structured = _structured_summary_for(item)
+    if (
+        type(getattr(structured, "schema_version", None)) is not int
+        or getattr(structured, "schema_version", 0)
+        != STRUCTURED_SUMMARY_SCHEMA_VERSION
+    ):
+        return ()
+    raw_claims = getattr(structured, "claims", None)
+    if not isinstance(raw_claims, tuple):
+        return ()
+    expected_digest = str(
+        getattr(structured, "source_digest", "") or "",
+    ).strip()
+    if not _structured_source_digest_matches(
+        item,
+        raw_claims=raw_claims,
+        expected_digest=expected_digest,
+        rows=rows,
+        conversation_id=conversation_id,
+        speaker_context=speaker_context,
+    ):
+        return ()
+    metadata = _metadata_for(item)
+    is_tag_summary = metadata is None and hasattr(item, "tag")
+    required_critical_ids: set[str] = set()
+    segment_source_order: dict[str, int] = {}
+    if metadata is not None:
+        # Segment source_digest authenticates the full source snapshot, but it
+        # does not by itself prove that the claim list covers a newer
+        # correction. Reject an active-only v1 payload when an admitted exact
+        # requester row says ``stopped``/``off``/``don't take`` and is absent
+        # from its claims. Legacy/corrupt rows then use the canonical fallback
+        # instead of presenting the stale subset as complete memory.
+        canonical_ids = _canonical_ids_for(item)
+        segment_source_order = {
+            canonical_id: index
+            for index, canonical_id in enumerate(canonical_ids)
+        }
+        for canonical_id in canonical_ids:
+            row = rows.get((conversation_id, canonical_id))
+            if row is None:
+                continue
+            requester_text = str(
+                getattr(row, "user_content", "") or "",
+            ).strip()
+            if not requester_text:
+                continue
+            if (
+                not _row_matches_exact_key(
+                    row,
+                    conversation_id=conversation_id,
+                    canonical_turn_id=canonical_id,
+                )
+                or not _source_row_is_admitted(row, speaker_context)
+            ):
+                return ()
+            if (
+                is_safety_critical_personal_evidence(requester_text)
+            ):
+                required_critical_ids.add(canonical_id)
+    elif is_tag_summary:
+        # The selected-claim digest proves only the compact layer-two
+        # envelope. It cannot prove that selection retained a newer stop,
+        # denial, or restart from its lower-layer history. Recheck the tag's
+        # complete canonical coverage and require every currently admitted
+        # safety-critical requester lane to survive as a valid selected claim.
+        # Otherwise an active-only selection could be internally authentic
+        # while omitting the exact correction that makes it unsafe.
+        canonical_ids = _canonical_ids_for(item)
+        if not canonical_ids:
+            return ()
+        canonical_id_set = set(canonical_ids)
+        for claim in raw_claims:
+            sources = getattr(claim, "sources", None)
+            if not isinstance(sources, tuple) or len(sources) != 1:
+                return ()
+            selected_id = str(
+                getattr(sources[0], "canonical_turn_id", "") or "",
+            ).strip()
+            if not selected_id or selected_id not in canonical_id_set:
+                return ()
+        for canonical_id in canonical_ids:
+            row = rows.get((conversation_id, canonical_id))
+            if (
+                row is None
+                or not _row_matches_exact_key(
+                    row,
+                    conversation_id=conversation_id,
+                    canonical_turn_id=canonical_id,
+                )
+            ):
+                return ()
+            if not _source_row_is_admitted(row, speaker_context):
+                continue
+            requester_text = str(
+                getattr(row, "user_content", "") or "",
+            ).strip()
+            if (
+                requester_text
+                and is_safety_critical_personal_evidence(requester_text)
+            ):
+                required_critical_ids.add(canonical_id)
+    validated: list[tuple[str, ValidatedSummaryClaim]] = []
+    validated_source_ids: set[str] = set()
+    for claim in raw_claims:
+        projection = _validate_structured_claim(
+            claim,
+            rows=rows,
+            conversation_id=conversation_id,
+            speaker_context=speaker_context,
+            colliding_labels=colliding_labels,
+        )
+        # A layer-two selection is one authenticated envelope, not a bag of
+        # independently salvageable claims. If a newer correction has been
+        # mutated/deleted while an older active claim still validates, keeping
+        # only that survivor reverses the state presented to the model. The
+        # same atomic rule covers malformed source cardinality and duplicate
+        # canonical selections: reject the whole tag so the assembler can use
+        # its exact segment/canonical fallback.
+        if is_tag_summary and projection is None:
+            return ()
+        if projection is not None:
+            raw_sources = tuple(getattr(claim, "sources", ()) or ())
+            canonical_id = ""
+            if len(raw_sources) == 1:
+                canonical_id = str(
+                    getattr(raw_sources[0], "canonical_turn_id", "") or "",
+                ).strip()
+            if is_tag_summary and (
+                not canonical_id or canonical_id in validated_source_ids
+            ):
+                return ()
+            # A segment's source digest authenticates only its persisted
+            # canonical id sequence. An otherwise valid claim from some other
+            # hydrated row has no authenticated position in this segment and
+            # cannot participate in its bounded model-facing prefix.
+            if metadata is not None and canonical_id not in segment_source_order:
+                continue
+            if canonical_id not in validated_source_ids:
+                validated.append((canonical_id, projection))
+            if canonical_id:
+                validated_source_ids.add(canonical_id)
+    if is_tag_summary and len(validated) != len(raw_claims):
+        return ()
+    if required_critical_ids - validated_source_ids:
+        return ()
+    if metadata is not None:
+        # Validate and reconstruct every candidate before deciding which ones
+        # are safety-critical. Persisted ``claim.text`` and taxonomy are model
+        # output, so consulting either before validation lets a forged older
+        # claim occupy the bounded SUMMARY prefix while a newer exact stop is
+        # pushed past it. The projection text is the whole canonical requester
+        # lane; order critical projections by the digest-authenticated physical
+        # chronology and only then retain the ordinary validated order.
+        critical = sorted(
+            (
+                entry for entry in validated
+                if is_safety_critical_personal_evidence(entry[1].text)
+            ),
+            key=lambda entry: segment_source_order[entry[0]],
+            reverse=True,
+        )
+        critical_source_ids = {canonical_id for canonical_id, _ in critical}
+        validated = critical + [
+            entry for entry in validated
+            if entry[0] not in critical_source_ids
+        ]
+    return tuple(
+        projection for _, projection in validated[
+            :_STRUCTURED_SEGMENTS_MAX_CLAIMS
+        ]
+    )
+
+
+def _escaped_json(payload: dict) -> str:
+    return (
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        .replace("&", "\\u0026")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+    )
+
+
+def render_structured_claims_for_model(
+    claims: Iterable[ValidatedSummaryClaim],
+    *,
+    depth: str,
+) -> str:
+    """Render compact tag claims or richer segment claims without source ids."""
+    max_claims = (
+        _STRUCTURED_SUMMARY_MAX_CLAIMS
+        if depth == "summary"
+        else _STRUCTURED_SEGMENTS_MAX_CLAIMS
+    )
+    materialized = [
+        claim for claim in claims if len(claim.sources) == 1
+    ][:max_claims]
+    if not materialized or depth not in {"summary", "segments"}:
+        return SUMMARY_ATTRIBUTION_QUARANTINE
+    rendered_claims: list[dict] = []
+    for claim in materialized:
+        common = {
+            "text": claim.text,
+            "claim_type": claim.claim_type,
+            "temporal_status": claim.temporal_status,
+            "modality": claim.modality,
+        }
+        if depth == "summary":
+            source = claim.sources[0]
+            common.update({
+                "display_name": source.display_name,
+                "role": source.role,
+                "evidence_excerpt": source.evidence_excerpt,
+                "session_date": source.session_date,
+                "current_requester_match": source.requester_match,
+            })
+        else:
+            common.update({
+                "event_time": claim.event_time,
+                "sources": [
+                    {
+                        "display_name": source.display_name,
+                        "role": source.role,
+                        "evidence_excerpt": source.evidence_excerpt,
+                        "session_date": source.session_date,
+                        "current_requester_match": source.requester_match,
+                    }
+                    for source in claim.sources
+                ],
+            })
+        rendered_claims.append(common)
+    encoded = _escaped_json({
+        "source": "structured_summary_v1",
+        "depth": depth,
+        "claims": rendered_claims,
+    })
+    if len(encoded.encode("utf-8")) > _STRUCTURED_RENDER_MAX_UTF8_BYTES:
+        return SUMMARY_ATTRIBUTION_QUARANTINE
+    rendered = _STRUCTURED_SUMMARY_OPEN + encoded + _STRUCTURED_SUMMARY_CLOSE
+    return rendered if is_proved_summary_rendering(
+        rendered,
+    ) else SUMMARY_ATTRIBUTION_QUARANTINE
+
+
+def _full_source_projection(
+    item: object,
+    *,
+    rows: dict[tuple[str, str], object],
+    conversation_id: str,
+    speaker_context: "SpeakerRetrievalContext",
+    colliding_labels: frozenset[str],
+) -> SummarySourceProjection:
+    canonical_ids = _canonical_ids_for(item)
+    metadata = _metadata_for(item)
+    mapping_complete = bool(
+        (
+            getattr(metadata, "source_mapping_complete", False) is True
+            or (
+                metadata is None
+                and isinstance(
+                    getattr(item, "source_canonical_turn_ids", None), list,
+                )
+            )
+        )
+        and canonical_ids
+        and len(canonical_ids) <= _FULL_TRANSCRIPT_MAX_TURNS
+    )
+    lanes: list[HistoricalSourceLane] = []
+    for canonical_id in canonical_ids:
+        row = rows.get((conversation_id, canonical_id))
+        if (
+            row is None
+            or not _row_matches_exact_key(
+                row,
+                conversation_id=conversation_id,
+                canonical_turn_id=canonical_id,
+            )
+            or not _source_row_is_admitted(row, speaker_context)
+        ):
+            mapping_complete = False
+            continue
+        session_date = str(getattr(row, "session_date", "") or "").strip()
+        user_content = str(getattr(row, "user_content", "") or "")
+        assistant_content = str(
+            getattr(row, "assistant_content", "") or "",
+        )
+        if not user_content.strip() and not assistant_content.strip():
+            mapping_complete = False
+            continue
+        if user_content.strip():
+            actor_id = str(
+                getattr(row, "sender_actor_id", "") or "",
+            ).strip()
+            label = str(getattr(row, "sender", "") or "").strip()
+            if (
+                not actor_id
+                or not is_safe_human_label(label, actor_id)
+                or human_label_collision_key(label) in colliding_labels
+            ):
+                mapping_complete = False
+            else:
+                lanes.append(HistoricalSourceLane(
+                    speaker=label,
+                    role="historical_human",
+                    content=user_content,
+                    session_date=session_date,
+                    requester_match=_requester_match_for_actor(
+                        actor_id, speaker_context,
+                    ),
+                    actor_id=actor_id,
+                ))
+        if assistant_content.strip():
+            lanes.append(HistoricalSourceLane(
+                speaker="Assistant",
+                role="historical_assistant",
+                content=assistant_content,
+                session_date=session_date,
+                requester_match="not_applicable",
+            ))
+    return SummarySourceProjection(
+        lanes=tuple(lanes) if mapping_complete else (),
+        complete=bool(mapping_complete and lanes),
+    )
+
+
+def render_full_source_projection_for_model(
+    projection: SummarySourceProjection | None,
+) -> str:
+    """Render the exact role-separated canonical transcript for FULL depth."""
+    if projection is None or not projection.complete or not projection.lanes:
+        return SUMMARY_ATTRIBUTION_QUARANTINE
+    payload = {
+        "source": "canonical_turns",
+        "depth": "full",
+        "lanes": [
+            {
+                "display_name": lane.speaker,
+                "role": lane.role,
+                "content": lane.content,
+                "session_date": lane.session_date,
+                "current_requester_match": lane.requester_match,
+            }
+            for lane in projection.lanes
+        ],
+    }
+    encoded = _escaped_json(payload)
+    if len(encoded.encode("utf-8")) > _FULL_TRANSCRIPT_MAX_UTF8_BYTES:
+        return SUMMARY_ATTRIBUTION_QUARANTINE
+    rendered = _FULL_TRANSCRIPT_OPEN + encoded + _FULL_TRANSCRIPT_CLOSE
+    return rendered if is_proved_summary_rendering(
+        rendered,
+    ) else SUMMARY_ATTRIBUTION_QUARANTINE
 
 
 def render_source_projection_for_model(
@@ -921,7 +2070,10 @@ def render_segment_refs_for_model(
         speaker_context=speaker_context,
     )
     return {
-        ref: render_source_projection_for_model(projection)
+        ref: _mark_request_local_summary_rendering(
+            render_source_projection_for_model(projection),
+            speaker_context=speaker_context,
+        )
         for ref, projection in zip(loaded_refs, projections, strict=True)
     }
 
@@ -956,37 +2108,185 @@ def render_summary_for_model(
     return value
 
 
+def render_summary_items_for_model(
+    requests: Iterable[tuple[object, object]],
+    *,
+    store: object | None,
+    conversation_id: str,
+    speaker_context: "SpeakerRetrievalContext | None",
+) -> list[str]:
+    """Render mixed SUMMARY/SEGMENTS/FULL requests with one row hydration.
+
+    Version-one segment claims are validated independently. Version-one tag
+    selections validate atomically so a failed newer correction cannot expose
+    only an older surviving state. If validation fails (or the item is legacy),
+    SUMMARY and SEGMENTS fall back to existing exact human-source projection;
+    the assembler resolves invalid tags through their source segments. FULL
+    never reads ``StoredSegment.full_text``; it reconstructs both roles from
+    exact canonical lanes.
+    """
+    materialized: list[tuple[object, str]] = []
+    for item, raw_depth in requests:
+        depth = str(getattr(raw_depth, "value", raw_depth) or "").strip().lower()
+        materialized.append((item, depth))
+    if not materialized:
+        return []
+    empty = [SUMMARY_ATTRIBUTION_QUARANTINE for _ in materialized]
+    if (
+        store is None
+        or not conversation_id
+        or speaker_context is None
+        or not getattr(speaker_context, "eligible", False)
+        or not _context_owns_conversation(speaker_context, conversation_id)
+    ):
+        return empty
+    getter = getattr(store, "get_canonical_turn_rows_by_id", None)
+    if not callable(getter):
+        return empty
+
+    keys: list[tuple[str, str]] = []
+    for item, _depth in materialized:
+        # A layer-two TagSummary can cover thousands of canonical turns. Its
+        # compact v1 presentation still has to hydrate the tag's full source
+        # id set: selected-claim provenance alone cannot detect omission of a
+        # newer safety-critical correction. Invalid tags remain bounded at
+        # presentation time by the assembler's source-segment fallback.
+        ids = _canonical_ids_for(item) + _structured_source_ids_for(item)
+        keys.extend(
+            (conversation_id, canonical_id)
+            for canonical_id in dict.fromkeys(ids)
+        )
+    if not keys:
+        return empty
+    try:
+        loaded = getter(
+            list(dict.fromkeys(keys)), speaker_context=speaker_context,
+        )
+    except Exception:
+        return empty
+    if not hasattr(loaded, "get"):
+        return empty
+    rows = loaded
+    colliding_labels = _known_label_collisions(
+        rows,
+        store=store,
+        speaker_context=speaker_context,
+    )
+    items = [item for item, _depth in materialized]
+    legacy_projections = resolve_summary_source_projections(
+        items,
+        store=store,
+        conversation_id=conversation_id,
+        speaker_context=speaker_context,
+        _preloaded_rows=rows,
+        _known_colliding_labels=colliding_labels,
+    )
+
+    rendered: list[str] = []
+    for (item, depth), legacy_projection in zip(
+        materialized, legacy_projections, strict=True,
+    ):
+        if depth == "full":
+            rendered.append(_mark_request_local_summary_rendering(
+                render_full_source_projection_for_model(
+                    _full_source_projection(
+                        item,
+                        rows=rows,
+                        conversation_id=conversation_id,
+                        speaker_context=speaker_context,
+                        colliding_labels=colliding_labels,
+                    ),
+                ),
+                speaker_context=speaker_context,
+            ))
+            continue
+        if depth not in {"summary", "segments"}:
+            rendered.append(SUMMARY_ATTRIBUTION_QUARANTINE)
+            continue
+        claims = _validated_structured_claims(
+            item,
+            rows=rows,
+            conversation_id=conversation_id,
+            speaker_context=speaker_context,
+            colliding_labels=colliding_labels,
+        )
+        candidate = render_structured_claims_for_model(claims, depth=depth)
+        if candidate != SUMMARY_ATTRIBUTION_QUARANTINE:
+            rendered.append(_mark_request_local_summary_rendering(
+                candidate,
+                speaker_context=speaker_context,
+            ))
+            continue
+
+        structured = _structured_summary_for(item)
+        is_v1 = (
+            type(getattr(structured, "schema_version", None)) is int
+            and getattr(structured, "schema_version", 0)
+            == STRUCTURED_SUMMARY_SCHEMA_VERSION
+        )
+        metadata = _metadata_for(item)
+        raw_claims = getattr(structured, "claims", ())
+        # Legacy artifacts have no structured authority and retain the exact
+        # canonical fallback. A present v1 artifact may use that fallback only
+        # when its full segment source snapshot still matches. Otherwise a
+        # detected source-id deletion/reorder would be converted into a stale
+        # partial transcript (for example old active without the later stop).
+        v1_segment_snapshot_proved = bool(
+            is_v1
+            and metadata is not None
+            and isinstance(raw_claims, tuple)
+            and _structured_source_digest_matches(
+                item,
+                raw_claims=raw_claims,
+                expected_digest=str(
+                    getattr(structured, "source_digest", "") or "",
+                ).strip(),
+                rows=rows,
+                conversation_id=conversation_id,
+                speaker_context=speaker_context,
+            )
+        )
+        rendered.append(_mark_request_local_summary_rendering(
+            (
+                render_source_projection_for_model(legacy_projection)
+                if not is_v1 or v1_segment_snapshot_proved
+                else SUMMARY_ATTRIBUTION_QUARANTINE
+            ),
+            speaker_context=speaker_context,
+        ))
+    return rendered
+
+
 def render_summaries_for_model(
     items: Iterable[object],
     *,
     store: object | None,
     conversation_id: str,
     speaker_context: "SpeakerRetrievalContext | None",
+    depth: object = "summary",
 ) -> list[str]:
-    """Batch-resolve and render objects carrying ``summary`` + ``metadata``."""
-    materialized = list(items)
-    projections = resolve_summary_source_projections(
-        materialized,
+    """Compatibility wrapper for rendering one depth across a batch."""
+    return render_summary_items_for_model(
+        ((item, depth) for item in items),
         store=store,
         conversation_id=conversation_id,
         speaker_context=speaker_context,
     )
-    return [
-        render_source_projection_for_model(projection)
-        for projection in projections
-    ]
 
 
 def sanitize_summary_payload_for_model(
     payload: object,
     *,
     allow_proved_renderings: bool = False,
+    speaker_context: "SpeakerRetrievalContext | None" = None,
 ) -> object:
     """Quarantine anonymous derived prose in a JSON-like model payload.
 
-    This stateless boundary is for aggregate/search/time tools whose result no
-    longer carries enough exact row provenance to bridge a legacy referent.  It
-    mutates dictionaries/lists in place, matching the existing speaker-field
+    This stateless boundary is for aggregate/search/time tools. A syntactically
+    valid envelope is still untrusted input: ``allow_proved_renderings`` only
+    preserves the ephemeral subtype emitted by a canonical-row renderer bound
+    to the exact same immutable ``speaker_context`` object. It mutates
+    dictionaries/lists in place, matching the existing speaker-field
     projection helpers.
     """
     if isinstance(payload, dict):
@@ -997,7 +2297,10 @@ def sanitize_summary_payload_for_model(
                         value
                         if (
                             allow_proved_renderings
-                            and is_proved_summary_rendering(value)
+                            and _is_request_local_summary_rendering(
+                                value,
+                                speaker_context=speaker_context,
+                            )
                         )
                         else render_summary_for_model(
                             value, require_proved_scope=True,
@@ -1009,7 +2312,10 @@ def sanitize_summary_payload_for_model(
                             item
                             if (
                                 allow_proved_renderings
-                                and is_proved_summary_rendering(item)
+                                and _is_request_local_summary_rendering(
+                                    item,
+                                    speaker_context=speaker_context,
+                                )
                             )
                             else render_summary_for_model(
                                 item, require_proved_scope=True,
@@ -1019,6 +2325,7 @@ def sanitize_summary_payload_for_model(
                         else sanitize_summary_payload_for_model(
                             item,
                             allow_proved_renderings=allow_proved_renderings,
+                            speaker_context=speaker_context,
                         )
                         for item in value
                     ]
@@ -1029,11 +2336,13 @@ def sanitize_summary_payload_for_model(
             sanitize_summary_payload_for_model(
                 value,
                 allow_proved_renderings=allow_proved_renderings,
+                speaker_context=speaker_context,
             )
     elif isinstance(payload, list):
         for value in payload:
             sanitize_summary_payload_for_model(
                 value,
                 allow_proved_renderings=allow_proved_renderings,
+                speaker_context=speaker_context,
             )
     return payload

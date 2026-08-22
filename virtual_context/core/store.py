@@ -457,15 +457,17 @@ class ContextStore(ABC):
         self,
         keys: list[tuple[str, str]],
         *,
-        speaker_context: SpeakerRetrievalContext,
+        speaker_context: SpeakerRetrievalContext | None = None,
+        internal_validation: bool = False,
     ) -> dict[tuple[str, str], CanonicalTurnRow]:
         """Batched physical row lookup by (conversation_id, canonical_turn_id).
 
-        Context-requiring hydration for the speaker-aware branch: rows are
-        returned exactly as stored (no logical sibling merge), missing or
-        inadmissible keys are omitted, and each row keeps its own stored
-        conversation id. The base implementation returns nothing so a
-        backend without the surface fails closed on hydration.
+        Rows are returned exactly as stored (no logical sibling merge), and
+        each row keeps its own stored conversation id. Normal retrieval must
+        pass ``speaker_context``. Trusted maintenance/writer boundaries may
+        instead set ``internal_validation=True`` to hydrate only the literal
+        exact keys for source-integrity checks. Omitting both authorities
+        fails closed. The base implementation always returns nothing.
         """
         return {}
 

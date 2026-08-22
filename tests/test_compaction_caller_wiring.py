@@ -52,7 +52,9 @@ from virtual_context.types import (
     CompactionLeaseLost,
     Fact,
     FactLink,
+    SegmentMetadata,
     StoredSegment,
+    StoredSummary,
     SupersessionConfig,
     TagSummary,
 )
@@ -648,6 +650,24 @@ class _TagSummaryStore(_SpyStore):
         self._record("store_tag_summary_embedding", args, kwargs)
 
 
+class _TargetedTagSummaryStore(_TagSummaryStore):
+    def get_summaries_by_tags(self, **kwargs: Any) -> list:
+        self.calls.append(_Call("get_summaries_by_tags", (), kwargs))
+        return [StoredSummary(
+            ref="seg-source",
+            primary_tag="medical",
+            tags=["medical"],
+            summary="Retrieval-only synopsis.",
+            metadata=SegmentMetadata(canonical_turn_ids=["ct-wanted"]),
+        )]
+
+    def get_canonical_turn_rows_by_id(self, keys, **kwargs):
+        self.calls.append(_Call(
+            "get_canonical_turn_rows_by_id", (keys,), kwargs,
+        ))
+        return {}
+
+
 class _TagSummaryPipelineStub:
     def __init__(self, store) -> None:
         self._store = store
@@ -684,6 +704,28 @@ class TestT318c_TagSummaryEmbeddingLeaseLostPropagates:
                 compact_rows=None,
                 operation_id="op-1",
             )
+
+
+def test_tag_rollup_validation_hydrates_only_declared_source_ids():
+    store = _TargetedTagSummaryStore()
+    build_tag_summaries = _bound_build_tag_summaries(store)
+
+    build_tag_summaries(
+        results=[CompactionResult(
+            segment_id="seg-source",
+            primary_tag="medical",
+            tags=["medical"],
+        )],
+        compact_rows=None,
+        operation_id="op-1",
+    )
+
+    [lookup] = [
+        call for call in store.calls
+        if call.method == "get_canonical_turn_rows_by_id"
+    ]
+    assert lookup.args == ([("conv-A", "ct-wanted")],)
+    assert lookup.kwargs == {"internal_validation": True}
 
 
 # ---------------------------------------------------------------------------

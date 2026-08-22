@@ -237,7 +237,8 @@ class SegmentStore(Protocol):
         self,
         keys: list[tuple[str, str]],
         *,
-        speaker_context: SpeakerRetrievalContext,
+        speaker_context: SpeakerRetrievalContext | None = None,
+        internal_validation: bool = False,
     ) -> dict[tuple[str, str], CanonicalTurnRow]: ...
     def get_all_canonical_turns(
         self,

@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 
 from .engine_utils import extract_turn_pairs
 from .store import ContextStore
+from .structured_summary import validate_tag_rollup_inputs
 from .turn_tag_index import TurnTagIndex
 from ..types import LLMProviderError
 
@@ -2738,6 +2739,16 @@ class CompactionPipeline:
                     source_message_id=(getattr(row, "source_message_id", "") or ""),
                     canonical_turn_id=row.canonical_turn_id,
                     speaker_label=label,
+                    session_date=(getattr(row, "session_date", "") or "").strip(),
+                    audience_conversation_id=(
+                        getattr(row, "audience_conversation_id", "") or ""
+                    ).strip(),
+                    origin_channel_id=(
+                        getattr(row, "origin_channel_id", "") or ""
+                    ).strip(),
+                    audience_attribution_version=int(
+                        getattr(row, "audience_attribution_version", 0) or 0,
+                    ),
                 ))
 
                 quote = (getattr(row, "reply_target_body", "") or "").strip()
@@ -3473,6 +3484,76 @@ class CompactionPipeline:
             if summaries:
                 tag_to_summaries[tag] = summaries
 
+        # Structured claims cross a trust boundary here. The compactor is a
+        # pure model-facing component and cannot tell whether a stored segment
+        # dropped a newer correction, changed its canonical ids, or forged a
+        # claim provenance digest. Rehydrate the exact physical rows once and
+        # pass only an opaque proof for envelopes that still validate. Invalid
+        # segment prose remains useful to the retrieval-only tag synopsis.
+        tag_rollup_sources = [
+            summary
+            for summaries in tag_to_summaries.values()
+            for summary in summaries
+        ]
+        requested_source_ids = list(dict.fromkeys(
+            canonical_id
+            for summary in tag_rollup_sources
+            for canonical_id in (
+                getattr(
+                    getattr(summary, "metadata", None),
+                    "canonical_turn_ids",
+                    (),
+                ) or ()
+            )
+            if type(canonical_id) is str
+            and bool(canonical_id)
+            and canonical_id == canonical_id.strip()
+        ))
+        try:
+            physical_rows = self._store.get_canonical_turn_rows_by_id(
+                [
+                    (self._config.conversation_id, canonical_id)
+                    for canonical_id in requested_source_ids
+                ],
+                internal_validation=True,
+            )
+            physical_by_id = {
+                str(getattr(row, "canonical_turn_id", "") or ""): row
+                for row in physical_rows.values()
+                if str(getattr(row, "canonical_turn_id", "") or "")
+            }
+            validated_tag_rollup_inputs = validate_tag_rollup_inputs(
+                tag_rollup_sources,
+                physical_by_id,
+                conversation_id=self._config.conversation_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Tag structured-input validation failed closed for conv=%s "
+                "(%s)",
+                self._config.conversation_id[:12],
+                type(exc).__name__,
+            )
+            validated_tag_rollup_inputs = validate_tag_rollup_inputs(
+                (), {}, conversation_id=self._config.conversation_id,
+            )
+        unique_source_refs = {
+            str(getattr(summary, "ref", "") or "")
+            for summary in tag_rollup_sources
+            if str(getattr(summary, "ref", "") or "")
+        }
+        rejected_structured_count = len(
+            unique_source_refs - validated_tag_rollup_inputs.segment_refs
+        )
+        if rejected_structured_count:
+            logger.warning(
+                "Tag rollup withheld structured envelopes for %d of %d "
+                "source segments in conv=%s",
+                rejected_structured_count,
+                len(unique_source_refs),
+                self._config.conversation_id[:12],
+            )
+
         # Gather turn numbers + canonical_turn_ids per cover tag, plus
         # ``max_turn``. Prefer the in-memory index; fall back to the
         # compact_rows source when the index is empty.
@@ -3534,6 +3615,7 @@ class CompactionPipeline:
             existing_tag_summaries=existing_tag_summaries,
             max_turn=max_turn,
             generated_by_turn_id=generated_by_turn_id,
+            validated_tag_rollup_inputs=validated_tag_rollup_inputs,
         )
 
         for ts_i, ts in enumerate(new_tag_summaries):

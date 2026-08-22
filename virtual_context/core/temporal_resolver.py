@@ -21,15 +21,15 @@ from .quote_search import _parse_session_date as _parse_session_date_str
 from .summary_identity import (
     SUMMARY_ATTRIBUTION_QUARANTINE,
     contains_ambiguous_human_referent,
-    render_segment_refs_for_model,
-    resolve_segment_ref_attributions,
+    render_summaries_for_model,
+    resolve_summary_speaker_attributions,
 )
 
 if TYPE_CHECKING:
     from .semantic_search import SemanticSearchManager
     from .search_engine import SearchEngine
     from .store import ContextStore
-    from ..types import SpeakerRetrievalContext, VirtualContextConfig
+    from ..types import SpeakerRetrievalContext, StoredSegment, VirtualContextConfig
 
 logger = logging.getLogger(__name__)
 
@@ -417,32 +417,72 @@ class TemporalResolver:
         *,
         speaker_context: "SpeakerRetrievalContext | None",
     ) -> tuple[list[dict], set[str]]:
-        """Admit summary-derived rows only with exact audience-bound proof."""
+        """Render temporal hits as source-bound segment claims.
+
+        Free-form segment summaries remain useful for ranking above, but are
+        never copied into this model-facing result. Version-one claims are
+        validated against exact audience/channel-scoped canonical rows; a
+        legacy segment receives the renderer's exact canonical fallback.
+        Claims from different historical humans remain separate rather than
+        forcing a segment-wide speaker.
+        """
         if speaker_context is None:
-            return results, set()
+            # Direct legacy/admin callers have no authority with which to
+            # hydrate structured sources. Preserve that compatibility path,
+            # but never let anonymous person prose feed milestone/state
+            # derivation.
+            return [
+                item for item in results
+                if not contains_ambiguous_human_referent(
+                    item.get("excerpt", ""),
+                )
+            ], set()
         if not getattr(speaker_context, "eligible", False):
             return [], set()
 
         conversation_id = self._config.conversation_id or ""
-        attributions = resolve_segment_ref_attributions(
-            (item.get("segment_ref") for item in results),
+        refs = list(dict.fromkeys(
+            str(item.get("segment_ref", "") or "").strip()
+            for item in results
+            if str(item.get("segment_ref", "") or "").strip()
+        ))
+        loaded_refs: list[str] = []
+        segments: list[object] = []
+        for ref in refs:
+            try:
+                segment = self._store.get_segment(
+                    ref, conversation_id=conversation_id or None,
+                )
+            except TypeError:
+                try:
+                    segment = self._store.get_segment(ref)
+                except Exception:
+                    segment = None
+            except Exception:
+                segment = None
+            if segment is not None:
+                loaded_refs.append(ref)
+                segments.append(segment)
+
+        rendered = render_summaries_for_model(
+            segments,
+            store=self._store,
+            conversation_id=conversation_id,
+            speaker_context=speaker_context,
+            depth="segments",
+        )
+        rendered_by_ref = dict(zip(loaded_refs, rendered, strict=True))
+        resolved = resolve_summary_speaker_attributions(
+            segments,
             store=self._store,
             conversation_id=conversation_id,
             speaker_context=speaker_context,
         )
-        rendered_by_ref = render_segment_refs_for_model(
-            (item.get("segment_ref") for item in results),
-            store=self._store,
-            conversation_id=conversation_id,
-            speaker_context=speaker_context,
-        )
+        attribution_by_ref = dict(zip(loaded_refs, resolved, strict=True))
         scoped: list[dict] = []
         actors: set[str] = set()
         for item in results:
             ref = str(item.get("segment_ref", "") or "").strip()
-            attribution = attributions.get(ref)
-            if attribution is None or not attribution.is_proved_single_human:
-                continue
             excerpt = rendered_by_ref.get(
                 ref, SUMMARY_ATTRIBUTION_QUARANTINE,
             )
@@ -455,7 +495,9 @@ class TemporalResolver:
             # words, so only lane-local labels inside the envelope survive.
             projected.pop("historical_speaker", None)
             scoped.append(projected)
-            actors.update(attribution.actor_ids)
+            attribution = attribution_by_ref.get(ref)
+            if attribution is not None and attribution.complete:
+                actors.update(attribution.actor_ids)
         return scoped, actors
 
     def _scope_fact_results_for_request(
@@ -584,9 +626,10 @@ class TemporalResolver:
             segment_ref = str(seg.ref or "").strip()
             if not segment_ref:
                 continue
+            # Free-form prose is an internal retrieval synopsis only. Its
+            # coreference quality must not decide whether an independently
+            # source-bound structured claim can be found and rendered later.
             summary_text = str(seg.summary or "").strip()
-            if contains_ambiguous_human_referent(summary_text):
-                summary_text = ""
             excerpt = summary_text or str(seg.full_text or "").strip()
             if not excerpt:
                 continue
@@ -704,8 +747,6 @@ class TemporalResolver:
                         continue
                     tag = str(getattr(hit, "primary_tag", "") or "")
                     summary_text = str(getattr(hit, "summary", "") or "")
-                    if contains_ambiguous_human_referent(summary_text):
-                        continue
                     bucket = candidates.setdefault(
                         segment_ref,
                         {
@@ -808,9 +849,7 @@ class TemporalResolver:
                 except Exception:
                     seg = None
                 if seg is not None and seg.summary:
-                    safe_summary = str(seg.summary)
-                    if not contains_ambiguous_human_referent(safe_summary):
-                        bucket["summary_text"] = safe_summary
+                    bucket["summary_text"] = str(seg.summary)
 
         if mode in _REMEMBER_WHEN_STATE_MODES and target_date is not None:
             selected = self._select_state_candidates(
@@ -848,14 +887,7 @@ class TemporalResolver:
                 except Exception:
                     seg = None
                 if seg is not None and seg.summary:
-                    safe_summary = str(seg.summary)
-                    if not contains_ambiguous_human_referent(safe_summary):
-                        excerpt = safe_summary
-            if (
-                contains_ambiguous_human_referent(excerpt)
-                and "summary" in str(quote.match_type or "")
-            ):
-                continue
+                    excerpt = str(seg.summary)
             if mode in _REMEMBER_WHEN_CHANGE_MODES:
                 excerpt = self._change_result_excerpt(str(excerpt or ""))
             result = {
@@ -922,10 +954,7 @@ class TemporalResolver:
             if parsed is None or not (start <= parsed <= end):
                 continue
             summary_text = str(seg.summary or "").strip()
-            if (
-                not summary_text
-                or contains_ambiguous_human_referent(summary_text)
-            ):
+            if not summary_text:
                 continue
             semantic_text = " ".join(
                 part for part in [
@@ -1342,10 +1371,7 @@ class TemporalResolver:
             if not segment_ref or segment_ref in existing_refs:
                 continue
             summary_text = str(seg.summary or "").strip()
-            if (
-                not summary_text
-                or contains_ambiguous_human_referent(summary_text)
-            ):
+            if not summary_text:
                 continue
             semantic_text = " ".join(
                 part for part in [

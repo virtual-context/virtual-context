@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Callable, NamedTuple
 
 from ..types import (
     AUTHOR_ROLE_ASSISTANT,
+    AUTHOR_ROLE_REQUESTER,
     CompactionResult,
     CompactorConfig,
     Fact,
@@ -20,6 +21,10 @@ from ..types import (
     AUDIENCE_ATTRIBUTION_VERSION,
     SOURCE_CANONICAL_TURN_IDS_KEY,
     SegmentMetadata,
+    StructuredSummary,
+    SummaryClaim,
+    SummarySource,
+    STRUCTURED_SUMMARY_SCHEMA_VERSION,
     StoredSummary,
     TaggedSegment,
     TagPromptRule,
@@ -29,10 +34,22 @@ from ..types import (
 )
 from .llm_utils import format_code_ref, normalize_code_refs, normalize_tag, parse_llm_json
 from .summary_identity import (
-    SUMMARY_ATTRIBUTION_QUARANTINE,
     contains_ambiguous_human_referent,
     human_label_collision_key,
     is_safe_human_label,
+)
+from .structured_summary import (
+    ValidatedTagRollupInputs,
+    apply_tag_claim_safety_floor,
+    event_time_is_supported,
+    infer_modality,
+    infer_temporal_status,
+    is_safety_critical_personal_evidence,
+    statuses_conflict,
+    structured_claim_fingerprint,
+    structured_source_digest,
+    structured_source_provenance_digest,
+    structured_tag_claim_digest,
 )
 from .telemetry import TelemetryLedger
 
@@ -67,6 +84,97 @@ SPEAKER IDENTITY CONTRACT:
 _TAG_SUMMARY_IDENTITY_QUARANTINE = (
     "[tag summary withheld: source prose lacks explicit speaker attribution]"
 )
+
+
+_STRUCTURED_SUMMARY_CONTRACT = """\
+SOURCE-BACKED SUMMARY CLAIMS CONTRACT:
+- In addition to the ordinary retrieval synopsis in "summary", return a
+  "summary_claims" JSON array. These claims are the compact summary that may
+  be shown to a future answering model.
+- The only available source lanes are the JSON objects below. Cite them by the
+  ephemeral "source_ref" value. Never emit a canonical id or actor id.
+- Every claim must cite exactly one source and copy a short, exact, contiguous
+  substring from that source's "content" into "evidence_excerpt".
+- Return at most 16 claims. Keep each claim under 240 characters and each
+  evidence excerpt under 240 characters.
+- Never combine multiple turns in one claim, even when they have the same
+  speaker. Split each separately supported statement into its own claim.
+  Assistant output is prior model text, not a structured evidence source;
+  retrieve FULL depth when it is needed.
+- "claim_type" must be one of: personal, world, decision, action, technical,
+  conversation.
+- "temporal_status" must be empty or one of: active, completed, ceased,
+  planned, abandoned, recurring. Use "ceased" for stopped/no-longer-active and
+  "planned" for intended but not begun. Never default an unclear state to
+  active.
+- "modality" must be one of: asserted, hypothetical, conditional, question,
+  recommendation, uncertain.
+- "event_time" must be empty or copied exactly from the cited evidence. The
+  source session date is utterance provenance, not proof of the event date.
+- "text" must be the same exact source substring as the first
+  "evidence_excerpt". The application re-stamps this field from admitted
+  evidence and binds the source speaker outside the claim text; it never trusts
+  a generated paraphrase as factual evidence.
+
+Available source lanes:
+{sources}
+
+The response object must include:
+"summary_claims": [
+  {{
+    "text": "same exact substring as the first evidence_excerpt",
+    "claim_type": "personal|world|decision|action|technical|conversation",
+    "temporal_status": "active|completed|ceased|planned|abandoned|recurring|",
+    "modality": "asserted|hypothetical|conditional|question|recommendation|uncertain",
+    "event_time": "",
+    "sources": [
+      {{"source_ref": "src_1", "evidence_excerpt": "exact source substring"}}
+    ]
+  }}
+]"""
+
+_SUMMARY_CLAIM_TYPES = frozenset({
+    "personal", "world", "decision", "action", "technical", "conversation",
+})
+_SUMMARY_MODALITIES = frozenset({
+    "asserted", "hypothetical", "conditional", "question",
+    "recommendation", "uncertain",
+})
+_SUMMARY_TEMPORAL_STATUSES = frozenset({
+    "", "active", "completed", "ceased", "planned", "abandoned", "recurring",
+})
+_MAX_GENERATED_SUMMARY_CLAIMS = 16
+_MAX_SUMMARY_CLAIMS = 256
+_MAX_TAG_SELECTED_CLAIMS = 16
+_MAX_CLAIM_SOURCES = 1
+_MAX_CLAIM_TEXT_CHARS = 1000
+_MAX_EVIDENCE_CHARS = 800
+_MAX_EVENT_TIME_CHARS = 128
+
+
+_TAG_CLAIM_SELECTION_CONTRACT = """\
+SOURCE-BOUND LAYER-TWO CLAIM SELECTION:
+- The ordinary "summary" and "description" fields are retrieval-only prose.
+  The application will never treat that prose as factual evidence.
+- Select the most useful compact presentation from the candidate claim records
+  below by returning their ephemeral "claim_ref" values in importance order.
+- Return between 1 and 16 refs when candidates exist, and [] when none exist.
+  Do not invent a ref. A repeated ref has no effect.
+- The application copies the selected claim objects byte-for-byte. You cannot
+  rewrite their statement, speaker, temporal status, modality, or source.
+- Prefer a newer explicit state transition (for example, stopped or ceased)
+  over an older active state when both concern the same subject. Preserve
+  useful claims from different named speakers when the tag spans them.
+- A deterministic safety floor adds exact personal corrections and state
+  transitions you omit. It orders a newer correction ahead of older selected
+  claims and does not let selection suppress that correction.
+- Never emit an actor id, canonical id, provenance digest, or source id.
+
+Candidate claim records:
+{claim_candidates}
+
+The response object must also include:
+"selected_claim_refs": ["claim_1", "claim_2"]"""
 
 
 def _complete_roster_actor_ids(roster: object | None) -> frozenset[str]:
@@ -181,6 +289,717 @@ def _segment_scope_fingerprint(segment: TaggedSegment) -> str:
         "vc-summary-audience-v1\0" + audience + "\0" + channel
     ).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+def _structured_prompt_sources(
+    roster: object | None,
+    segment: TaggedSegment,
+) -> tuple[list[dict[str, str]], dict[str, object]]:
+    """Build ephemeral LLM source refs from exact compaction lanes.
+
+    Durable actor and canonical ids stay in the returned in-process mapping;
+    only ``src_N`` plus safe display data enters the prompt. Copied reply-edge
+    lanes are deliberately excluded because their body is not an independently
+    hydrated canonical source row.
+    """
+    if roster is None or not getattr(roster, "complete", False):
+        return [], {}
+
+    candidates: list[tuple[object, str, str]] = []
+    label_actors: dict[str, set[str]] = {}
+    seen_lanes: set[tuple[str, str]] = set()
+    for lane in tuple(getattr(roster, "lanes", ()) or ()):
+        lane_role = str(getattr(lane, "role", "") or "")
+        if lane_role != AUTHOR_ROLE_REQUESTER:
+            continue
+        content = str(getattr(lane, "text", "") or "").strip()
+        canonical_id = str(
+            getattr(lane, "canonical_turn_id", "") or "",
+        ).strip()
+        if not content or not canonical_id:
+            continue
+        source_role = "requester"
+        dedupe_key = (source_role, canonical_id)
+        if dedupe_key in seen_lanes:
+            continue
+        seen_lanes.add(dedupe_key)
+        actor = str(getattr(lane, "actor_id", "") or "").strip()
+        label = str(getattr(lane, "speaker_label", "") or "").strip()
+        if not actor or not is_safe_human_label(label, actor):
+            continue
+        label_actors.setdefault(
+            human_label_collision_key(label), set(),
+        ).add(actor)
+        candidates.append((lane, source_role, label))
+
+    colliding = {
+        key for key, actors in label_actors.items() if len(actors) > 1
+    }
+    prompt_sources: list[dict[str, str]] = []
+    source_map: dict[str, object] = {}
+    for lane, source_role, label in candidates:
+        if human_label_collision_key(label) in colliding:
+            continue
+        source_ref = f"src_{len(prompt_sources) + 1}"
+        source_map[source_ref] = lane
+        prompt_sources.append({
+            "source_ref": source_ref,
+            "role": source_role,
+            "speaker": label,
+            "session_date": str(
+                getattr(lane, "session_date", "") or segment.session_date or "",
+            ),
+            "content": str(getattr(lane, "text", "") or "").strip(),
+        })
+    return prompt_sources, source_map
+
+
+def _build_structured_summary(
+    parsed: dict,
+    roster: object | None,
+    segment: TaggedSegment,
+    *,
+    generation_model: str = "",
+) -> StructuredSummary:
+    """Validate model claims and stamp provenance from physical lanes.
+
+    Invalid claims are omitted independently.  The free-form synopsis remains
+    available for retrieval even when no claim survives; only these validated
+    claim objects are eligible for model-visible summary presentation.
+    """
+    _prompt_sources, source_map = _structured_prompt_sources(roster, segment)
+    scope_by_id: dict[str, tuple[str, str, int]] = {}
+    for message in segment.messages:
+        for canonical_id in list(
+            (message.metadata or {}).get(SOURCE_CANONICAL_TURN_IDS_KEY) or []
+        ):
+            scope_by_id[str(canonical_id)] = (
+                str(message.source_audience_conversation_id or ""),
+                str(message.source_origin_channel_id or ""),
+                int(message.source_audience_attribution_version or 0),
+            )
+    digest_records: list[dict[str, object]] = []
+    for lane in source_map.values():
+        canonical_id = str(
+            getattr(lane, "canonical_turn_id", "") or "",
+        ).strip()
+        source_role = "requester"
+        fallback_audience, fallback_channel, fallback_version = scope_by_id.get(
+            canonical_id, ("", "", 0),
+        )
+        audience = str(
+            getattr(lane, "audience_conversation_id", "")
+            or fallback_audience or "",
+        )
+        channel = str(
+            getattr(lane, "origin_channel_id", "")
+            or fallback_channel or "",
+        )
+        attribution_version = getattr(
+            lane, "audience_attribution_version", fallback_version,
+        )
+        if type(attribution_version) is not int:
+            attribution_version = 0
+        lane_session_date = str(
+            getattr(lane, "session_date", "") or segment.session_date or "",
+        )
+        digest_records.append({
+            "canonical_turn_id": canonical_id,
+            "source_role": source_role,
+            "actor_id": str(getattr(lane, "actor_id", "") or ""),
+            "speaker_label": str(getattr(lane, "speaker_label", "") or ""),
+            "content": str(getattr(lane, "text", "") or "").strip(),
+            "session_date": lane_session_date,
+            "audience_conversation_id": audience,
+            "origin_channel_id": channel,
+            "audience_attribution_version": attribution_version,
+        })
+    source_digest = (
+        structured_source_digest(digest_records) if digest_records else ""
+    )
+    raw_claims = parsed.get("summary_claims")
+    if not isinstance(raw_claims, list) or not source_map:
+        return StructuredSummary(
+            schema_version=STRUCTURED_SUMMARY_SCHEMA_VERSION,
+            claims=(),
+            source_digest=source_digest,
+            generation_model=generation_model,
+        )
+
+    claims: list[SummaryClaim] = []
+    for raw_claim in raw_claims[:_MAX_GENERATED_SUMMARY_CLAIMS]:
+        if not isinstance(raw_claim, dict):
+            continue
+        text = raw_claim.get("text")
+        claim_type = raw_claim.get("claim_type")
+        temporal_status = raw_claim.get("temporal_status")
+        modality = raw_claim.get("modality")
+        event_time = raw_claim.get("event_time")
+        raw_sources = raw_claim.get("sources")
+        if (
+            type(text) is not str
+            or not text.strip()
+            or len(text) > _MAX_CLAIM_TEXT_CHARS
+            or type(claim_type) is not str
+            or claim_type not in _SUMMARY_CLAIM_TYPES
+            or type(temporal_status) is not str
+            or temporal_status not in _SUMMARY_TEMPORAL_STATUSES
+            or type(modality) is not str
+            or modality not in _SUMMARY_MODALITIES
+            or type(event_time) is not str
+            or len(event_time) > _MAX_EVENT_TIME_CHARS
+            or not isinstance(raw_sources, list)
+            or len(raw_sources) != _MAX_CLAIM_SOURCES
+        ):
+            continue
+
+        stamped_sources: list[SummarySource] = []
+        source_roles: set[str] = set()
+        source_actors: set[str] = set()
+        excerpts: list[str] = []
+        valid = True
+        for raw_source in raw_sources:
+            if not isinstance(raw_source, dict):
+                valid = False
+                break
+            source_ref = raw_source.get("source_ref")
+            excerpt = raw_source.get("evidence_excerpt")
+            if (
+                type(source_ref) is not str
+                or type(excerpt) is not str
+                or not excerpt
+                or len(excerpt) > _MAX_EVIDENCE_CHARS
+            ):
+                valid = False
+                break
+            lane = source_map.get(source_ref)
+            lane_text = str(getattr(lane, "text", "") or "")
+            if lane is None or excerpt not in lane_text:
+                valid = False
+                break
+            source_role = "requester"
+            source_roles.add(source_role)
+            canonical_id = str(
+                getattr(lane, "canonical_turn_id", "") or "",
+            ).strip()
+            if not canonical_id:
+                valid = False
+                break
+            actor = str(getattr(lane, "actor_id", "") or "").strip()
+            speaker_label = str(
+                getattr(lane, "speaker_label", "") or "",
+            ).strip()
+            if not actor or not is_safe_human_label(speaker_label, actor):
+                valid = False
+                break
+            source_actors.add(actor)
+            # A model-selected substring is only a locator. Storing it alone
+            # can drop a negation from the same sentence (for example selecting
+            # ``currently taking`` from ``no longer currently taking``). V1
+            # therefore binds and presents the complete canonical human lane.
+            canonical_evidence = lane_text.strip()
+            if not canonical_evidence or len(canonical_evidence) > _MAX_EVIDENCE_CHARS:
+                valid = False
+                break
+            excerpts.append(canonical_evidence)
+            fallback_audience, fallback_channel, fallback_version = scope_by_id.get(
+                canonical_id, ("", "", 0),
+            )
+            audience = str(
+                getattr(lane, "audience_conversation_id", "")
+                or fallback_audience or "",
+            )
+            channel = str(
+                getattr(lane, "origin_channel_id", "")
+                or fallback_channel or "",
+            )
+            attribution_version = getattr(
+                lane, "audience_attribution_version", fallback_version,
+            )
+            if type(attribution_version) is not int:
+                attribution_version = 0
+            lane_session_date = str(
+                getattr(lane, "session_date", "") or segment.session_date or "",
+            )
+            stamped_sources.append(SummarySource(
+                canonical_turn_id=canonical_id,
+                source_role=source_role,
+                speaker_label=speaker_label,
+                evidence_excerpt=canonical_evidence,
+                session_date=lane_session_date,
+                source_provenance_digest=structured_source_provenance_digest({
+                    "canonical_turn_id": canonical_id,
+                    "source_role": source_role,
+                    "actor_id": actor,
+                    "speaker_label": speaker_label,
+                    "content": canonical_evidence,
+                    "session_date": lane_session_date,
+                    "audience_conversation_id": audience,
+                    "origin_channel_id": channel,
+                    "audience_attribution_version": attribution_version,
+                }),
+            ))
+
+        if (
+            not valid
+            or len(source_roles) != 1
+            or ("requester" in source_roles and len(source_actors) != 1)
+        ):
+            continue
+        evidence_text = "\n".join(excerpts)
+        evidenced_status = infer_temporal_status(evidence_text)
+        if statuses_conflict(temporal_status, evidenced_status):
+            continue
+        # Persist only a status deterministically present in the exact quote.
+        # The model-proposed value is useful as a contradiction alarm above,
+        # never as authority to upgrade an otherwise timeless excerpt into a
+        # current/planned/ceased state.
+        resolved_status = evidenced_status
+        resolved_modality = infer_modality(evidence_text)
+        if not event_time_is_supported(
+            event_time, excerpts, segment.session_date or "",
+        ):
+            event_time = ""
+
+        # Persist an extractive claim, not the model's paraphrase.  The LLM is
+        # useful for selecting an atomic source span and classifying it, but a
+        # generated sentence cannot be deterministically proven entailed by a
+        # quote.  This assignment is the hard boundary that prevents a model
+        # from citing "I stopped" while writing "still uses" in claim text.
+        extractive_text = excerpts[0].strip()
+        claims.append(SummaryClaim(
+            text=extractive_text,
+            # V1 does not treat a model-authored semantic class as proven
+            # metadata. A requester can quote or refute another speaker, and
+            # labeling that exact lane ``personal`` would still reframe the
+            # quoted assertion as the requester's state. The exact lane is a
+            # validated conversation claim; retrieval taxonomy remains in the
+            # non-presented synopsis/tags until a deterministic classifier is
+            # available.
+            claim_type="conversation",
+            temporal_status=resolved_status,
+            modality=resolved_modality,
+            event_time=event_time.strip(),
+            sources=tuple(stamped_sources),
+        ))
+
+    # The LLM may rank ordinary details, but it cannot be the sole authority
+    # deciding whether a correction or state transition exists. Otherwise a
+    # prompt-guard failure can omit a newer ``I stopped``/``I don't take`` lane
+    # and leave an older active claim as the only compressed memory. Add every
+    # bounded safety-critical requester lane deterministically when the model
+    # did not select it. The claim remains the complete exact lane with
+    # application-derived metadata; no generated sentence is introduced.
+    selected_canonical_ids = {
+        source.canonical_turn_id
+        for claim in claims
+        for source in claim.sources
+    }
+    for lane in source_map.values():
+        canonical_evidence = str(getattr(lane, "text", "") or "").strip()
+        canonical_id = str(
+            getattr(lane, "canonical_turn_id", "") or "",
+        ).strip()
+        if (
+            canonical_id in selected_canonical_ids
+            or not canonical_id
+            or not canonical_evidence
+            or len(canonical_evidence) > _MAX_EVIDENCE_CHARS
+            or not is_safety_critical_personal_evidence(canonical_evidence)
+        ):
+            continue
+        actor = str(getattr(lane, "actor_id", "") or "").strip()
+        speaker_label = str(
+            getattr(lane, "speaker_label", "") or "",
+        ).strip()
+        if not actor or not is_safe_human_label(speaker_label, actor):
+            continue
+        fallback_audience, fallback_channel, fallback_version = scope_by_id.get(
+            canonical_id, ("", "", 0),
+        )
+        audience = str(
+            getattr(lane, "audience_conversation_id", "")
+            or fallback_audience or "",
+        )
+        channel = str(
+            getattr(lane, "origin_channel_id", "")
+            or fallback_channel or "",
+        )
+        attribution_version = getattr(
+            lane, "audience_attribution_version", fallback_version,
+        )
+        if type(attribution_version) is not int:
+            attribution_version = 0
+        lane_session_date = str(
+            getattr(lane, "session_date", "") or segment.session_date or "",
+        )
+        source = SummarySource(
+            canonical_turn_id=canonical_id,
+            source_role="requester",
+            speaker_label=speaker_label,
+            evidence_excerpt=canonical_evidence,
+            session_date=lane_session_date,
+            source_provenance_digest=structured_source_provenance_digest({
+                "canonical_turn_id": canonical_id,
+                "source_role": "requester",
+                "actor_id": actor,
+                "speaker_label": speaker_label,
+                "content": canonical_evidence,
+                "session_date": lane_session_date,
+                "audience_conversation_id": audience,
+                "origin_channel_id": channel,
+                "audience_attribution_version": attribution_version,
+            }),
+        )
+        claims.append(SummaryClaim(
+            text=canonical_evidence,
+            claim_type="conversation",
+            temporal_status=infer_temporal_status(canonical_evidence),
+            modality=infer_modality(canonical_evidence),
+            event_time="",
+            sources=(source,),
+        ))
+        selected_canonical_ids.add(canonical_id)
+
+    # A provider-controlled claim list must not control the order in which a
+    # newer correction and an older state reach SEGMENTS.  Put mandatory
+    # safety lanes first in reverse physical source order (the roster follows
+    # ``canonical_turn_ids``), then retain the provider's order for ordinary
+    # exact claims. Also collapse duplicate selections of one physical lane.
+    source_order = {
+        str(getattr(lane, "canonical_turn_id", "") or ""): index
+        for index, lane in enumerate(source_map.values())
+    }
+    unique_claims: list[SummaryClaim] = []
+    seen_claim_sources: set[str] = set()
+    for claim in claims:
+        canonical_id = claim.sources[0].canonical_turn_id
+        if canonical_id in seen_claim_sources:
+            continue
+        seen_claim_sources.add(canonical_id)
+        unique_claims.append(claim)
+    mandatory_claims = sorted(
+        (
+            claim for claim in unique_claims
+            if is_safety_critical_personal_evidence(claim.text)
+        ),
+        key=lambda claim: source_order.get(
+            claim.sources[0].canonical_turn_id, -1,
+        ),
+        reverse=True,
+    )
+    mandatory_ids = {
+        claim.sources[0].canonical_turn_id for claim in mandatory_claims
+    }
+    claims = mandatory_claims + [
+        claim for claim in unique_claims
+        if claim.sources[0].canonical_turn_id not in mandatory_ids
+    ]
+
+    return StructuredSummary(
+        schema_version=STRUCTURED_SUMMARY_SCHEMA_VERSION,
+        claims=tuple(claims),
+        source_digest=source_digest,
+        generation_model=generation_model,
+    )
+
+
+def _trusted_prior_tag_structured_summary(
+    existing_tag_summary: TagSummary | None,
+) -> StructuredSummary | None:
+    """Return a prior layer-two envelope only when its order is authenticated."""
+    if existing_tag_summary is None:
+        return None
+    structured = getattr(existing_tag_summary, "structured_summary", None)
+    source_ids = getattr(
+        existing_tag_summary, "source_canonical_turn_ids", None,
+    )
+    if (
+        not isinstance(structured, StructuredSummary)
+        or structured.schema_version != STRUCTURED_SUMMARY_SCHEMA_VERSION
+        or not structured.claims
+        or len(structured.claims) > _MAX_TAG_SELECTED_CLAIMS
+        or not isinstance(source_ids, list)
+        or not source_ids
+        or any(
+            type(canonical_id) is not str
+            or not canonical_id
+            or canonical_id != canonical_id.strip()
+            for canonical_id in source_ids
+        )
+        or len(set(source_ids)) != len(source_ids)
+    ):
+        return None
+    fingerprints = [
+        structured_claim_fingerprint(claim) for claim in structured.claims
+    ]
+    if len(set(fingerprints)) != len(fingerprints):
+        return None
+    if structured.source_digest != structured_tag_claim_digest(
+        structured.claims, source_ids,
+    ):
+        return None
+    return structured
+
+
+def _tag_claim_pool(
+    summaries: list[StoredSummary],
+    *,
+    existing_tag_summary: TagSummary | None = None,
+    validated_tag_rollup_inputs: ValidatedTagRollupInputs | None = None,
+) -> tuple[SummaryClaim, ...]:
+    """Return newest-first, exact lower-layer claims eligible for selection.
+
+    The currently loaded segments lead the pool so a recent cessation or
+    decision is visible even when the normal incremental compaction window is
+    bounded.  Claims retained by the previous tag rollup follow, preserving
+    layer-two coverage from older segments without ever feeding its generated
+    free-form synopsis back into the evidence path.
+    """
+    # ``get_summaries_by_tags`` returns newest segments first. Admit those
+    # claims before the prior rollup so a recent cessation/decision cannot be
+    # pushed out by an older 256-claim history. The existing layer-two claims
+    # are then carried forward unchanged, preserving coverage beyond the
+    # bounded segment window used by normal incremental compaction.
+    structured_inputs: list[object] = []
+    for summary in summaries:
+        if (
+            validated_tag_rollup_inputs is None
+            or not validated_tag_rollup_inputs.admits(summary)
+        ):
+            continue
+        metadata = getattr(summary, "metadata", None)
+        structured_inputs.append(
+            getattr(metadata, "structured_summary", None),
+        )
+    fresh_claims: list[SummaryClaim] = []
+    fresh_seen: set[str] = set()
+    for structured in structured_inputs:
+        if not isinstance(structured, StructuredSummary):
+            continue
+        if structured.schema_version != STRUCTURED_SUMMARY_SCHEMA_VERSION:
+            continue
+        # The proof authenticates the segment source digest and every claim
+        # against physical rows. The segment writer already places exact
+        # mandatory corrections first, so preserve that authenticated tuple.
+        for claim in structured.claims:
+            if not isinstance(claim, SummaryClaim) or len(claim.sources) != 1:
+                continue
+            source = claim.sources[0]
+            if (
+                not isinstance(source, SummarySource)
+                or source.source_role != "requester"
+                or claim.text != source.evidence_excerpt
+            ):
+                continue
+            fingerprint = structured_claim_fingerprint(claim)
+            if fingerprint in fresh_seen:
+                continue
+            fresh_seen.add(fingerprint)
+            fresh_claims.append(claim)
+
+    prior_claims: list[SummaryClaim] = []
+    prior_seen: set[str] = set()
+    prior_structured = _trusted_prior_tag_structured_summary(existing_tag_summary)
+    if prior_structured is not None:
+        for claim in prior_structured.claims:
+            if not isinstance(claim, SummaryClaim) or len(claim.sources) != 1:
+                continue
+            source = claim.sources[0]
+            if (
+                not isinstance(source, SummarySource)
+                or source.source_role != "requester"
+                or claim.text != source.evidence_excerpt
+            ):
+                continue
+            fingerprint = structured_claim_fingerprint(claim)
+            # A claim already present anywhere in the fresh lower layer does
+            # not need a reserved prior slot; SEGMENTS still owns that source.
+            if fingerprint in fresh_seen or fingerprint in prior_seen:
+                continue
+            prior_seen.add(fingerprint)
+            prior_claims.append(claim)
+
+    # Reserve the small prior selected envelope so the normal bounded latest-
+    # segment query cannot erase older layer-two coverage. All admitted fresh
+    # claims remain ahead of it; only the oldest overflow is omitted.
+    prior_claims = prior_claims[:_MAX_TAG_SELECTED_CLAIMS]
+    fresh_limit = max(0, _MAX_SUMMARY_CLAIMS - len(prior_claims))
+    return tuple(fresh_claims[:fresh_limit] + prior_claims)
+
+
+def _tag_claim_selection_digest(
+    claims: tuple[SummaryClaim, ...],
+    source_canonical_turn_ids: list[str],
+) -> str:
+    """Bind selected claims to exact ordered full tag source coverage."""
+    return structured_tag_claim_digest(claims, source_canonical_turn_ids)
+
+
+def _tag_claim_prompt_catalog(claims: tuple[SummaryClaim, ...]) -> str:
+    """Serialize selection candidates without durable source identifiers."""
+    records: list[dict[str, str]] = []
+    for index, claim in enumerate(claims, 1):
+        source = claim.sources[0]
+        records.append({
+            "claim_ref": f"claim_{index}",
+            "speaker": source.speaker_label,
+            "statement": claim.text,
+            "claim_type": claim.claim_type,
+            "temporal_status": claim.temporal_status,
+            "modality": claim.modality,
+            "event_time": claim.event_time,
+            "session_date": source.session_date,
+        })
+    return json.dumps(
+        records, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    )
+
+
+def _select_tag_claims(
+    claims: tuple[SummaryClaim, ...],
+    selected_claim_refs: object,
+    *,
+    require_valid_selection: bool,
+) -> tuple[SummaryClaim, ...]:
+    """Validate ephemeral refs and return exact, immutable source claims.
+
+    Duplicate refs are harmlessly collapsed in first-occurrence order. Any
+    other malformed selection falls back to the newest-first bounded pool for
+    the online availability path; the migration seam fails closed instead.
+    """
+    fallback = claims[:_MAX_TAG_SELECTED_CLAIMS]
+    if not claims:
+        return ()
+
+    valid = (
+        isinstance(selected_claim_refs, list)
+        and 0 < len(selected_claim_refs) <= _MAX_TAG_SELECTED_CLAIMS
+        and all(type(ref) is str for ref in selected_claim_refs)
+    )
+    selected: list[SummaryClaim] = []
+    seen_refs: set[str] = set()
+    if valid:
+        by_ref = {
+            f"claim_{index}": claim for index, claim in enumerate(claims, 1)
+        }
+        for ref in selected_claim_refs:
+            if ref not in by_ref:
+                valid = False
+                break
+            if ref in seen_refs:
+                continue
+            seen_refs.add(ref)
+            selected.append(by_ref[ref])
+        valid = valid and bool(selected)
+
+    if not valid:
+        if require_valid_selection:
+            raise TagSummaryGenerationError(
+                "tag rollup returned an invalid selected_claim_refs list",
+            )
+        return tuple(apply_tag_claim_safety_floor(
+            claims, fallback, limit=_MAX_TAG_SELECTED_CLAIMS,
+        ))
+    return tuple(apply_tag_claim_safety_floor(
+        claims, selected, limit=_MAX_TAG_SELECTED_CLAIMS,
+    ))
+
+
+def _rollup_structured_summary(
+    summaries: list[StoredSummary],
+    *,
+    generation_model: str = "",
+    existing_tag_summary: TagSummary | None = None,
+    selected_claim_refs: object = None,
+    require_valid_selection: bool = False,
+    source_canonical_turn_ids: list[str],
+    validated_tag_rollup_inputs: ValidatedTagRollupInputs | None = None,
+) -> StructuredSummary:
+    """Select exact lower-layer claims for the model-visible tag summary.
+
+    The provider controls only an ordered list of ephemeral references. Every
+    persisted claim remains the original frozen ``SummaryClaim`` object. The
+    Selected claim fingerprints and complete ordered parent source ids form
+    the digest. Each copied source also keeps its physical provenance digest,
+    so readers can revalidate the compact envelope without hydrating every
+    unselected parent segment.
+    """
+    pool = _tag_claim_pool(
+        summaries,
+        existing_tag_summary=existing_tag_summary,
+        validated_tag_rollup_inputs=validated_tag_rollup_inputs,
+    )
+    selected = _select_tag_claims(
+        pool,
+        selected_claim_refs,
+        require_valid_selection=require_valid_selection,
+    )
+    return StructuredSummary(
+        schema_version=STRUCTURED_SUMMARY_SCHEMA_VERSION,
+        claims=selected,
+        source_digest=_tag_claim_selection_digest(
+            selected, source_canonical_turn_ids,
+        ),
+        generation_model=generation_model,
+    )
+
+
+def _tag_rollup_coordinates(
+    summaries: list[StoredSummary],
+    turn_numbers: list[int],
+    canonical_turn_ids: list[str],
+    existing_tag_summary: TagSummary | None,
+    validated_tag_rollup_inputs: ValidatedTagRollupInputs | None = None,
+) -> tuple[list[str], list[int], list[str]]:
+    """Union incremental layer-two coverage without losing old sources."""
+    summary_canonical_ids = [
+        str(canonical_id)
+        for summary in summaries
+        if (
+            validated_tag_rollup_inputs is not None
+            and validated_tag_rollup_inputs.admits(summary)
+        )
+        for canonical_id in (
+            getattr(summary.metadata, "canonical_turn_ids", ()) or ()
+        )
+        if str(canonical_id)
+    ]
+    trusted_prior = _trusted_prior_tag_structured_summary(existing_tag_summary)
+    prior_refs = (
+        list(existing_tag_summary.source_segment_refs)
+        if existing_tag_summary is not None and trusted_prior is not None else []
+    )
+    prior_turns = (
+        list(existing_tag_summary.source_turn_numbers)
+        if existing_tag_summary is not None and trusted_prior is not None else []
+    )
+    prior_canonical_ids = (
+        list(existing_tag_summary.source_canonical_turn_ids)
+        if existing_tag_summary is not None and trusted_prior is not None else []
+    )
+    trusted_caller_ids = (
+        canonical_turn_ids
+        if (
+            isinstance(canonical_turn_ids, list)
+            and all(
+                type(canonical_id) is str
+                and bool(canonical_id)
+                and canonical_id == canonical_id.strip()
+                for canonical_id in canonical_turn_ids
+            )
+            and len(set(canonical_turn_ids)) == len(canonical_turn_ids)
+        )
+        else []
+    )
+    refs = list(dict.fromkeys(
+        [summary.ref for summary in summaries] + prior_refs,
+    ))
+    turns = sorted(set(turn_numbers) | set(prior_turns))
+    source_ids = list(dict.fromkeys(
+        summary_canonical_ids + trusted_caller_ids + prior_canonical_ids,
+    ))
+    return refs, turns, source_ids
 
 
 def _metadata_value(metadata: object, key: str) -> object:
@@ -343,6 +1162,15 @@ class SegmentSummaryRequest(NamedTuple):
     original_tokens: int
     normalized_code_refs: list[dict]
 
+
+class SegmentSummaryGenerationError(RuntimeError):
+    """A migration-safe segment generation could not produce a valid result."""
+
+
+class TagSummaryGenerationError(RuntimeError):
+    """A migration-safe tag rollup could not produce a valid retrieval index."""
+
+
 TAG_SUMMARY_ROLLUP_PROMPT = """\
 You are summarizing all stored context about the tag "{tag}".
 Below are {count} segment summaries that each cover a portion of conversation
@@ -389,7 +1217,8 @@ Respond with JSON:
   "description": "concise topic paragraph, max 80 words",
   "entities": ["..."],
   "key_decisions": ["..."],
-  "action_items": ["..."]
+  "action_items": ["..."],
+  "selected_claim_refs": ["claim_1", "claim_2"]
 }}"""
 
 
@@ -418,6 +1247,7 @@ Respond with JSON:
   "entities": ["..."],
   "key_decisions": ["..."],
   "action_items": ["..."],
+  "selected_claim_refs": ["claim_1", "claim_2"],
   "code_refs": [{{"file": "...", "line": 123, "symbol": "..."}}]
 }}"""
 
@@ -868,13 +1698,6 @@ class DomainCompactor:
                         conversation_text = self._format_conversation(segment.messages)
                         fallback_summary = conversation_text[:2000]
                         roster = rosters.get(segment.id)
-                        if (
-                            contains_ambiguous_human_referent(fallback_summary)
-                            or len(_complete_roster_actor_ids(roster)) != 1
-                            or not _named_complete_roster_labels(roster)
-                            or len(_segment_source_scope_keys(segment)) != 1
-                        ):
-                            fallback_summary = SUMMARY_ATTRIBUTION_QUARANTINE
                         results[idx] = CompactionResult(
                             segment_id=segment.id,
                             primary_tag=segment.primary_tag,
@@ -902,6 +1725,10 @@ class DomainCompactor:
                                     segment.end_timestamp,
                                 ),
                                 session_date=segment.session_date,
+                                structured_summary=_build_structured_summary(
+                                    {}, roster, segment,
+                                    generation_model=self.model_name,
+                                ),
                             ),
                             full_text=conversation_text,
                             messages=[
@@ -941,6 +1768,84 @@ class DomainCompactor:
         _sys.stderr.write("\n")
         _sys.stderr.flush()
         return results
+
+    def summarize_segment(
+        self,
+        segment: TaggedSegment,
+        *,
+        roster: "ActorRoster | None" = None,
+        fact_signals: list[FactSignal] | None = None,
+        code_refs: list[dict] | None = None,
+        prev_context: str = "",
+        include_facts: bool = False,
+    ) -> CompactionResult:
+        """Public single-segment generation seam used by safe migrations.
+
+        This uses the same request, retry, and claim-admission implementation as
+        normal compaction, but it deliberately disables source-text fallbacks.
+        Provider failures, malformed structured JSON, and persistently unusable
+        responses raise :class:`SegmentSummaryGenerationError` (or the original
+        provider exception) so a migration cannot stamp a failed row as current.
+        A valid response with no admitted claims may still be returned; migration
+        callers decide whether an empty claim set is meaningful for their scope.
+        Fact post-processing is disabled by default because a structured-summary
+        migration does not persist facts and reply-lane extraction can make
+        additional provider calls. Callers must persist with their own
+        lifecycle/CAS guard.
+        """
+        return self._compact_one(
+            segment,
+            fact_signals=fact_signals,
+            code_refs=code_refs,
+            prev_context=prev_context,
+            roster=roster,
+            fail_closed=True,
+            extract_facts=include_facts,
+        )
+
+    def build_structured_summary(
+        self,
+        parsed: dict,
+        *,
+        roster: "ActorRoster | None",
+        segment: TaggedSegment,
+    ) -> StructuredSummary:
+        """Validate parsed claims using the normal compaction boundary."""
+        return _build_structured_summary(
+            parsed,
+            roster,
+            segment,
+            generation_model=self.model_name,
+        )
+
+    def summarize_tag(
+        self,
+        tag: str,
+        summaries: list[StoredSummary],
+        turn_numbers: list[int],
+        canonical_turn_ids: list[str],
+        max_turn: int,
+        *,
+        generated_by_turn_id: str = "",
+        validated_tag_rollup_inputs: ValidatedTagRollupInputs | None = None,
+    ) -> TagSummary:
+        """Build one tag rollup without availability-oriented LLM fallback.
+
+        The structured layer is always copied from admitted segment claims;
+        the provider only writes the internal retrieval synopsis. Provider or
+        JSON failures propagate so a migration can retain the prior tag row and
+        embedding instead of stamping a fallback as regenerated.
+        """
+        return self._build_one_tag_summary(
+            tag,
+            summaries,
+            turn_numbers,
+            canonical_turn_ids,
+            max_turn,
+            generated_by_turn_id=generated_by_turn_id,
+            fail_closed=True,
+            validated_tag_rollup_inputs=validated_tag_rollup_inputs,
+        )
 
     def build_segment_summary_request(
         self,
@@ -1074,11 +1979,19 @@ class DomainCompactor:
         prompt += "\n\n" + _SEGMENT_IDENTITY_CONTRACT.format(
             labels=json.dumps(list(roster_labels), ensure_ascii=False),
         )
+        prompt_sources, _source_map = _structured_prompt_sources(roster, segment)
+        prompt += "\n\n" + _STRUCTURED_SUMMARY_CONTRACT.format(
+            sources=json.dumps(
+                prompt_sources, ensure_ascii=False, separators=(",", ":"),
+            ),
+        )
 
         system = (
             "You are a conversation summarizer. Output valid JSON only. "
             "No markdown fences, no extra text. Preserve negation and intent exactly. "
-            "Every summary claim must be grounded in the segment being summarized."
+            "Every summary claim must be grounded in the segment being summarized. "
+            "The free-form summary is a retrieval synopsis; summary_claims are "
+            "the source-backed presentation record and must follow their schema exactly."
         )
         if prev_context:
             system += (
@@ -1103,6 +2016,8 @@ class DomainCompactor:
         code_refs: list[dict] | None = None,
         prev_context: str = "",
         roster: "ActorRoster | None" = None,
+        fail_closed: bool = False,
+        extract_facts: bool = True,
     ) -> CompactionResult:
         request = self.build_segment_summary_request(
             segment,
@@ -1117,6 +2032,26 @@ class DomainCompactor:
         normalized_refs = request.normalized_code_refs
         system = request.system
         prompt = request.prompt
+        structured_prompt_sources, _ = _structured_prompt_sources(roster, segment)
+        # Require a structured claim when at least one source lane can fit in
+        # the v1 exact-evidence envelope.  A provider that silently ignores the
+        # new field must not make canonical fallback the permanent normal path
+        # without even receiving the existing one-shot corrective retry.
+        structured_claim_expected = any(
+            0 < len(str(source.get("content", "")).strip()) <= _MAX_EVIDENCE_CHARS
+            for source in structured_prompt_sources
+        )
+
+        def _missing_required_structured_claims(candidate: dict) -> bool:
+            return bool(
+                structured_claim_expected
+                and not _build_structured_summary(
+                    candidate,
+                    roster,
+                    segment,
+                    generation_model=self.model_name,
+                ).claims
+            )
 
         # DIAGNOSTIC: log compactor input for each segment
         logger.info(
@@ -1125,7 +2060,6 @@ class DomainCompactor:
             conversation_text[:300].replace("\n", "\\n"),
         )
 
-        used_source_fallback = False
         try:
             t0 = time.time()
             response_text, usage = self.llm.complete(
@@ -1135,17 +2069,35 @@ class DomainCompactor:
             )
             duration_ms = (time.time() - t0) * 1000
             self._log_usage("segment_summarize", duration_ms=duration_ms, usage=usage)
-            parsed = self._parse_response(response_text)
-            _reject_reason = self._segment_summary_reject_reason(
-                parsed.get("summary", ""), conversation_text, roster,
-            )
+            if fail_closed:
+                parsed = self._parse_structured_response_strict(response_text)
+                _reject_reason = (
+                    "malformed_structured_response"
+                    if parsed is None
+                    else self._segment_summary_reject_reason(
+                        parsed.get("summary", ""), conversation_text, roster,
+                    )
+                )
+                parsed = parsed or {}
+            else:
+                parsed = self._parse_response(response_text)
+                _reject_reason = self._segment_summary_reject_reason(
+                    parsed.get("summary", ""), conversation_text, roster,
+                )
+            if (
+                _reject_reason is None
+                and _missing_required_structured_claims(parsed)
+            ):
+                _reject_reason = "missing_structured_claims"
             if _reject_reason is not None:
                 # A tiny acknowledgement whose generated "summary" is longer
                 # than its full transcript is the production signature of
                 # preceding-context leakage.  There is no value in spending a
                 # second call: preserve the exact source immediately.
                 if (
-                    len(conversation_text.strip()) < 256
+                    not fail_closed
+                    and not structured_claim_expected
+                    and len(conversation_text.strip()) < 256
                     and self._summary_overshoots_source(
                         parsed.get("summary", ""), conversation_text,
                     )
@@ -1162,7 +2114,6 @@ class DomainCompactor:
                         "date_references": [],
                         "refined_tags": segment.tags,
                     }
-                    used_source_fallback = True
                 else:
                     logger.warning(
                         "Unusable LLM summary for segment %s (reason=%s); retrying once",
@@ -1186,6 +2137,13 @@ class DomainCompactor:
                                 if _reject_reason == "ambiguous_human_referent"
                                 else ""
                             )
+                            + (
+                                " Your previous response contained no admissible source-backed "
+                                "summary claim. Return at least one summary_claims item citing "
+                                "exactly one available source_ref and an exact evidence substring."
+                                if _reject_reason == "missing_structured_claims"
+                                else ""
+                            )
                         ),
                         user=prompt,
                         max_tokens=(
@@ -1198,27 +2156,73 @@ class DomainCompactor:
                         duration_ms=(time.time() - retry_started) * 1000,
                         usage=usage,
                     )
-                    parsed = self._parse_response(response_text)
+                    if fail_closed:
+                        parsed = self._parse_structured_response_strict(response_text)
+                        if parsed is None:
+                            raise SegmentSummaryGenerationError(
+                                f"segment {segment.id} returned malformed structured "
+                                "JSON after retry"
+                            )
+                    else:
+                        parsed = self._parse_response(response_text)
                     _retry_reason = self._segment_summary_reject_reason(
                         parsed.get("summary", ""), conversation_text, roster,
                     )
+                    if (
+                        _retry_reason is None
+                        and _missing_required_structured_claims(parsed)
+                    ):
+                        _retry_reason = "missing_structured_claims"
                     if _retry_reason is not None:
-                        logger.warning(
-                            "Unusable LLM summary persisted after retry for segment %s "
-                            "(reason=%s); using bounded source-text fallback",
-                            segment.id,
-                            _retry_reason,
-                        )
-                        parsed = {
-                            "summary": conversation_text[:target_tokens * 4],
-                            "entities": [],
-                            "key_decisions": [],
-                            "action_items": [],
-                            "date_references": [],
-                            "refined_tags": segment.tags,
-                        }
-                        used_source_fallback = True
+                        if _retry_reason == "ambiguous_human_referent":
+                            # The free-form synopsis is an internal retrieval
+                            # index, not model-visible evidence. Keep the best
+                            # available index text after one hygiene retry; the
+                            # independently validated structured claims below
+                            # remain the only summary presentation artifact.
+                            logger.warning(
+                                "Generic referent persisted in retrieval synopsis "
+                                "for segment %s; retaining index text only",
+                                segment.id,
+                            )
+                        elif _retry_reason == "missing_structured_claims":
+                            if fail_closed:
+                                raise SegmentSummaryGenerationError(
+                                    f"segment {segment.id} returned no admissible "
+                                    "structured claims after retry"
+                                )
+                            # Keep the generated text as a private retrieval
+                            # synopsis, but leave the structured envelope empty
+                            # so every presentation surface uses the exact
+                            # canonical fallback and migration will select it.
+                            logger.warning(
+                                "No admissible structured claims after retry for "
+                                "segment %s; retaining synopsis for retrieval only",
+                                segment.id,
+                            )
+                        else:
+                            if fail_closed:
+                                raise SegmentSummaryGenerationError(
+                                    f"segment {segment.id} remained unusable after "
+                                    f"retry: {_retry_reason}"
+                                )
+                            logger.warning(
+                                "Unusable LLM summary persisted after retry for segment %s "
+                                "(reason=%s); using bounded source-text fallback",
+                                segment.id,
+                                _retry_reason,
+                            )
+                            parsed = {
+                                "summary": conversation_text[:target_tokens * 4],
+                                "entities": [],
+                                "key_decisions": [],
+                                "action_items": [],
+                                "date_references": [],
+                                "refined_tags": segment.tags,
+                            }
         except Exception as e:
+            if fail_closed:
+                raise
             logger.warning(f"LLM summarization failed for segment {segment.id}: {e}")
             parsed = {
                 "summary": conversation_text[:target_tokens * 4],
@@ -1228,47 +2232,19 @@ class DomainCompactor:
                 "date_references": [],
                 "refined_tags": segment.tags,
             }
-            used_source_fallback = True
 
-        summary = parsed.get("summary", "")
-        # Final storage boundary. Source-text fallback is normally the safest
-        # recovery because it preserves exact source bytes. A transcript that
-        # lacks a complete named roster uses the neutral ``Source`` prefix;
-        # that avoids inventing a human label but still cannot prove who said
-        # the words. Retain it in ``full_text``/``messages`` and quarantine
-        # only its derived summary field.
-        if contains_ambiguous_human_referent(summary):
-            logger.error(
-                "Unsafe segment summary reached final storage gate for %s; "
-                "withholding derived prose",
-                segment.id,
-            )
-            summary = SUMMARY_ATTRIBUTION_QUARANTINE
-            parsed["summary"] = summary
-        if used_source_fallback and not (
-            len(_complete_roster_actor_ids(roster)) == 1
-            and len(_named_complete_roster_labels(roster)) >= 1
-            and len(_segment_source_scope_keys(segment)) == 1
-        ):
-            logger.error(
-                "Source fallback lacks one complete actor+audience scope for %s; "
-                "withholding derived prose",
-                segment.id,
-            )
-            summary = SUMMARY_ATTRIBUTION_QUARANTINE
-            parsed["summary"] = summary
-        if roster is not None and not (
-            len(_complete_roster_actor_ids(roster)) == 1
-            and len(_named_complete_roster_labels(roster)) >= 1
-            and len(_segment_source_scope_keys(segment)) == 1
-        ):
-            logger.error(
-                "Segment summary lacks one complete actor+audience scope for %s; "
-                "withholding derived prose",
-                segment.id,
-            )
-            summary = SUMMARY_ATTRIBUTION_QUARANTINE
-            parsed["summary"] = summary
+        summary_value = parsed.get("summary", "")
+        summary = summary_value if isinstance(summary_value, str) else ""
+        # ``summary`` is deliberately retained as a lossy retrieval synopsis,
+        # including for multi-human groups. It is never admitted to an answer
+        # prompt directly. Claim-local source validation, not segment-wide
+        # roster cardinality, controls model-visible summary presentation.
+        structured_summary = _build_structured_summary(
+            parsed,
+            roster,
+            segment,
+            generation_model=self.model_name,
+        )
         summary_tokens = self.token_counter(summary)
 
         # DIAGNOSTIC: log compactor output
@@ -1306,6 +2282,7 @@ class DomainCompactor:
             source_audience_fingerprint=_segment_scope_fingerprint(segment),
             time_span=(segment.start_timestamp, segment.end_timestamp),
             session_date=segment.session_date,
+            structured_summary=structured_summary,
         )
 
         messages_dicts = [
@@ -1327,7 +2304,7 @@ class DomainCompactor:
                 return ", ".join(str(v) for v in val)
             return str(val) if val else ""
 
-        if isinstance(raw_facts, list):
+        if extract_facts and isinstance(raw_facts, list):
             for f in raw_facts:
                 if not isinstance(f, dict) or not f.get("subject") or not f.get("object"):
                     continue
@@ -1377,7 +2354,8 @@ class DomainCompactor:
                     author_source_role=_str(f.get("speaker", "")),
                 ))
 
-        facts = self._attribute_facts(facts, roster, segment=segment)
+        if extract_facts:
+            facts = self._attribute_facts(facts, roster, segment=segment)
 
         return CompactionResult(
             segment_id=segment.id,
@@ -1764,6 +2742,41 @@ class DomainCompactor:
         }
 
     @staticmethod
+    def _parse_structured_response_strict(response: str) -> dict | None:
+        """Parse the migration/writer contract without a prose fallback.
+
+        Normal online compaction may preserve source text when a provider is
+        unavailable.  A repair migration cannot: doing so and stamping a v1
+        digest would make provider failure indistinguishable from a completed
+        structured regeneration.  Require the two top-level fields owned by
+        this writer and let claim-local validation handle their contents.
+        """
+        result = parse_llm_json(response)
+        if not isinstance(result, dict):
+            return None
+        if type(result.get("summary")) is not str:
+            return None
+        if not result["summary"].strip():
+            return None
+        if not isinstance(result.get("summary_claims"), list):
+            return None
+        return result
+
+    @staticmethod
+    def _parse_tag_response_strict(response: str) -> dict | None:
+        """Parse a migration-safe tag synopsis without raw-text fallback."""
+        result = parse_llm_json(response)
+        if not isinstance(result, dict):
+            return None
+        if type(result.get("summary")) is not str or not result["summary"].strip():
+            return None
+        description = result.get("description", "")
+        if type(description) is not str:
+            return None
+        result.setdefault("description", "")
+        return result
+
+    @staticmethod
     def _is_degenerate_summary(summary: object) -> bool:
         """Reject incomplete JSON/fence fragments before they become memory."""
         if not isinstance(summary, str):
@@ -1851,11 +2864,15 @@ class DomainCompactor:
         existing_tag_summaries: dict[str, TagSummary] | None = None,
         max_turn: int = -1,
         generated_by_turn_id: str = "",
+        validated_tag_rollup_inputs: ValidatedTagRollupInputs | None = None,
     ) -> list[TagSummary]:
         """Build or update tag summaries for cover tags.
 
-        Only rebuilds tag summaries that are stale (``covers_through_turn`` <
-        ``max_turn``) or missing.  Uses ThreadPoolExecutor for concurrency.
+        Rebuilds tag summaries that are missing, behind the global turn
+        watermark, or missing an exact validated per-tag source coordinate.
+        The latter matters when another tag already advanced the global
+        watermark: a new correction for this tag must still rebuild layer two.
+        Uses ThreadPoolExecutor for concurrency.
         """
         existing_tag_summaries = existing_tag_summaries or {}
         tags_to_build: list[str] = []
@@ -1864,7 +2881,70 @@ class DomainCompactor:
             if not summaries:
                 continue  # no segment summaries yet
             existing = existing_tag_summaries.get(tag)
-            if existing is None or existing.covers_through_turn < max_turn:
+            source_set_changed = False
+            if existing is not None and validated_tag_rollup_inputs is not None:
+                admitted = [
+                    summary for summary in summaries
+                    if validated_tag_rollup_inputs.admits(summary)
+                ]
+                incoming_refs = {
+                    str(getattr(summary, "ref", "") or "")
+                    for summary in admitted
+                    if str(getattr(summary, "ref", "") or "")
+                }
+                incoming_ids = {
+                    str(canonical_id)
+                    for summary in admitted
+                    for canonical_id in (
+                        getattr(summary.metadata, "canonical_turn_ids", ())
+                        or ()
+                    )
+                    if type(canonical_id) is str and canonical_id
+                }
+                raw_caller_ids = (tag_to_canonical_turn_ids or {}).get(
+                    tag, [],
+                )
+                if (
+                    isinstance(raw_caller_ids, list)
+                    and all(
+                        type(canonical_id) is str
+                        and bool(canonical_id)
+                        and canonical_id == canonical_id.strip()
+                        for canonical_id in raw_caller_ids
+                    )
+                    and len(set(raw_caller_ids)) == len(raw_caller_ids)
+                ):
+                    incoming_ids.update(raw_caller_ids)
+                raw_existing_refs = getattr(
+                    existing, "source_segment_refs", None,
+                )
+                raw_existing_ids = getattr(
+                    existing, "source_canonical_turn_ids", None,
+                )
+                existing_refs = {
+                    ref for ref in (
+                        raw_existing_refs
+                        if isinstance(raw_existing_refs, list) else []
+                    )
+                    if type(ref) is str and ref
+                }
+                existing_ids = {
+                    canonical_id
+                    for canonical_id in (
+                        raw_existing_ids
+                        if isinstance(raw_existing_ids, list) else []
+                    )
+                    if type(canonical_id) is str and canonical_id
+                }
+                source_set_changed = bool(
+                    incoming_refs - existing_refs
+                    or incoming_ids - existing_ids
+                )
+            if (
+                existing is None
+                or existing.covers_through_turn < max_turn
+                or source_set_changed
+            ):
                 tags_to_build.append(tag)
 
         if not tags_to_build:
@@ -1881,6 +2961,8 @@ class DomainCompactor:
                     (tag_to_canonical_turn_ids or {}).get(tag, []),
                     max_turn,
                     generated_by_turn_id=generated_by_turn_id,
+                    existing_tag_summary=existing_tag_summaries.get(tag),
+                    validated_tag_rollup_inputs=validated_tag_rollup_inputs,
                 )
                 for tag in tags_to_build
             ]
@@ -1903,7 +2985,9 @@ class DomainCompactor:
                     tag_to_turns.get(tag, []),
                     (tag_to_canonical_turn_ids or {}).get(tag, []),
                     max_turn,
-                    generated_by_turn_id,
+                    generated_by_turn_id=generated_by_turn_id,
+                    existing_tag_summary=existing_tag_summaries.get(tag),
+                    validated_tag_rollup_inputs=validated_tag_rollup_inputs,
                 ): i
                 for i, tag in enumerate(tags_to_build)
             }
@@ -1930,14 +3014,38 @@ class DomainCompactor:
                     tag = tags_to_build[idx]
                     logger.error(f"Tag summary build failed for '{tag}': {e}")
                     summaries = tag_to_summaries.get(tag, [])
-                    fallback_text = _safe_tag_rollup_fallback(summaries)
+                    existing = existing_tag_summaries.get(tag)
+                    fallback_text = (
+                        existing.summary
+                        if existing is not None and existing.summary.strip()
+                        else _safe_tag_rollup_fallback(summaries)
+                    )
+                    refs, turns, source_ids = _tag_rollup_coordinates(
+                        summaries,
+                        tag_to_turns.get(tag, []),
+                        (tag_to_canonical_turn_ids or {}).get(tag, []),
+                        existing,
+                        validated_tag_rollup_inputs,
+                    )
                     results[idx] = TagSummary(
                         tag=tag,
                         summary=fallback_text,
+                        description=(
+                            existing.description if existing is not None else ""
+                        ),
+                        structured_summary=_rollup_structured_summary(
+                            summaries,
+                            generation_model=self.model_name,
+                            existing_tag_summary=existing,
+                            source_canonical_turn_ids=source_ids,
+                            validated_tag_rollup_inputs=(
+                                validated_tag_rollup_inputs
+                            ),
+                        ),
                         summary_tokens=self.token_counter(fallback_text),
-                        source_segment_refs=[s.ref for s in summaries],
-                        source_turn_numbers=sorted(set(tag_to_turns.get(tag, []))),
-                        source_canonical_turn_ids=list(dict.fromkeys((tag_to_canonical_turn_ids or {}).get(tag, []))),
+                        source_segment_refs=refs,
+                        source_turn_numbers=turns,
+                        source_canonical_turn_ids=source_ids,
                         code_refs=_collect_code_refs(
                             *[getattr(s.metadata, "code_refs", []) for s in summaries]
                         ),
@@ -1962,10 +3070,31 @@ class DomainCompactor:
         canonical_turn_ids: list[str],
         max_turn: int,
         generated_by_turn_id: str = "",
+        fail_closed: bool = False,
+        existing_tag_summary: TagSummary | None = None,
+        validated_tag_rollup_inputs: ValidatedTagRollupInputs | None = None,
     ) -> TagSummary:
-        combined = "\n\n---\n\n".join(
-            _format_tag_rollup_source(summary) for summary in summaries
+        claim_pool = _tag_claim_pool(
+            summaries,
+            existing_tag_summary=existing_tag_summary,
+            validated_tag_rollup_inputs=validated_tag_rollup_inputs,
         )
+        if fail_closed and summaries and not claim_pool:
+            raise TagSummaryGenerationError(
+                f"tag {tag!r} has no physically validated claim inputs",
+            )
+        source_blocks = [
+            _format_tag_rollup_source(summary) for summary in summaries
+        ]
+        if (
+            existing_tag_summary is not None
+            and existing_tag_summary.summary.strip()
+        ):
+            source_blocks.append(
+                "[Prior tag synopsis; retrieval context only]\n"
+                + existing_tag_summary.summary,
+            )
+        combined = "\n\n---\n\n".join(source_blocks)
         combined_tokens = self.token_counter(combined)
         target_tokens = max(
             self.config.min_summary_tokens,
@@ -1979,42 +3108,28 @@ class DomainCompactor:
         )
         prompt = prompt_template.format(
             tag=tag,
-            count=len(summaries),
+            count=len(source_blocks),
             target_tokens=target_tokens,
             segment_summaries=combined,
         )
         prompt += "\n\n" + _TAG_IDENTITY_CONTRACT
+        prompt += "\n\n" + _TAG_CLAIM_SELECTION_CONTRACT.format(
+            claim_candidates=_tag_claim_prompt_catalog(claim_pool),
+        )
 
         system = (
             "You are a conversation summarizer. Output valid JSON only. "
             "No markdown fences, no extra text."
         )
 
-        fallback_text = _safe_tag_rollup_fallback(summaries)
-        if not _single_proved_tag_rollup_label(summaries):
-            logger.info(
-                "Skipping generative tag rollup for '%s': source speaker "
-                "provenance is missing or not single-human",
-                tag,
+        fallback_text = (
+            existing_tag_summary.summary
+            if (
+                existing_tag_summary is not None
+                and existing_tag_summary.summary.strip()
             )
-            return TagSummary(
-                tag=tag,
-                summary=fallback_text,
-                description="",
-                summary_tokens=self.token_counter(fallback_text),
-                source_segment_refs=[s.ref for s in summaries],
-                source_turn_numbers=sorted(set(turn_numbers)),
-                source_canonical_turn_ids=list(dict.fromkeys(canonical_turn_ids or [])),
-                code_refs=_collect_code_refs(
-                    *[getattr(s.metadata, "code_refs", []) for s in summaries]
-                ),
-                covers_through_turn=max_turn,
-                covers_through_canonical_turn_id=(
-                    list(dict.fromkeys(canonical_turn_ids or []))[-1]
-                    if canonical_turn_ids else ""
-                ),
-                generated_by_turn_id=generated_by_turn_id,
-            )
+            else _safe_tag_rollup_fallback(summaries)
+        )
         try:
             t0 = time.time()
             response_text, usage = self.llm.complete(
@@ -2024,7 +3139,14 @@ class DomainCompactor:
             )
             duration_ms = (time.time() - t0) * 1000
             self._log_usage("tag_rollup", duration_ms=duration_ms, usage=usage)
-            parsed = self._parse_response(response_text)
+            if fail_closed:
+                parsed = self._parse_tag_response_strict(response_text)
+                if parsed is None:
+                    raise TagSummaryGenerationError(
+                        f"tag {tag!r} returned malformed JSON"
+                    )
+            else:
+                parsed = self._parse_response(response_text)
             ambiguous_fields = _ambiguous_tag_rollup_fields(parsed)
             if ambiguous_fields:
                 logger.warning(
@@ -2055,7 +3177,14 @@ class DomainCompactor:
                     duration_ms=(time.time() - retry_started) * 1000,
                     usage=usage,
                 )
-                parsed = self._parse_response(response_text)
+                if fail_closed:
+                    parsed = self._parse_tag_response_strict(response_text)
+                    if parsed is None:
+                        raise TagSummaryGenerationError(
+                            f"tag {tag!r} returned malformed JSON after retry"
+                        )
+                else:
+                    parsed = self._parse_response(response_text)
                 retry_fields = _ambiguous_tag_rollup_fields(parsed)
                 if retry_fields:
                     logger.warning(
@@ -2066,8 +3195,16 @@ class DomainCompactor:
                     )
                     parsed = {"summary": fallback_text, "description": ""}
         except Exception as e:
+            if fail_closed:
+                raise
             logger.warning(f"LLM tag summary rollup failed for '{tag}': {e}")
-            parsed = {"summary": fallback_text, "description": ""}
+            parsed = {
+                "summary": fallback_text,
+                "description": (
+                    existing_tag_summary.description
+                    if existing_tag_summary is not None else ""
+                ),
+            }
 
         summary_text = parsed.get("summary", "")
         description = parsed.get("description", "")
@@ -2084,23 +3221,48 @@ class DomainCompactor:
             )
             summary_text = fallback_text
             description = ""
+        source_refs, source_turns, source_ids = _tag_rollup_coordinates(
+            summaries,
+            turn_numbers,
+            canonical_turn_ids,
+            existing_tag_summary,
+            validated_tag_rollup_inputs,
+        )
+        structured_summary = _rollup_structured_summary(
+            summaries,
+            generation_model=self.model_name,
+            existing_tag_summary=existing_tag_summary,
+            selected_claim_refs=parsed.get("selected_claim_refs"),
+            require_valid_selection=fail_closed,
+            source_canonical_turn_ids=source_ids,
+            validated_tag_rollup_inputs=validated_tag_rollup_inputs,
+        )
         code_refs = _collect_code_refs(
             parsed.get("code_refs"),
             *[getattr(s.metadata, "code_refs", []) for s in summaries],
+            (
+                existing_tag_summary.code_refs
+                if existing_tag_summary is not None else []
+            ),
         )
         return TagSummary(
             tag=tag,
             summary=summary_text,
             description=description,
+            structured_summary=structured_summary,
             summary_tokens=self.token_counter(summary_text),
-            source_segment_refs=[s.ref for s in summaries],
-            source_turn_numbers=sorted(set(turn_numbers)),
-            source_canonical_turn_ids=list(dict.fromkeys(canonical_turn_ids or [])),
+            source_segment_refs=source_refs,
+            source_turn_numbers=source_turns,
+            source_canonical_turn_ids=source_ids,
             code_refs=code_refs,
             covers_through_turn=max_turn,
             covers_through_canonical_turn_id=(
                 list(dict.fromkeys(canonical_turn_ids or []))[-1]
-                if canonical_turn_ids else ""
+                if canonical_turn_ids
+                else (
+                    existing_tag_summary.covers_through_canonical_turn_id
+                    if existing_tag_summary is not None else ""
+                )
             ),
             generated_by_turn_id=generated_by_turn_id,
         )

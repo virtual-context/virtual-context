@@ -68,6 +68,8 @@ from ..types import (
     channel_excerpt_prefix,
     strip_channel_hash,
     strict_segment_identity_metadata,
+    strict_structured_summary,
+    structured_summary_to_dict,
     CARD_CROSS_CONTEXT_KINDS,
     CARD_KINDS,
     CARD_SCOPES,
@@ -157,6 +159,7 @@ CREATE TABLE IF NOT EXISTS tag_summaries (
     source_segment_refs TEXT NOT NULL DEFAULT '[]',
     source_turn_numbers TEXT NOT NULL DEFAULT '[]',
     source_canonical_turn_ids TEXT NOT NULL DEFAULT '[]',
+    structured_summary_json TEXT NOT NULL DEFAULT '{"schema_version":0,"claims":[],"source_digest":"","generation_model":""}',
     covers_through_turn INTEGER NOT NULL DEFAULT -1,
     covers_through_canonical_turn_id TEXT NOT NULL DEFAULT '',
     generated_by_turn_id TEXT NOT NULL DEFAULT '',
@@ -891,6 +894,9 @@ def _row_to_segment(row: dict, tags: list[str]) -> StoredSegment:
             generated_by_turn_id=metadata_raw.get("generated_by_turn_id", ""),
             session_date=metadata_raw.get("session_date", ""),
             source_mapping_complete=identity_metadata["source_mapping_complete"],
+            structured_summary=strict_structured_summary(
+                metadata_raw.get("structured_summary")
+            ),
         ),
         created_at=_str_to_dt(row["created_at"]),
         start_timestamp=_str_to_dt(row["start_timestamp"]),
@@ -933,11 +939,24 @@ def _row_to_summary(row: dict, tags: list[str]) -> StoredSummary:
             generated_by_turn_id=metadata_raw.get("generated_by_turn_id", ""),
             session_date=metadata_raw.get("session_date", ""),
             source_mapping_complete=identity_metadata["source_mapping_complete"],
+            structured_summary=strict_structured_summary(
+                metadata_raw.get("structured_summary")
+            ),
         ),
         created_at=_str_to_dt(row["created_at"]),
         start_timestamp=_str_to_dt(row["start_timestamp"]),
         end_timestamp=_str_to_dt(row["end_timestamp"]),
     )
+
+
+def _structured_summary_from_json(raw: object):
+    if not isinstance(raw, str):
+        return strict_structured_summary(raw)
+    try:
+        decoded = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return strict_structured_summary(None)
+    return strict_structured_summary(decoded)
 
 
 def _row_to_reconcile_row(row: dict) -> CanonicalTurnReconcileRow:
@@ -2176,6 +2195,11 @@ class PostgresStore(ContextStore):
         # on both the base table and the ordinal view, OUTSIDE those catches.
         self._assert_actor_schema()
         self._assert_canonical_message_source_schema()
+        # Layered serving unconditionally reads the structured tag payload and
+        # its exact source coverage. The best-effort ALTERs above deliberately
+        # swallow duplicate-column errors, so assert the final manifest outside
+        # that catch and refuse to boot on a permission/lock/DDL failure.
+        self._assert_tag_summary_schema()
         # Same rule for the handle relation: a swallowed CREATE must not
         # become a process that silently cannot persist stable handles.
         self._assert_speaker_handle_schema()
@@ -3352,19 +3376,85 @@ class PostgresStore(ContextStore):
                     pass
 
     def _ensure_tag_summary_schema(self) -> None:
+        column_definitions = (
+            (
+                "source_canonical_turn_ids",
+                "TEXT NOT NULL DEFAULT '[]'",
+            ),
+            (
+                "covers_through_canonical_turn_id",
+                "TEXT NOT NULL DEFAULT ''",
+            ),
+            (
+                "structured_summary_json",
+                "TEXT NOT NULL DEFAULT '{\"schema_version\":0,\"claims\":[],"
+                "\"source_digest\":\"\",\"generation_model\":\"\"}'",
+            ),
+        )
+        try:
+            with self.pool.connection() as conn:
+                rows = conn.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = current_schema() "
+                    "AND table_name = 'tag_summaries'"
+                ).fetchall()
+                present = {
+                    str(row["column_name"] if isinstance(row, dict) else row[0])
+                    for row in (rows or ())
+                }
+                missing = [
+                    (column, definition)
+                    for column, definition in column_definitions
+                    if column not in present
+                ]
+                if not missing:
+                    return
+
+                # ``SET LOCAL`` governs only the current transaction. Avoid
+                # paying an ACCESS EXCLUSIVE lock on every engine startup by
+                # issuing ALTER only for catalog-confirmed missing columns,
+                # and bound the real migration's lock-acquisition window.
+                with conn.transaction():
+                    conn.execute("SET LOCAL lock_timeout = '2s'")
+                    for column, definition in missing:
+                        conn.execute(
+                            "ALTER TABLE tag_summaries "
+                            f"ADD COLUMN {column} {definition}"
+                        )
+        except Exception:
+            # Bootstrap DDL is best-effort here only so startup reaches the
+            # required manifest assertion below. Permission, lock-timeout, or
+            # other failures must therefore remain observable as a missing
+            # column in ``_assert_tag_summary_schema`` rather than being
+            # mistaken for a usable layered-summary schema.
+            logger.warning(
+                "tag_summaries structured-column bootstrap failed",
+                exc_info=True,
+            )
+
+    def _assert_tag_summary_schema(self) -> None:
+        """Fail startup when required layer-two columns did not land."""
+        required = {
+            "source_canonical_turn_ids",
+            "covers_through_canonical_turn_id",
+            "structured_summary_json",
+        }
         with self.pool.connection() as conn:
-            try:
-                conn.execute(
-                    "ALTER TABLE tag_summaries ADD COLUMN source_canonical_turn_ids TEXT NOT NULL DEFAULT '[]'"
-                )
-            except Exception:
-                pass
-            try:
-                conn.execute(
-                    "ALTER TABLE tag_summaries ADD COLUMN covers_through_canonical_turn_id TEXT NOT NULL DEFAULT ''"
-                )
-            except Exception:
-                pass
+            rows = conn.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = current_schema() "
+                "AND table_name = 'tag_summaries'"
+            ).fetchall()
+        present = {
+            str(row["column_name"] if isinstance(row, dict) else row[0])
+            for row in (rows or ())
+        }
+        missing = required - present
+        if missing:
+            raise RuntimeError(
+                "tag_summaries schema incomplete: "
+                + ", ".join(sorted(missing))
+            )
 
     def _ensure_compaction_scoping_columns(self) -> None:
         """Add operation_id / compaction_operation_id columns used by the
@@ -3679,6 +3769,9 @@ class PostgresStore(ContextStore):
                 "generated_by_turn_id": getattr(segment.metadata, "generated_by_turn_id", ""),
                 "source_mapping_complete": bool(
                     getattr(segment.metadata, "source_mapping_complete", False)
+                ),
+                "structured_summary": structured_summary_to_dict(
+                    getattr(segment.metadata, "structured_summary", None)
                 ),
             }
             if segment.metadata.session_date:
@@ -8003,9 +8096,10 @@ class PostgresStore(ContextStore):
                         """INSERT INTO tag_summaries
                         (tag, conversation_id, summary, description, code_refs, summary_tokens,
                          source_segment_refs, source_turn_numbers, source_canonical_turn_ids,
+                         structured_summary_json,
                          covers_through_turn, covers_through_canonical_turn_id, generated_by_turn_id,
                          created_at, updated_at, operation_id)
-                        SELECT %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
+                        SELECT %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
                           FROM compaction_operation
                          WHERE operation_id = %s
                            AND conversation_id = %s
@@ -8019,6 +8113,7 @@ class PostgresStore(ContextStore):
                             source_segment_refs=EXCLUDED.source_segment_refs,
                             source_turn_numbers=EXCLUDED.source_turn_numbers,
                             source_canonical_turn_ids=EXCLUDED.source_canonical_turn_ids,
+                            structured_summary_json=EXCLUDED.structured_summary_json,
                             covers_through_turn=EXCLUDED.covers_through_turn,
                             covers_through_canonical_turn_id=EXCLUDED.covers_through_canonical_turn_id,
                             generated_by_turn_id=EXCLUDED.generated_by_turn_id,
@@ -8031,6 +8126,9 @@ class PostgresStore(ContextStore):
                             tag_summary.summary_tokens, json.dumps(tag_summary.source_segment_refs),
                             json.dumps(tag_summary.source_turn_numbers),
                             json.dumps(getattr(tag_summary, "source_canonical_turn_ids", []) or []),
+                            json.dumps(structured_summary_to_dict(
+                                getattr(tag_summary, "structured_summary", None)
+                            ), separators=(",", ":")),
                             tag_summary.covers_through_turn,
                             getattr(tag_summary, "covers_through_canonical_turn_id", "") or "",
                             getattr(tag_summary, "generated_by_turn_id", "") or "",
@@ -8053,9 +8151,10 @@ class PostgresStore(ContextStore):
                         """INSERT INTO tag_summaries
                         (tag, conversation_id, summary, description, code_refs, summary_tokens,
                          source_segment_refs, source_turn_numbers, source_canonical_turn_ids,
+                         structured_summary_json,
                          covers_through_turn, covers_through_canonical_turn_id, generated_by_turn_id,
                          created_at, updated_at)
-                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                         ON CONFLICT (tag, conversation_id) DO UPDATE SET
                             summary=EXCLUDED.summary, description=EXCLUDED.description,
                             code_refs=EXCLUDED.code_refs,
@@ -8063,6 +8162,7 @@ class PostgresStore(ContextStore):
                             source_segment_refs=EXCLUDED.source_segment_refs,
                             source_turn_numbers=EXCLUDED.source_turn_numbers,
                             source_canonical_turn_ids=EXCLUDED.source_canonical_turn_ids,
+                            structured_summary_json=EXCLUDED.structured_summary_json,
                             covers_through_turn=EXCLUDED.covers_through_turn,
                             covers_through_canonical_turn_id=EXCLUDED.covers_through_canonical_turn_id,
                             generated_by_turn_id=EXCLUDED.generated_by_turn_id,
@@ -8073,6 +8173,9 @@ class PostgresStore(ContextStore):
                          tag_summary.summary_tokens, json.dumps(tag_summary.source_segment_refs),
                          json.dumps(tag_summary.source_turn_numbers),
                          json.dumps(getattr(tag_summary, "source_canonical_turn_ids", []) or []),
+                         json.dumps(structured_summary_to_dict(
+                             getattr(tag_summary, "structured_summary", None)
+                         ), separators=(",", ":")),
                          tag_summary.covers_through_turn,
                          getattr(tag_summary, "covers_through_canonical_turn_id", "") or "",
                          getattr(tag_summary, "generated_by_turn_id", "") or "",
@@ -8092,6 +8195,9 @@ class PostgresStore(ContextStore):
                 source_segment_refs=json.loads(row["source_segment_refs"]),
                 source_turn_numbers=json.loads(row["source_turn_numbers"]),
                 source_canonical_turn_ids=json.loads(row.get("source_canonical_turn_ids", "[]") or "[]"),
+                structured_summary=_structured_summary_from_json(
+                    row.get("structured_summary_json")
+                ),
                 covers_through_turn=row["covers_through_turn"],
                 covers_through_canonical_turn_id=row.get("covers_through_canonical_turn_id", "") or "",
                 generated_by_turn_id=row.get("generated_by_turn_id", ""),
@@ -8117,6 +8223,9 @@ class PostgresStore(ContextStore):
                     source_segment_refs=json.loads(row["source_segment_refs"]),
                     source_turn_numbers=json.loads(row["source_turn_numbers"]),
                     source_canonical_turn_ids=json.loads(row.get("source_canonical_turn_ids", "[]") or "[]"),
+                    structured_summary=_structured_summary_from_json(
+                        row.get("structured_summary_json")
+                    ),
                     covers_through_turn=row["covers_through_turn"],
                     covers_through_canonical_turn_id=row.get("covers_through_canonical_turn_id", "") or "",
                     generated_by_turn_id=row.get("generated_by_turn_id", ""),
@@ -11945,7 +12054,8 @@ class PostgresStore(ContextStore):
         self,
         keys: list[tuple[str, str]],
         *,
-        speaker_context: SpeakerRetrievalContext,
+        speaker_context: SpeakerRetrievalContext | None = None,
+        internal_validation: bool = False,
     ) -> dict[tuple[str, str], CanonicalTurnRow]:
         """Batched PHYSICAL row lookup for the speaker-aware branch.
 
@@ -11954,17 +12064,24 @@ class PostgresStore(ContextStore):
         never supply another row's text or provenance. Each returned row
         keeps its stored conversation id; missing keys are omitted. A key
         naming a conversation other than the context's proved owner is
-        rejected rather than widening scope.
+        rejected rather than widening scope. ``internal_validation=True`` is
+        an explicit writer/maintenance authority that performs only the
+        literal exact-key lookup and is never a retrieval authorization.
         """
         if not keys:
             return {}
-        request_scope = _speaker_canonical_scope_sql(
-            speaker_context, None,
-        )
-        if request_scope is None:
-            return {}
-        scope_sql, scope_params = request_scope
-        owner = (speaker_context.owner_conversation_id or "").strip()
+        if speaker_context is None:
+            if not internal_validation:
+                return {}
+            scope_sql, scope_params, owner = "", (), ""
+        else:
+            request_scope = _speaker_canonical_scope_sql(
+                speaker_context, None,
+            )
+            if request_scope is None:
+                return {}
+            scope_sql, scope_params = request_scope
+            owner = (speaker_context.owner_conversation_id or "").strip()
         by_conversation: dict[str, list[str]] = {}
         for conversation_id, canonical_turn_id in keys:
             if not conversation_id or not canonical_turn_id:

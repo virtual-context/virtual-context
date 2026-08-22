@@ -4,11 +4,18 @@ The engine is the core intelligence layer. It handles compression, tagging, fact
 
 ## Compactor
 
-Compaction converts raw conversation turns into compressed segments. It starts when the context window fill level crosses the soft threshold (default 70%) and is forced at the hard threshold (default 85%). It selects uncompacted turns outside the protected window, groups them by tag overlap, and calls the summarization LLM to produce condensed segment summaries. Each summary preserves the tag set, turn range, and token count of the original, and every non-`_general` tag on a just-compacted segment gets its tag summary materialized at commit.
+Compaction converts raw conversation turns into compressed segments. It starts when the context window fill level crosses the soft threshold (default 70%) and is forced at the hard threshold (default 85%). It selects uncompacted turns outside the protected window, groups them by tag overlap, and calls the summarization LLM to produce two deliberately separate artifacts:
+
+- a free-form synopsis used only for BM25, embeddings, and candidate ranking; and
+- a versioned structured summary whose claims are bound to complete requester-authored canonical lanes, exact speaker identity, audience/channel scope, modality, and conservative temporal status.
+
+Generated synopsis prose is never factual prompt evidence. Segment claims are revalidated against canonical rows whenever they are rendered. Every tag on a just-compacted segment, including a primary `_general` tag, gets a layer-two tag summary materialized at commit.
 
 Compaction is incremental. A watermark tracks which turns have been processed; only turns above the watermark are candidates. Protected recent turns (default 6) are never compacted, keeping the most recent context at full fidelity. In multi-worker deployments each compaction runs as a leased, fenced operation, so a stalled worker cannot overwrite a takeover (see [architecture](architecture.md)).
 
-There is no second summarize-the-summaries tier. The separately named `deep_compaction_ratio` is a payload-side filter in the proxy's message rewriting: turns far enough below the compacted boundary are dropped from the outgoing payload entirely instead of being stubbed, because the segment summaries already cover them. Stored data is never affected.
+Tag summaries are the second summary tier. They carry forward and deduplicate validated segment claims without re-authoring their speaker, evidence, modality, or temporal status; their own free-form synopsis remains retrieval-only. Incremental rebuilds put newest claims first while retaining the prior validated claim set and source coverage.
+
+The separately named `deep_compaction_ratio` is unrelated to that layer: it is a payload-side filter in the proxy's message rewriting. Turns far enough below the compacted boundary are dropped from the outgoing payload entirely instead of being stubbed because stored summaries already cover them. Stored data is never affected.
 
 The compactor runs on a background pool after `on_turn_complete`, never blocking the response path.
 
@@ -92,10 +99,10 @@ The segmenter splits compacted output into discrete segments, each with:
 
 - A tag set (inherited from the compacted turns)
 - A token count
-- A text body (the summary)
+- A retrieval synopsis and a source-bound structured claim set
 - A turn range (which original turns this covers)
 
-Segments are the unit of summary storage. Retrieval ranks *tags* (see below) and then fetches the segments stored under the selected tags.
+Segments are the layer-one unit of summary storage. Retrieval ranks *tags* (see below) using the free synopsis and then presents only validated structured claims. Paging has three real depths: `SUMMARY` uses the layer-two tag claim set, `SEGMENTS` uses the individual layer-one claim sets, and `FULL` reconstructs exact role-separated canonical turns without trusting stored `full_text`.
 
 ## Retrieval
 

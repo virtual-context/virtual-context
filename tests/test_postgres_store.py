@@ -28,6 +28,11 @@ CANONICAL_MESSAGE_SOURCE_ASSISTANT_INDEX = (
     "(assistant_canonical_turn_id) "
     "WHERE (assistant_canonical_turn_id IS NOT NULL)"
 )
+TAG_SUMMARY_REQUIRED_COLUMNS = (
+    "source_canonical_turn_ids",
+    "covers_through_canonical_turn_id",
+    "structured_summary_json",
+)
 
 
 def _fact_embeddings_catalog_result(sql: str):
@@ -59,6 +64,11 @@ def _fact_embeddings_catalog_result(sql: str):
         or "idx_fact_embeddings_conv_model" in sql
     ):
         return _FakeRowsResult([{"present": 1}])
+
+    if "information_schema.columns" in sql and "tag_summaries" in sql:
+        return _FakeRowsResult(
+            [{"column_name": column} for column in TAG_SUMMARY_REQUIRED_COLUMNS]
+        )
 
     if "trg_guard_attested_canonical_turn_update" in sql:
         return _FakeRowsResult([{"present": 1}])
@@ -192,6 +202,149 @@ def test_postgres_store_uses_bounded_connection_pool(monkeypatch):
     assert pool.conn.closed
 
 
+def test_postgres_store_refuses_missing_structured_tag_summary_column(monkeypatch):
+    import pytest
+
+    from virtual_context.storage import postgres as pg
+
+    class _MissingTagColumnConn(_FakeConn):
+        def execute(self, sql: str, params=None):
+            if "information_schema.columns" in sql and "tag_summaries" in sql:
+                self.executed.append((sql, params))
+                return _FakeRowsResult([
+                    {"column_name": "source_canonical_turn_ids"},
+                    {"column_name": "covers_through_canonical_turn_id"},
+                ])
+            return super().execute(sql, params)
+
+    class _MissingTagColumnPool(_FakePool):
+        def __init__(self, conninfo: str, **kwargs) -> None:
+            super().__init__(conninfo, **kwargs)
+            self.conn = _MissingTagColumnConn("missing-tag-column")
+
+    monkeypatch.setattr(pg, "ConnectionPool", _MissingTagColumnPool)
+
+    with pytest.raises(
+        RuntimeError,
+        match="tag_summaries schema incomplete: structured_summary_json",
+    ):
+        pg.PostgresStore("postgresql://example")
+
+
+class _TagSummarySchemaConn(_FakeConn):
+    """Mutable catalog double for the focused tag-summary bootstrap tests."""
+
+    def __init__(
+        self,
+        present: set[str],
+        *,
+        fail_column: str = "",
+    ) -> None:
+        super().__init__("tag-summary-schema")
+        self.present = set(present)
+        self.fail_column = fail_column
+
+    def execute(self, sql: str, params=None):
+        self.executed.append((sql, params))
+        if "information_schema.columns" in sql and "tag_summaries" in sql:
+            return _FakeRowsResult([
+                {"column_name": column}
+                for column in sorted(self.present)
+            ])
+        prefix = "ALTER TABLE tag_summaries ADD COLUMN "
+        if sql.startswith(prefix):
+            column = sql[len(prefix):].split(None, 1)[0]
+            if column == self.fail_column:
+                raise RuntimeError(f"DDL refused for {column}")
+            self.present.add(column)
+        return self
+
+
+class _TagSummarySchemaPool:
+    def __init__(self, conn: _TagSummarySchemaConn) -> None:
+        self.conn = conn
+
+    def connection(self) -> _ConnCheckout:
+        return _ConnCheckout(self.conn)
+
+
+def _tag_summary_schema_store(conn: _TagSummarySchemaConn):
+    from virtual_context.storage import postgres as pg
+
+    store = object.__new__(pg.PostgresStore)
+    store.pool = _TagSummarySchemaPool(conn)
+    return store
+
+
+def test_tag_summary_schema_present_issues_no_alter():
+    conn = _TagSummarySchemaConn(set(TAG_SUMMARY_REQUIRED_COLUMNS))
+    store = _tag_summary_schema_store(conn)
+
+    store._ensure_tag_summary_schema()
+    store._assert_tag_summary_schema()
+
+    statements = [sql for sql, _params in conn.executed]
+    assert not any(
+        sql.startswith("ALTER TABLE tag_summaries") for sql in statements
+    )
+    assert "SET LOCAL lock_timeout = '2s'" not in statements
+
+
+def test_tag_summary_schema_missing_column_uses_bounded_add():
+    missing = "structured_summary_json"
+    conn = _TagSummarySchemaConn(
+        set(TAG_SUMMARY_REQUIRED_COLUMNS) - {missing},
+    )
+    store = _tag_summary_schema_store(conn)
+
+    store._ensure_tag_summary_schema()
+    store._assert_tag_summary_schema()
+
+    statements = [sql for sql, _params in conn.executed]
+    lock_index = statements.index("SET LOCAL lock_timeout = '2s'")
+    alters = [
+        (index, sql)
+        for index, sql in enumerate(statements)
+        if sql.startswith("ALTER TABLE tag_summaries")
+    ]
+    assert alters == [(
+        lock_index + 1,
+        "ALTER TABLE tag_summaries ADD COLUMN structured_summary_json "
+        "TEXT NOT NULL DEFAULT '{\"schema_version\":0,\"claims\":[],"
+        "\"source_digest\":\"\",\"generation_model\":\"\"}'",
+    )]
+
+
+def test_tag_summary_schema_add_failure_defers_to_required_assertion():
+    import pytest
+
+    missing = "structured_summary_json"
+    conn = _TagSummarySchemaConn(
+        set(TAG_SUMMARY_REQUIRED_COLUMNS) - {missing},
+        fail_column=missing,
+    )
+    store = _tag_summary_schema_store(conn)
+
+    # The best-effort bootstrap catches DDL failure solely so the required
+    # manifest assertion below remains the startup error.
+    store._ensure_tag_summary_schema()
+
+    with pytest.raises(
+        RuntimeError,
+        match="tag_summaries schema incomplete: structured_summary_json",
+    ):
+        store._assert_tag_summary_schema()
+
+    statements = [sql for sql, _params in conn.executed]
+    assert "SET LOCAL lock_timeout = '2s'" in statements
+    assert any(
+        sql.startswith(
+            "ALTER TABLE tag_summaries ADD COLUMN structured_summary_json",
+        )
+        for sql in statements
+    )
+
+
 def test_postgres_store_get_all_segments_uses_batch_tag_lookup(monkeypatch):
     from virtual_context.storage import postgres as pg
 
@@ -314,7 +467,13 @@ def test_segment_compaction_provenance_serializes_and_hydrates(monkeypatch):
     from datetime import datetime, timezone
 
     from virtual_context.storage import postgres as pg
-    from virtual_context.types import SegmentMetadata, StoredSegment
+    from virtual_context.types import (
+        SegmentMetadata,
+        StoredSegment,
+        StructuredSummary,
+        SummaryClaim,
+        SummarySource,
+    )
 
     _FakePool.instances.clear()
     monkeypatch.setattr(pg, "ConnectionPool", _FakePool)
@@ -322,6 +481,27 @@ def test_segment_compaction_provenance_serializes_and_hydrates(monkeypatch):
     conn = _FakePool.instances[0].conn
     conn.executed.clear()
     now = datetime(2026, 8, 22, tzinfo=timezone.utc)
+    structured = StructuredSummary(
+        schema_version=1,
+        claims=(
+            SummaryClaim(
+                text="I stopped tesamorelin after side effects.",
+                claim_type="personal",
+                temporal_status="ceased",
+                modality="asserted",
+                sources=(SummarySource(
+                    canonical_turn_id="ct-1",
+                    source_role="requester",
+                    speaker_label="BigTex",
+                    evidence_excerpt="I stopped tesamorelin after side effects.",
+                    session_date="2026-08-18",
+                    source_provenance_digest="b" * 64,
+                ),),
+            ),
+        ),
+        source_digest="a" * 64,
+        generation_model="test-summary-model",
+    )
     segment = StoredSegment(
         ref="seg-provenance",
         conversation_id="conv",
@@ -338,6 +518,7 @@ def test_segment_compaction_provenance_serializes_and_hydrates(monkeypatch):
             source_speaker_identity_count=1,
             source_speaker_identity_fingerprint="speaker-proof",
             source_audience_fingerprint="audience-proof",
+            structured_summary=structured,
         ),
         created_at=now,
         start_timestamp=now,
@@ -357,6 +538,9 @@ def test_segment_compaction_provenance_serializes_and_hydrates(monkeypatch):
     assert stored_metadata["source_speaker_identity_count"] == 1
     assert stored_metadata["source_speaker_identity_fingerprint"] == "speaker-proof"
     assert stored_metadata["source_audience_fingerprint"] == "audience-proof"
+    assert pg.strict_structured_summary(
+        stored_metadata["structured_summary"]
+    ) == structured
 
     row = {
         "ref": segment.ref,
@@ -383,6 +567,97 @@ def test_segment_compaction_provenance_serializes_and_hydrates(monkeypatch):
         assert value.metadata.source_speaker_identity_count == 1
         assert value.metadata.source_speaker_identity_fingerprint == "speaker-proof"
         assert value.metadata.source_audience_fingerprint == "audience-proof"
+        assert value.metadata.structured_summary == structured
+
+
+def test_tag_summary_structured_payload_serializes_and_hydrates(monkeypatch):
+    from datetime import datetime, timezone
+
+    from virtual_context.storage import postgres as pg
+    from virtual_context.types import (
+        StructuredSummary,
+        SummaryClaim,
+        SummarySource,
+        TagSummary,
+    )
+
+    structured = StructuredSummary(
+        schema_version=1,
+        claims=(SummaryClaim(
+            text="I stopped tesamorelin after side effects.",
+            claim_type="personal",
+            temporal_status="ceased",
+            modality="asserted",
+            sources=(SummarySource(
+                canonical_turn_id="ct-1",
+                source_role="requester",
+                speaker_label="BigTex",
+                evidence_excerpt="I stopped tesamorelin after side effects.",
+                session_date="2026-08-18",
+                source_provenance_digest="b" * 64,
+            ),),
+        ),),
+        source_digest="a" * 64,
+        generation_model="test-summary-model",
+    )
+    now = datetime(2026, 8, 22, tzinfo=timezone.utc)
+    tag_summary = TagSummary(
+        tag="medical",
+        summary="Tesamorelin history.",
+        source_segment_refs=["seg-1"],
+        source_turn_numbers=[1],
+        source_canonical_turn_ids=["ct-1"],
+        covers_through_turn=1,
+        covers_through_canonical_turn_id="ct-1",
+        structured_summary=structured,
+        created_at=now,
+        updated_at=now,
+    )
+
+    _FakePool.instances.clear()
+    monkeypatch.setattr(pg, "ConnectionPool", _FakePool)
+    store = pg.PostgresStore("postgresql://example")
+    conn = _FakePool.instances[0].conn
+    conn.executed.clear()
+
+    store.save_tag_summary(tag_summary, "conv")
+    insert_sql, insert_params = next(
+        (sql, params) for sql, params in conn.executed
+        if "INSERT INTO tag_summaries" in sql
+    )
+    assert "structured_summary_json" in insert_sql
+    encoded = insert_params[9]
+    assert pg._structured_summary_from_json(encoded) == structured
+
+    row = {
+        "tag": "medical",
+        "summary": "Tesamorelin history.",
+        "description": "",
+        "code_refs": "[]",
+        "summary_tokens": 4,
+        "source_segment_refs": '["seg-1"]',
+        "source_turn_numbers": "[1]",
+        "source_canonical_turn_ids": '["ct-1"]',
+        "structured_summary_json": encoded,
+        "covers_through_turn": 1,
+        "covers_through_canonical_turn_id": "ct-1",
+        "generated_by_turn_id": "",
+        "created_at": now.isoformat(),
+        "updated_at": now.isoformat(),
+    }
+    original_execute = conn.execute
+
+    def execute(sql: str, params=None):
+        if "SELECT * FROM tag_summaries" in sql:
+            return _FakeRowsResult([row])
+        return original_execute(sql, params)
+
+    monkeypatch.setattr(conn, "execute", execute)
+    loaded = store.get_tag_summary("medical", "conv")
+    assert loaded is not None
+    assert loaded.structured_summary == structured
+    assert loaded.source_canonical_turn_ids == ["ct-1"]
+    assert loaded.covers_through_canonical_turn_id == "ct-1"
 
 
 # ---------------------------------------------------------------------------

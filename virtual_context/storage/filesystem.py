@@ -14,7 +14,7 @@ import yaml
 
 from ..core.store import ContextStore
 from ..core.exceptions import ConversationLifecycleConflict
-from ..types import ChunkEmbedding, ConversationStats, DepthLevel, EngineStateSnapshot, QuoteResult, SegmentMetadata, StoredSegment, StoredSummary, TagStats, TagSummary, TurnTagEntry, WorkingSetEntry, strict_segment_identity_metadata
+from ..types import ChunkEmbedding, ConversationStats, DepthLevel, EngineStateSnapshot, QuoteResult, SegmentMetadata, StoredSegment, StoredSummary, TagStats, TagSummary, TurnTagEntry, WorkingSetEntry, strict_segment_identity_metadata, strict_structured_summary, structured_summary_to_dict
 from .helpers import dt_to_str as _dt_to_str, str_to_dt as _str_to_dt, extract_excerpt as _extract_excerpt
 
 
@@ -75,6 +75,9 @@ def _segment_to_markdown(seg: StoredSegment) -> str:
         "start_turn_number": getattr(seg.metadata, "start_turn_number", -1),
         "end_turn_number": getattr(seg.metadata, "end_turn_number", -1),
         "generated_by_turn_id": getattr(seg.metadata, "generated_by_turn_id", ""),
+        "structured_summary": structured_summary_to_dict(
+            getattr(seg.metadata, "structured_summary", None)
+        ),
     }
     if seg.metadata.session_date:
         frontmatter["session_date"] = seg.metadata.session_date
@@ -174,6 +177,9 @@ def _markdown_to_segment(text: str, ref: str) -> StoredSegment | None:
         end_turn_number=fm.get("end_turn_number", -1),
         generated_by_turn_id=fm.get("generated_by_turn_id", ""),
         session_date=fm.get("session_date", ""),
+        structured_summary=strict_structured_summary(
+            fm.get("structured_summary")
+        ),
     )
 
     return StoredSegment(
@@ -645,7 +651,16 @@ class FilesystemStore(ContextStore):
             "summary_tokens": tag_summary.summary_tokens,
             "source_segment_refs": tag_summary.source_segment_refs,
             "source_turn_numbers": tag_summary.source_turn_numbers,
+            "source_canonical_turn_ids": list(getattr(
+                tag_summary, "source_canonical_turn_ids", [],
+            ) or []),
+            "structured_summary": structured_summary_to_dict(
+                getattr(tag_summary, "structured_summary", None)
+            ),
             "covers_through_turn": tag_summary.covers_through_turn,
+            "covers_through_canonical_turn_id": getattr(
+                tag_summary, "covers_through_canonical_turn_id", "",
+            ) or "",
             "generated_by_turn_id": getattr(tag_summary, "generated_by_turn_id", "") or "",
             "created_at": _dt_to_str(tag_summary.created_at),
             "updated_at": _dt_to_str(tag_summary.updated_at),
@@ -669,7 +684,14 @@ class FilesystemStore(ContextStore):
             summary_tokens=data.get("summary_tokens", 0),
             source_segment_refs=data.get("source_segment_refs", []),
             source_turn_numbers=data.get("source_turn_numbers", []),
+            source_canonical_turn_ids=data.get("source_canonical_turn_ids", []),
+            structured_summary=strict_structured_summary(
+                data.get("structured_summary")
+            ),
             covers_through_turn=data.get("covers_through_turn", -1),
+            covers_through_canonical_turn_id=data.get(
+                "covers_through_canonical_turn_id", "",
+            ),
             generated_by_turn_id=data.get("generated_by_turn_id", ""),
             created_at=_str_to_dt(data["created_at"]) if "created_at" in data else datetime.now(timezone.utc),
             updated_at=_str_to_dt(data["updated_at"]) if "updated_at" in data else datetime.now(timezone.utc),

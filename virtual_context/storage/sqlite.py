@@ -45,7 +45,11 @@ from ..core.canonical_turns import STRIP_WHITESPACE
 from ..core.store import ContextStore
 from ..core.exceptions import CanonicalSourceConflict, ConversationLifecycleConflict
 from ..types import AUDIENCE_ATTRIBUTION_VERSION, ChunkEmbedding, ConversationStats, DepthLevel, EngineStateSnapshot, Fact, FactLink, FactSignal, CanonicalTurnChunkEmbedding, CanonicalTurnReconcileRow, CanonicalTurnRow, LinkedFact, QuoteResult, SegmentMetadata, SourceProvenance, SpeakerRetrievalContext, StoredSegment, StoredSummary, TagStats, TagSummary, TemporalStatus, TurnTagEntry, WorkingSetEntry, channel_excerpt_prefix, strip_channel_hash
-from ..types import strict_segment_identity_metadata
+from ..types import (
+    strict_segment_identity_metadata,
+    strict_structured_summary,
+    structured_summary_to_dict,
+)
 from ..types import (
     CARD_CROSS_CONTEXT_KINDS,
     CARD_KINDS,
@@ -134,6 +138,7 @@ CREATE TABLE IF NOT EXISTS tag_summaries (
     summary_tokens INTEGER NOT NULL DEFAULT 0,
     source_segment_refs TEXT NOT NULL DEFAULT '[]',
     source_turn_numbers TEXT NOT NULL DEFAULT '[]',
+    structured_summary_json TEXT NOT NULL DEFAULT '{"schema_version":0,"claims":[],"source_digest":"","generation_model":""}',
     covers_through_turn INTEGER NOT NULL DEFAULT -1,
     generated_by_turn_id TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
@@ -727,6 +732,9 @@ def _row_to_segment(row: sqlite3.Row, tags: list[str]) -> StoredSegment:
             generated_by_turn_id=metadata_raw.get("generated_by_turn_id", ""),
             session_date=metadata_raw.get("session_date", ""),
             source_mapping_complete=identity_metadata["source_mapping_complete"],
+            structured_summary=strict_structured_summary(
+                metadata_raw.get("structured_summary")
+            ),
         ),
         created_at=_str_to_dt(row["created_at"]),
         start_timestamp=_str_to_dt(row["start_timestamp"]),
@@ -769,11 +777,24 @@ def _row_to_summary(row: sqlite3.Row, tags: list[str]) -> StoredSummary:
             generated_by_turn_id=metadata_raw.get("generated_by_turn_id", ""),
             session_date=metadata_raw.get("session_date", ""),
             source_mapping_complete=identity_metadata["source_mapping_complete"],
+            structured_summary=strict_structured_summary(
+                metadata_raw.get("structured_summary")
+            ),
         ),
         created_at=_str_to_dt(row["created_at"]),
         start_timestamp=_str_to_dt(row["start_timestamp"]),
         end_timestamp=_str_to_dt(row["end_timestamp"]),
     )
+
+
+def _structured_summary_from_json(raw: object):
+    if not isinstance(raw, str):
+        return strict_structured_summary(raw)
+    try:
+        decoded = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return strict_structured_summary(None)
+    return strict_structured_summary(decoded)
 
 
 def _fact_author_col(row: sqlite3.Row, name: str) -> str:
@@ -1913,6 +1934,7 @@ class SQLiteStore(ContextStore):
                     source_segment_refs TEXT NOT NULL DEFAULT '[]',
                     source_turn_numbers TEXT NOT NULL DEFAULT '[]',
                     source_canonical_turn_ids TEXT NOT NULL DEFAULT '[]',
+                    structured_summary_json TEXT NOT NULL DEFAULT '{"schema_version":0,"claims":[],"source_digest":"","generation_model":""}',
                     covers_through_turn INTEGER NOT NULL DEFAULT -1,
                     covers_through_canonical_turn_id TEXT NOT NULL DEFAULT '',
                     generated_by_turn_id TEXT NOT NULL DEFAULT '',
@@ -1923,10 +1945,13 @@ class SQLiteStore(ContextStore):
                 INSERT OR IGNORE INTO tag_summaries_new
                     (tag, conversation_id, summary, description, code_refs, summary_tokens,
                      source_segment_refs, source_turn_numbers, source_canonical_turn_ids,
+                     structured_summary_json,
                      covers_through_turn, covers_through_canonical_turn_id, generated_by_turn_id,
                      created_at, updated_at)
                 SELECT tag, '', summary, description, '[]', summary_tokens,
-                       source_segment_refs, source_turn_numbers, '[]', covers_through_turn, '', '',
+                       source_segment_refs, source_turn_numbers, '[]',
+                       '{"schema_version":0,"claims":[],"source_digest":"","generation_model":""}',
+                       covers_through_turn, '', '',
                        created_at, updated_at
                 FROM tag_summaries;
                 DROP TABLE tag_summaries;
@@ -1943,6 +1968,14 @@ class SQLiteStore(ContextStore):
         except sqlite3.OperationalError:
             conn.execute(
                 "ALTER TABLE tag_summaries ADD COLUMN covers_through_canonical_turn_id TEXT NOT NULL DEFAULT ''"
+            )
+        try:
+            conn.execute("SELECT structured_summary_json FROM tag_summaries LIMIT 1")
+        except sqlite3.OperationalError:
+            conn.execute(
+                "ALTER TABLE tag_summaries ADD COLUMN structured_summary_json "
+                "TEXT NOT NULL DEFAULT '{\"schema_version\":0,\"claims\":[],"
+                "\"source_digest\":\"\",\"generation_model\":\"\"}'"
             )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_tag_summaries_conv_updated "
@@ -3697,6 +3730,9 @@ CREATE TABLE IF NOT EXISTS request_captures (
             "generated_by_turn_id": getattr(segment.metadata, "generated_by_turn_id", ""),
             "source_mapping_complete": bool(
                 getattr(segment.metadata, "source_mapping_complete", False)
+            ),
+            "structured_summary": structured_summary_to_dict(
+                getattr(segment.metadata, "structured_summary", None)
             ),
         }
         if segment.metadata.session_date:
@@ -7859,9 +7895,10 @@ CREATE TABLE IF NOT EXISTS request_captures (
                     """INSERT INTO tag_summaries
                     (tag, conversation_id, summary, description, code_refs, summary_tokens,
                      source_segment_refs, source_turn_numbers, source_canonical_turn_ids,
+                     structured_summary_json,
                      covers_through_turn, covers_through_canonical_turn_id, generated_by_turn_id,
                      created_at, updated_at, operation_id)
-                    SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                       FROM compaction_operation
                      WHERE operation_id = ?
                        AND conversation_id = ?
@@ -7876,6 +7913,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
                         source_segment_refs = excluded.source_segment_refs,
                         source_turn_numbers = excluded.source_turn_numbers,
                         source_canonical_turn_ids = excluded.source_canonical_turn_ids,
+                        structured_summary_json = excluded.structured_summary_json,
                         covers_through_turn = excluded.covers_through_turn,
                         covers_through_canonical_turn_id = excluded.covers_through_canonical_turn_id,
                         generated_by_turn_id = excluded.generated_by_turn_id,
@@ -7891,6 +7929,9 @@ CREATE TABLE IF NOT EXISTS request_captures (
                         json.dumps(tag_summary.source_segment_refs),
                         json.dumps(tag_summary.source_turn_numbers),
                         json.dumps(getattr(tag_summary, "source_canonical_turn_ids", []) or []),
+                        json.dumps(structured_summary_to_dict(
+                            getattr(tag_summary, "structured_summary", None)
+                        ), separators=(",", ":")),
                         tag_summary.covers_through_turn,
                         getattr(tag_summary, "covers_through_canonical_turn_id", "") or "",
                         getattr(tag_summary, "generated_by_turn_id", "") or "",
@@ -7919,9 +7960,10 @@ CREATE TABLE IF NOT EXISTS request_captures (
                     """INSERT OR REPLACE INTO tag_summaries
                     (tag, conversation_id, summary, description, code_refs, summary_tokens,
                      source_segment_refs, source_turn_numbers, source_canonical_turn_ids,
+                     structured_summary_json,
                      covers_through_turn, covers_through_canonical_turn_id, generated_by_turn_id,
                      created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         tag_summary.tag,
                         conversation_id,
@@ -7932,6 +7974,9 @@ CREATE TABLE IF NOT EXISTS request_captures (
                         json.dumps(tag_summary.source_segment_refs),
                         json.dumps(tag_summary.source_turn_numbers),
                         json.dumps(getattr(tag_summary, "source_canonical_turn_ids", []) or []),
+                        json.dumps(structured_summary_to_dict(
+                            getattr(tag_summary, "structured_summary", None)
+                        ), separators=(",", ":")),
                         tag_summary.covers_through_turn,
                         getattr(tag_summary, "covers_through_canonical_turn_id", "") or "",
                         getattr(tag_summary, "generated_by_turn_id", "") or "",
@@ -7976,6 +8021,11 @@ CREATE TABLE IF NOT EXISTS request_captures (
             source_canonical_turn_ids=json.loads(row["source_canonical_turn_ids"] or "[]")
             if "source_canonical_turn_ids" in row.keys()
             else [],
+            structured_summary=_structured_summary_from_json(
+                row["structured_summary_json"]
+                if "structured_summary_json" in row.keys()
+                else None
+            ),
             covers_through_turn=row["covers_through_turn"],
             covers_through_canonical_turn_id=row["covers_through_canonical_turn_id"]
             if "covers_through_canonical_turn_id" in row.keys()
@@ -8019,6 +8069,11 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 source_canonical_turn_ids=json.loads(row["source_canonical_turn_ids"] or "[]")
                 if "source_canonical_turn_ids" in row.keys()
                 else [],
+                structured_summary=_structured_summary_from_json(
+                    row["structured_summary_json"]
+                    if "structured_summary_json" in row.keys()
+                    else None
+                ),
                 covers_through_turn=row["covers_through_turn"],
                 covers_through_canonical_turn_id=row["covers_through_canonical_turn_id"]
                 if "covers_through_canonical_turn_id" in row.keys()
@@ -11079,7 +11134,8 @@ CREATE TABLE IF NOT EXISTS request_captures (
         self,
         keys: list[tuple[str, str]],
         *,
-        speaker_context: SpeakerRetrievalContext,
+        speaker_context: SpeakerRetrievalContext | None = None,
+        internal_validation: bool = False,
     ) -> dict[tuple[str, str], CanonicalTurnRow]:
         """Batched PHYSICAL row lookup for the speaker-aware branch.
 
@@ -11088,17 +11144,24 @@ CREATE TABLE IF NOT EXISTS request_captures (
         never supply another row's text or provenance. Each returned row
         keeps its stored conversation id; missing keys are omitted. A key
         naming a conversation other than the context's proved owner is
-        rejected rather than widening scope.
+        rejected rather than widening scope. ``internal_validation=True`` is
+        an explicit writer/maintenance authority that performs only the
+        literal exact-key lookup and is never a retrieval authorization.
         """
         if not keys:
             return {}
-        request_scope = _speaker_canonical_scope_sql(
-            speaker_context, None,
-        )
-        if request_scope is None:
-            return {}
-        scope_sql, scope_params = request_scope
-        owner = (speaker_context.owner_conversation_id or "").strip()
+        if speaker_context is None:
+            if not internal_validation:
+                return {}
+            scope_sql, scope_params, owner = "", (), ""
+        else:
+            request_scope = _speaker_canonical_scope_sql(
+                speaker_context, None,
+            )
+            if request_scope is None:
+                return {}
+            scope_sql, scope_params = request_scope
+            owner = (speaker_context.owner_conversation_id or "").strip()
         by_conversation: dict[str, list[str]] = {}
         for conversation_id, canonical_turn_id in keys:
             if not conversation_id or not canonical_turn_id:

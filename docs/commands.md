@@ -189,6 +189,7 @@ Each imported conversation keeps its own conversation ID from the export, so sep
 | `rebuild-derived-data` | Rebuild derived data for a conversation |
 | `reattribute-audience` | Correct audience attribution on stored rows |
 | `resummarize-segments` | Re-run summarization for stored segments |
+| `migrate-structured-summaries` | Rebuild source-bound segment claims and deterministic tag rollups |
 | `resequence-canonical-turns` | Repair canonical turn ordering |
 | `normalize-canonical-actor-ids` | Normalize actor ID formats on canonical rows |
 | `reindex-canonical-turn-embeddings` | Rebuild canonical turn embedding indexes |
@@ -201,7 +202,7 @@ Run `virtual-context admin <subcommand> --help` for the flags each command takes
 **Two safety models exist; know which one your command uses.**
 
 - Commands that **write by default** and take `--dry-run` to report instead: `backfill-senders`, `backfill-channels`, `backfill-actors`, `backfill-reply-roles`, `backfill-fact-authors`, `rebuild-actor-cards`, `retag-canonical-turns`, `backfill-session-state-markers`.
-- Commands that **dry-run by default** and take `--apply` to write: `reattribute-audience`, `rebuild-derived-data`, `resummarize-segments`, `resequence-canonical-turns`, `normalize-canonical-actor-ids`, `reindex-canonical-turn-embeddings`.
+- Commands that **dry-run by default** and take `--apply` to write: `reattribute-audience`, `rebuild-derived-data`, `resummarize-segments`, `migrate-structured-summaries`, `resequence-canonical-turns`, `normalize-canonical-actor-ids`, `reindex-canonical-turn-embeddings`.
 - `backfill-tag-summaries` and `backfill-fact-embeddings` take `--force-rebuild` to regenerate rows that already exist.
 
 Storage and scope targeting, shared across the admin surface:
@@ -216,6 +217,78 @@ Storage and scope targeting, shared across the admin surface:
 | `--platform <name>` | Actor commands only: operator-asserted platform (e.g. `telegram`) for conversations whose caller keys never named one; never inferred, applied only to identity blocks carrying a sender ID without platform proof |
 
 Storage resolution follows the precedence chain: explicit flag > `-c` config > the `DATABASE_URL` environment variable (see [configuration](configuration.md#environment-variables)); the env fallback is consulted only when neither a storage flag nor `-c` was given, so a bare invocation works inside a container that has `DATABASE_URL` set and no config file mounted.
+
+#### Structured summary migration
+
+`migrate-structured-summaries` upgrades both summary layers to the current
+source-bound structured-claim schema. It is intentionally Postgres-only,
+defaults to `--phase all`, and dry-runs by default:
+
+```bash
+virtual-context -c /app/default-tenant-config.yaml admin \
+  migrate-structured-summaries "$CONVERSATION_ID" \
+  --tenant-id "$TENANT_ID" --postgres-dsn "$DATABASE_URL"
+
+virtual-context -c /app/default-tenant-config.yaml admin \
+  migrate-structured-summaries "$CONVERSATION_ID" \
+  --tenant-id "$TENANT_ID" --postgres-dsn "$DATABASE_URL" --apply \
+  --phase segments --limit 25 \
+  --journal /data/tenants/diagnostics/structured-summary-migration.jsonl
+
+# Finish the segment phase first. Then migrate tags in bounded resumable runs;
+# a bounded --phase all run intentionally refuses to start tags while segment
+# candidates remain.
+virtual-context -c /app/default-tenant-config.yaml admin \
+  migrate-structured-summaries "$CONVERSATION_ID" \
+  --tenant-id "$TENANT_ID" --postgres-dsn "$DATABASE_URL" --apply \
+  --phase tags --after-tag "$LAST_COMPLETED_TAG"
+```
+
+The dry run uses a server-enforced read-only connection and constructs neither
+an engine nor a store. Apply mode reconstructs each segment only from the exact
+canonical turn IDs in a proved-complete source mapping; it never reads the
+stored `summary`, `full_text`, or `messages_json` as model input (only an
+in-database checksum of the old synopsis is selected for the journal). It then
+runs the normal strict segment summarizer and atomically writes the newly
+generated retrieval synopsis, its token/model metadata, and
+`metadata_json.structured_summary`. The Postgres summary-FTS trigger refreshes
+`summary_tsv` in that same write; full-text chunk embeddings are unchanged
+because their canonical source text is unchanged. Each write is preceded by an
+`fsync`'d JSONL journal entry containing old/new synopsis checksums and the
+structured-envelope checksum, and is guarded by segment `xmin`, tenant,
+lifecycle epoch, lifecycle generation, active-operation, canonical-source
+digest, and retained source-alias checks.
+
+Schema v1 admits requester evidence only. Every persisted excerpt must equal
+the complete trimmed canonical `user_content` lane and carry its exact actor,
+speaker, audience, channel, date, and canonical-turn provenance. Assistant
+output, reply-target copies, partial substrings, and legacy summary prose are
+never admitted as evidence.
+
+The tag phase runs only after a full, unbounded segment inventory proves that
+every eligible source segment has a current non-empty claim envelope. It copies
+and deduplicates those exact claims newest-first (up to 256), then calls the
+strict normal tag rollup only to regenerate the free retrieval synopsis. It
+never supplies the old tag synopsis to the model. The tag row and the embedding
+of its new synopsis are written in one transaction after the lifecycle, source
+set, segment `xmin` values, canonical source digests, and existing tag/embedding
+row versions are revalidated under locks. If provider generation, embedding,
+or any compare-and-set fails, neither row is changed. The tag `source_digest`
+is a deterministic claim-set integrity/idempotency checksum; serving performs
+the independent canonical-row rehydration that authorizes each claim.
+
+`--limit` caps attempted candidates (and therefore model cost), not successful
+writes in each selected phase. A provider failure or concurrent change freezes
+that phase's `resume_after_ref` or `resume_after_tag` so the undecided item is
+retried. Resume with the reported value, then finish each phase with one run
+without its cursor; already-current rows are skipped without a model call.
+
+After any accepted tag write, the JSON result reports a required serving-cache
+action. Delete `vc:tag_summary_embeddings:<conversation>`,
+`vc:tag_stats:<conversation>`, and matching
+`vc:context_hint:<conversation>:*` Redis entries, then recycle every serving
+worker to clear process-local snapshots. The historical upgrade is not
+serving-complete until those actions and the final verification run succeed.
 
 #### Other notable flags
 

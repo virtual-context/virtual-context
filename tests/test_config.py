@@ -267,6 +267,12 @@ class TestValidateConfig:
         errors = validate_config(config)
         assert any("storage.backend" in e for e in errors)
 
+    def test_filesystem_is_not_a_model_facing_engine_backend(self):
+        config = load_config(config_dict={}, validate=False)
+        config.storage.backend = "filesystem"
+        errors = validate_config(config)
+        assert any("storage.backend" in error for error in errors)
+
 
 class TestMultiInstanceConfig:
     """Phase 5: proxy.instances config parsing and validation."""

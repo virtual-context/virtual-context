@@ -37,6 +37,7 @@ from .speaker_labels import (
 from .summary_identity import (
     contains_ambiguous_human_referent,
     is_proved_summary_rendering,
+    render_summaries_for_model,
     sanitize_summary_payload_for_model,
 )
 from .tool_guard import guard_tool_execution
@@ -1163,6 +1164,83 @@ def _suppress_presented_segments(
     return result
 
 
+def _render_recall_all_payload(
+    engine: "VirtualContextEngine",
+    raw: object,
+    *,
+    speaker_context: SpeakerRetrievalContext,
+) -> object:
+    """Attach only validated layer-2 claims to ``vc_recall_all`` topics.
+
+    ``RetrievalAssembler.recall_all`` deliberately returns structural topic
+    inventory.  The request-bound tool surface can safely add the actual tag
+    summary layer because it also has the immutable audience authority needed
+    to re-hydrate every claim source.  Stored tag ``summary`` and
+    ``description`` prose are never copied here.
+    """
+    if not isinstance(raw, dict):
+        return raw
+    cloned = copy.deepcopy(raw)
+    entries = cloned.get("summaries")
+    if not isinstance(entries, list) or not entries:
+        return cloned
+
+    wanted_tags = [
+        str(entry.get("tag", "") or "").strip()
+        for entry in entries
+        if isinstance(entry, dict)
+        and str(entry.get("tag", "") or "").strip()
+    ]
+    if not wanted_tags:
+        return cloned
+    try:
+        all_tag_summaries = engine._store.get_all_tag_summaries(
+            conversation_id=engine.config.conversation_id,
+        )
+    except Exception:
+        all_tag_summaries = []
+    by_tag = {
+        str(getattr(item, "tag", "") or "").strip(): item
+        for item in all_tag_summaries
+        if str(getattr(item, "tag", "") or "").strip()
+    }
+    render_items = [by_tag[tag] for tag in wanted_tags if tag in by_tag]
+    rendered = render_summaries_for_model(
+        render_items,
+        store=engine._store,
+        conversation_id=engine.config.conversation_id,
+        speaker_context=speaker_context,
+        depth="summary",
+    )
+    rendered_by_tag = {
+        str(item.tag): value
+        for item, value in zip(render_items, rendered, strict=True)
+        if is_proved_summary_rendering(value)
+    }
+
+    safe_entries: list[dict] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        tag = str(entry.get("tag", "") or "").strip()
+        safe_entry = {
+            key: copy.deepcopy(entry[key])
+            for key in (
+                "tag", "tokens", "source_segment_refs", "source_turn_numbers",
+            )
+            if key in entry
+        }
+        proved = rendered_by_tag.get(tag)
+        if proved:
+            safe_entry["summary"] = proved
+        safe_entries.append(safe_entry)
+    cloned["summaries"] = safe_entries
+    cloned["topics_with_validated_summaries"] = sum(
+        1 for entry in safe_entries if "summary" in entry
+    )
+    return cloned
+
+
 def execute_vc_tool(
     engine: VirtualContextEngine,
     name: str,
@@ -1378,6 +1456,9 @@ def execute_vc_tool(
         sanitized = sanitize_summary_payload_for_model(
             pruned,
             allow_proved_renderings=require_proof,
+            speaker_context=(
+                summary_speaker_context if require_proof else None
+            ),
         )
         final_pruned = _prune_unsafe_derived_entries(
             sanitized,
@@ -1750,11 +1831,11 @@ def execute_vc_tool(
                 )
             result = _suppress_presented_segments(result, presented_segment_refs)
             result = _trim_find_quote_payload(result)
-            result = _attach_related_facts(
-                engine, result, fq_query, presented_fact_ids,
-                annotation_context=annotation_ctx,
-                speaker_conditioning=_fq_conditioning,
-            )
+            # ``vc_find_quote`` is an exact-source evidence tool. Generated
+            # fact prose may help internal ranking, but appending it after the
+            # quote boundary can reintroduce an assistant-authored or stale
+            # state assertion beside a canonical human lane. Keep the result
+            # extractive; fact semantics are never model-visible enrichment.
         elif name == "vc_search_summaries":
             fq_query = tool_input.get("query", "")
             fq_mode = tool_input.get("mode", "lookup")
@@ -1808,6 +1889,11 @@ def execute_vc_tool(
             result = _trim_find_quote_payload(result)
         elif name == "vc_recall_all":
             result = engine.recall_all()
+            result = _render_recall_all_payload(
+                engine,
+                result,
+                speaker_context=summary_speaker_context,
+            )
             result = _sanitize_summary_tool_payload(
                 result,
                 require_proof=True,

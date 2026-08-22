@@ -474,7 +474,7 @@ class TestEndToEndThroughExecution:
         assert "filter_applied" not in got
         assert "warning" not in got
 
-    def test_speaker_only_remains_active_through_fact_enrichment(self):
+    def test_speaker_only_quote_withholds_generated_fact_enrichment(self):
         facts = [
             Fact(
                 id="fact-bea",
@@ -533,9 +533,8 @@ class TestEndToEndThroughExecution:
 
         got = json.loads(out)
         assert got["filter_applied"] is True
-        assert got["related_facts_count"] == 1
-        assert got["related_facts"][0]["subject"] == "Bea"
-        assert "replaces_older_facts" not in got["related_facts"][0]
+        assert "related_facts_count" not in got
+        assert "related_facts" not in got
         assert not any(
             row.get("source") == "fact_segment"
             for row in got["results"]
@@ -543,7 +542,7 @@ class TestEndToEndThroughExecution:
         assert "Alex" not in out
         assert "foreign" not in out
         assert "unattributed" not in out
-        assert presented == {"fact-bea"}
+        assert presented == set()
 
     def test_speaker_only_with_no_authored_facts_adds_no_fact_payload(self):
         facts = [Fact(

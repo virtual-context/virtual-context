@@ -414,12 +414,15 @@ class CompositeStore:
         self,
         keys: list[tuple[str, str]],
         *,
-        speaker_context: "SpeakerRetrievalContext",
+        speaker_context: "SpeakerRetrievalContext | None" = None,
+        internal_validation: bool = False,
     ) -> dict[tuple[str, str], CanonicalTurnRow]:
-        # The exact request context is forwarded so the backend proves scope
-        # itself; the composite never post-filters returned rows into scope.
+        # Forward either the exact request context or the explicit internal
+        # validation authority; the composite never post-filters rows.
         return self._segments.get_canonical_turn_rows_by_id(
-            keys, speaker_context=speaker_context,
+            keys,
+            speaker_context=speaker_context,
+            internal_validation=internal_validation,
         )
 
     def get_all_canonical_turns(

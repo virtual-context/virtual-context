@@ -593,12 +593,16 @@ def test_fill_pass_store_recovery_injects_proved_source_as_context_not_user():
 
     assert turns == 1
     assert exact in rendered
-    assert generated not in rendered
+    # FULL recovery is the exact canonical transcript. Historical assistant
+    # output survives only in its explicit non-human lane; it is never
+    # compressed or relabeled as BigTex's statement.
+    assert generated in rendered
     assert copied_reply not in rendered
-    assert "<historical-source-transcript>" in rendered
+    assert "<canonical-source-transcript>" in rendered
     context_text = result["messages"][0]["content"][-1]["text"]
     assert '"display_name":"BigTex"' in context_text
     assert '"role":"historical_human"' in context_text
+    assert '"role":"historical_assistant"' in context_text
     assert "actor:discord:bigtex" not in rendered
     assert [message["role"] for message in result["messages"]] == ["user"]
     store.get_recent_canonical_turns.assert_any_call(_FILL_OWNER, limit=200)

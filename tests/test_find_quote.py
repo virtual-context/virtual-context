@@ -1637,12 +1637,13 @@ class TestFindQuoteIntentAndRecency:
             session_date="2026-08-01",
         )]
 
+        context = _speaker_context()
         out = core_search_summaries(
             store=store,
             semantic=semantic,
             query="AWS EC2 cost",
             conversation_id="conversation",
-            speaker_context=_speaker_context(),
+            speaker_context=context,
         )
 
         serialized = json.dumps(out)
@@ -1666,7 +1667,9 @@ class TestFindQuoteIntentAndRecency:
         assert "anchor_example_calculation" not in out
         assert "reader_hint" not in out
         sanitized = sanitize_summary_payload_for_model(
-            out, allow_proved_renderings=True,
+            out,
+            allow_proved_renderings=True,
+            speaker_context=context,
         )
         assert sanitized == out
 
@@ -1830,12 +1833,13 @@ class TestFindQuoteIntentAndRecency:
         semantic = MagicMock()
         semantic.semantic_search.return_value = []
 
+        context = _speaker_context()
         out = core_search_summaries(
             store=store,
             semantic=semantic,
             query="latest deployment now",
             conversation_id="conversation",
-            speaker_context=_speaker_context(),
+            speaker_context=context,
         )
 
         assert out["found"] is True
@@ -1893,12 +1897,13 @@ class TestFindQuoteIntentAndRecency:
         semantic = MagicMock()
         semantic.semantic_search.return_value = []
 
+        context = _speaker_context()
         out = core_search_summaries(
             store=store,
             semantic=semantic,
             query="latest deployment now",
             conversation_id="conversation",
-            speaker_context=_speaker_context(),
+            speaker_context=context,
         )
 
         assert out["found"] is True
@@ -1912,7 +1917,9 @@ class TestFindQuoteIntentAndRecency:
         assert all("priority" not in row for row in out["results"])
         assert all("session_recency_rank" not in row for row in out["results"])
         assert sanitize_summary_payload_for_model(
-            out, allow_proved_renderings=True,
+            out,
+            allow_proved_renderings=True,
+            speaker_context=context,
         ) == out
 
     def test_exact_value_mode_prioritizes_explicit_value_hits(self):

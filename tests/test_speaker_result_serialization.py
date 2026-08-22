@@ -380,23 +380,15 @@ class TestGateOnAggregateAnnotation:
         assert "error" not in payload
         assert payload["speaker_scope"] == "unknown"
 
-    def test_related_facts_are_annotated(self, engine):
+    def test_find_quote_withholds_generated_related_fact_prose(self, engine):
         engine.config.search.speaker_annotations_enabled = True
         out = execute_vc_tool(
             engine, "vc_find_quote", {"query": "Boston", "mode": "lookup"},
             speaker_context=_ctx(),
         )
         payload = json.loads(out)
-        related = payload.get("related_facts", [])
-        assert related, "expected related facts for the Boston query"
-        for entry in related:
-            assert "attribution_basis" in entry
-            assert "author_attribution_version" in entry
-        role_local = [
-            e for e in related if e["attribution_basis"] == "role_local"
-        ]
-        assert role_local
-        assert all(e["speaker_label"] == "Sania" for e in role_local)
+        assert "related_facts" not in payload
+        assert "related_facts_count" not in payload
         for actor in CANARY_ACTORS:
             assert actor not in out
 
@@ -448,11 +440,9 @@ class TestGateOnAggregateAnnotation:
         assert "private diagnosis" not in out
         assert "actor:discord:internal-poison" not in out
         engine._store.get_segment.assert_not_called()
-        related = payload["related_facts"]
-        assert related[0]["attribution_basis"] == "role_local"
-        # No admissible row was found, so the label fails open to empty —
-        # and the internal actor id still never appears.
-        assert related[0]["speaker_label"] == ""
+        assert "related_facts" not in payload
+        assert "related_facts_count" not in payload
+        engine._store.search_facts.assert_not_called()
         assert ACTOR not in out
 
 

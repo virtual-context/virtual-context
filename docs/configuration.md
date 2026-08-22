@@ -140,7 +140,7 @@ The summarization LLM is separate from the upstream provider. You can use a chea
 
 ```yaml
 storage:
-  backend: "sqlite"                 # "sqlite", "filesystem", "postgres", "neo4j", or "falkordb"
+  backend: "sqlite"                 # "sqlite", "postgres", "neo4j", or "falkordb"
   sqlite:
     path: ".virtualcontext/store.db"
   postgres:
@@ -151,7 +151,12 @@ storage:
     password: "password"
 ```
 
-SQLite is the default and requires no setup. PostgreSQL (requires the `postgres` extra) is recommended for multi-worker proxy deployments. Neo4j/FalkorDB adds graph-based fact traversal. The `filesystem` backend stores segments as Markdown files with YAML frontmatter and does not host the full feature set of the database backends.
+SQLite is the default and requires no setup. PostgreSQL (requires the
+`postgres` extra) is recommended for multi-worker proxy deployments.
+Neo4j/FalkorDB adds graph-based fact traversal. `FilesystemStore` remains a
+direct Markdown archival/test utility, but it is not accepted as an engine
+backend because it cannot persist the canonical source rows required by
+source-bound SUMMARY, SEGMENTS, and FULL rendering.
 
 ### Retrieval
 

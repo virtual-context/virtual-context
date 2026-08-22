@@ -699,7 +699,11 @@ def validate_config(config: VirtualContextConfig) -> list[str]:
         )
 
     # Storage backend
-    _valid_backends = ("sqlite", "filesystem", "postgres", "neo4j", "falkordb")
+    # Model-visible layered summaries require physical canonical-row
+    # hydration. FilesystemStore remains available as a direct archival/test
+    # utility, but it does not host canonical turns and therefore cannot be an
+    # engine backend without silently quarantining SUMMARY/SEGMENTS/FULL.
+    _valid_backends = ("sqlite", "postgres", "neo4j", "falkordb")
     if config.storage.backend not in _valid_backends:
         errors.append(
             f"storage.backend must be one of {_valid_backends}, "

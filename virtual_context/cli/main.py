@@ -3063,6 +3063,11 @@ def main():
     )
     resummarize_parser.add_argument("--postgres-dsn")
 
+    from .structured_summary_migration_cmd import (
+        configure_parser as _configure_structured_summary_migration,
+    )
+    _configure_structured_summary_migration(admin_sub, _positive_int)
+
     resequence_parser = admin_sub.add_parser(
         "resequence-canonical-turns",
         help=(
@@ -3342,6 +3347,11 @@ def main():
         elif args.admin_command == "resummarize-segments":
             from .resummarize_cmd import cmd_admin_resummarize_segments
             cmd_admin_resummarize_segments(args)
+        elif args.admin_command == "migrate-structured-summaries":
+            from .structured_summary_migration_cmd import (
+                cmd_admin_migrate_structured_summaries,
+            )
+            cmd_admin_migrate_structured_summaries(args)
         elif args.admin_command == "resequence-canonical-turns":
             cmd_admin_resequence_canonical_turns(args)
         elif args.admin_command == "normalize-canonical-actor-ids":
@@ -3360,6 +3370,7 @@ def main():
                 "  virtual-context admin reattribute-audience <conversation_id> <from_audience> <to_audience> --tenant-id <id> [--apply] [--limit N]\n"
                 "  virtual-context admin rebuild-derived-data <conversation_id> --tenant-id <id> [--apply]\n"
                 "  virtual-context admin resummarize-segments <conversation_id> --tenant-id <id> [--identity-violations] [--apply] [--include-short] [--limit N] [--after-ref <ref>] [--since <ts>] [--until <ts>] [--journal <path>] [--max-consecutive-provider-failures N] [--postgres-dsn <dsn>]\n"
+                "  virtual-context admin migrate-structured-summaries <conversation_id> --tenant-id <id> [--apply] [--phase segments|tags|all] [--limit N] [--after-ref <ref>] [--after-tag <tag>] [--journal <path>] [--max-consecutive-provider-failures N] [--postgres-dsn <dsn>]\n"
                 "  virtual-context admin resequence-canonical-turns <conversation_id> --tenant-id <id> [--apply]\n"
                 "  virtual-context admin normalize-canonical-actor-ids <conversation_id> --tenant-id <id> --platform <platform> [--apply]\n"
                 "  virtual-context admin reindex-canonical-turn-embeddings [<conversation_id>] [--tenant-id <id>] [--all-convs-for-tenant] [--apply] [--limit N]\n"

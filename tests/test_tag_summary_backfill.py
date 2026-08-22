@@ -67,6 +67,7 @@ class _RecordingCompactor:
         existing_tag_summaries=None,
         max_turn,
         generated_by_turn_id="",
+        validated_tag_rollup_inputs=None,
     ):
         self.calls.append({
             "cover_tags": list(cover_tags),
@@ -78,6 +79,7 @@ class _RecordingCompactor:
             "existing_tag_summaries": dict(existing_tag_summaries or {}),
             "max_turn": max_turn,
             "generated_by_turn_id": generated_by_turn_id,
+            "validated_tag_rollup_inputs": validated_tag_rollup_inputs,
         })
         return [
             TagSummary(

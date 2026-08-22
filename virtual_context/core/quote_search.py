@@ -30,8 +30,7 @@ from .store import ContextStore
 from .summary_identity import (
     SUMMARY_ATTRIBUTION_QUARANTINE,
     SummarySpeakerAttribution,
-    render_source_projection_for_model,
-    resolve_summary_source_projections,
+    render_summaries_for_model,
     resolve_summary_speaker_attributions,
 )
 
@@ -2917,13 +2916,14 @@ def _contain_summary_results_for_speaker_context(
     conversation_id: str | None,
     speaker_context: SpeakerRetrievalContext,
 ) -> tuple[list[QuoteResult], dict[str, SummarySpeakerAttribution]]:
-    """Prove and render segment results before any model-visible derivation.
+    """Prove and render segment claims before any model-visible derivation.
 
     The bridge is exact-segment -> exact canonical ids -> exact physical rows.
-    A tool output, missing segment, incomplete mapping, mixed-human segment, or
-    audience/channel mismatch is omitted as one evidence bundle. Actor ids stay
-    only in the returned internal attribution map; model-visible results receive
-    the audience-safe historical label and the explicit attribution wrapper.
+    Stored free-form summary prose is used only to rank candidates. The
+    model-visible value is the segment's independently validated structured
+    claims at SEGMENTS depth (or the exact canonical fallback for a legacy
+    row). Missing segments and audience/channel mismatches fail closed. Actor
+    ids stay only in the returned internal attribution map.
     """
     segments_by_ref: OrderedDict[str, object] = OrderedDict()
     for result in results:
@@ -2948,23 +2948,23 @@ def _contain_summary_results_for_speaker_context(
         speaker_context=speaker_context,
     )
     attribution_by_ref = dict(zip(refs, attributions, strict=True))
-    projections = resolve_summary_source_projections(
+    rendered_segments = render_summaries_for_model(
         segment_values,
         store=store,
         conversation_id=conversation_id or "",
         speaker_context=speaker_context,
+        depth="segments",
     )
-    projection_by_ref = dict(zip(refs, projections, strict=True))
+    rendered_by_ref = dict(zip(refs, rendered_segments, strict=True))
 
     contained: list[QuoteResult] = []
     proved_by_ref: dict[str, SummarySpeakerAttribution] = {}
     for result in results:
         ref = (result.segment_ref or "").strip()
         attribution = attribution_by_ref.get(ref)
-        projection = projection_by_ref.get(ref)
-        if attribution is None or projection is None:
+        rendered = rendered_by_ref.get(ref, SUMMARY_ATTRIBUTION_QUARANTINE)
+        if attribution is None:
             continue
-        rendered = render_source_projection_for_model(projection)
         if rendered == SUMMARY_ATTRIBUTION_QUARANTINE:
             continue
         contained.append(replace(result, text=rendered))
@@ -2977,10 +2977,11 @@ def _project_summary_historical_speaker(
     result: QuoteResult,
     attributions: dict[str, SummarySpeakerAttribution],
 ) -> None:
-    """Canonical transcript lanes carry their own role-local speakers.
+    """Validated claim sources carry their own role-local speakers.
 
     A segment-wide label would stamp the same human over an adjacent assistant
-    lane and recreate the reassignment this boundary exists to prevent.
+    source (or another participant's claim) and recreate the reassignment this
+    boundary exists to prevent.
     """
     return None
 
@@ -3000,13 +3001,13 @@ def _all_summary_results_prove_same_actor(
 
 
 def _strip_canonical_summary_derivatives(response: dict) -> dict:
-    """Keep canonical excerpts and structural metadata, never prose derivatives.
+    """Keep proved summary envelopes and structure, never lossy derivatives.
 
     Quantity lists, current-state priorities, calculations, preference anchors,
     coverage prose, and reader hints were historically synthesized from the
-    generated summary text. Recomputing them from a multi-lane JSON envelope
-    would also erase which exact lane supplied a value. They remain disabled
-    until each derivative carries a validated canonical-row/lane reference.
+    generated summary text. Recomputing them from a structured-claim envelope
+    would erase which exact claim source supplied a value. They remain disabled
+    until each derivative carries a validated claim/source reference.
     """
     allowed_response = {
         "query", "mode", "query_intent", "session_filter", "found",

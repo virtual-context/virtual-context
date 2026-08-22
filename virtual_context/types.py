@@ -1416,6 +1416,307 @@ class TaggedSegment:
     merge_ref: str = ""            # when set, update this existing segment instead of creating new
 
 
+@dataclass(frozen=True)
+class SummarySource:
+    """Exact source evidence supporting one structured summary claim.
+
+    ``canonical_turn_id`` is durable control-plane provenance.  It must never
+    be serialized into a model-facing rendering; readers use it to re-hydrate
+    and re-validate the physical source row.  Human actor ids are deliberately
+    absent from this persisted shape.
+    """
+
+    canonical_turn_id: str = ""
+    source_role: str = ""
+    speaker_label: str = ""
+    evidence_excerpt: str = ""
+    session_date: str = ""
+    # Opaque SHA-256 over the exact physical requester row, including actor
+    # and audience scope.  This binds copied tag claims to the same historical
+    # speaker without persisting or rendering the actor id itself.
+    source_provenance_digest: str = ""
+
+
+@dataclass(frozen=True)
+class SummaryClaim:
+    """One compact extractive claim with temporal and source provenance.
+
+    In schema v1 ``text`` is byte-for-byte the first source's
+    ``evidence_excerpt``. Generated prose remains a retrieval index and never
+    occupies this evidence-bearing field.
+    """
+
+    text: str = ""
+    claim_type: str = ""
+    temporal_status: str = ""
+    modality: str = ""
+    event_time: str = ""
+    sources: tuple[SummarySource, ...] = ()
+
+
+@dataclass(frozen=True)
+class StructuredSummary:
+    """Versioned, source-bound model-facing summary representation.
+
+    Version zero is the backward-compatible legacy sentinel: it carries no
+    trusted claims.  Version one is the first persisted structured-claim
+    schema.  Unknown or malformed payloads decode to version zero rather than
+    partially admitting unproved prose. ``source_digest`` binds the claims to
+    the exact canonical source snapshot used to generate them;
+    ``generation_model`` is maintenance provenance. Neither is model-facing.
+    """
+
+    schema_version: int = 0
+    claims: tuple[SummaryClaim, ...] = ()
+    source_digest: str = ""
+    generation_model: str = ""
+
+
+STRUCTURED_SUMMARY_SCHEMA_VERSION = 1
+# Schema v1 deliberately admits human/requester evidence only. Historical
+# assistant output is prior model text and may contain the exact hallucination
+# a future summary is trying to correct; it remains available at FULL depth,
+# never as compressed factual evidence.
+SUMMARY_SOURCE_ROLES: tuple[str, ...] = ("requester",)
+SUMMARY_CLAIM_TYPES: tuple[str, ...] = (
+    "personal", "world", "decision", "action", "technical", "conversation",
+)
+SUMMARY_CLAIM_MODALITIES: tuple[str, ...] = (
+    "asserted", "hypothetical", "conditional", "question",
+    "recommendation", "uncertain",
+)
+SUMMARY_TEMPORAL_STATUSES: tuple[str, ...] = (
+    "", *(member.value for member in TemporalStatus),
+)
+STRUCTURED_SUMMARY_MAX_CLAIMS = 256
+# A v1 claim is an atomic assertion tied to exactly one canonical requester
+# lane.  Multiple evidence lanes can disagree in time or modality; collapsing
+# them into one claim would require generated synthesis to decide which lane is
+# authoritative.  Keep that synthesis out of the evidence contract.
+STRUCTURED_SUMMARY_MAX_SOURCES_PER_CLAIM = 1
+STRUCTURED_SUMMARY_MAX_TEXT_CHARS = 1000
+STRUCTURED_SUMMARY_MAX_EXCERPT_CHARS = 800
+STRUCTURED_SUMMARY_MAX_EVENT_TIME_CHARS = 128
+STRUCTURED_SUMMARY_MAX_CANONICAL_ID_CHARS = 256
+STRUCTURED_SUMMARY_MAX_SPEAKER_LABEL_CHARS = 256
+STRUCTURED_SUMMARY_MAX_SESSION_DATE_CHARS = 128
+STRUCTURED_SUMMARY_MAX_SOURCE_DIGEST_CHARS = 64
+STRUCTURED_SUMMARY_MAX_GENERATION_MODEL_CHARS = 256
+_STRUCTURED_SUMMARY_SOURCE_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def structured_summary_to_dict(value: StructuredSummary) -> dict[str, object]:
+    """Encode a valid structured summary into its stable JSON object shape.
+
+    Encoding is fail-empty for the same reason decoding is: storage code must
+    not persist a subtly malformed authorization payload merely because a
+    caller constructed the dataclass directly with Python's permissive types.
+    """
+
+    if not isinstance(value, StructuredSummary):
+        return {
+            "schema_version": 0,
+            "claims": [],
+            "source_digest": "",
+            "generation_model": "",
+        }
+    raw: dict[str, object] = {
+        "schema_version": value.schema_version,
+        "claims": [
+            {
+                "text": claim.text,
+                "claim_type": claim.claim_type,
+                "temporal_status": claim.temporal_status,
+                "modality": claim.modality,
+                "event_time": claim.event_time,
+                "sources": [
+                    {
+                        "canonical_turn_id": source.canonical_turn_id,
+                        "source_role": source.source_role,
+                        "speaker_label": source.speaker_label,
+                        "evidence_excerpt": source.evidence_excerpt,
+                        "session_date": source.session_date,
+                        "source_provenance_digest": (
+                            source.source_provenance_digest
+                        ),
+                    }
+                    for source in claim.sources
+                    if isinstance(source, SummarySource)
+                ],
+            }
+            for claim in value.claims
+            if isinstance(claim, SummaryClaim)
+        ],
+        "source_digest": value.source_digest,
+        "generation_model": value.generation_model,
+    }
+    decoded = strict_structured_summary(raw)
+    if decoded != value:
+        return {
+            "schema_version": 0,
+            "claims": [],
+            "source_digest": "",
+            "generation_model": "",
+        }
+    return raw
+
+
+def strict_structured_summary(raw: object) -> StructuredSummary:
+    """Fail-empty parser for persisted structured summary provenance.
+
+    Every field uses exact JSON types.  In particular, booleans are not
+    accepted as integers, tuples are not accepted as JSON arrays, and schema
+    version one admits requester-authored sources only. Historical assistant
+    output remains available at FULL depth. A malformed claim invalidates the
+    complete payload so callers cannot mistake a partially decoded summary for
+    complete evidence.
+    """
+
+    if not isinstance(raw, dict):
+        return StructuredSummary()
+    payload_keys = set(raw)
+    current_keys = {
+        "schema_version", "claims", "source_digest", "generation_model",
+    }
+    legacy_v0_keys = {"schema_version", "claims"}
+    if payload_keys not in (current_keys, legacy_v0_keys):
+        return StructuredSummary()
+    version = raw.get("schema_version")
+    claims_raw = raw.get("claims")
+    source_digest = raw.get("source_digest", "")
+    generation_model = raw.get("generation_model", "")
+    if type(version) is not int or not isinstance(claims_raw, list):
+        return StructuredSummary()
+    if (
+        type(source_digest) is not str
+        or len(source_digest) > STRUCTURED_SUMMARY_MAX_SOURCE_DIGEST_CHARS
+        or (
+            bool(source_digest)
+            and _STRUCTURED_SUMMARY_SOURCE_DIGEST_RE.fullmatch(source_digest) is None
+        )
+        or type(generation_model) is not str
+        or len(generation_model) > STRUCTURED_SUMMARY_MAX_GENERATION_MODEL_CHARS
+    ):
+        return StructuredSummary()
+    if version == 0:
+        return StructuredSummary()
+    if version != STRUCTURED_SUMMARY_SCHEMA_VERSION:
+        return StructuredSummary()
+    if len(claims_raw) > STRUCTURED_SUMMARY_MAX_CLAIMS:
+        return StructuredSummary()
+    if claims_raw and not source_digest.strip():
+        return StructuredSummary()
+
+    claims: list[SummaryClaim] = []
+    for claim_raw in claims_raw:
+        if not isinstance(claim_raw, dict):
+            return StructuredSummary()
+        expected_claim_keys = {
+            "text", "claim_type", "temporal_status", "modality",
+            "event_time", "sources",
+        }
+        if set(claim_raw) != expected_claim_keys:
+            return StructuredSummary()
+        text = claim_raw.get("text")
+        claim_type = claim_raw.get("claim_type")
+        temporal_status = claim_raw.get("temporal_status")
+        modality = claim_raw.get("modality")
+        event_time = claim_raw.get("event_time")
+        sources_raw = claim_raw.get("sources")
+        if (
+            type(text) is not str
+            or not text.strip()
+            or len(text) > STRUCTURED_SUMMARY_MAX_TEXT_CHARS
+            or type(claim_type) is not str
+            or claim_type not in SUMMARY_CLAIM_TYPES
+            or type(temporal_status) is not str
+            or temporal_status not in SUMMARY_TEMPORAL_STATUSES
+            or type(modality) is not str
+            or modality not in SUMMARY_CLAIM_MODALITIES
+            or type(event_time) is not str
+            or len(event_time) > STRUCTURED_SUMMARY_MAX_EVENT_TIME_CHARS
+            or not isinstance(sources_raw, list)
+            or len(sources_raw) != STRUCTURED_SUMMARY_MAX_SOURCES_PER_CLAIM
+        ):
+            return StructuredSummary()
+
+        sources: list[SummarySource] = []
+        for source_raw in sources_raw:
+            if not isinstance(source_raw, dict):
+                return StructuredSummary()
+            expected_source_keys = {
+                "canonical_turn_id", "source_role", "speaker_label",
+                "evidence_excerpt", "session_date",
+                "source_provenance_digest",
+            }
+            if set(source_raw) != expected_source_keys:
+                return StructuredSummary()
+            canonical_turn_id = source_raw.get("canonical_turn_id")
+            source_role = source_raw.get("source_role")
+            speaker_label = source_raw.get("speaker_label")
+            evidence_excerpt = source_raw.get("evidence_excerpt")
+            session_date = source_raw.get("session_date")
+            source_provenance_digest = source_raw.get(
+                "source_provenance_digest",
+            )
+            if (
+                type(canonical_turn_id) is not str
+                or not canonical_turn_id.strip()
+                or len(canonical_turn_id) > STRUCTURED_SUMMARY_MAX_CANONICAL_ID_CHARS
+                or type(source_role) is not str
+                or source_role not in SUMMARY_SOURCE_ROLES
+                or type(speaker_label) is not str
+                or not speaker_label.strip()
+                or len(speaker_label) > STRUCTURED_SUMMARY_MAX_SPEAKER_LABEL_CHARS
+                or type(evidence_excerpt) is not str
+                or not evidence_excerpt.strip()
+                or len(evidence_excerpt) > STRUCTURED_SUMMARY_MAX_EXCERPT_CHARS
+                or type(session_date) is not str
+                or len(session_date) > STRUCTURED_SUMMARY_MAX_SESSION_DATE_CHARS
+                or type(source_provenance_digest) is not str
+                or _STRUCTURED_SUMMARY_SOURCE_DIGEST_RE.fullmatch(
+                    source_provenance_digest,
+                ) is None
+            ):
+                return StructuredSummary()
+            sources.append(SummarySource(
+                canonical_turn_id=canonical_turn_id,
+                source_role=source_role,
+                speaker_label=speaker_label,
+                evidence_excerpt=evidence_excerpt,
+                session_date=session_date,
+                source_provenance_digest=source_provenance_digest,
+            ))
+
+        source_roles = {source.source_role for source in sources}
+        if len(source_roles) != 1:
+            return StructuredSummary()
+        if source_roles != {"requester"}:
+            return StructuredSummary()
+        # Version one is extractive by construction. The model may select and
+        # classify a source span, but arbitrary paraphrase is never persisted
+        # as evidence. Keeping this invariant in the codec means every storage
+        # backend and maintenance writer fails empty on a forged gloss even if
+        # a future reader forgets to reconstruct from the source lane.
+        if text != sources[0].evidence_excerpt:
+            return StructuredSummary()
+
+        claims.append(SummaryClaim(
+            text=text,
+            claim_type=claim_type,
+            temporal_status=temporal_status,
+            modality=modality,
+            event_time=event_time,
+            sources=tuple(sources),
+        ))
+    return StructuredSummary(
+        schema_version=version,
+        claims=tuple(claims),
+        source_digest=source_digest,
+        generation_model=generation_model,
+    )
+
+
 @dataclass
 class SegmentMetadata:
     entities: list[str] = field(default_factory=list)
@@ -1452,6 +1753,7 @@ class SegmentMetadata:
     # positional slice is not a row mapping. An incomplete mapping makes fact
     # authorship empty rather than guessed.
     source_mapping_complete: bool = False
+    structured_summary: StructuredSummary = field(default_factory=StructuredSummary)
 
 
 def strict_segment_identity_metadata(raw: object) -> dict[str, object]:
@@ -1545,6 +1847,10 @@ class FactLane:
     source_message_id: str = ""
     canonical_turn_id: str = ""
     speaker_label: str = ""
+    session_date: str = ""
+    audience_conversation_id: str = ""
+    origin_channel_id: str = ""
+    audience_attribution_version: int = 0
 
 
 @dataclass
@@ -2198,6 +2504,7 @@ class TagSummary:
     generated_by_turn_id: str = ""
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    structured_summary: StructuredSummary = field(default_factory=StructuredSummary)
 
 
 @dataclass
@@ -2297,9 +2604,9 @@ class RetrievalResult:
 class DepthLevel(str, Enum):
     """Depth at which a topic's content is injected into the context window."""
     NONE = "none"           # listed in hint only, nothing injected
-    SUMMARY = "summary"     # tag summary (~200t per tag) — default
-    SEGMENTS = "segments"   # individual segment summaries (~2,000t per tag)
-    FULL = "full"           # StoredSegment.full_text (~8,000t+ per tag)
+    SUMMARY = "summary"     # validated layer-2 tag claims — default
+    SEGMENTS = "segments"   # validated layer-1 segment claims + evidence
+    FULL = "full"           # exact role-separated canonical transcript
 
 
 @dataclass

@@ -17,9 +17,7 @@ from virtual_context.types import (
     StoredSegment,
 )
 from virtual_context.core.summary_identity import (
-    HistoricalSourceLane,
-    SummarySourceProjection,
-    render_source_projection_for_model,
+    render_summaries_for_model,
 )
 
 
@@ -32,15 +30,45 @@ def _mock_engine(**overrides):
     return engine
 
 
-def _canonical_transcript(speaker: str, content: str) -> str:
-    return render_source_projection_for_model(SummarySourceProjection(
-        lanes=(HistoricalSourceLane(
-            speaker=speaker,
-            role="historical_human",
-            content=content,
-        ),),
-        complete=True,
+def _canonical_transcript(
+    speaker: str,
+    content: str,
+    *,
+    speaker_context: SpeakerRetrievalContext,
+) -> str:
+    canonical_id = "ct-tool-test"
+    row = SimpleNamespace(
+        canonical_turn_id=canonical_id,
+        conversation_id=speaker_context.owner_conversation_id,
+        user_content=content,
+        assistant_content="",
+        reply_target_body="",
+        sender_actor_id=f"actor-{speaker.casefold()}",
+        sender=speaker,
+        audience_conversation_id=speaker_context.audience_conversation_id,
+        audience_attribution_version=AUDIENCE_ATTRIBUTION_VERSION,
+        origin_channel_id=speaker_context.audience_channel_id,
+        session_date="",
+    )
+    key = (row.conversation_id, canonical_id)
+    store = SimpleNamespace(
+        get_canonical_turn_rows_by_id=(
+            lambda keys, *, speaker_context: (
+                {key: row} if key in keys and speaker_context.eligible else {}
+            )
+        ),
+    )
+    segment = SimpleNamespace(metadata=SegmentMetadata(
+        canonical_turn_ids=[canonical_id],
+        source_mapping_complete=True,
     ))
+    return render_summaries_for_model(
+        [segment],
+        store=store,
+        conversation_id=row.conversation_id,
+        speaker_context=speaker_context,
+        depth="segments",
+    )[0]
 
 
 def _historical_source_payload(excerpt: str) -> dict:
@@ -358,6 +386,7 @@ class TestToolResultVerificationHint:
                     "excerpt": _canonical_transcript(
                         "BigTex",
                         "500 EC2 instances are required at $0.11/hour.",
+                        speaker_context=context,
                     ),
                     "topic": "cost-analysis",
                     "segment_ref": "seg-anchor",
@@ -492,6 +521,7 @@ class TestToolResultVerificationHint:
                     "excerpt": _canonical_transcript(
                         label,
                         "Peptide dosing was discussed.",
+                        speaker_context=context,
                     ),
                     "topic": "health",
                 }],
@@ -642,6 +672,7 @@ class TestToolResultVerificationHint:
         wrapped = _canonical_transcript(
             "BigTex",
             "Tesamorelin was tolerated well.",
+            speaker_context=context,
         )
         engine.remember_when.return_value = {
             "mode": "summarize_over_time",

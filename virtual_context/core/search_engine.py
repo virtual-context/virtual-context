@@ -22,7 +22,6 @@ if TYPE_CHECKING:
     from .semantic_search import SemanticSearchManager
     from ..types import (
         Message,
-        SegmentMetadata,
         SpeakerRetrievalContext,
         VirtualContextConfig,
     )
@@ -144,19 +143,24 @@ class SearchEngine:
             tags=[tag], min_overlap=1, limit=500,
             conversation_id=self._config.conversation_id,
         )
-        from .summary_identity import render_summaries_for_model
+        from .summary_identity import render_summary_items_for_model
 
-        rendered_segments = render_summaries_for_model(
-            segments,
+        rendered_layers = render_summary_items_for_model(
+            (
+                request
+                for segment in segments
+                for request in ((segment, "segments"), (segment, "full"))
+            ),
             store=self._store,
             conversation_id=self._config.conversation_id,
             speaker_context=speaker_context,
         )
         rendered_by_ref = {
-            segment.ref: rendered
-            for segment, rendered in zip(
-                segments, rendered_segments, strict=True,
+            segment.ref: (
+                rendered_layers[index * 2],
+                rendered_layers[index * 2 + 1],
             )
+            for index, segment in enumerate(segments)
         }
         seen_refs: set[str] = set()
         for seg in segments:
@@ -164,16 +168,21 @@ class SearchEngine:
                 continue
             seen_refs.add(seg.ref)
             meta = seg.metadata or SegmentMetadata(turn_count=0)
-            rendered = rendered_by_ref.get(
-                seg.ref, SUMMARY_ATTRIBUTION_QUARANTINE,
+            rendered_summary, rendered_full = rendered_by_ref.get(
+                seg.ref,
+                (
+                    SUMMARY_ATTRIBUTION_QUARANTINE,
+                    SUMMARY_ATTRIBUTION_QUARANTINE,
+                ),
             )
             result["stored_turns"].append({
                 "segment_ref": seg.ref,
-                # Stored messages/full_text/summary are all derived blobs.
-                # Only the exact canonical projection is model-safe.
+                # Stored blobs never cross the boundary. Keep the public API's
+                # two fields semantically distinct: compact source-bound
+                # segment claims versus the exact FULL canonical transcript.
                 "messages": [],
-                "full_text": rendered,
-                "summary": rendered,
+                "full_text": rendered_full,
+                "summary": rendered_summary,
                 "turn_count": meta.turn_count,
                 "created_at": str(seg.created_at),
             })
@@ -256,4 +265,5 @@ class SearchEngine:
         return sanitize_summary_payload_for_model(
             result,
             allow_proved_renderings=resolved_context.eligible,
+            speaker_context=resolved_context,
         )

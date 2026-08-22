@@ -3141,7 +3141,10 @@ def fill_pass(
         and getattr(assembled.retrieval_result, "overflow_summaries", None)
     ):
         from ..core.assembler import format_tag_section
-        from ..core.summary_identity import render_summaries_for_model
+        from ..core.summary_identity import (
+            is_proved_summary_rendering,
+            render_summaries_for_model,
+        )
         from ..types import SpeakerRetrievalContext
 
         overflow = list(assembled.retrieval_result.overflow_summaries)
@@ -3153,10 +3156,13 @@ def fill_pass(
                 getattr(assembled, "speaker_context", None)
                 or SpeakerRetrievalContext.ineligible()
             ),
+            depth="segments",
         )
         for summary, rendered_summary in zip(
             overflow, rendered_overflow, strict=True,
         ):
+            if not is_proved_summary_rendering(rendered_summary):
+                continue
             if summary.primary_tag in covered_tags:
                 continue
             if summary.ref in presented_refs:
@@ -3180,14 +3186,38 @@ def fill_pass(
 
     # 1b. Breadth summaries (remaining conversation tag summaries, recency-sorted)
     if store is not None and tokens_used < summary_budget:
+        from ..core.summary_identity import (
+            is_proved_summary_rendering,
+            render_summaries_for_model,
+        )
+        from ..types import SpeakerRetrievalContext
+
         all_tag_summaries = store.get_all_tag_summaries(conversation_id=conversation_id)
-        for ts in sorted(all_tag_summaries, key=lambda s: s.updated_at, reverse=True):
+        ordered_tag_summaries = sorted(
+            all_tag_summaries, key=lambda s: s.updated_at, reverse=True,
+        )
+        rendered_tag_summaries = render_summaries_for_model(
+            ordered_tag_summaries,
+            store=store,
+            conversation_id=conversation_id,
+            speaker_context=(
+                getattr(assembled, "speaker_context", None)
+                if assembled is not None
+                else None
+            ) or SpeakerRetrievalContext.ineligible(),
+            depth="summary",
+        )
+        for ts, rendered_summary in zip(
+            ordered_tag_summaries, rendered_tag_summaries, strict=True,
+        ):
+            if not is_proved_summary_rendering(rendered_summary):
+                continue
             if ts.tag in covered_tags:
                 continue
             source_refs = set(ts.source_segment_refs)
             if source_refs and source_refs <= presented_refs:
                 continue
-            text = _format_breadth_section(ts)
+            text = _format_breadth_section(ts, rendered_summary)
             tokens = len(text) // 4
             if tokens_used + tokens > summary_budget:
                 continue
@@ -3320,6 +3350,7 @@ def fill_pass(
                 store=store,
                 conversation_id=conversation_id,
                 speaker_context=speaker_context,
+                depth="full",
             ) if candidates else []
 
             # Prefer newest rows, but emit surviving envelopes in historical
@@ -3404,13 +3435,11 @@ def _append_to_context(body: dict, fmt: PayloadFormat, text: str) -> dict:
     return fmt.inject_context(body, text)
 
 
-def _format_breadth_section(ts) -> str:
-    """Render a TagSummary breadth item as a simple tag section."""
-    from ..core.summary_identity import render_summary_for_model
-
+def _format_breadth_section(ts, rendered_summary: str) -> str:
+    """Render an already validated TagSummary breadth item."""
     return (
         f'<virtual-context tags="{ts.tag}" type="breadth">\n'
-        f"{render_summary_for_model(ts.summary, require_proved_scope=True)}\n"
+        f"{rendered_summary}\n"
         f"</virtual-context>"
     )
 

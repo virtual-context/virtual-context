@@ -27,7 +27,6 @@ from .core.summary_identity import sanitize_summary_payload_for_model
 from .core.tag_canonicalizer import TagCanonicalizer
 from .core.tag_generator import build_tag_generator, TagGenerator
 from .core.turn_tag_index import TurnTagIndex
-from .storage.filesystem import FilesystemStore
 from .storage.sqlite import SQLiteStore
 from .token_counter import create_token_counter
 from .types import (
@@ -918,10 +917,11 @@ class VirtualContextEngine:
                 state=fallback, search=fallback,
             )
         elif self.config.storage.backend == "filesystem":
-            fs = FilesystemStore(root=self.config.storage.root)
-            store = CompositeStore(
-                segments=fs, facts=fs, fact_links=NoopFactLinkStore(),
-                state=fs, search=fs,
+            raise ValueError(
+                "storage.backend=filesystem cannot serve source-bound layered "
+                "context because it does not persist canonical turns; use "
+                "sqlite or postgres (FilesystemStore remains available as a "
+                "direct archival utility)"
             )
         else:
             raise ValueError(f"Unsupported storage backend: {self.config.storage.backend}")
@@ -3184,6 +3184,22 @@ class VirtualContextEngine:
             "(max_turn=%d, conv=%s)",
             len(cover_tags), max_turn, conv_id[:12],
         )
+        from .core.structured_summary import validate_tag_rollup_inputs
+
+        physical_by_id = {
+            str(getattr(row, "canonical_turn_id", "") or ""): row
+            for row in (canonical_rows or [])
+            if str(getattr(row, "canonical_turn_id", "") or "")
+        }
+        validated_tag_rollup_inputs = validate_tag_rollup_inputs(
+            (
+                summary
+                for summaries in tag_to_summaries.values()
+                for summary in summaries
+            ),
+            physical_by_id,
+            conversation_id=conv_id,
+        )
         _t_compactor = _time.monotonic()
         new_summaries = self._compactor.compact_tag_summaries(
             cover_tags=cover_tags,
@@ -3192,6 +3208,7 @@ class VirtualContextEngine:
             tag_to_canonical_turn_ids=tag_to_canonical_turn_ids,
             existing_tag_summaries=existing_tag_summaries,
             max_turn=max_turn,
+            validated_tag_rollup_inputs=validated_tag_rollup_inputs,
         )
         _compactor_elapsed = round(_time.monotonic() - _t_compactor, 2)
 
@@ -4822,6 +4839,7 @@ class VirtualContextEngine:
         return sanitize_summary_payload_for_model(
             result,
             allow_proved_renderings=resolved_context.eligible,
+            speaker_context=resolved_context,
         )
 
     # ------------------------------------------------------------------

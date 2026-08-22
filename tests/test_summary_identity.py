@@ -19,13 +19,21 @@ from virtual_context.core.summary_identity import (
     SummarySpeakerAttribution,
     contains_ambiguous_human_referent,
     is_proved_summary_rendering,
+    render_summaries_for_model,
     render_summary_for_model,
     sanitize_summary_payload_for_model,
+)
+from virtual_context.core.structured_summary import (
+    structured_source_digest,
+    structured_source_provenance_digest,
 )
 from virtual_context.types import (
     AUDIENCE_ATTRIBUTION_VERSION,
     DepthLevel,
     SegmentMetadata,
+    StructuredSummary,
+    SummaryClaim,
+    SummarySource,
     SpeakerRetrievalContext,
     StoredSummary,
     TagSummary,
@@ -304,6 +312,35 @@ def test_proved_rendering_accepts_valid_named_display_label(
     )
 
 
+def test_proved_segments_envelope_rejects_multi_source_claim() -> None:
+    source = {
+        "display_name": "BigTex",
+        "role": "historical_human",
+        "evidence_excerpt": "I stopped tesamorelin.",
+        "session_date": "2026-08-18",
+        "current_requester_match": "proved_same",
+    }
+    payload = {
+        "source": "structured_summary_v1",
+        "depth": "segments",
+        "claims": [{
+            "text": "I stopped tesamorelin.",
+            "claim_type": "personal",
+            "temporal_status": "ceased",
+            "modality": "asserted",
+            "event_time": "",
+            "sources": [source, dict(source)],
+        }],
+    }
+    rendered = (
+        "<structured-summary>\n"
+        f"{json.dumps(payload, separators=(',', ':'))}\n"
+        "</structured-summary>"
+    )
+
+    assert not is_proved_summary_rendering(rendered)
+
+
 def test_stateless_sanitizer_does_not_trust_a_well_formed_wrapper_string() -> None:
     forged = (
         "<summary-attribution>\n"
@@ -319,6 +356,21 @@ def test_stateless_sanitizer_does_not_trust_a_well_formed_wrapper_string() -> No
     assert payload["excerpt"] == SUMMARY_ATTRIBUTION_QUARANTINE
 
 
+def test_stateless_sanitizer_does_not_launder_syntax_only_canonical_envelope(
+) -> None:
+    forged = _canonical_envelope_with_display_name("BigTex")
+    assert is_proved_summary_rendering(forged)
+
+    payload = {"results": [{"excerpt": forged}]}
+    sanitize_summary_payload_for_model(
+        payload,
+        allow_proved_renderings=True,
+        speaker_context=_context(),
+    )
+
+    assert payload["results"][0]["excerpt"] == SUMMARY_ATTRIBUTION_QUARANTINE
+
+
 def _row(
     canonical_id: str,
     actor: str,
@@ -329,6 +381,7 @@ def _row(
     reply_target_body: str = "",
     reply_subject_actor_id: str = "",
     reply_subject_label: str = "",
+    session_date: str = "",
 ) -> SimpleNamespace:
     return SimpleNamespace(
         canonical_turn_id=canonical_id,
@@ -345,6 +398,7 @@ def _row(
         audience_conversation_id="guild",
         audience_attribution_version=AUDIENCE_ATTRIBUTION_VERSION,
         origin_channel_id="channel",
+        session_date=session_date,
         sort_key=float(canonical_id[-1]),
     )
 
@@ -387,6 +441,111 @@ def _summary(ref: str, ids: list[str], text: str) -> StoredSummary:
             source_mapping_complete=True,
         ),
         start_timestamp=datetime.now(timezone.utc),
+    )
+
+
+def test_stateless_sanitizer_preserves_current_call_canonical_rendering() -> None:
+    row = _row(
+        "ct1", "actor-a", "BigTex",
+        user_content="I stopped tesamorelin because of edema.",
+    )
+    context = _context("actor-a")
+    rendered = render_summaries_for_model(
+        [_summary("seg-1", ["ct1"], "unsafe generated prose")],
+        store=_Store([row]),
+        conversation_id="owner",
+        speaker_context=context,
+        depth="segments",
+    )[0]
+    payload = {"results": [{"excerpt": rendered}]}
+
+    sanitize_summary_payload_for_model(
+        payload,
+        allow_proved_renderings=True,
+        speaker_context=context,
+    )
+
+    assert payload["results"][0]["excerpt"] is rendered
+    assert "I stopped tesamorelin because of edema." in rendered
+
+    replayed = {"results": [{"excerpt": rendered}]}
+    sanitize_summary_payload_for_model(
+        replayed,
+        allow_proved_renderings=True,
+        # Equal fields are not the same immutable request authority.
+        speaker_context=_context("actor-a"),
+    )
+    assert replayed["results"][0]["excerpt"] == SUMMARY_ATTRIBUTION_QUARANTINE
+
+
+def _segment_source_digest(
+    rows: list[SimpleNamespace],
+    *,
+    session_date: str = "",
+) -> str:
+    records: list[dict[str, object]] = []
+    for row in rows:
+        if row.user_content.strip():
+            records.append({
+                "canonical_turn_id": row.canonical_turn_id,
+                "source_role": "requester",
+                "actor_id": row.sender_actor_id,
+                "speaker_label": row.sender,
+                "content": row.user_content.strip(),
+                "session_date": session_date,
+                "audience_conversation_id": row.audience_conversation_id,
+                "origin_channel_id": row.origin_channel_id,
+                "audience_attribution_version": row.audience_attribution_version,
+            })
+    return structured_source_digest(records)
+
+
+def _attach_structured(
+    summary: StoredSummary,
+    claims: tuple[SummaryClaim, ...],
+    rows: list[SimpleNamespace],
+) -> StoredSummary:
+    summary.metadata.structured_summary = StructuredSummary(
+        schema_version=1,
+        claims=claims,
+        source_digest=_segment_source_digest(
+            rows, session_date=summary.metadata.session_date,
+        ),
+        generation_model="test-model",
+    )
+    return summary
+
+
+def _source(
+    canonical_id: str,
+    label: str,
+    evidence: str,
+    *,
+    role: str = "requester",
+    session_date: str = "",
+    actor: str = "actor-a",
+) -> SummarySource:
+    return SummarySource(
+        canonical_turn_id=canonical_id,
+        source_role=role,
+        speaker_label=label,
+        evidence_excerpt=evidence,
+        session_date=session_date,
+        source_provenance_digest=(
+            structured_source_provenance_digest({
+                "canonical_turn_id": canonical_id,
+                "source_role": role,
+                "actor_id": actor if role == "requester" else "",
+                "speaker_label": label,
+                "content": evidence,
+                "session_date": session_date,
+                "audience_conversation_id": "guild",
+                "origin_channel_id": "channel",
+                "audience_attribution_version": AUDIENCE_ATTRIBUTION_VERSION,
+            })
+            if role == "requester"
+            else ""
+        ),
     )
 
 
@@ -584,6 +743,813 @@ def test_generated_false_current_state_is_replaced_by_exact_plan_and_stop() -> N
     assert is_proved_summary_rendering(
         section.split("[1/1]\n", 1)[1].split("\n</virtual-context>", 1)[0],
     )
+
+
+def test_valid_v1_claim_renders_extractive_summary_with_attribution() -> None:
+    evidence = "I stopped tesamorelin because of edema."
+    row = _row("ct1", "actor-a", "BigTex", user_content=evidence)
+    summary = _attach_structured(
+        _summary("seg-1", ["ct1"], "BigTex still uses tesamorelin."),
+        (SummaryClaim(
+            # Even a poisoned persisted paraphrase is never model-visible.
+            text="BigTex still uses tesamorelin.",
+            claim_type="personal",
+            temporal_status="ceased",
+            modality="asserted",
+            sources=(_source("ct1", "BigTex", evidence),),
+        ),),
+        [row],
+    )
+
+    section = format_tag_section(
+        "health",
+        [summary],
+        store=_Store([row]),
+        conversation_id="owner",
+        speaker_context=_context("actor-a"),
+    )
+
+    assert '"source":"structured_summary_v1"' in section
+    assert '"depth":"summary"' in section
+    assert '"display_name":"BigTex"' in section
+    assert '"temporal_status":""' in section
+    assert '"claim_type":"conversation"' in section
+    assert section.count(evidence) == 2  # extractive text plus one compact excerpt
+    assert "still uses tesamorelin" not in section
+    assert "ct1" not in section
+    assert "actor-a" not in section
+    assert (
+        summary.metadata.structured_summary.claims[0]
+        .sources[0].source_provenance_digest
+        not in section
+    )
+    assert "source_provenance_digest" not in section
+
+
+def test_v1_never_renders_model_active_status_without_quote_local_proof() -> None:
+    evidence = "I take tesamorelin on Tuesdays."
+    row = _row("ct1", "actor-a", "BigTex", user_content=evidence)
+    summary = _attach_structured(
+        _summary("seg-1", ["ct1"], "retrieval-only synopsis"),
+        (SummaryClaim(
+            text="BigTex actively uses tesamorelin.",
+            claim_type="personal",
+            temporal_status="active",
+            modality="asserted",
+            sources=(_source("ct1", "BigTex", evidence),),
+        ),),
+        [row],
+    )
+
+    section = format_tag_section(
+        "health",
+        [summary],
+        store=_Store([row]),
+        conversation_id="owner",
+        speaker_context=_context("actor-a"),
+    )
+
+    assert evidence in section
+    assert '"temporal_status":""' in section
+    assert '"temporal_status":"active"' not in section
+    assert "actively uses tesamorelin" not in section
+
+
+def test_v1_requires_request_authority_for_the_exact_storage_owner() -> None:
+    evidence = "I stopped tesamorelin."
+    row = _row("ct1", "actor-a", "BigTex", user_content=evidence)
+    summary = _attach_structured(
+        _summary("seg-1", ["ct1"], "retrieval-only synopsis"),
+        (SummaryClaim(
+            text=evidence,
+            claim_type="personal",
+            temporal_status="ceased",
+            modality="asserted",
+            sources=(_source("ct1", "BigTex", evidence),),
+        ),),
+        [row],
+    )
+
+    section = format_tag_section(
+        "health",
+        [summary],
+        store=_Store([row]),
+        conversation_id="different-owner",
+        speaker_context=_context("actor-a"),
+    )
+
+    assert SUMMARY_ATTRIBUTION_QUARANTINE in section
+    assert evidence not in section
+
+
+def test_model_taxonomy_and_status_are_neutralized_without_losing_exact_siblings() -> None:
+    stopped = "I stopped tesamorelin because of edema."
+    planned = "I plan to try MOTS-c; I have not started it."
+    rows = [
+        _row("ct1", "actor-a", "BigTex", user_content=stopped),
+        _row("ct2", "actor-a", "BigTex", user_content=planned),
+    ]
+    summary = _attach_structured(
+        _summary("seg-1", ["ct1", "ct2"], "unsafe legacy synopsis"),
+        (
+            SummaryClaim(
+                text="BigTex currently uses tesamorelin.",
+                claim_type="personal",
+                temporal_status="active",
+                modality="asserted",
+                sources=(_source("ct1", "BigTex", stopped),),
+            ),
+            SummaryClaim(
+                text="BigTex plans MOTS-c.",
+                claim_type="personal",
+                temporal_status="planned",
+                modality="asserted",
+                sources=(_source("ct2", "BigTex", planned),),
+            ),
+        ),
+        rows,
+    )
+
+    section = format_tag_section(
+        "health",
+        [summary],
+        store=_Store(rows),
+        conversation_id="owner",
+        speaker_context=_context("actor-a"),
+    )
+
+    assert '"source":"structured_summary_v1"' in section
+    assert planned in section
+    assert stopped in section
+    assert '"temporal_status":"active"' not in section
+    assert '"temporal_status":"planned"' not in section
+    assert section.count('"claim_type":"conversation"') == 2
+    assert "unsafe legacy synopsis" not in section
+
+
+def test_v1_source_role_excerpt_label_and_single_actor_are_claim_local_gates() -> None:
+    valid_evidence = "I stopped tesamorelin."
+    other_evidence = "I stopped MOTS-c."
+    assistant_evidence = "A generated assistant assertion."
+    rows = [
+        _row(
+            "ct1", "actor-a", "BigTex",
+            user_content=valid_evidence,
+            assistant_content=assistant_evidence,
+        ),
+        _row("ct2", "actor-b", "Kuw9239", user_content=other_evidence),
+    ]
+    claims = (
+        SummaryClaim(
+            text="valid",
+            claim_type="personal",
+            temporal_status="ceased",
+            modality="asserted",
+            sources=(_source("ct1", "BigTex", valid_evidence),),
+        ),
+        SummaryClaim(
+            text="missing excerpt",
+            claim_type="personal",
+            temporal_status="ceased",
+            modality="asserted",
+            sources=(_source("ct1", "BigTex", "not an exact source span"),),
+        ),
+        SummaryClaim(
+            text="wrong lane",
+            claim_type="technical",
+            temporal_status="",
+            modality="asserted",
+            sources=(_source("ct1", "BigTex", assistant_evidence),),
+        ),
+        SummaryClaim(
+            text="unsafe label",
+            claim_type="personal",
+            temporal_status="ceased",
+            modality="asserted",
+            sources=(_source("ct1", "User", valid_evidence),),
+        ),
+        SummaryClaim(
+            text="two human actors",
+            claim_type="personal",
+            temporal_status="ceased",
+            modality="asserted",
+            sources=(
+                _source("ct1", "BigTex", valid_evidence),
+                _source(
+                    "ct2", "Kuw9239", other_evidence, actor="actor-b",
+                ),
+            ),
+        ),
+    )
+    summary = _attach_structured(
+        _summary("seg-1", ["ct1", "ct2"], "unsafe legacy synopsis"),
+        claims,
+        rows,
+    )
+
+    section = format_tag_section(
+        "health",
+        [summary],
+        store=_Store(rows),
+        conversation_id="owner",
+        speaker_context=_context("actor-a"),
+    )
+    assert '"source":"structured_summary_v1"' not in section
+    assert '"source":"canonical_turns"' in section
+    assert valid_evidence in section
+    assert "not an exact source span" not in section
+    assert other_evidence in section
+    assert assistant_evidence not in section
+
+
+def test_v1_claim_from_another_audience_is_not_rendered() -> None:
+    evidence = "I stopped tesamorelin."
+    row = _row("ct1", "actor-a", "BigTex", user_content=evidence)
+    row.audience_conversation_id = "private-dm"
+    summary = _attach_structured(
+        _summary("seg-1", ["ct1"], "unsafe legacy synopsis"),
+        (SummaryClaim(
+            text=evidence,
+            claim_type="personal",
+            temporal_status="ceased",
+            modality="asserted",
+            sources=(_source("ct1", "BigTex", evidence),),
+        ),),
+        [row],
+    )
+
+    section = format_tag_section(
+        "health",
+        [summary],
+        store=_Store([row]),
+        conversation_id="owner",
+        speaker_context=_context(),
+    )
+
+    assert SUMMARY_ATTRIBUTION_QUARANTINE in section
+    assert evidence not in section
+    assert "structured_summary_v1" not in section
+
+
+def test_model_active_classification_renders_only_exact_neutralized_evidence() -> None:
+    evidence = "I stopped tesamorelin because of edema."
+    row = _row("ct1", "actor-a", "BigTex", user_content=evidence)
+    summary = _attach_structured(
+        _summary("seg-1", ["ct1"], "BigTex actively takes tesamorelin."),
+        (SummaryClaim(
+            text="BigTex actively takes tesamorelin.",
+            claim_type="personal",
+            temporal_status="active",
+            modality="asserted",
+            sources=(_source("ct1", "BigTex", evidence),),
+        ),),
+        [row],
+    )
+
+    section = format_tag_section(
+        "health",
+        [summary],
+        store=_Store([row]),
+        conversation_id="owner",
+        speaker_context=_context("actor-a"),
+    )
+
+    assert '"source":"structured_summary_v1"' in section
+    assert '"temporal_status":""' in section
+    assert '"claim_type":"conversation"' in section
+    assert evidence in section
+    assert "actively takes tesamorelin" not in section
+
+
+def test_stale_v1_source_digest_is_quarantined_not_partially_fallen_back() -> None:
+    evidence = "I stopped tesamorelin."
+    row = _row("ct1", "actor-a", "BigTex", user_content=evidence)
+    summary = _summary("seg-1", ["ct1"], "unsafe legacy synopsis")
+    summary.metadata.structured_summary = StructuredSummary(
+        schema_version=1,
+        claims=(SummaryClaim(
+            text=evidence,
+            claim_type="personal",
+            temporal_status="ceased",
+            modality="asserted",
+            sources=(_source("ct1", "BigTex", evidence),),
+        ),),
+        source_digest="f" * 64,
+    )
+
+    section = format_tag_section(
+        "health",
+        [summary],
+        store=_Store([row]),
+        conversation_id="owner",
+        speaker_context=_context(),
+    )
+
+    assert '"source":"structured_summary_v1"' not in section
+    assert SUMMARY_ATTRIBUTION_QUARANTINE in section
+    assert evidence not in section
+
+
+@pytest.mark.parametrize("include_malformed_stop", [False, True])
+def test_v1_missing_or_invalid_critical_lane_falls_back_to_complete_sources(
+    include_malformed_stop: bool,
+) -> None:
+    active = "I am currently taking tesamorelin."
+    stopped = "I stopped tesamorelin yesterday."
+    rows = [
+        _row("ct1", "actor-a", "BigTex", user_content=active),
+        _row("ct2", "actor-a", "BigTex", user_content=stopped),
+    ]
+    claims = [SummaryClaim(
+        text=active,
+        claim_type="conversation",
+        temporal_status="",
+        modality="asserted",
+        sources=(_source("ct1", "BigTex", active),),
+    )]
+    if include_malformed_stop:
+        claims.append(SummaryClaim(
+            text=stopped,
+            claim_type="conversation",
+            temporal_status="",
+            modality="asserted",
+            # The raw id appears covered, but the label/provenance is invalid.
+            sources=(_source("ct2", "Kuw9239", stopped),),
+        ))
+    summary = _attach_structured(
+        _summary("seg-1", ["ct1", "ct2"], "retrieval-only synopsis"),
+        tuple(claims),
+        rows,
+    )
+
+    section = format_tag_section(
+        "health",
+        [summary],
+        store=_Store(rows),
+        conversation_id="owner",
+        speaker_context=_context("actor-a"),
+    )
+
+    assert '"source":"structured_summary_v1"' not in section
+    assert '"source":"canonical_turns"' in section
+    assert active in section
+    assert stopped in section
+
+
+@pytest.mark.parametrize(
+    "nonuse",
+    [
+        "I never took tesamorelin.",
+        "I was prescribed tesamorelin but never took it.",
+        "I wasn’t taking tesamorelin.",
+        "I was not taking tesamorelin.",
+        "I haven't taken tesamorelin.",
+        "I have not taken tesamorelin.",
+        "I haven't used tesamorelin.",
+        "I haven't been taking tesamorelin.",
+        "I was prescribed tesamorelin but haven't taken it.",
+        "I've not taken tesamorelin.",
+        "I've not used tesamorelin.",
+        "I've not been taking tesamorelin.",
+        "I've never been on tesamorelin.",
+        "I don't actually take tesamorelin.",
+        "I was prescribed tesamorelin but I've not taken it.",
+        "I'm definitely not taking tesamorelin.",
+        "I am absolutely not taking tesamorelin.",
+        "I definitely don't take tesamorelin.",
+        "I've certainly not used tesamorelin.",
+    ],
+)
+def test_v1_active_only_envelope_over_newer_nonuse_falls_back_to_complete_sources(
+    nonuse: str,
+) -> None:
+    active = "I am currently taking tesamorelin."
+    rows = [
+        _row("ct1", "actor-a", "BigTex", user_content=active),
+        _row("ct2", "actor-a", "BigTex", user_content=nonuse),
+    ]
+    summary = _attach_structured(
+        _summary("seg-1", ["ct1", "ct2"], "retrieval-only synopsis"),
+        (SummaryClaim(
+            text=active,
+            claim_type="conversation",
+            temporal_status="",
+            modality="asserted",
+            sources=(_source("ct1", "BigTex", active),),
+        ),),
+        rows,
+    )
+
+    section = format_tag_section(
+        "health",
+        [summary],
+        store=_Store(rows),
+        conversation_id="owner",
+        speaker_context=_context("actor-a"),
+    )
+
+    assert '"source":"structured_summary_v1"' not in section
+    assert '"source":"canonical_turns"' in section
+    assert active in section
+    assert nonuse in section
+
+
+def test_segment_summary_prefix_uses_validated_text_and_physical_order() -> None:
+    active = "I am currently taking tesamorelin."
+    ordinary = [f"Ordinary health detail {index}." for index in range(1, 9)]
+    stopped = "I stopped tesamorelin yesterday."
+    evidence = [active, *ordinary, stopped]
+    rows = [
+        _row(f"ct{index}", "actor-a", "BigTex", user_content=text)
+        for index, text in enumerate(evidence)
+    ]
+    claims = [SummaryClaim(
+        # Persisted/model text is forged to look safety-critical even though
+        # its exact source is the older active lane.
+        text="I stopped a different protocol.",
+        claim_type="personal",
+        temporal_status="",
+        modality="asserted",
+        sources=(_source("ct0", "BigTex", active),),
+    )]
+    claims.extend(
+        SummaryClaim(
+            text=text,
+            claim_type="conversation",
+            temporal_status="",
+            modality="asserted",
+            sources=(_source(f"ct{index}", "BigTex", text),),
+        )
+        for index, text in enumerate(ordinary, 1)
+    )
+    claims.append(SummaryClaim(
+        # The newer exact stop must be classified from its reconstructed
+        # projection, not hidden behind neutral model text/taxonomy.
+        text="Routine health update.",
+        claim_type="technical",
+        temporal_status="",
+        modality="asserted",
+        sources=(_source("ct9", "BigTex", stopped),),
+    ))
+    summary = _attach_structured(
+        _summary("seg-1", [row.canonical_turn_id for row in rows], "index"),
+        tuple(claims),
+        rows,
+    )
+
+    section = format_tag_section(
+        "health",
+        [summary],
+        store=_Store(rows),
+        conversation_id="owner",
+        speaker_context=_context("actor-a"),
+    )
+    encoded = section.split("<structured-summary>\n", 1)[1].split(
+        "\n</structured-summary>", 1,
+    )[0]
+    rendered_claims = json.loads(encoded)["claims"]
+    rendered_text = [claim["text"] for claim in rendered_claims]
+
+    assert len(rendered_text) == 8
+    assert rendered_text[0] == stopped
+    assert active in rendered_text
+    assert rendered_text.index(stopped) < rendered_text.index(active)
+    assert "I stopped a different protocol." not in section
+    assert "Routine health update." not in section
+
+
+def test_invalid_projection_cannot_satisfy_critical_segment_coverage() -> None:
+    active = "I am currently taking tesamorelin."
+    stopped = "I stopped tesamorelin yesterday."
+    rows = [
+        _row("ct1", "actor-a", "BigTex", user_content=active),
+        _row("ct2", "actor-a", "BigTex", user_content=stopped),
+    ]
+    summary = _attach_structured(
+        _summary("seg-1", ["ct1", "ct2"], "retrieval-only synopsis"),
+        (
+            SummaryClaim(
+                # Raw generated text cannot make this older active source
+                # count as coverage for a different critical lane.
+                text="I stopped a different protocol.",
+                claim_type="personal",
+                temporal_status="",
+                modality="asserted",
+                sources=(_source("ct1", "BigTex", active),),
+            ),
+            SummaryClaim(
+                text="Routine health update.",
+                claim_type="technical",
+                temporal_status="",
+                modality="asserted",
+                # Exact id, but invalid label/provenance: no valid projection.
+                sources=(_source("ct2", "Kuw9239", stopped),),
+            ),
+        ),
+        rows,
+    )
+
+    section = format_tag_section(
+        "health",
+        [summary],
+        store=_Store(rows),
+        conversation_id="owner",
+        speaker_context=_context("actor-a"),
+    )
+
+    assert '"source":"structured_summary_v1"' not in section
+    assert '"source":"canonical_turns"' in section
+    assert active in section
+    assert stopped in section
+    assert "I stopped a different protocol." not in section
+    assert "Routine health update." not in section
+
+
+def test_v1_source_membership_deletion_cannot_fall_back_to_stale_subset() -> None:
+    active = "I am currently taking tesamorelin."
+    stopped = "I stopped tesamorelin yesterday."
+    rows = [
+        _row("ct1", "actor-a", "BigTex", user_content=active),
+        _row("ct2", "actor-a", "BigTex", user_content=stopped),
+    ]
+    summary = _attach_structured(
+        _summary("seg-1", ["ct1", "ct2"], "retrieval-only synopsis"),
+        (
+            SummaryClaim(
+                text=stopped,
+                claim_type="conversation",
+                temporal_status="",
+                modality="asserted",
+                sources=(_source("ct2", "BigTex", stopped),),
+            ),
+            SummaryClaim(
+                text=active,
+                claim_type="conversation",
+                temporal_status="",
+                modality="asserted",
+                sources=(_source("ct1", "BigTex", active),),
+            ),
+        ),
+        rows,
+    )
+    # Mutating only membership used to detect the stale v1 and then expose the
+    # same mutated canonical fallback, silently dropping the correction.
+    summary.metadata.canonical_turn_ids = ["ct1"]
+
+    section = format_tag_section(
+        "health",
+        [summary],
+        store=_Store(rows),
+        conversation_id="owner",
+        speaker_context=_context("actor-a"),
+    )
+
+    assert SUMMARY_ATTRIBUTION_QUARANTINE in section
+    assert active not in section
+    assert stopped not in section
+
+
+def test_assistant_personal_claim_cannot_establish_human_state() -> None:
+    assistant_claim = "You already run tesamorelin."
+    row = _row(
+        "ct1",
+        "actor-a",
+        "BigTex",
+        user_content="Should I start tesamorelin?",
+        assistant_content=assistant_claim,
+    )
+    summary = _attach_structured(
+        _summary("seg-1", ["ct1"], "BigTex already uses tesamorelin."),
+        (SummaryClaim(
+            text="BigTex already uses tesamorelin.",
+            claim_type="personal",
+            temporal_status="active",
+            modality="asserted",
+            sources=(_source(
+                "ct1", "Assistant", assistant_claim, role="assistant",
+            ),),
+        ),),
+        [row],
+    )
+
+    section = format_tag_section(
+        "health",
+        [summary],
+        store=_Store([row]),
+        conversation_id="owner",
+        speaker_context=_context("actor-a"),
+    )
+
+    assert '"source":"structured_summary_v1"' not in section
+    assert "Should I start tesamorelin?" in section
+    assert assistant_claim not in section
+
+
+@pytest.mark.parametrize(
+    ("assistant_claim", "roster_pairs"),
+    [
+        ("You already run tesamorelin.", ()),
+        ("BigTex already runs tesamorelin.", ()),
+        ("Kuw9239 already runs tesamorelin.", (("Kuw9239", "actor-b"),)),
+    ],
+)
+def test_assistant_world_claim_about_a_human_is_dropped_independently(
+    assistant_claim: str,
+    roster_pairs: tuple[tuple[str, str], ...],
+) -> None:
+    technical_evidence = "DB-side vector ranking."
+    row = _row(
+        "ct1",
+        "actor-a",
+        "BigTex",
+        user_content=technical_evidence,
+        assistant_content=assistant_claim,
+    )
+    summary = _attach_structured(
+        _summary("seg-1", ["ct1"], "unsafe legacy synopsis"),
+        (
+            SummaryClaim(
+                text="technical continuity",
+                claim_type="technical",
+                temporal_status="",
+                modality="asserted",
+                sources=(_source("ct1", "BigTex", technical_evidence),),
+            ),
+            SummaryClaim(
+                text="forged human assertion",
+                claim_type="world",
+                temporal_status="",
+                modality="asserted",
+                sources=(_source(
+                    "ct1", "Assistant", assistant_claim, role="assistant",
+                ),),
+            ),
+        ),
+        [row],
+    )
+    context = SpeakerRetrievalContext(
+        tenant_id="tenant",
+        owner_conversation_id="owner",
+        audience_conversation_id="guild",
+        audience_channel_id="channel",
+        requester_actor_id="actor-a",
+        roster_label_actor_pairs=roster_pairs,
+    )
+
+    section = format_tag_section(
+        "health",
+        [summary],
+        store=_Store([row]),
+        conversation_id="owner",
+        speaker_context=context,
+    )
+    encoded = section.split("<structured-summary>\n", 1)[1].split(
+        "\n</structured-summary>", 1,
+    )[0]
+    payload = json.loads(encoded)
+
+    assert [claim["text"] for claim in payload["claims"]] == [
+        technical_evidence,
+    ]
+    assert assistant_claim not in section
+    assert '"display_name":"Assistant"' not in section
+
+
+def test_assistant_technical_evidence_is_available_only_at_full_depth() -> None:
+    user_evidence = "Please inspect the retrieval implementation."
+    assistant_evidence = "DB-side vector ranking with pgvector."
+    row = _row(
+        "ct1",
+        "actor-a",
+        "BigTex",
+        user_content=user_evidence,
+        assistant_content=assistant_evidence,
+    )
+    summary = _attach_structured(
+        _summary("seg-1", ["ct1"], "unsafe legacy synopsis"),
+        (SummaryClaim(
+            text="generated technical paraphrase",
+            claim_type="technical",
+            temporal_status="",
+            modality="asserted",
+            sources=(_source(
+                "ct1", "Assistant", assistant_evidence, role="assistant",
+            ),),
+        ),),
+        [row],
+    )
+
+    section = format_tag_section(
+        "technical",
+        [summary],
+        store=_Store([row]),
+        conversation_id="owner",
+        speaker_context=_context("actor-a"),
+    )
+
+    assert '"source":"structured_summary_v1"' not in section
+    assert assistant_evidence not in section
+    assert '"display_name":"Assistant"' not in section
+    assert user_evidence in section
+
+
+def test_v1_rejects_status_inverting_substring_as_claim_local_evidence() -> None:
+    complete_ceased_lane = "I am no longer currently taking tesamorelin."
+    selected_active_substring = "currently taking tesamorelin"
+    planned_lane = "I plan to start MOTS-c next month."
+    rows = [
+        _row(
+            "ct1", "actor-a", "BigTex",
+            user_content=complete_ceased_lane,
+        ),
+        _row("ct2", "actor-a", "BigTex", user_content=planned_lane),
+    ]
+    summary = _attach_structured(
+        _summary("seg-1", ["ct1", "ct2"], "unsafe legacy synopsis"),
+        (
+            SummaryClaim(
+                text="BigTex currently takes tesamorelin.",
+                claim_type="personal",
+                temporal_status="active",
+                modality="asserted",
+                sources=(_source(
+                    "ct1", "BigTex", selected_active_substring,
+                ),),
+            ),
+            SummaryClaim(
+                text="BigTex plans MOTS-c.",
+                claim_type="personal",
+                temporal_status="planned",
+                modality="asserted",
+                sources=(_source("ct2", "BigTex", planned_lane),),
+            ),
+        ),
+        rows,
+    )
+
+    section = format_tag_section(
+        "health",
+        [summary],
+        store=_Store(rows),
+        conversation_id="owner",
+        speaker_context=_context("actor-a"),
+    )
+
+    assert '"source":"structured_summary_v1"' not in section
+    assert '"source":"canonical_turns"' in section
+    assert planned_lane in section
+    assert complete_ceased_lane in section
+    assert "BigTex currently takes tesamorelin" not in section
+    assert '"temporal_status":"active"' not in section
+
+
+def test_v1_rejects_multi_source_claim_that_hides_later_status_evidence() -> None:
+    active_lane = "I am currently taking tesamorelin."
+    ceased_lane = "I stopped tesamorelin."
+    planned_lane = "I plan to start MOTS-c next month."
+    rows = [
+        _row("ct1", "actor-a", "BigTex", user_content=active_lane),
+        _row("ct2", "actor-a", "BigTex", user_content=ceased_lane),
+        _row("ct3", "actor-a", "BigTex", user_content=planned_lane),
+    ]
+    summary = _attach_structured(
+        _summary("seg-1", ["ct1", "ct2", "ct3"], "unsafe synopsis"),
+        (
+            SummaryClaim(
+                text=active_lane,
+                claim_type="personal",
+                temporal_status="ceased",
+                modality="asserted",
+                sources=(
+                    _source("ct1", "BigTex", active_lane),
+                    _source("ct2", "BigTex", ceased_lane),
+                ),
+            ),
+            SummaryClaim(
+                text=planned_lane,
+                claim_type="personal",
+                temporal_status="planned",
+                modality="asserted",
+                sources=(_source("ct3", "BigTex", planned_lane),),
+            ),
+        ),
+        rows,
+    )
+
+    section = format_tag_section(
+        "health",
+        [summary],
+        store=_Store(rows),
+        conversation_id="owner",
+        speaker_context=_context("actor-a"),
+    )
+
+    assert '"source":"structured_summary_v1"' not in section
+    assert '"source":"canonical_turns"' in section
+    assert planned_lane in section
+    assert active_lane in section
+    assert ceased_lane in section
+    assert '"temporal_status":"ceased"' not in section
 
 
 def test_off_roster_name_and_internal_actor_id_in_generated_prose_never_render() -> None:
@@ -892,9 +1858,10 @@ def test_all_hint_modes_drop_all_unproved_tag_summary_prose() -> None:
 
     for output in (supervised, autonomous):
         assert "what the user DID or experienced" not in output
-        assert "Fact records and summaries are derived retrieval aids" in output
-        assert "verify the exact human source text" in output
-        assert "speaker annotation does not prove" in output
+        assert "Presented structured summaries contain validated" in output
+        assert "normal compressed evidence layer" in output
+        assert "Free-form synopsis/description prose is retrieval-only" in output
+        assert "Fact records remain derived indexes" in output
         assert "rendered source-speaker attribution" not in output
 
 

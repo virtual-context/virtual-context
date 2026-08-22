@@ -16,7 +16,9 @@ Layer 2: Tag summaries             (working set descriptors, bird's-eye view)
 
 **Canonical turns** are the durable record. Every user and assistant message is persisted as its own row with a content hash, a sort key that defines conversation order, sender and channel provenance, and the compaction lifecycle state. Everything else (segments, facts, tag summaries, embeddings) is derived from canonical turns and can be rebuilt from them.
 
-**Segments** are per-topic summaries produced by compaction: turns are grouped by tag and summarized independently, with structured facts extracted alongside. **Tag summaries** are one-per-tag digests; every non-`_general` tag on a compacted segment gets a tag summary row, so the topic list the model sees is complete. (`_general` is the fallback tag for content the tagger could not classify; it is excluded from tag summaries and is tracked as a quality signal.)
+**Segments** are per-topic layer-one summaries produced by compaction. Each stores a free-form retrieval synopsis plus structured claims bound to complete requester-authored canonical lanes. The synopsis helps rank memory but is never shown as factual evidence. **Tag summaries** are one-per-tag layer-two digests that copy and deduplicate validated segment claims without re-authoring them. A primary `_general` tag is materialized too, so unclassified content remains recallable.
+
+Paging preserves the layers instead of flattening them: `SUMMARY` presents compact tag claims, `SEGMENTS` presents the richer individual segment claims and source evidence, and `FULL` reconstructs the exact canonical human and historical-assistant lanes. Legacy rows without structured claims fall back to admitted canonical requester text until they are regenerated.
 
 ## Request Pipeline (proxy path)
 
@@ -162,14 +164,17 @@ Group conversations carry per-message sender identity. The envelope parser claim
 
 ## Storage Backends
 
-Five backends are accepted: `sqlite`, `filesystem`, `postgres`, `neo4j`, `falkordb`.
+Four engine backends are accepted: `sqlite`, `postgres`, `neo4j`, `falkordb`.
 
 - **SQLite** (default): single-file, zero-config. Suitable for single-user and development.
-- **Filesystem**: segments as Markdown files with YAML frontmatter. Does not host canonical turns; features that require them degrade gracefully.
+- **FilesystemStore utility**: segments as Markdown files with YAML frontmatter
+  for direct archival/test use. It is not an engine backend because it does not
+  host the canonical turns required to prove model-visible layered summaries.
 - **PostgreSQL**: the multi-worker backend. Canonical turns, fencing, epochs, and the sweeper queries all run here in production deployments.
 - **Neo4j / FalkorDB**: graph-backed fact relationships and traversal queries.
 
-The backends share the `Store` protocol, but not every backend hosts every table; capability checks in the protocol let callers degrade per backend.
+The engine backends share the `Store` protocol. Model-facing context never
+degrades to an unproved filesystem projection.
 
 ## Provider Adapters
 

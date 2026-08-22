@@ -9,12 +9,7 @@ import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
-
-logger = logging.getLogger(__name__)
-
-_ASSEMBLE_BREAKDOWN_LOG_THRESHOLD_MS = 200.0
-_ASSEMBLE_BREAKDOWN_MAX_STAGES = 8
+from typing import TYPE_CHECKING, Callable
 
 from .speaker_roster import (
     build_speaker_roster,
@@ -24,8 +19,10 @@ from .speaker_roster import (
 from .summary_identity import (
     SUMMARY_ATTRIBUTION_QUARANTINE,
     is_proved_summary_rendering,
+    render_summary_items_for_model,
     render_summaries_for_model,
 )
+from .structured_summary import structured_tag_claim_digest
 
 from ..types import (
     AssembledContext,
@@ -36,12 +33,21 @@ from ..types import (
     RetrievalResult,
     SpeakerRetrievalContext,
     SpeakerRosterSnapshot,
+    STRUCTURED_SUMMARY_SCHEMA_VERSION,
     StoredSegment,
     StoredSummary,
     TagPromptRule,
     WorkingSetEntry,
     get_sender_name,
 )
+
+if TYPE_CHECKING:
+    from .store import ContextStore
+
+logger = logging.getLogger(__name__)
+
+_ASSEMBLE_BREAKDOWN_LOG_THRESHOLD_MS = 200.0
+_ASSEMBLE_BREAKDOWN_MAX_STAGES = 8
 
 
 def _admitted_summary_rendering(candidate: object) -> str:
@@ -55,12 +61,14 @@ def _admitted_summary_rendering(candidate: object) -> str:
 
 def format_tag_section(
     tag: str,
-    summaries: list["StoredSummary"],
+    summaries: list[object],
     store: "ContextStore | None" = None,
     conversation_id: str = "",
     speaker_context: "SpeakerRetrievalContext | None" = None,
     rendered_summary_by_object: dict[int, str] | None = None,
     include_source_refs: bool = False,
+    depth: str = "summary",
+    newest_first: bool = False,
 ) -> str:
     """Render a tag section in the canonical <virtual-context> format.
 
@@ -70,23 +78,44 @@ def format_tag_section(
     if not summaries:
         return ""
 
-    summaries = sorted(summaries, key=lambda s: s.start_timestamp)
+    summaries = sorted(
+        summaries,
+        key=lambda item: (
+            getattr(item, "start_timestamp", None)
+            or getattr(item, "created_at", None)
+            or getattr(item, "updated_at", None)
+            or datetime.min.replace(tzinfo=timezone.utc),
+            str(getattr(item, "ref", "") or ""),
+        ),
+        reverse=newest_first,
+    )
     if rendered_summary_by_object is None:
         rendered_summaries = render_summaries_for_model(
             summaries,
             store=store,
             conversation_id=conversation_id,
             speaker_context=speaker_context,
+            depth=depth,
         )
     else:
         rendered_summaries = [
             _admitted_summary_rendering(
-                rendered_summary_by_object[id(summary)],
+                rendered_summary_by_object.get(
+                    id(summary), SUMMARY_ATTRIBUTION_QUARANTINE,
+                ),
             )
             for summary in summaries
         ]
 
-    all_tags = sorted({t for s in summaries for t in s.tags})
+    all_tags = sorted({
+        item_tag
+        for summary in summaries
+        for item_tag in (
+            list(getattr(summary, "tags", []) or [])
+            or [str(getattr(summary, "tag", "") or "")]
+        )
+        if item_tag
+    })
     tags_attr = ", ".join(all_tags) if all_tags else tag
 
     total = len(summaries)
@@ -95,36 +124,46 @@ def format_tag_section(
         zip(summaries, rendered_summaries, strict=True), 1,
     ):
         prefix = f"[{idx}/{total}]"
-        session = s.metadata.session_date
+        session = str(
+            getattr(getattr(s, "metadata", None), "session_date", "") or "",
+        )
         if session:
             prefix += f" [{session}]"
         text = f"{prefix}\n{rendered_summary}"
         if include_source_refs:
+            raw_ref = str(getattr(s, "ref", "") or "")
+            if not raw_ref:
+                raw_ref = ""
             source_ref = json.dumps(
-                str(getattr(s, "ref", "") or ""), ensure_ascii=False,
+                raw_ref, ensure_ascii=False,
             )
             source_ref = (
                 source_ref.replace("&", "\\u0026")
                 .replace("<", "\\u003c")
                 .replace(">", "\\u003e")
             )
-            text += f"\n[source_ref: {source_ref}]"
+            if raw_ref:
+                text += f"\n[source_ref: {source_ref}]"
         # ``code_refs`` are LLM-derived metadata, not canonical source lanes.
         # Appending them here would put unproved prose outside the transcript
         # envelope (and let a crafted path close this XML wrapper), so summary
         # presentation intentionally omits them.
-        tool_tags = [t for t in s.tags if t.startswith("tool_")]
+        tool_tags = [
+            item_tag for item_tag in (getattr(s, "tags", []) or [])
+            if item_tag.startswith("tool_")
+        ]
         if tool_tags:
             text += f'\n[tool output truncated — vc_expand_topic("{tool_tags[0]}") for full result]'
         # Optional tool hint enrichment
-        if store and conversation_id and s.ref:
+        source_segment_ref = str(getattr(s, "ref", "") or "")
+        if store and conversation_id and source_segment_ref:
             get_refs = getattr(store, "get_tool_outputs_for_segment", None)
             get_names = getattr(store, "get_tool_names_for_segment", None)
             if callable(get_refs) and callable(get_names):
                 try:
-                    refs = get_refs(conversation_id, s.ref)
+                    refs = get_refs(conversation_id, source_segment_ref)
                     if refs:
-                        names = get_names(conversation_id, s.ref)
+                        names = get_names(conversation_id, source_segment_ref)
                         names_str = ", ".join(names) if names else "tools"
                         text += f"\n[Tools: {names_str} -- {len(refs)} outputs restorable via vc_restore_tool]"
                 except Exception:
@@ -133,8 +172,10 @@ def format_tag_section(
 
     body = "\n\n---\n\n".join(summary_texts)
 
+    depth_attr = "" if depth == "summary" else f' depth="{depth}"'
     return (
-        f'<virtual-context tags="{tags_attr}" segments="{len(summaries)}">\n'
+        f'<virtual-context tags="{tags_attr}"{depth_attr} '
+        f'segments="{len(summaries)}">\n'
         f"{body}\n"
         f"</virtual-context>"
     )
@@ -653,7 +694,7 @@ class ContextAssembler:
         - NONE: skip (hint only)
         - SUMMARY: tag summary (current default)
         - SEGMENTS: individual segment summaries
-        - FULL: StoredSegment.full_text
+        - FULL: exact role-separated canonical transcript
         When working_set is None, all tags served as SUMMARY.
 
         max_context_tokens: If set, caps the total VC context (core + hint + tags)
@@ -686,6 +727,12 @@ class ContextAssembler:
         summaries_by_tag: dict[str, list[StoredSummary]] = {}
         for s in retrieval_result.summaries:
             summaries_by_tag.setdefault(s.primary_tag, []).append(s)
+        for tag_summary in (
+            getattr(retrieval_result, "tag_summaries", None) or []
+        ):
+            tag_name = str(getattr(tag_summary, "tag", "") or "")
+            if tag_name:
+                summaries_by_tag.setdefault(tag_name, [])
 
         # Also collect tags from full_segments that might not be in summaries
         if full_segments:
@@ -745,66 +792,477 @@ class ContextAssembler:
         configured_facts_cap = self.config.facts_max_tokens
         facts_cap = 0
 
-        # Resolve every candidate summary in one request-local batch. Without
-        # this, each tag section performs its own exact-row hydration and
-        # audience-label scan, turning a safety boundary into two DB queries
-        # per tag on large group conversations.
-        identity_items: list[StoredSummary | StoredSegment] = list(
-            retrieval_result.summaries,
-        )
-        if full_segments:
-            identity_items.extend(
-                segment
-                for segments in full_segments.values()
-                for segment in segments
+        # Prefer a real layer-2 TagSummary only when it carries nonempty v1
+        # claims. During migration, current segment-only retrieval remains
+        # useful: its v1 claims render compactly at SUMMARY depth, while every
+        # legacy item retains the exact-source fallback. Segment candidates are
+        # pre-rendered in the same hydration batch so a stale/invalid tag digest
+        # can fall back without replacing useful detail with a whole-tag
+        # quarantine.
+        summary_depth_tags: set[str] = set()
+        for tag in sorted_tags:
+            requested_depth = (
+                working_set[tag].depth
+                if working_set and tag in working_set
+                else DepthLevel.SUMMARY
             )
-        identity_items = list({id(item): item for item in identity_items}.values())
-        rendered_summary_by_object = dict(zip(
-            (id(item) for item in identity_items),
-            render_summaries_for_model(
-                identity_items,
+            has_requested_segments = bool(
+                full_segments
+                and tag in full_segments
+                and full_segments[tag]
+                and requested_depth in {DepthLevel.SEGMENTS, DepthLevel.FULL}
+            )
+            if requested_depth != DepthLevel.NONE and not has_requested_segments:
+                summary_depth_tags.add(tag)
+        available_tag_summaries: list[object] = list(
+            getattr(retrieval_result, "tag_summaries", None) or [],
+        )
+        provided_v1_tags = {
+            str(getattr(summary, "tag", "") or "")
+            for summary in available_tag_summaries
+            if (
+                getattr(
+                    getattr(summary, "structured_summary", None),
+                    "schema_version",
+                    0,
+                ) == STRUCTURED_SUMMARY_SCHEMA_VERSION
+                and bool(getattr(
+                    getattr(summary, "structured_summary", None),
+                    "claims",
+                    (),
+                ))
+            )
+        }
+        get_tag_summary = getattr(
+            getattr(self, "_store", None), "get_tag_summary", None,
+        )
+        if callable(get_tag_summary):
+            for tag in sorted(summary_depth_tags - provided_v1_tags):
+                try:
+                    tag_summary = get_tag_summary(
+                        tag,
+                        conversation_id=getattr(
+                            self, "_conversation_id", "",
+                        ),
+                    )
+                except Exception:
+                    tag_summary = None
+                if tag_summary is not None:
+                    available_tag_summaries.append(tag_summary)
+        actual_tag_summary_by_tag = {
+            str(getattr(summary, "tag", "") or ""): summary
+            for summary in available_tag_summaries
+            if str(getattr(summary, "tag", "") or "") in summary_depth_tags
+        }
+        # Keep v1 envelopes with an empty claim set in this map as well.  They
+        # are not model-presentable layer two, but their digest-bound source
+        # refs are the only safe route to the complete atomic SEGMENTS
+        # fallback (for example, when deterministic claim selection refused an
+        # ambiguous set of same-session state transitions).
+        tag_summary_by_tag = {
+            str(getattr(summary, "tag", "") or ""): summary
+            for summary in available_tag_summaries
+            if (
+                str(getattr(summary, "tag", "") or "") in summary_depth_tags
+                and getattr(
+                    getattr(summary, "structured_summary", None),
+                    "schema_version",
+                    0,
+                ) == STRUCTURED_SUMMARY_SCHEMA_VERSION
+            )
+        }
+
+        def _has_complete_segment_mapping(item: object) -> bool:
+            metadata = getattr(item, "metadata", None)
+            canonical_ids = getattr(metadata, "canonical_turn_ids", None)
+            return bool(
+                getattr(metadata, "source_mapping_complete", False) is True
+                and isinstance(canonical_ids, list)
+                and canonical_ids
+                and all(
+                    type(canonical_id) is str
+                    and canonical_id
+                    and canonical_id == canonical_id.strip()
+                    for canonical_id in canonical_ids
+                )
+                and len(set(canonical_ids)) == len(canonical_ids)
+            )
+
+        usable_retrieved_segments = {
+            tag: [
+                item for item in items
+                if _has_complete_segment_mapping(item)
+            ]
+            for tag, items in summaries_by_tag.items()
+        }
+        hydrated_segment_by_ref: dict[str, object | None] = {}
+
+        def _hydrate_tag_source_segments(
+            tag: str,
+            *,
+            require_authenticated_v1: bool = False,
+        ) -> list[object]:
+            """Resolve one tag's complete digest-bound segment fallback."""
+            tag_summary = actual_tag_summary_by_tag.get(tag)
+            raw_refs = getattr(tag_summary, "source_segment_refs", None)
+            raw_source_ids = getattr(
+                tag_summary, "source_canonical_turn_ids", None,
+            )
+            structured = getattr(tag_summary, "structured_summary", None)
+            raw_claims = getattr(structured, "claims", None)
+            expected_digest = str(
+                getattr(structured, "source_digest", "") or "",
+            ).strip()
+            get_segment = getattr(
+                getattr(self, "_store", None), "get_segment", None,
+            )
+            if (
+                not isinstance(raw_refs, list)
+                or not raw_refs
+                or not all(
+                    type(ref) is str and ref and ref == ref.strip()
+                    for ref in raw_refs
+                )
+                or len(set(raw_refs)) != len(raw_refs)
+                or not isinstance(raw_source_ids, list)
+                or not raw_source_ids
+                or not all(
+                    type(canonical_id) is str
+                    and canonical_id
+                    and canonical_id == canonical_id.strip()
+                    for canonical_id in raw_source_ids
+                )
+                or len(set(raw_source_ids)) != len(raw_source_ids)
+                or not callable(get_segment)
+            ):
+                return []
+            if require_authenticated_v1 and (
+                not isinstance(raw_claims, tuple)
+                or structured_tag_claim_digest(
+                    raw_claims, raw_source_ids,
+                ) != expected_digest
+            ):
+                return []
+            hydrated: list[object] = []
+            covered_source_ids: list[str] = []
+            seen_source_ids: set[str] = set()
+            for ref in raw_refs:
+                if ref not in hydrated_segment_by_ref:
+                    try:
+                        segment = get_segment(
+                            ref,
+                            conversation_id=getattr(
+                                self, "_conversation_id", "",
+                            ),
+                        )
+                    except Exception:
+                        segment = None
+                    if (
+                        segment is None
+                        or str(getattr(segment, "ref", "") or "") != ref
+                        or not _has_complete_segment_mapping(segment)
+                        or tag not in (
+                            list(getattr(segment, "tags", []) or [])
+                            or [str(getattr(segment, "primary_tag", "") or "")]
+                        )
+                    ):
+                        segment = None
+                    hydrated_segment_by_ref[ref] = segment
+                segment = hydrated_segment_by_ref[ref]
+                if segment is None:
+                    return []
+                canonical_ids = list(
+                    getattr(segment.metadata, "canonical_turn_ids", []) or [],
+                )
+                for canonical_id in canonical_ids:
+                    if canonical_id not in seen_source_ids:
+                        seen_source_ids.add(canonical_id)
+                        covered_source_ids.append(canonical_id)
+                hydrated.append(segment)
+            if covered_source_ids != raw_source_ids:
+                return []
+            return hydrated
+
+        def _tag_has_uncovered_retrieved_sources(tag: str) -> bool:
+            """Return whether retrieval found exact segment coverage newer than L2.
+
+            A tag envelope authenticates only its declared segment refs and
+            canonical ids.  A completely mapped segment returned for this
+            request is therefore a freshness signal when either coordinate is
+            outside that declaration; serving the otherwise-valid tag alone
+            would discard a correction that retrieval has already found.
+            """
+            tag_summary = actual_tag_summary_by_tag.get(tag)
+            declared_refs = getattr(tag_summary, "source_segment_refs", None)
+            declared_ids = getattr(
+                tag_summary, "source_canonical_turn_ids", None,
+            )
+            if not isinstance(declared_refs, list):
+                declared_refs = []
+            if not isinstance(declared_ids, list):
+                declared_ids = []
+            ref_set = {
+                ref for ref in declared_refs
+                if type(ref) is str and ref and ref == ref.strip()
+            }
+            id_set = {
+                canonical_id for canonical_id in declared_ids
+                if (
+                    type(canonical_id) is str
+                    and canonical_id
+                    and canonical_id == canonical_id.strip()
+                )
+            }
+            for segment in usable_retrieved_segments.get(tag, []):
+                ref = str(getattr(segment, "ref", "") or "")
+                canonical_ids = list(
+                    getattr(segment.metadata, "canonical_turn_ids", []) or [],
+                )
+                if ref not in ref_set or any(
+                    canonical_id not in id_set
+                    for canonical_id in canonical_ids
+                ):
+                    return True
+            return False
+
+        def _tag_has_unproved_uncovered_retrieval(tag: str) -> bool:
+            """Fail closed when a new retrieved ref cannot prove its mapping."""
+            tag_summary = actual_tag_summary_by_tag.get(tag)
+            raw_declared_refs = getattr(
+                tag_summary, "source_segment_refs", None,
+            )
+            declared_refs = {
+                ref for ref in (
+                    raw_declared_refs
+                    if isinstance(raw_declared_refs, list) else []
+                )
+                if type(ref) is str and ref and ref == ref.strip()
+            }
+            summary_floor = bool(
+                retrieval_result.retrieval_metadata.get("summary_floor")
+            )
+            for segment in summaries_by_tag.get(tag, []):
+                if _has_complete_segment_mapping(segment):
+                    continue
+                ref = str(getattr(segment, "ref", "") or "")
+                # Summary-floor rows are retrieval indexes, not physical
+                # segment candidates.  Their source refs are resolved from the
+                # actual tag row below and must not manufacture staleness.
+                if summary_floor and ref == f"tag-summary-{tag}":
+                    continue
+                if not ref or ref not in declared_refs:
+                    return True
+            return False
+
+        def _complete_tag_segment_union(tag: str) -> list[object]:
+            """Return an atomic exact-source fallback for stale/invalid L2.
+
+            Every digest-declared parent is hydrated first.  Current retrieved
+            segments are then appended in retrieval order.  A ref may repeat
+            only with the identical canonical-id mapping, and canonical lanes
+            may not overlap across distinct refs; either ambiguity quarantines
+            the whole tag instead of presenting a partial state transition.
+            """
+            declared = _hydrate_tag_source_segments(
+                tag, require_authenticated_v1=True,
+            )
+            if not declared:
+                return []
+            union: list[object] = []
+            ids_by_ref: dict[str, tuple[str, ...]] = {}
+            seen_source_ids: set[str] = set()
+            for segment in (
+                declared + list(usable_retrieved_segments.get(tag, []))
+            ):
+                ref = str(getattr(segment, "ref", "") or "")
+                if not ref or ref != ref.strip():
+                    return []
+                canonical_ids = tuple(
+                    getattr(segment.metadata, "canonical_turn_ids", []) or [],
+                )
+                prior_ids = ids_by_ref.get(ref)
+                if prior_ids is not None:
+                    if prior_ids != canonical_ids:
+                        return []
+                    continue
+                if any(
+                    canonical_id in seen_source_ids
+                    for canonical_id in canonical_ids
+                ):
+                    return []
+                ids_by_ref[ref] = canonical_ids
+                seen_source_ids.update(canonical_ids)
+                union.append(segment)
+            return union
+
+        # Decide the actual depth/item set first, then hydrate every required
+        # canonical row in one request-local batch. The same segment may appear
+        # under two tags at different depths, so renderings are keyed by both
+        # object identity and depth rather than overwriting one another.
+        section_specs: dict[str, tuple[str, list[object]]] = {}
+        render_requests: list[tuple[object, str]] = []
+        seen_render_requests: set[tuple[int, str]] = set()
+        for tag in sorted_tags:
+            requested_depth = DepthLevel.SUMMARY
+            if working_set and tag in working_set:
+                requested_depth = working_set[tag].depth
+            if requested_depth == DepthLevel.NONE:
+                logger.info("Tag '%s' SKIP (depth=NONE, hint-only)", tag)
+                continue
+            if (
+                requested_depth == DepthLevel.FULL
+                and full_segments
+                and tag in full_segments
+                and full_segments[tag]
+            ):
+                render_depth = "full"
+                items = list(full_segments[tag])
+            elif (
+                requested_depth == DepthLevel.SEGMENTS
+                and full_segments
+                and tag in full_segments
+                and full_segments[tag]
+            ):
+                render_depth = "segments"
+                items = list(full_segments[tag])
+            else:
+                render_depth = "summary"
+                tag_summary = tag_summary_by_tag.get(tag)
+                retrieved_fallbacks = list(
+                    usable_retrieved_segments.get(tag, []),
+                )
+                if tag_summary is not None:
+                    items = [tag_summary]
+                else:
+                    # Legacy summary-floor rows are synthetic StoredSummary
+                    # wrappers with neither v1 claims nor canonical mapping.
+                    # Resolve the real tag row's segment refs so migration-era
+                    # requests retain exact canonical fallback instead of a
+                    # permanent attribution quarantine.
+                    items = (
+                        retrieved_fallbacks
+                        or _hydrate_tag_source_segments(tag)
+                        or list(summaries_by_tag.get(tag, []))
+                    )
+            if not items:
+                logger.info("Tag '%s' SKIP (no summaries available)", tag)
+                continue
+            section_specs[tag] = (render_depth, items)
+            for item in items:
+                key = (id(item), render_depth)
+                if key not in seen_render_requests:
+                    seen_render_requests.add(key)
+                    render_requests.append((item, render_depth))
+
+        rendered_values = render_summary_items_for_model(
+            render_requests,
+            store=getattr(self, "_store", None),
+            conversation_id=getattr(self, "_conversation_id", ""),
+            speaker_context=roster_context or speaker_context,
+        )
+        rendered_by_depth: dict[str, dict[int, str]] = {}
+        for (item, render_depth), rendered in zip(
+            render_requests, rendered_values, strict=True,
+        ):
+            rendered_by_depth.setdefault(render_depth, {})[id(item)] = rendered
+        late_render_requests: list[tuple[object, str]] = []
+        pending_atomic_tag_fallbacks: dict[str, list[object]] = {}
+        forced_atomic_segment_union_tags: set[str] = set()
+        newest_first_atomic_tags: set[str] = set()
+        for tag, tag_summary in tag_summary_by_tag.items():
+            if tag not in section_specs:
+                continue
+            render_depth, items = section_specs[tag]
+            if not items or items[0] is not tag_summary:
+                continue
+            tag_rendering = rendered_by_depth.get("summary", {}).get(
+                id(items[0]), SUMMARY_ATTRIBUTION_QUARANTINE,
+            )
+            requires_fallback = not tag_rendering.startswith(
+                "<structured-summary>\n",
+            )
+            requires_fresh_union = _tag_has_uncovered_retrieved_sources(tag)
+            if _tag_has_unproved_uncovered_retrieval(tag):
+                forced_atomic_segment_union_tags.add(tag)
+                rendered_by_depth.setdefault(
+                    "summary", {},
+                )[id(tag_summary)] = SUMMARY_ATTRIBUTION_QUARANTINE
+                continue
+            if requires_fallback or requires_fresh_union:
+                if requires_fresh_union:
+                    forced_atomic_segment_union_tags.add(tag)
+                fallback_items = _complete_tag_segment_union(tag)
+                if not fallback_items:
+                    if requires_fresh_union:
+                        rendered_by_depth.setdefault(
+                            "summary", {},
+                        )[id(tag_summary)] = SUMMARY_ATTRIBUTION_QUARANTINE
+                    continue
+                pending_atomic_tag_fallbacks[tag] = fallback_items
+                for fallback_item in fallback_items:
+                    fallback_key = (id(fallback_item), "summary")
+                    if fallback_key not in seen_render_requests:
+                        seen_render_requests.add(fallback_key)
+                        late_render_requests.append(
+                            (fallback_item, "summary"),
+                        )
+        if late_render_requests:
+            late_rendered = render_summary_items_for_model(
+                late_render_requests,
                 store=getattr(self, "_store", None),
                 conversation_id=getattr(self, "_conversation_id", ""),
                 speaker_context=roster_context or speaker_context,
-            ),
-            strict=True,
-        ))
+            )
+            for (item, render_depth), rendered in zip(
+                late_render_requests, late_rendered, strict=True,
+            ):
+                rendered_by_depth.setdefault(
+                    render_depth, {},
+                )[id(item)] = rendered
+        for tag, fallback_items in pending_atomic_tag_fallbacks.items():
+            fallback_renderings = rendered_by_depth.get("summary", {})
+            if all(
+                _admitted_summary_rendering(
+                    fallback_renderings.get(
+                        id(fallback_item), SUMMARY_ATTRIBUTION_QUARANTINE,
+                    ),
+                ) != SUMMARY_ATTRIBUTION_QUARANTINE
+                for fallback_item in fallback_items
+            ):
+                section_specs[tag] = ("summary", fallback_items)
+                newest_first_atomic_tags.add(tag)
+            elif tag in forced_atomic_segment_union_tags:
+                tag_summary = tag_summary_by_tag[tag]
+                rendered_by_depth.setdefault(
+                    "summary", {},
+                )[id(tag_summary)] = SUMMARY_ATTRIBUTION_QUARANTINE
 
-        # Build all tag section candidates
+        # Build all tag section candidates.
         _stage = time.monotonic()
         _built_sections: dict[str, str] = {}
         _section_tokens: dict[str, int] = {}
-        for tag in sorted_tags:
-            depth = DepthLevel.SUMMARY
-            if working_set and tag in working_set:
-                depth = working_set[tag].depth
-            if depth == DepthLevel.NONE:
-                logger.info("Tag '%s' SKIP (depth=NONE, hint-only)", tag)
-                continue
-            if depth == DepthLevel.FULL and full_segments and tag in full_segments:
+        for tag, (render_depth, items) in section_specs.items():
+            if render_depth == "full":
                 section = self._format_full_section(
                     tag,
-                    full_segments[tag],
-                    speaker_context=speaker_context,
-                    rendered_summary_by_object=rendered_summary_by_object,
+                    items,
+                    speaker_context=roster_context or speaker_context,
+                    rendered_summary_by_object=rendered_by_depth.get("full"),
                 )
-            elif depth == DepthLevel.SEGMENTS and full_segments and tag in full_segments:
+            elif render_depth == "segments":
                 section = self._format_segments_section(
                     tag,
-                    full_segments[tag],
-                    speaker_context=speaker_context,
-                    rendered_summary_by_object=rendered_summary_by_object,
+                    items,
+                    speaker_context=roster_context or speaker_context,
+                    rendered_summary_by_object=rendered_by_depth.get("segments"),
                 )
             else:
-                sums = summaries_by_tag.get(tag, [])
-                if not sums:
-                    logger.info("Tag '%s' SKIP (no summaries available)", tag)
-                    continue
                 section = self._format_tag_section(
                     tag,
-                    sums,
-                    speaker_context=speaker_context,
-                    rendered_summary_by_object=rendered_summary_by_object,
+                    items,
+                    speaker_context=roster_context or speaker_context,
+                    rendered_summary_by_object=rendered_by_depth.get("summary"),
+                    newest_first=tag in newest_first_atomic_tags,
                 )
             _built_sections[tag] = section
             _section_tokens[tag] = self.token_counter(section)
@@ -1325,10 +1783,11 @@ class ContextAssembler:
     def _format_tag_section(
         self,
         tag: str,
-        summaries: list[StoredSummary],
+        summaries: list[object],
         *,
         speaker_context: SpeakerRetrievalContext | None = None,
         rendered_summary_by_object: dict[int, str] | None = None,
+        newest_first: bool = False,
     ) -> str:
         return format_tag_section(
             tag,
@@ -1337,6 +1796,8 @@ class ContextAssembler:
             conversation_id=getattr(self, "_conversation_id", ""),
             speaker_context=speaker_context,
             rendered_summary_by_object=rendered_summary_by_object,
+            depth="summary",
+            newest_first=newest_first,
         )
 
     def _format_segments_section(
@@ -1358,11 +1819,14 @@ class ContextAssembler:
                 store=getattr(self, "_store", None),
                 conversation_id=getattr(self, "_conversation_id", ""),
                 speaker_context=speaker_context,
+                depth="segments",
             )
         else:
             rendered_summaries = [
                 _admitted_summary_rendering(
-                    rendered_summary_by_object[id(segment)],
+                    rendered_summary_by_object.get(
+                        id(segment), SUMMARY_ATTRIBUTION_QUARANTINE,
+                    ),
                 )
                 for segment in segments
             ]
@@ -1404,11 +1868,14 @@ class ContextAssembler:
                 store=getattr(self, "_store", None),
                 conversation_id=getattr(self, "_conversation_id", ""),
                 speaker_context=speaker_context,
+                depth="full",
             )
         else:
             rendered_summaries = [
                 _admitted_summary_rendering(
-                    rendered_summary_by_object[id(segment)],
+                    rendered_summary_by_object.get(
+                        id(segment), SUMMARY_ATTRIBUTION_QUARANTINE,
+                    ),
                 )
                 for segment in segments
             ]
@@ -1420,9 +1887,8 @@ class ContextAssembler:
             all_tags = sorted(seg.tags) if seg.tags else [tag]
             tags_attr = ", ".join(all_tags)
             # Stored ``full_text`` is another derived blob; proving the source
-            # ids does not prove those bytes came from them. Full depth uses
-            # the same exact canonical-row projection as summary depth and
-            # never reintroduces generated or legacy segment prose.
+            # ids does not prove those bytes came from it. Full depth rebuilds
+            # the complete role-separated transcript from exact canonical rows.
             text = rendered_summary
             session_attr = f' session="{seg.metadata.session_date}"' if seg.metadata.session_date else ""
             parts.append(

@@ -1395,11 +1395,11 @@ def test_remember_when_state_at_time_prioritizes_coherent_state_anchor():
     resolver = TemporalResolver(store=store, search_engine=search, config=_make_config())
 
     anchor_summary = (
-        "User is managing a Jira sprint with 17 tasks targeting 88% completion "
+        "BigTex is managing a Jira sprint with 17 tasks targeting 88% completion "
         "while prioritizing caching, testing, deployment, and monitoring work."
     )
     noise_summary = (
-        "User logged performance data for a resizing project and planned more "
+        "BigTex logged performance data for a resizing project and planned more "
         "logging improvements with 20% completion."
     )
 
@@ -1619,7 +1619,7 @@ def test_remember_when_state_at_time_surfaces_anchor_aligned_supporting_facts():
     search = FakeSearch()
     resolver = TemporalResolver(store=store, search_engine=search, config=_make_config())
 
-    anchor_summary = "User is managing a Jira sprint with 17 tasks targeting 88% completion."
+    anchor_summary = "BigTex is managing a Jira sprint with 17 tasks targeting 88% completion."
     store.segment_hits["jira"] = [
         _make_quote("seg-anchor", "segmentation-optimization", "November-01-2024", anchor_summary),
     ]
@@ -1663,11 +1663,11 @@ def test_remember_when_state_at_time_separates_conflicting_value_bundles():
     resolver = TemporalResolver(store=store, search_engine=search, config=_make_config())
 
     anchor_summary = (
-        "User is managing a Jira sprint with 17 tasks targeting 88% completion "
+        "BigTex is managing a Jira sprint with 17 tasks targeting 88% completion "
         "while prioritizing caching, testing, deployment, and monitoring work."
     )
     conflict_summary = (
-        "User created 14 dynamic resizing tasks in Jira and targeted 85% sprint completion."
+        "BigTex created 14 dynamic resizing tasks in Jira and targeted 85% sprint completion."
     )
     store.segment_hits["jira"] = [
         _make_quote("seg-anchor", "segmentation-optimization", "November-01-2024", anchor_summary),
