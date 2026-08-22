@@ -9,6 +9,7 @@ import os
 import re
 import sqlite3
 import threading
+from collections.abc import Collection
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -4389,13 +4390,30 @@ CREATE TABLE IF NOT EXISTS request_captures (
         *,
         conversation_id: str | None = None,
         limit: int | None = None,
+        segment_refs: Collection[str] | None = None,
     ) -> list[StoredSegment]:
+        """Return full stored segments, newest first.
+
+        *segment_refs* restricts the result to exactly those refs. ``None``
+        means no filter; an EMPTY collection returns NOTHING rather than
+        everything, because the caller that computes a target set and finds it
+        empty must get an empty run, not an unbounded one.
+        """
+        if segment_refs is not None and not segment_refs:
+            return []
         conn = self._get_conn()
         query = "SELECT * FROM segments"
         params: list[object] = []
+        conditions: list[str] = []
         if conversation_id is not None:
-            query += " WHERE conversation_id = ?"
+            conditions.append("conversation_id = ?")
             params.append(conversation_id)
+        if segment_refs is not None:
+            refs_list = list(segment_refs)
+            conditions.append(f"ref IN ({','.join('?' for _ in refs_list)})")
+            params.extend(refs_list)
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
         query += " ORDER BY created_at DESC"
         if limit is not None and limit > 0:
             query += " LIMIT ?"

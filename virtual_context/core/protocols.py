@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from collections.abc import Collection
 from typing import Protocol, runtime_checkable
 
 from ..types import (
@@ -53,6 +54,7 @@ class SegmentStore(Protocol):
         *,
         conversation_id: str | None = None,
         limit: int | None = None,
+        segment_refs: Collection[str] | None = None,
     ) -> list[StoredSegment]: ...
     def get_tag_aliases(self, conversation_id: str | None = None) -> dict[str, str]: ...
     def set_tag_alias(

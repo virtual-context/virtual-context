@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from collections.abc import Collection
 from typing import TYPE_CHECKING
 
 from .protocols import FactLinkStore, FactStore, SearchStore, SegmentStore, StateStore
@@ -156,10 +157,12 @@ class CompositeStore:
         *,
         conversation_id: str | None = None,
         limit: int | None = None,
+        segment_refs: Collection[str] | None = None,
     ) -> list[StoredSegment]:
         return self._segments.get_all_segments(
             conversation_id=conversation_id,
             limit=limit,
+            segment_refs=segment_refs,
         )
 
     def get_tag_aliases(self, conversation_id: str | None = None) -> dict[str, str]:

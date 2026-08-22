@@ -8,7 +8,7 @@ import hashlib
 import os
 import re
 from datetime import date, datetime, timedelta, timezone
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from pathlib import Path
 
 from .config import load_config
@@ -3888,8 +3888,25 @@ class VirtualContextEngine:
         *,
         dry_run: bool = False,
         limit: int | None = None,
+        segment_refs: Collection[str] | None = None,
     ) -> dict:
-        """Re-distill eligible segments using canonical-row actor rosters."""
+        """Re-distill eligible segments using canonical-row actor rosters.
+
+        *segment_refs* narrows the run to exactly those segments. ``None``
+        means every segment in the conversation; an EMPTY collection means
+        none, so a caller whose computed target set came back empty gets an
+        empty run rather than a full one.
+
+        Segments are keyed by ref rather than by tag because a ref is stable
+        and a segment's primary tag is not -- the same ref has been observed
+        carrying different primary tags minutes apart, so a tag-keyed target
+        set does not describe a fixed population.
+
+        A ref that stops being eligible between the set being computed and
+        this method reaching it is skipped as ``skipped_existing`` at no model
+        cost, so a target set that goes slightly stale mid-run is cheap rather
+        than wrong.
+        """
         if not conversation_id:
             raise ValueError(
                 "backfill_fact_authors requires a non-empty conversation_id"
@@ -3916,7 +3933,13 @@ class VirtualContextEngine:
         segments = self._store.get_all_segments(
             conversation_id=conversation_id,
             limit=limit,
+            segment_refs=segment_refs,
         )
+        report["targeted"] = segment_refs is not None
+        report["targets_requested"] = (
+            len(set(segment_refs)) if segment_refs is not None else None
+        )
+        report["targets_found"] = len(segments) if segment_refs is not None else None
         from .types import AUTHOR_VERSION_REPLY_LANE
 
         def _author_settled(fact) -> bool:

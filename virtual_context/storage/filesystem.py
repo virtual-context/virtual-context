@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Collection
+
 import json
 import os
 import threading
@@ -503,8 +505,21 @@ class FilesystemStore(ContextStore):
         *,
         conversation_id: str | None = None,
         limit: int | None = None,
+        segment_refs: Collection[str] | None = None,
     ) -> list[StoredSegment]:
+        """Return full stored segments, newest first.
+
+        *segment_refs* restricts the result to exactly those refs. ``None``
+        means no filter; an EMPTY collection returns NOTHING rather than
+        everything, because the caller that computes a target set and finds it
+        empty must get an empty run, not an unbounded one.
+        """
+        if segment_refs is not None and not segment_refs:
+            return []
         entries = list(self._index.values())
+        if segment_refs is not None:
+            wanted = set(segment_refs)
+            entries = [e for e in entries if e.get("ref") in wanted]
         if conversation_id is not None:
             entries = [
                 entry for entry in entries

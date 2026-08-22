@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Collection
+
 from abc import ABC, abstractmethod
 from contextlib import nullcontext
 from datetime import datetime, timedelta
@@ -235,8 +237,15 @@ class ContextStore(ABC):
         *,
         conversation_id: str | None = None,
         limit: int | None = None,
+        segment_refs: Collection[str] | None = None,
     ) -> list[StoredSegment]:
-        """Return full stored segments, newest first when supported."""
+        """Return full stored segments, newest first when supported.
+
+        *segment_refs* restricts the result to exactly those refs. ``None``
+        means no filter; an EMPTY collection returns NOTHING rather than
+        everything, because the caller that computes a target set and finds it
+        empty must get an empty run, not an unbounded one.
+        """
         return []
 
     @abstractmethod

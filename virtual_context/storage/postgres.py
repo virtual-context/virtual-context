@@ -11,6 +11,7 @@ import re
 import signal
 import threading
 import time
+from collections.abc import Collection
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
@@ -3746,25 +3747,32 @@ class PostgresStore(ContextStore):
         *,
         conversation_id: str | None = None,
         limit: int | None = None,
+        segment_refs: Collection[str] | None = None,
     ) -> list[StoredSegment]:
+        """Return full stored segments, newest first.
+
+        *segment_refs* restricts the result to exactly those refs. ``None``
+        means no filter; an EMPTY collection returns NOTHING rather than
+        everything, because the caller that computes a target set and finds it
+        empty must get an empty run, not an unbounded one.
+        """
+        if segment_refs is not None and not segment_refs:
+            return []
+        conditions: list[str] = []
+        params: list[object] = []
+        if conversation_id is not None:
+            conditions.append("conversation_id = %s")
+            params.append(conversation_id)
+        if segment_refs is not None:
+            conditions.append("ref = ANY(%s)")
+            params.append(list(segment_refs))
+        where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+        sql = f"SELECT * FROM segments{where} ORDER BY created_at DESC"
+        if limit is not None and limit > 0:
+            sql += " LIMIT %s"
+            params.append(limit)
         with self.pool.connection() as conn:
-            if conversation_id is not None and limit is not None and limit > 0:
-                rows = conn.execute(
-                    "SELECT * FROM segments WHERE conversation_id = %s ORDER BY created_at DESC LIMIT %s",
-                    (conversation_id, limit),
-                ).fetchall()
-            elif conversation_id is not None:
-                rows = conn.execute(
-                    "SELECT * FROM segments WHERE conversation_id = %s ORDER BY created_at DESC",
-                    (conversation_id,),
-                ).fetchall()
-            elif limit is not None and limit > 0:
-                rows = conn.execute(
-                    "SELECT * FROM segments ORDER BY created_at DESC LIMIT %s",
-                    (limit,),
-                ).fetchall()
-            else:
-                rows = conn.execute("SELECT * FROM segments ORDER BY created_at DESC").fetchall()
+            rows = conn.execute(sql, params).fetchall()
             if not rows:
                 return []
             refs = [row["ref"] for row in rows]
