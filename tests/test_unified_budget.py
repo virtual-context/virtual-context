@@ -137,7 +137,10 @@ class TestUnifiedPoolAllocation:
             token_budget=100_000,
         )
         assert result.budget_breakdown["tags"] < 50
-        assert result.budget_breakdown["facts"] > 100
+        # Generated fact prose is withheld at the model boundary (it is not
+        # evidence), so the facts block consumes none of the pool no matter
+        # how many facts retrieval produced.
+        assert result.budget_breakdown["facts"] == 0
         assert result.budget_breakdown["tags"] + result.budget_breakdown["facts"] <= 1000
 
     def test_broad_query_both_categories_fill(self):

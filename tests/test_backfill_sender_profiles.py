@@ -18,7 +18,7 @@ from pathlib import Path
 from virtual_context.types import Message
 
 
-CONV = "sk:agent:t:discord:guild:1"
+CONV = "sk:agent:t:discord:direct:1"
 
 
 def _make_engine(tmp_path: Path, conversation_id: str = CONV):

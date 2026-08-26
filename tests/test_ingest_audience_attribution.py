@@ -131,7 +131,7 @@ def test_completed_turn_persist_returns_only_the_accepted_user_actor(tmp_path):
                 sender_actor_id=actor_id,
                 origin_channel_id="vasttest2",
                 source_conversation_key=(
-                    "sk:agent:vast:discord:guild:1524917037191925871"
+                    "sk:agent:vast:discord:direct:1524917037191925871"
                 ),
             ),
         )

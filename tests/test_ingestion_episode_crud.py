@@ -23,12 +23,12 @@ def _seed_canonical(s: SQLiteStore, *, conv_id: str = "c", count: int = 0, tagge
                     normalized_user_text, normalized_assistant_text,
                     user_content, assistant_content,
                     sort_key, source_batch_id, first_seen_at, last_seen_at,
-                    covered_ingestible_entries, tagged_at,
+                    covered_ingestible_entries, tagged_at, turn_group_number,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, 1, 'u','a','u_raw','a_raw', ?, 'b', ?, ?, 1, ?, ?, ?)
+                ) VALUES (?, ?, ?, 1, 'u','a','u_raw','a_raw', ?, 'b', ?, ?, 1, ?, ?, ?, ?)
             """, (
                 f"t{i}", conv_id, f"h{i}", float((i + 1) * 1000),
-                now, now, now if i < tagged else None, now, now,
+                now, now, now if i < tagged else None, i, now, now,
             ))
 
 

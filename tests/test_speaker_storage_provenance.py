@@ -45,8 +45,8 @@ def _row(
     reply_subject_actor_id: str = "",
     reply_subject_label: str = "",
     reply_target_body: str = "",
-    audience_conversation_id: str = "",
-    audience_attribution_version: int = 0,
+    audience_conversation_id: str = "c",
+    audience_attribution_version: int = 1,
     origin_channel_id: str = "",
     origin_channel_label: str = "",
     conv: str = "c",
@@ -70,11 +70,12 @@ def _row(
     )
 
 
-def _ctx() -> SpeakerRetrievalContext:
+def _ctx(channel: str = "") -> SpeakerRetrievalContext:
     return SpeakerRetrievalContext(
         tenant_id="t",
         owner_conversation_id="c",
         audience_conversation_id="c",
+        audience_channel_id=channel,
     )
 
 
@@ -142,11 +143,11 @@ class TestRequesterLaneProjection:
         _row(store, ct_id="ct-1", sort_key=1000.0,
              user_content="my toes are tingling", sender="BigTex",
              sender_actor_id="actor:tg:111",
-             audience_conversation_id="aud-1",
-             audience_attribution_version=2,
+             audience_conversation_id="c",
+             audience_attribution_version=1,
              origin_channel_id="chan-9")
         results = store.search_canonical_turn_text(
-            "tingling", conversation_id="c", speaker_context=_ctx(),
+            "tingling", conversation_id="c", speaker_context=_ctx("chan-9"),
         )
         assert len(results) == 1
         qr = results[0]
@@ -156,8 +157,8 @@ class TestRequesterLaneProjection:
         assert prov.canonical_turn_id == "ct-1"
         assert prov.source_role == "requester"
         assert prov.actor_id == "actor:tg:111"
-        assert prov.audience_conversation_id == "aud-1"
-        assert prov.audience_attribution_version == 2
+        assert prov.audience_conversation_id == "c"
+        assert prov.audience_attribution_version == 1
         assert prov.origin_channel_id == "chan-9"
         assert prov.claimed_subject_label == ""
         assert qr.matched_side == "user"
@@ -252,8 +253,8 @@ class TestSubjectLane:
              reply_subject_actor_id="actor:subj",
              reply_subject_label="Sania",
              reply_target_body="the trip to boston was amazing",
-             audience_conversation_id="aud-1",
-             audience_attribution_version=2)
+             audience_conversation_id="c",
+             audience_attribution_version=1)
         results = store.search_canonical_turn_text(
             "boston", conversation_id="c", speaker_context=_ctx(),
         )
@@ -264,8 +265,8 @@ class TestSubjectLane:
         assert prov.actor_id == "actor:subj"
         assert prov.claimed_subject_label == "Sania"
         assert prov.canonical_turn_id == "ct-1"
-        assert prov.audience_conversation_id == "aud-1"
-        assert prov.audience_attribution_version == 2
+        assert prov.audience_conversation_id == "c"
+        assert prov.audience_attribution_version == 1
         # Lane-local excerpt: reply text only — no requester text, no
         # sender label, and no asserted claim label in the model haystack.
         assert "trip to boston" in qr.text
@@ -364,7 +365,7 @@ class TestChannelScopedSpeakerPath:
              origin_channel_id="chan-a", origin_channel_label="#general")
         results = store.search_canonical_turn_text(
             "vasttest", conversation_id="c", channel="chan-a",
-            speaker_context=_ctx(),
+            speaker_context=_ctx("chan-a"),
         )
         assert len(results) == 2
         for qr in results:

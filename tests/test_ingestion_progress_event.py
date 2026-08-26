@@ -13,10 +13,10 @@ def _seed_row(inner, conv_id, canonical_id, sort_key, tagged=False):
                 normalized_user_text, normalized_assistant_text,
                 user_content, assistant_content,
                 sort_key, source_batch_id, first_seen_at, last_seen_at,
-                covered_ingestible_entries, tagged_at,
+                covered_ingestible_entries, tagged_at, turn_group_number,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, 1, 'u','a','u_raw','a_raw', ?, 'b', ?, ?, 1, ?, ?, ?)
-        """, (canonical_id, conv_id, f"h_{canonical_id}", sort_key, now, now, now if tagged else None, now, now))
+            ) VALUES (?, ?, ?, 1, 'u','a','u_raw','a_raw', ?, 'b', ?, ?, 1, ?, ?, ?, ?)
+        """, (canonical_id, conv_id, f"h_{canonical_id}", sort_key, now, now, now if tagged else None, int(sort_key // 1000) - 1, now, now))
 
 
 def test_tagger_publishes_ingestion_progress_per_row(tmp_path):

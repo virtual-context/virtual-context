@@ -20,8 +20,12 @@ import pytest
 from virtual_context.core.canonical_turns import utcnow_iso
 
 
-def _seed_canonical_row(inner, conv_id, canonical_id, sort_key, tagged=False):
+def _seed_canonical_row(inner, conv_id, canonical_id, sort_key, tagged=False, group=None):
     now = utcnow_iso()
+    # The tagger drains complete untagged GROUPS; an unassigned group
+    # number (< 0) is invisible to it, so each combined row is its own
+    # complete group keyed on its sort position.
+    group_number = group if group is not None else max(int(sort_key // 1000) - 1, 0)
     with inner._get_conn() as conn:
         conn.execute("""
             INSERT INTO canonical_turns (
@@ -29,10 +33,10 @@ def _seed_canonical_row(inner, conv_id, canonical_id, sort_key, tagged=False):
                 normalized_user_text, normalized_assistant_text,
                 user_content, assistant_content,
                 sort_key, source_batch_id, first_seen_at, last_seen_at,
-                covered_ingestible_entries, tagged_at,
+                covered_ingestible_entries, tagged_at, turn_group_number,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, 1, 'u','a','u_raw','a_raw', ?, 'b', ?, ?, 1, ?, ?, ?)
-        """, (canonical_id, conv_id, f"h_{canonical_id}", sort_key, now, now, now if tagged else None, now, now))
+            ) VALUES (?, ?, ?, 1, 'u','a','u_raw','a_raw', ?, 'b', ?, ?, 1, ?, ?, ?, ?)
+        """, (canonical_id, conv_id, f"h_{canonical_id}", sort_key, now, now, now if tagged else None, group_number, now, now))
 
 
 def test_tagger_tags_untagged_rows_until_empty(tmp_path: Path):
@@ -187,10 +191,11 @@ def test_tagger_writes_real_tags_from_generator(tmp_path: Path):
     from tests.test_handle_prepare_payload import _inner_store
     inner = _inner_store(state.engine)
 
-    # Seed a single untagged canonical row with content the keyword
-    # generator recognizes as ``legal``. Use the raw INSERT helper so the
-    # row starts with primary_tag='_general' and tags_json='[]', i.e. the
-    # exact shape ``IngestReconciler._prepare_message_row`` produces.
+    # Seed a complete untagged group with content the keyword generator
+    # recognizes as ``legal``: role-split user and assistant rows sharing
+    # one group number, the shape ``IngestReconciler._prepare_message_row``
+    # produces. The group tagger drains complete groups only; a lone
+    # half or an unassigned group number is invisible to it.
     now = utcnow_iso()
     with inner._get_conn() as conn:
         conn.execute("""
@@ -199,13 +204,28 @@ def test_tagger_writes_real_tags_from_generator(tmp_path: Path):
                 normalized_user_text, normalized_assistant_text,
                 user_content, assistant_content,
                 sort_key, source_batch_id, first_seen_at, last_seen_at,
-                covered_ingestible_entries, tagged_at,
+                covered_ingestible_entries, tagged_at, turn_group_number,
                 created_at, updated_at
             ) VALUES (
                 't0', ?, 'h_t0', 1,
                 'please file the motion in court', '',
                 'please file the motion in court', '',
-                1000.0, 'b', ?, ?, 1, NULL, ?, ?
+                1000.0, 'b', ?, ?, 1, NULL, 0, ?, ?
+            )
+        """, (conv_id, now, now, now, now))
+        conn.execute("""
+            INSERT INTO canonical_turns (
+                canonical_turn_id, conversation_id, turn_hash, hash_version,
+                normalized_user_text, normalized_assistant_text,
+                user_content, assistant_content,
+                sort_key, source_batch_id, first_seen_at, last_seen_at,
+                covered_ingestible_entries, tagged_at, turn_group_number,
+                created_at, updated_at
+            ) VALUES (
+                't0-a', ?, 'h_t0_a', 1,
+                '', 'the motion is filed',
+                '', 'the motion is filed',
+                2000.0, 'b', ?, ?, 1, NULL, 0, ?, ?
             )
         """, (conv_id, now, now, now, now))
 
@@ -251,17 +271,20 @@ def test_tagger_races_untagged_row_insertion_between_empty_check_and_complete(tm
         worker_id=state._worker_id, lease_ttl_s=30.0,
     )
     inner.set_phase(conversation_id=conv_id, lifecycle_epoch=1, phase="ingesting")
-    # Monkeypatch iter_untagged to inject a row on the first empty-batch check.
-    orig = state.engine._store.iter_untagged_canonical_rows
+    # Monkeypatch the group fetch to inject a row on the first
+    # empty-batch check — the tagger drains complete untagged groups.
+    orig = state.engine._store.iter_complete_untagged_canonical_groups
     call_count = {"n": 0}
     def spy(**kw):
         call_count["n"] += 1
         result = orig(**kw)
         if call_count["n"] == 1 and not result:
             # First empty batch: inject a row BEFORE returning empty.
-            _seed_canonical_row(inner, conv_id, "t_late", 500.0)
+            _seed_canonical_row(inner, conv_id, "t_late", 500.0, group=0)
         return result
-    monkeypatch.setattr(state.engine._store, "iter_untagged_canonical_rows", spy)
+    monkeypatch.setattr(
+        state.engine._store, "iter_complete_untagged_canonical_groups", spy,
+    )
 
     state._tagger_run()
     # The late-inserted row should now be tagged.

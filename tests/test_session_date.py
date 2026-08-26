@@ -391,8 +391,11 @@ class TestAssemblerSessionDate:
             ),
         ]
         result = assembler._format_tag_section("shoes", summaries)
-        assert "Some shoe info" in result
-        assert "[" not in result.split("Some shoe info")[0].split("\n")[-1]
+        # A bare stored summary is unproved and its BODY is withheld at the
+        # model boundary; the subject here is the session prefix, which must
+        # not render when session_date is empty.
+        assert result
+        assert "[2023/" not in result
 
     def test_summary_section_sorted_chronologically(self):
         """_format_tag_section sorts summaries old→new by start_timestamp."""
@@ -419,7 +422,9 @@ class TestAssemblerSessionDate:
             ),
         ]
         result = assembler._format_tag_section("shoes", summaries)
-        assert result.index("Earlier event") < result.index("Later event")
+        # Unproved bodies are withheld at the model boundary; the session
+        # prefixes carry the chronology and must appear old -> new.
+        assert result.index("[2023/05/25") < result.index("[2023/05/29")
 
 
 # ---------------------------------------------------------------------------

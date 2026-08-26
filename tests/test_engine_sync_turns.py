@@ -681,7 +681,7 @@ def test_sync_uses_conversation_reconcile_lock(engine, monkeypatch):
     calls: list[tuple[str, str]] = []
 
     @contextmanager
-    def _lock(conversation_id: str):
+    def _lock(conversation_id: str, expected_conversation_generation=None, expected_generation=None):
         calls.append(("enter", conversation_id))
         try:
             yield

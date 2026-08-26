@@ -68,6 +68,9 @@ def _make_state(*, conversation_id: str = "conv-legacy-ingest") -> tuple[ProxySt
     # no-ops (nothing to drain), then proceeds to complete the episode
     # via the already-mocked ``complete_ingestion_episode``.
     engine._store.iter_untagged_canonical_rows.return_value = []
+    # The tagger loop drains complete untagged GROUPS; same truthy-Mock
+    # infinite-loop hazard as the row sweep above.
+    engine._store.iter_complete_untagged_canonical_groups.return_value = []
     engine.config.conversation_id = conversation_id
     engine.config.context_window = 120_000
     engine.config.monitor.context_window = 120_000
@@ -1053,6 +1056,25 @@ def test_resume_pending_ingestion_spawns_heartbeat_sidecar() -> None:
     state.engine._restored_pending_turns = [
         (0, "Q1", "A1", None, None),
         (1, "Q2", "A2", None, None),
+    ]
+
+    # The durable walk derives the resume window from canonical rows:
+    # group 0 tagged, groups 1-2 complete and untagged.
+    def _durable_row(turn, user, assistant, tagged_at=None):
+        return SimpleNamespace(
+            turn_group_number=turn,
+            user_content=user,
+            assistant_content=assistant,
+            user_raw_content=None,
+            assistant_raw_content=None,
+            tagged_at=tagged_at,
+            sort_key=float(turn) * 1000.0,
+        )
+
+    state.engine._store.get_all_canonical_turns.return_value = [
+        _durable_row(0, "Q0", "A0", tagged_at="2026-01-01T00:00:00Z"),
+        _durable_row(1, "Q1", "A1"),
+        _durable_row(2, "Q2", "A2"),
     ]
 
     # Stub the heavy worker loop so the test ends quickly; the test only

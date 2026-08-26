@@ -923,14 +923,19 @@ class TestIngestSingleTailFastSkipUpgrade:
             raw_turn_count=1,
             expected_lifecycle_epoch=1,
         )
-        rec.ingest_single(
-            conversation_id="c",
-            user_content="u1",
-            assistant_content="a1",
-            user_origin_channel_id="7",
-            user_origin_channel_label="#late",
-            expected_lifecycle_epoch=999,
-        )
+        from virtual_context.core.lifecycle_epoch import LifecycleEpochMismatch
+
+        # A stale caller epoch now fails closed at entry rather than being
+        # silently declined; either way no stale provenance may land.
+        with pytest.raises(LifecycleEpochMismatch):
+            rec.ingest_single(
+                conversation_id="c",
+                user_content="u1",
+                assistant_content="a1",
+                user_origin_channel_id="7",
+                user_origin_channel_label="#late",
+                expected_lifecycle_epoch=999,
+            )
         rows = _rows(store)
         assert (rows[0].origin_channel_id, rows[0].origin_channel_label) == ("", "")
 

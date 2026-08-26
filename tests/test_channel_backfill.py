@@ -600,6 +600,7 @@ class TestCliWiring:
 
         payload = _run_cli(monkeypatch, capsys, [
             "admin", "backfill-channels", "c1", "--dry-run",
+            "--tenant-id", "t1",
             "--storage-backend", "sqlite", "--sqlite-path", db,
         ])
         assert payload["dry_run"] is True

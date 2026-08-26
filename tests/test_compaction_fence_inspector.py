@@ -63,6 +63,11 @@ PHASE_WRITER_ALLOWLIST = frozenset({
     "drain_compaction_exit",
     "set_phase",
     "set_phase_and_drain_pending_raw",
+    # The atomic complete-group ingestion claim performs the phase
+    # transition, episode upsert and lease decision in ONE transaction
+    # (closing the user-half lease pin and the check-then-open race);
+    # its phase write is epoch-filtered like set_phase.
+    "claim_ingestion_for_complete_group",
     # Admin / VCMERGE / lifecycle helpers operate outside the
     # compaction fence on phases other than 'compacting'. They each
     # carry their own conversation_lifecycle lock or are explicitly
@@ -117,6 +122,9 @@ ACTIVE_OP_INSERT_ALLOWLIST = frozenset({
     # ``INSERT INTO compaction_operation`` which catches the legacy
     # rebuild path too.
     "_ensure_schema",
+    # The locked variant of the same bootstrap: identical rebuild
+    # inserts, executed under the schema lock.
+    "_ensure_schema_locked",
 })
 
 

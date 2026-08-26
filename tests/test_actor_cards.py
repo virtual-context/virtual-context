@@ -1058,11 +1058,38 @@ def test_turn_only_card_lifecycle_adds_refines_revokes_and_ignores_probe(store):
                 })
             return json.dumps(_curation(entries)), {}
 
+    class Admission:
+        """Model the judge's replace decision: a carried-over cross-context
+        entry contradicted by a fresh one is refused, everything else is
+        durable. Curator omission alone no longer revokes cross-context
+        entries; the admission judge is the deciding surface."""
+
+        def complete(self, **kwargs):
+            prompt = json.loads(kwargs["user"])
+            fresh_bodies = [
+                c["body"] for c in prompt["candidates"]
+                if c["origin"] == "fresh"
+            ]
+            prose = any("brief prose" in b for b in fresh_bodies)
+            decisions = []
+            for c in prompt["candidates"]:
+                replaced = (
+                    c["origin"] == "existing"
+                    and prose
+                    and "bullet summaries" in c["body"]
+                )
+                decisions.append({
+                    "candidate_id": c["candidate_id"],
+                    "admit": not replaced,
+                    "reason": "stopped_or_replaced" if replaced else "durable",
+                })
+            return json.dumps(_admission(decisions)), {}
+
     curator = Curator()
     pipeline = _card_pipeline(
         store,
         curator,
-        admission=_AdmitAll(),
+        admission=Admission(),
     )
 
     assert pipeline._rebuild_actor_card(OPTICS) == 1
@@ -1522,7 +1549,7 @@ def test_compaction_card_builder_rejects_same_audience_turn_omitted_from_prompt(
         Curator(),
         admission=_AdmitAll(),
     )
-    pipeline._actor_card_prompt_turns = lambda _turns: []
+    pipeline._actor_card_prompt_turns = lambda _turns, **_kw: []
     with pytest.raises(
         RuntimeError,
         match="rejected every model entry",

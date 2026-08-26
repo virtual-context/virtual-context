@@ -37,7 +37,7 @@ from virtual_context.proxy.server import _roles_for_active_user
 from virtual_context.storage.sqlite import SQLiteStore
 from virtual_context.types import CanonicalTurnRow, Message, SearchConfig
 
-GUILD_KEY = "sk:agent:bast:discord:channel:15249"
+GUILD_KEY = "sk:agent:bast:discord:direct:15249"
 OPTICS = "1111111111111111111"
 BIGTEX = "2222222222222222222"
 OPTICS_ACTOR = f"actor:discord:{OPTICS}"

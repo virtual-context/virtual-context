@@ -31,7 +31,7 @@ def _metadata() -> dict:
         origin_channel_id="152491",
         origin_channel_label="#vasttest",
         reply_target_message_id="1527739528876654792",
-        source_conversation_key="agent:vast:discord:guild:1524917037191925871",
+        source_conversation_key="agent:vast:discord:direct:1524917037191925871",
     )
 
 

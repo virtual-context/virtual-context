@@ -14,7 +14,9 @@ from virtual_context.storage.postgres import PostgresStore
 
 class _Result:
     def fetchone(self):
-        return ("conv",)
+        # The pool is configured with dict_row; the reconcile body reads
+        # named columns from the lifecycle row.
+        return {"conversation_id": "conv", "generation": 0, "deleted": False}
 
 
 class _Connection:

@@ -340,6 +340,14 @@ def test_vcattach_does_not_delete_old_conversation_in_cloud_mode():
     state = SimpleNamespace(engine=SimpleNamespace(_store=SimpleNamespace(_store=inner)))
     registry = MagicMock()
     tenant_registry = MagicMock()
+    # The post-alias marker repair needs a coherent lifecycle view; a bare
+    # MagicMock fails its int/bool validation and turns the attach into a
+    # retryable incomplete-repair response.
+    inner.get_conversation_generation.return_value = 0
+    inner.is_conversation_deleted.return_value = False
+    tenant_registry._session_state_provider.load_authoritative_snapshot.return_value = (
+        None, None,
+    )
     result = SimpleNamespace(
         vcattach_label="d4f83259-4ffc-fa3f-5914-a266d0a4577c",
         conversation_id="56315149-9812-9cf5-21a7-ade5a2279ad8",
@@ -636,8 +644,15 @@ def _build_rest_registry(tenant_id="tenant-1", labels=None, conv_ids=None,
     provider = MagicMock()
     if tombstone is None:
         provider.load.return_value = None
+        # The post-alias marker repair loads the authoritative snapshot as
+        # a (raw, state) pair; no snapshot means nothing to guard.
+        provider.load_authoritative_snapshot.return_value = (None, None)
     else:
         provider.load.return_value = SimpleNamespace(deleted=tombstone)
+        provider.load_authoritative_snapshot.return_value = (
+            None,
+            SimpleNamespace(deleted=tombstone, conversation_generation=0),
+        )
     return SimpleNamespace(
         _session_state_provider=provider,
         _states={tenant_id: dict(in_memory_states or {})},

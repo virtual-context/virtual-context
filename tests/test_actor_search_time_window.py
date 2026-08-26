@@ -25,8 +25,8 @@ from virtual_context.core.discord_snowflake import (
 from virtual_context.storage.sqlite import SQLiteStore
 from virtual_context.types import SpeakerRetrievalContext
 
-CONV = "sk:agent:vast:discord:guild:1524917037191925871"
-OTHER = "sk:agent:vast:discord:guild:9999999999999999999"
+CONV = "sk:agent:vast:discord:direct:1524917037191925871"
+OTHER = "sk:agent:vast:discord:direct:9999999999999999999"
 ACTOR = "actor:discord:387316537012518913"
 OTHER_ACTOR = "actor:discord:167509689360187392"
 CHAN_A = "1524946242499514418"
@@ -84,6 +84,11 @@ def ctx():
         tenant_id="t1",
         owner_conversation_id=CONV,
         audience_conversation_id=CONV,
+        # The seeded rows span sibling channels and the assertions expect
+        # them all: the explicit unified-owner policy shape, which requires
+        # the request's own channel to be named.
+        audience_channel_scope="conversation",
+        request_origin_channel_id=CHAN_A,
         requester_actor_id=ACTOR,
         original_active_user_text="what did optics say",
     )

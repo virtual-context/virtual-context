@@ -60,6 +60,8 @@ def test_run_compaction_never_triggers_store_cleanup_from_tag_rules():
     pipeline._config = SimpleNamespace(
         conversation_id="conv-1",
         tag_rules=[SimpleNamespace(match="debug*", priority=7)],
+        # The post-commit card-rebuild sweep reads the assembler gate.
+        assembler=SimpleNamespace(actor_card_enabled=False),
     )
 
     pipeline._run_compaction([], [], generated_by_turn_id="turn-123")

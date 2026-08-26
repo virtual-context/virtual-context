@@ -21,25 +21,38 @@ from virtual_context.storage.postgres import PostgresStore
 from virtual_context.types import StorageConfig, TagGeneratorConfig
 
 
-PG_URL = os.environ.get("VC_TEST_POSTGRES_URL")
+from tests.pg_helpers import pg_dsn
+
+PG_URL = pg_dsn()
+
+
+def _is_disposable_database(url: str | None) -> bool:
+    """This file is destructive; it runs ONLY against a database whose name
+    declares disposability. The ``vc_disposable_`` prefix is the operator's
+    explicit opt-in — the shared fleet database never carries it."""
+    if not url:
+        return False
+    try:
+        dbname = str(psycopg.conninfo.conninfo_to_dict(url).get("dbname") or "")
+    except Exception:
+        return False
+    return dbname.startswith("vc_disposable_")
+
+
 pytestmark = pytest.mark.skipif(
-    not PG_URL,
-    reason="explicit VC_TEST_POSTGRES_URL not set",
+    not _is_disposable_database(PG_URL),
+    reason=(
+        "destructive source-admission tests require a vc_disposable_* "
+        "database (DATABASE_URL / VC_TEST_POSTGRES_URL via pg_dsn())"
+    ),
 )
 
 
 def _assert_disposable_database() -> None:
     """Never let this destructive integration file point at a normal DB."""
-    if not PG_URL:
-        return
-    dbname = str(psycopg.conninfo.conninfo_to_dict(PG_URL).get("dbname") or "")
-    if (
-        os.environ.get("VC_ALLOW_DISPOSABLE_POSTGRES_TEST") != "1"
-        or not dbname.startswith("vc_disposable_")
-    ):
+    if not _is_disposable_database(PG_URL):
         raise RuntimeError(
-            "Postgres source-admission tests require an explicitly allowed "
-            "vc_disposable_* database"
+            "Postgres source-admission tests require a vc_disposable_* database"
         )
 
 

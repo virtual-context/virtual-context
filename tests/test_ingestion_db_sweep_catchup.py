@@ -36,13 +36,13 @@ def _seed_canonical_row(inner, conv_id, canonical_id, sort_key, *, tagged=False,
                 normalized_user_text, normalized_assistant_text,
                 user_content, assistant_content,
                 sort_key, source_batch_id, first_seen_at, last_seen_at,
-                covered_ingestible_entries, tagged_at,
+                covered_ingestible_entries, tagged_at, turn_group_number,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, 'b', ?, ?, 1, ?, ?, ?)
+            ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, 'b', ?, ?, 1, ?, ?, ?, ?)
         """, (
             canonical_id, conv_id, f"h_{canonical_id}", user_text, assistant_text,
             user_text, assistant_text, sort_key, now, now,
-            now if tagged else None, now, now,
+            now if tagged else None, max(int(sort_key // 1000) - 1, 0), now, now,
         ))
 
 

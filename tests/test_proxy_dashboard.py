@@ -556,7 +556,7 @@ class TestDashboardDeleteSession:
         resp = client.delete("/dashboard/conversations/sess-old")
         assert resp.status_code == 200
         assert resp.json()["deleted"] == 3
-        engine._store.delete_conversation.assert_called_once_with("sess-old")
+        engine._store.delete_conversation.assert_called_once_with("sess-old", expected_generation=1)
 
     def test_delete_conversation_no_state(self):
         """DELETE when state is None returns 503."""

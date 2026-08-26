@@ -535,9 +535,9 @@ def test_step_6_does_not_claim_when_fresh_owner(tmp_path):
                 normalized_user_text, normalized_assistant_text,
                 user_content, assistant_content,
                 sort_key, source_batch_id, first_seen_at, last_seen_at,
-                covered_ingestible_entries, tagged_at,
+                covered_ingestible_entries, tagged_at, turn_group_number,
                 created_at, updated_at
-            ) VALUES ('t0', ?, 'h0', 1, 'u','a','u_raw','a_raw', 1000.0, 'b', ?, ?, 1, NULL, ?, ?)
+            ) VALUES ('t0', ?, 'h0', 1, 'u','a','u_raw','a_raw', 1000.0, 'b', ?, ?, 1, NULL, 0, ?, ?)
         """, (conv_id, now, now, now, now))
     inner.set_phase(conversation_id=conv_id, lifecycle_epoch=1, phase="ingesting")
     # Another worker already owns the lease at epoch=1 with raw=100.
@@ -579,9 +579,9 @@ def test_step_6_reclaims_stale_lease(tmp_path):
                 normalized_user_text, normalized_assistant_text,
                 user_content, assistant_content,
                 sort_key, source_batch_id, first_seen_at, last_seen_at,
-                covered_ingestible_entries, tagged_at,
+                covered_ingestible_entries, tagged_at, turn_group_number,
                 created_at, updated_at
-            ) VALUES ('t0', ?, 'h0', 1, 'u','a','u_raw','a_raw', 1000.0, 'b', ?, ?, 1, NULL, ?, ?)
+            ) VALUES ('t0', ?, 'h0', 1, 'u','a','u_raw','a_raw', 1000.0, 'b', ?, ?, 1, NULL, 0, ?, ?)
         """, (conv_id, now, now, now, now))
     inner.set_phase(conversation_id=conv_id, lifecycle_epoch=1, phase="ingesting")
     inner.upsert_ingestion_episode(

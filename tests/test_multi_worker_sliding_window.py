@@ -57,13 +57,14 @@ def _seed_canonical_row(
                 normalized_user_text, normalized_assistant_text,
                 user_content, assistant_content,
                 sort_key, source_batch_id, first_seen_at, last_seen_at,
-                covered_ingestible_entries, tagged_at,
+                covered_ingestible_entries, tagged_at, turn_group_number,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, 1, 'u','a','u_raw','a_raw', ?, 'b', ?, ?, 1, ?, ?, ?)
+            ) VALUES (?, ?, ?, 1, 'u','a','u_raw','a_raw', ?, 'b', ?, ?, 1, ?, ?, ?, ?)
             """,
             (
                 canonical_id, conv_id, f"h_{canonical_id}", sort_key,
-                now, now, now if tagged else None, now, now,
+                now, now, now if tagged else None,
+                max(int(sort_key // 1000) - 1, 0), now, now,
             ),
         )
 
@@ -216,8 +217,13 @@ def test_sliding_window_non_owner_widens_but_does_not_claim(tmp_path):
         inner = _inner_store(worker_a.engine)
 
         # Worker A claims via handle_prepare_payload (step 6 spawns tagger).
+        # The claim keys on a COMPLETE untagged group: a lone user half is
+        # deferred, so the first payload carries a full pair.
         decision_a = worker_a.handle_prepare_payload(
-            body={"messages": [{"role": "user", "content": "hi"}]},
+            body={"messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello there"},
+            ]},
             payload_accounting={
                 "raw_payload_entry_count": 10,
                 "ingestible_entry_count": 5,
