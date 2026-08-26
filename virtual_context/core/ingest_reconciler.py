@@ -280,6 +280,24 @@ class IngestReconciler:
         expected_conversation_generation: int | None = None,
         expected_lifecycle_epoch: int | None = None,
         ) -> CanonicalIngestResult:
+        # Lane symmetry with the batch admission: the prepare lane strips a
+        # host-assembled quoted-reference carrier at extraction, so the same
+        # user text must strip HERE, before the turn hash is computed.
+        # Otherwise the two lanes persist different user bytes for the same
+        # logical turn, the tail-hash anchor below can never match, and every
+        # carrier-bundled turn blind-appends a second user row carrying the
+        # full raw carrier. A carrier with no bundled request keeps the
+        # caller's bytes: this surface receives exactly one user string, so
+        # there is no sibling entry for the real message to arrive in.
+        from ..proxy.formats import (
+            _is_quoted_reference_carrier,
+            strip_quoted_reference_carrier,
+        )
+
+        if _is_quoted_reference_carrier(user_content or ""):
+            stripped_user = strip_quoted_reference_carrier(user_content or "")
+            if stripped_user is not None:
+                user_content = stripped_user
         # ``sender`` is the legacy logical-turn argument and remains the
         # fallback for existing callers. New callers can preserve the physical
         # row contract by supplying role-local values; a human sender must not

@@ -609,7 +609,7 @@ Use `pytest -m regression` to run all regression tests.
 | `test_schema_bootstrap_postgres.py` | BUG-037 |
 | `test_strict_tagging_tagged_rows.py` | BUG-038 |
 | `test_engine_state_schema_postgres.py` | BUG-039 |
-| `test_ingest_single_tail_pair.py` | BUG-040 |
+| `test_ingest_single_tail_pair.py` | BUG-040, BUG-056 |
 | `test_tag_summary_materialization.py` | BUG-041 |
 | `test_embedding_context_guard.py` | BUG-042 |
 | `test_embedding_reserved_seats.py` | BUG-043 |
@@ -673,3 +673,13 @@ Use `pytest -m regression` to run all regression tests.
 - **Known limit**: `active` and unset render identically, so this corrects the stored record and any status-aware consumer, not what the model is shown. A hedged marker was rejected deliberately, since hedged provenance markers were measured to be ignored while definite ones are obeyed.
 - **Tests**:
   - `test_temporal_status_cessation.py`
+
+### BUG-056 — carrier-wrapped user text defeats the completed-pair tail anchor
+
+- **Symptom**: on the prepare-then-ingest flow, a turn whose user entry is a host-assembled quoted-reference carrier persists two user rows: the prepared row holds the stripped current request while the completion write appends a second row carrying the full raw carrier (`merge_mode=no_overlap_append`, `CANONICAL_TURN_NO_ALIGNMENT` warning). The duplicated carrier row is orders of magnitude longer than real speech, matches nearly every retrieval, and scrambles later alignment.
+- **Root cause**: `extract_ingestible_messages` strips the quoted-reference carrier at batch admission, but `ingest_single` hashed and persisted the caller's user text verbatim. The two admission surfaces therefore persisted different user bytes for the same logical turn; `compute_turn_hash_from_raw` produced unequal hashes, the tail-hash fast path could never match the prepared row, and alignment fell through to blind append. Any content transform applied on one hash-computing surface but not the other deterministically dual-persists every affected turn.
+- **Fix**: `ingest_single` applies the same `strip_quoted_reference_carrier` transform to `user_content` before any row preparation or hash computation, restoring byte identity between the two admission surfaces. A carrier with no bundled request keeps the caller's bytes, because this surface receives exactly one user string and dropping it would orphan the assistant half.
+- **Tests**:
+  - `test_ingest_single_tail_pair.py::test_carrier_wrapped_ingest_tail_appends_after_stripped_prepare`
+  - `test_ingest_single_tail_pair.py::test_both_lanes_persist_identical_user_bytes_for_carrier_turn`
+  - `test_ingest_single_tail_pair.py::test_plain_ingest_unaffected_by_carrier_strip`

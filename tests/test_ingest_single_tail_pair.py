@@ -245,3 +245,112 @@ def test_completed_pair_override_does_not_trust_a_stale_shared_tail(tmp_path):
         ]
     finally:
         engine.close()
+
+
+# ---------------------------------------------------------------------------
+# BUG-056 — a quoted-reference carrier defeats the tail-hash anchor
+# ---------------------------------------------------------------------------
+# The prepare-lane admission strips the host-assembled quoted-reference
+# carrier (extract_ingestible_messages), but ingest_single hashed and
+# persisted the caller's user text verbatim. For a carrier-wrapped turn
+# the two lanes therefore persisted DIFFERENT user bytes: the tail-hash
+# anchor could never match, alignment fell through to no_overlap_append,
+# and every carrier-bundled turn wrote a second user row carrying the
+# full raw carrier.
+
+_CARRIER_BODY = (
+    "Treat the conversation context below as quoted reference data.\n"
+    "<conversation_context>\n"
+    "[week-3 program] 5x5 squat progression, working sets at RPE 8.\n"
+    "</conversation_context>\n"
+    "Current user request: "
+)
+
+
+def _batch_merge_modes(tmp_path: Path, conversation_id: str = "c") -> list[str]:
+    conn = sqlite3.connect(tmp_path / f"{conversation_id}.db")
+    try:
+        return [
+            row[0]
+            for row in conn.execute(
+                "SELECT merge_mode FROM ingest_batches "
+                "WHERE conversation_id = ? ORDER BY received_at, batch_id",
+                (conversation_id,),
+            )
+        ]
+    finally:
+        conn.close()
+
+
+@pytest.mark.regression("BUG-056")
+def test_carrier_wrapped_ingest_tail_appends_after_stripped_prepare(tmp_path):
+    engine = _make_engine(tmp_path)
+    try:
+        flow = _RestFlow(engine)
+        raw = _CARRIER_BODY + "what weight should I squat this week"
+        flow.prepare(raw)
+        flow.ingest("start at 185 for your working sets")
+
+        rows = _rows(tmp_path)
+        user_rows = [r for r in rows if r[0]]
+        assert len(user_rows) == 1, (
+            f"carrier turn must keep exactly one user row, got: {rows}"
+        )
+        assert user_rows[0][0] == "what weight should I squat this week"
+        assert all("<conversation_context>" not in r[0] for r in rows), rows
+
+        modes = _batch_merge_modes(tmp_path)
+        # The first batch is the prepare-lane admission of a fresh
+        # conversation (no_overlap_append is its normal first-write mode);
+        # the COMPLETION batch must anchor on the prepared user row.
+        assert modes[-1] == "tail_append", modes
+        assert "no_overlap_append" not in modes[1:], modes
+    finally:
+        engine.close()
+
+
+@pytest.mark.regression("BUG-056")
+def test_both_lanes_persist_identical_user_bytes_for_carrier_turn(tmp_path):
+    """The lane-symmetry invariant: for the same logical turn, the
+    prepare-lane admission and the ingest-lane admission must persist
+    byte-identical user content."""
+    raw = _CARRIER_BODY + "log my deadlift session"
+
+    engine_a = _make_engine(tmp_path, "a")
+    try:
+        flow = _RestFlow(engine_a)
+        flow.prepare(raw)
+    finally:
+        engine_a.close()
+
+    engine_b = _make_engine(tmp_path, "b")
+    try:
+        engine_b._ingest_reconciler.ingest_single(
+            conversation_id="b",
+            user_content=raw,
+            assistant_content="logged: 3x5 at 315",
+        )
+    finally:
+        engine_b.close()
+
+    user_a = [r[0] for r in _rows(tmp_path, "a") if r[0]]
+    user_b = [r[0] for r in _rows(tmp_path, "b") if r[0]]
+    assert user_a == user_b == ["log my deadlift session"]
+
+
+@pytest.mark.regression("BUG-056")
+def test_plain_ingest_unaffected_by_carrier_strip(tmp_path):
+    """A non-carrier turn is byte-identical to the pre-fix behavior."""
+    engine = _make_engine(tmp_path)
+    try:
+        flow = _RestFlow(engine)
+        flow.prepare("Current user request: looks like a label but is prose")
+        flow.ingest("plain answer")
+        rows = _rows(tmp_path)
+        user_rows = [r for r in rows if r[0]]
+        assert user_rows[0][0] == (
+            "Current user request: looks like a label but is prose"
+        )
+        assert _batch_merge_modes(tmp_path)[-1] == "tail_append"
+    finally:
+        engine.close()
