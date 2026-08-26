@@ -704,3 +704,13 @@ Use `pytest -m regression` to run all regression tests.
 - **Tests**:
   - `test_assistant_audience_stamping.py` (both surfaces, proved and unproved, backfill dry-run/apply/idempotence, unstamped-sibling skip)
   - `test_ingest_audience_attribution.py::test_completed_turn_persist_stamps_proved_audience` (superseded role-local audience pin updated; reply lanes remain role-local)
+
+### BUG-060 — request-derived inputs see the raw quoted-reference carrier
+
+- **Symptom**: for a carrier-wrapped request, tagging and retrieval key on kilobytes of quoted scaffolding instead of the user's own words, the in-memory history tail stores different bytes than the canonical row, and the active-user roles guard logs "active user metadata mismatch" and silently disables actor-card selection and audience derivation for the request.
+- **Root cause**: the request flow's `user_message` was the raw payload extraction, while the admission path strips the quoted-reference carrier from ingestible entries. Every consumer of `user_message` therefore diverged from admitted content, and the roles guard's byte comparison against the stripped active entry could never match on a carrier turn.
+- **Fix**: `derived_user_message` returns the carrier's bundled current request (same recognizer and extraction as the admission strip) and the raw text otherwise; the request flow derives `user_message` through it. The outbound payload is untouched — the model still receives the full carrier. A carrier with no bundled request keeps the caller's bytes, matching the admission surfaces.
+- **Tests**:
+  - `test_prepare_user_message_strip.py::test_derived_user_message_strips_bundled_carrier`
+  - `test_prepare_user_message_strip.py::test_derived_user_message_keeps_unbundled_and_plain_text`
+  - `test_prepare_user_message_strip.py::test_roles_guard_matches_on_stripped_carrier_request`

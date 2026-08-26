@@ -470,6 +470,33 @@ def _resolve_request_audience(
     return resolved.strip() if isinstance(resolved, str) else ""
 
 
+def derived_user_message(raw_user_message: str) -> str:
+    """The user's own words, for every input derived from the request.
+
+    A host-assembled quoted-reference carrier is transport scaffolding.
+    The admission path already strips it from ingestible entries, so the
+    request-derived inputs — the tagging and retrieval query, the
+    active-user roles guard, command detection, the in-memory history
+    tail — must see the same bytes the canonical store keeps; feeding
+    them the raw carrier keys retrieval on kilobytes of quoted
+    scaffolding and makes the roles guard mismatch the stripped active
+    entry, silently disabling actor and audience derivation. The
+    outbound payload is untouched: the model still receives the carrier.
+    A carrier with no bundled request keeps the caller's bytes, matching
+    the admission surfaces.
+    """
+    from .formats import (
+        _is_quoted_reference_carrier,
+        strip_quoted_reference_carrier,
+    )
+
+    if _is_quoted_reference_carrier(raw_user_message):
+        stripped = strip_quoted_reference_carrier(raw_user_message)
+        if stripped is not None:
+            return stripped
+    return raw_user_message
+
+
 def _roles_for_active_user(
     state: "ProxyState | None",
     active_user: Message | None,
@@ -899,7 +926,7 @@ async def prepare_payload(
 
     api_format = fmt.name
     _extract_user_stage = time.monotonic()
-    user_message = fmt.extract_user_message(body)
+    user_message = derived_user_message(fmt.extract_user_message(body))
     _note_prep("extract_user_message", _extract_user_stage)
     is_streaming = body.get("stream", False)
 
