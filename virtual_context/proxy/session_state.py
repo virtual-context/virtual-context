@@ -133,8 +133,15 @@ class SessionStateProvider:
     _TAG_SUMMARY_EMBEDDING_SNAPSHOT_TTL_SECONDS = 24 * 60 * 60
     _CONTEXT_HINT_CACHE_TTL_SECONDS = 6 * 60 * 60
     _TAG_EMBEDDING_RUNTIME_MAX_PER_MODEL = 5000
+    _TAG_EMBEDDING_RUNTIME_MAX_ENV = "VC_TAG_EMBEDDING_RUNTIME_MAX_PER_MODEL"
 
-    def __init__(self, redis_client=None, redis_url: str = "", store=None) -> None:
+    def __init__(
+        self,
+        redis_client=None,
+        redis_url: str = "",
+        store=None,
+        tag_embedding_runtime_max_per_model: int | None = None,
+    ) -> None:
         if redis_client is not None:
             self._redis = redis_client
         elif redis_url:
@@ -144,6 +151,29 @@ class SessionStateProvider:
             raise ValueError("redis_client or redis_url required")
         self._store = store  # Optional ContextStore for Postgres backup/fallback
         self._degraded = False
+        # The per-model runtime cache bound must hold the live tag
+        # vocabulary, or every request pays a re-materialization of the
+        # entries the previous request evicted. Resolved ONCE at
+        # construction (argument, then environment, then the class
+        # default) so a mid-flight environment change cannot alter
+        # behavior; an invalid value fails loudly rather than silently
+        # running with a wrong bound.
+        resolved_cap = tag_embedding_runtime_max_per_model
+        if resolved_cap is None:
+            import os as _os
+            raw_cap = _os.environ.get(
+                self._TAG_EMBEDDING_RUNTIME_MAX_ENV, "",
+            ).strip()
+            if raw_cap:
+                resolved_cap = int(raw_cap)  # ValueError on garbage
+        if resolved_cap is None:
+            resolved_cap = self._TAG_EMBEDDING_RUNTIME_MAX_PER_MODEL
+        if int(resolved_cap) < 1:
+            raise ValueError(
+                "tag_embedding_runtime_max_per_model must be a positive "
+                f"integer, got {resolved_cap!r}"
+            )
+        self._tag_embedding_runtime_max_per_model = int(resolved_cap)
         self._tag_embedding_runtime_cache: dict[str, OrderedDict[str, list[float]]] = {}
         self._tag_stats_runtime_cache: dict[str, list[TagStats]] = {}
         self._tag_summary_embedding_snapshot_runtime_cache: dict[str, dict[str, list[float]]] = {}
@@ -183,7 +213,7 @@ class SessionStateProvider:
         cache = self._runtime_tag_cache(model_name)
         cache[tag] = list(embedding)
         cache.move_to_end(tag)
-        while len(cache) > self._TAG_EMBEDDING_RUNTIME_MAX_PER_MODEL:
+        while len(cache) > self._tag_embedding_runtime_max_per_model:
             cache.popitem(last=False)
 
     @staticmethod
