@@ -610,6 +610,7 @@ Use `pytest -m regression` to run all regression tests.
 | `test_strict_tagging_tagged_rows.py` | BUG-038 |
 | `test_engine_state_schema_postgres.py` | BUG-039 |
 | `test_ingest_single_tail_pair.py` | BUG-040, BUG-056 |
+| `test_rest_phase_lifecycle.py` | BUG-057 |
 | `test_tag_summary_materialization.py` | BUG-041 |
 | `test_embedding_context_guard.py` | BUG-042 |
 | `test_embedding_reserved_seats.py` | BUG-043 |
@@ -683,3 +684,13 @@ Use `pytest -m regression` to run all regression tests.
   - `test_ingest_single_tail_pair.py::test_carrier_wrapped_ingest_tail_appends_after_stripped_prepare`
   - `test_ingest_single_tail_pair.py::test_both_lanes_persist_identical_user_bytes_for_carrier_turn`
   - `test_ingest_single_tail_pair.py::test_plain_ingest_unaffected_by_carrier_strip`
+
+### BUG-057 — interactive prepare-then-ingest conversations never leave phase='init'
+
+- **Symptom**: a conversation on the single-turn completion flow reports `phase='init'` forever no matter how many fully tagged turns it holds. Every phase-keyed consumer misclassifies it: idle cleanup treats it as never-established, backlog detection and reattribution skip it, and the dashboard shows a conversation that never activates.
+- **Root cause**: the `total == done` branch that flips `'init'` to `'active'` in the prepare flow is unreachable on that lane, because every prepare persists a fresh untagged user half before the branch evaluates, so the phase decision always sees `total > done` with an incomplete physical group and returns without transitioning. Tagging then completes in the post-ingest path, whose self-heal only covers `phase == 'ingesting'` (there is an episode to finalize); the init lane never claims an episode, so no code path ever advanced the phase.
+- **Fix**: phase is derived from retrievable content. `_activate_init_phase_if_tagged` flips `'init'` to `'active'` (epoch-guarded, idempotent, soft-failing) whenever the conversation holds at least one fully tagged group, invoked from the post-tag path beside the episode finalizer and as a self-heal in the prepare flow's `total > done` branch before the group claim. Conversations with no tagged content stay `'init'`; the empty-conversation flip and the `'ingesting'` self-heal are untouched.
+- **Tests**:
+  - `test_rest_phase_lifecycle.py::test_one_turn_conversation_activates_after_prepare_ingest_tag`
+  - `test_rest_phase_lifecycle.py::test_next_prepare_activates_stuck_init_conversation`
+  - `test_rest_phase_lifecycle.py::test_first_prepare_alone_keeps_init`

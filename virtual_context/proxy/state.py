@@ -775,6 +775,82 @@ class ProxyState:
         )
         return True
 
+    def _activate_init_phase_if_tagged(self, conversation_id: str) -> bool:
+        """Flip a conversation out of ``'init'`` once it holds tagged content.
+
+        The single-turn completion flow persists the user half at prepare
+        time and the assistant half at completion, then tags the pair in the
+        post-ingest path — no ingestion episode is ever claimed. The
+        ``total == done`` init→active branch in the prepare flow is therefore
+        unreachable on that lane (every prepare persists a fresh untagged
+        user half before the branch evaluates), and the episode finalizer
+        above only covers ``phase == 'ingesting'``. Net effect without this:
+        the conversation reports ``'init'`` forever, however many fully
+        tagged turns it holds, and every phase-keyed consumer misclassifies
+        it. Phase is instead derived from retrievable content: any fully
+        tagged group means the conversation is established, regardless of
+        in-flight message halves.
+
+        Contract mirrors the episode finalizer: callable anywhere,
+        idempotent, soft-fails to ``False`` on any guard rejection, returns
+        ``True`` iff this call observably flipped ``phase`` to ``'active'``.
+        """
+        try:
+            epoch = int(self.engine._engine_state.lifecycle_epoch)
+        except Exception:
+            return False
+        store = self.engine._store
+        try:
+            phase = store.get_conversation_phase(conversation_id)
+        except (KeyError, AttributeError, NotImplementedError):
+            return False
+        if phase != "init":
+            return False
+        try:
+            snap = store.read_progress_snapshot(conversation_id)
+        except Exception:
+            return False
+        if snap.done_ingestible <= 0:
+            return False
+        try:
+            ok = store.set_phase(
+                conversation_id=conversation_id,
+                lifecycle_epoch=epoch,
+                phase="active",
+            )
+        except Exception:
+            logger.warning(
+                "INIT_ACTIVATE: set_phase raised for conv=%s",
+                conversation_id[:12], exc_info=True,
+            )
+            return False
+        if not ok:
+            return False
+        try:
+            self._publish_phase_transition("init", "active")
+        except Exception:
+            logger.warning(
+                "INIT_ACTIVATE: _publish_phase_transition raised for conv=%s",
+                conversation_id[:12], exc_info=True,
+            )
+        # Same session-state sync as the episode finalizer: without it the
+        # durable phase reads 'active' while the session blob keeps serving
+        # the stale pre-flip state indefinitely.
+        try:
+            if self._state != SessionState.ACTIVE:
+                self._transition_to(SessionState.ACTIVE)
+        except Exception:
+            logger.warning(
+                "INIT_ACTIVATE: _transition_to(ACTIVE) raised for conv=%s",
+                conversation_id[:12], exc_info=True,
+            )
+        logger.info(
+            "INIT_ACTIVATE conv=%s: tagged content present; "
+            "phase 'init' → 'active'",
+            conversation_id[:12],
+        )
+        return True
+
     def _tagger_run(self) -> bool:
         """Background tagger loop. Processes untagged canonical rows until
         none remain, then completes the episode. Exits cleanly on epoch
@@ -1553,6 +1629,16 @@ class ProxyState:
                 if self._finalize_ingestion_if_complete(conversation_id):
                     phase = "active"
             return _decision(phase=phase, started_tagger=False)
+
+        # A conversation still in 'init' that already holds tagged content is
+        # established — the total==done branch above is unreachable on the
+        # single-turn completion lane because each prepare persists a fresh
+        # untagged user half first. Derive the transition from retrievable
+        # content before the group claim below; the claim then transitions
+        # 'active' → 'ingesting' normally when a complete group exists.
+        if phase == "init" and done_ingestible > 0:
+            if self._activate_init_phase_if_tagged(conversation_id):
+                phase = "active"
 
         # total_ingestible > done_ingestible can mean either a complete turn
         # or only a newly prepared user half.  Storage performs the complete-
@@ -2531,6 +2617,19 @@ class ProxyState:
             except Exception:
                 logger.warning(
                     "T%d opportunistic finalize raised for conv=%s",
+                    turn, conversation_id[:12], exc_info=True,
+                )
+            # Init-lane sibling of the self-heal above: the single-turn
+            # completion flow never claims an episode, so the finalizer's
+            # ``phase == 'ingesting'`` guard can never fire for it. Tagging
+            # just completed; if the conversation is still 'init' with
+            # tagged content it is established — flip it here rather than
+            # waiting for a prepare that keeps re-arming the untagged half.
+            try:
+                self._activate_init_phase_if_tagged(conversation_id)
+            except Exception:
+                logger.warning(
+                    "T%d init activation raised for conv=%s",
                     turn, conversation_id[:12], exc_info=True,
                 )
 
