@@ -139,6 +139,7 @@ def test_handle_prepare_payload_persists_canonical_rows(tmp_path):
         state.engine.close()
 
 
+@pytest.mark.regression("BUG-062")
 def test_proxy_ingest_history_keeps_total_fixed_for_single_prepare_payload(tmp_path):
     """A single payload should not widen its own denominator while tagging.
 

@@ -11749,6 +11749,16 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 and user_count == 1
                 and assistant_count == 1
                 and combined_count == 0
+            ) or (
+                # A single-half continuation group: consecutive same-role
+                # payload entries mint a group holding one row with exactly
+                # one half. The strict payload mapper proves per-message
+                # hash identity before reaching this CAS; refusing the
+                # shape here would let admission mint groups that tagging
+                # can never process.
+                len(rows) == 1
+                and combined_count == 0
+                and user_count + assistant_count == 1
             )
             if (
                 not valid_shape

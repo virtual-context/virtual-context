@@ -737,3 +737,11 @@ Use `pytest -m regression` to run all regression tests.
 - **Tests**:
   - `test_history_widening_guard.py::test_smaller_payload_never_resets_durable_history`
   - `test_history_widening_guard.py::test_genuine_widening_still_resets`
+
+### BUG-062 — admission mints single-half groups the tagging CAS refuses
+
+- **Symptom**: a payload holding a user message followed by two consecutive assistant messages persists three rows at prepare, then strict follow-up tagging raises "strict canonical tagging could not map payload messages to existing rows for logical turn 1" and the ingestion episode wedges with the rows untagged.
+- **Root cause**: batch admission assigns a consecutive same-role payload entry its own continuation group holding one row with exactly one half, but `update_canonical_group_tagging_if_unchanged`'s shape gate accepted only a single combined row or a user+assistant pair. The system contradicted itself: admission created a durable group shape the tagging write path categorically refused, so the strict mapper's proven mapping failed closed at the store.
+- **Fix**: the shape gate in both backends gains the single-half arm — one row carrying exactly one half — matching what admission itself mints. The strict payload mapper still proves per-message hash identity, group agreement, and role shape before the CAS runs; the gate remains the defense-in-depth check on group coherence.
+- **Tests**:
+  - `test_handle_prepare_payload.py::test_proxy_ingest_history_keeps_total_fixed_for_single_prepare_payload` (the pre-existing pin, assertions unchanged)
