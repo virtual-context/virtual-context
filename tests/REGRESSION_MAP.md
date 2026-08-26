@@ -612,6 +612,8 @@ Use `pytest -m regression` to run all regression tests.
 | `test_ingest_single_tail_pair.py` | BUG-040, BUG-056 |
 | `test_rest_phase_lifecycle.py` | BUG-057 |
 | `test_assistant_audience_stamping.py` | BUG-058 |
+| `test_benchmark_retrieval_authority.py` | BUG-059 |
+| `test_prepare_user_message_strip.py` | BUG-060 |
 | `test_tag_summary_materialization.py` | BUG-041 |
 | `test_embedding_context_guard.py` | BUG-042 |
 | `test_embedding_reserved_seats.py` | BUG-043 |
@@ -714,3 +716,13 @@ Use `pytest -m regression` to run all regression tests.
   - `test_prepare_user_message_strip.py::test_derived_user_message_strips_bundled_carrier`
   - `test_prepare_user_message_strip.py::test_derived_user_message_keeps_unbundled_and_plain_text`
   - `test_prepare_user_message_strip.py::test_roles_guard_matches_on_stripped_carrier_request`
+
+### BUG-059 — benchmark harness sends retrieval tool calls with no request authority
+
+- **Symptom**: every quote-search tool call issued during a benchmark run returns "No conversation search was performed because request retrieval authority is unproved" — the reader is told nothing is on record while the content sits in storage.
+- **Root cause**: model-facing retrieval fails closed by design: the tool runtime coerces an absent `speaker_context` to the ineligible sentinel and quote search refuses it. The LongMemEval harness called `query_with_tools` with no context at all, so the fail-closed boundary refused every benchmark retrieval.
+- **Fix**: `benchmark_speaker_context` constructs the owner-routed DM-shaped authority for the harness's single-conversation store (audience is the conversation itself, empty channel, exact-match channel scope) and the harness passes it on every reader call. Candidate admission additionally requires audience-stamped source rows; existing cached stores need the assistant-audience backfill before assistant-authored content admits.
+- **Tests**:
+  - `test_benchmark_retrieval_authority.py::test_benchmark_context_passes_quote_search_request_gate`
+  - `test_benchmark_retrieval_authority.py::test_benchmark_context_is_scoped_to_its_own_conversation`
+  - `test_benchmark_retrieval_authority.py::test_ineligible_sentinel_still_fails_the_gate`

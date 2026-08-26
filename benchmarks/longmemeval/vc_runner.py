@@ -12,7 +12,7 @@ from pathlib import Path
 
 from virtual_context.config import load_config
 from virtual_context.engine import VirtualContextEngine
-from virtual_context.types import Message
+from virtual_context.types import Message, SpeakerRetrievalContext
 
 from .cost import BudgetTracker
 from .dataset import LongMemEvalQuestion
@@ -42,6 +42,31 @@ OPENAI_OAUTH_TOKEN_ENVS: tuple[str, ...] = (
     "OPENAI_OAUTH_TOKEN",
     "OPENAI_ACCESS_TOKEN",
 )
+
+
+def benchmark_speaker_context(
+    engine: VirtualContextEngine, question_text: str,
+) -> SpeakerRetrievalContext:
+    """Request retrieval authority for the benchmark's single-conversation shape.
+
+    The retrieval tools fail closed without request-owned authority: the
+    tool runtime coerces an absent speaker_context to the ineligible
+    sentinel and quote search refuses to run. The harness owns the
+    single-conversation store it built, so the trusted authority is the
+    owner-routed DM shape: the audience IS the conversation, with no
+    channel dimension (empty channel, exact-match scope).
+    """
+    conv = engine.config.conversation_id
+    tenant_raw = getattr(engine.config, "tenant_id", "")
+    return SpeakerRetrievalContext(
+        tenant_id=tenant_raw if isinstance(tenant_raw, str) else "",
+        owner_conversation_id=conv,
+        audience_conversation_id=conv,
+        audience_channel_id="",
+        audience_channel_scope="channel",
+        request_origin_channel_id="",
+        original_active_user_text=question_text or "",
+    )
 
 
 def _cache_dir_for(question_id: str, cache_dir: Path | None = None) -> Path:
@@ -922,6 +947,7 @@ def run_vc(
         "required" if require_tools else "optional",
         engine._engine_state.compacted_prefix_messages,
     )
+    speaker_context = benchmark_speaker_context(engine, question.question)
     loop_result = engine.query_with_tools(
         messages=[{"role": "user", "content": user_prompt}],
         model=reader_model,
@@ -934,6 +960,7 @@ def run_vc(
         require_tools=require_tools,
         provider=reader_provider,
         extended_thinking=verbose_reasoning and reader_provider in ("anthropic", "openai-responses"),
+        speaker_context=speaker_context,
     )
 
     timings["query_s"] = round(time.time() - t0, 1)
