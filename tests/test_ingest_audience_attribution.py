@@ -101,9 +101,14 @@ def test_completed_turn_persist_stamps_proved_audience(tmp_path):
         assert user_row["audience"] == "c"
         assert user_row["version"] == 1
         assert user_row["source_message_id"] == "m-100"
-        # Role-local: the assistant row never receives an audience edge.
-        assert assistant_row["audience"] == ""
-        assert assistant_row["version"] == 0
+        # The audience is request provenance, not speaker attribution: the
+        # assistant half was produced inside the same proved route, so it
+        # carries the pair's audience. The reply lanes stay role-local —
+        # an assistant row never receives a human reply edge.
+        assert assistant_row["audience"] == "c"
+        assert assistant_row["version"] == 1
+        assert assistant_row["reply_target"] == ""
+        assert assistant_row["source_message_id"] == ""
     finally:
         engine.close()
 

@@ -611,6 +611,7 @@ Use `pytest -m regression` to run all regression tests.
 | `test_engine_state_schema_postgres.py` | BUG-039 |
 | `test_ingest_single_tail_pair.py` | BUG-040, BUG-056 |
 | `test_rest_phase_lifecycle.py` | BUG-057 |
+| `test_assistant_audience_stamping.py` | BUG-058 |
 | `test_tag_summary_materialization.py` | BUG-041 |
 | `test_embedding_context_guard.py` | BUG-042 |
 | `test_embedding_reserved_seats.py` | BUG-043 |
@@ -694,3 +695,12 @@ Use `pytest -m regression` to run all regression tests.
   - `test_rest_phase_lifecycle.py::test_one_turn_conversation_activates_after_prepare_ingest_tag`
   - `test_rest_phase_lifecycle.py::test_next_prepare_activates_stuck_init_conversation`
   - `test_rest_phase_lifecycle.py::test_first_prepare_alone_keeps_init`
+
+### BUG-058 — assistant rows carry no audience and are invisible to audience-scoped reads
+
+- **Symptom**: every assistant canonical row stores an empty `audience_conversation_id` with `audience_attribution_version=0`, so audience-scoped candidate admission (which requires an exact audience and version match) excludes the assistant half of every conversation categorically. Quote search over a proved route returns only user speech; assistant-authored content is unreachable however relevant.
+- **Root cause**: audience provenance rides the reply-edge struct, and the reply edge is speaker attribution, so both admission surfaces gave assistant rows the empty edge (`ingest_batch` role branch, `ingest_single` assistant row preparation). The audience, unlike the reply lanes, is a property of the request's proved route shared by both halves of the turn. No repair surface existed: the reply-roles backfill skips rows without user content.
+- **Fix**: an audience-only edge (audience fields set from the pair's proved audience, every speaker-attribution field empty) is stamped on assistant rows at both admission surfaces; an unproved route keeps the empty edge. `backfill_assistant_audience` (engine method + `admin backfill-assistant-audience` CLI, dry-run by default with `--apply`) repairs existing assistant rows from the sibling user row's proved audience via the one-way-fill reply CAS: idempotent, epoch-guarded, and skipping groups whose stamped siblings disagree.
+- **Tests**:
+  - `test_assistant_audience_stamping.py` (both surfaces, proved and unproved, backfill dry-run/apply/idempotence, unstamped-sibling skip)
+  - `test_ingest_audience_attribution.py::test_completed_turn_persist_stamps_proved_audience` (superseded role-local audience pin updated; reply lanes remain role-local)

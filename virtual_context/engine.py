@@ -3900,6 +3900,89 @@ class VirtualContextEngine:
         ))
         return report
 
+    def backfill_assistant_audience(
+        self,
+        conversation_id: str,
+        *,
+        dry_run: bool = False,
+        limit: int | None = None,
+    ) -> dict:
+        """Stamp assistant rows with their sibling user row's proved audience.
+
+        Audience provenance rode the reply edge, which is user-only, so
+        assistant rows persisted before admission stamped them carry no
+        audience and are invisible to every audience-scoped read. The
+        sibling user row in the same turn group proved the request's route;
+        both halves of the turn were produced inside it. Only assistant
+        rows whose group has exactly one distinct proved audience are
+        staged; disagreeing siblings are reported, never guessed. Writes go
+        through the one-way-fill reply CAS, so re-runs are no-ops and a
+        stored audience is never overwritten — moving a row between
+        audiences stays the job of reattribution.
+        """
+        if not conversation_id:
+            raise ValueError(
+                "backfill_assistant_audience requires a non-empty conversation_id"
+            )
+        self._require_actor_sql_store()
+        cas = getattr(
+            self._store, "update_canonical_turn_reply_roles_if_empty", None,
+        )
+        if not callable(cas):
+            raise RuntimeError("the configured store has no physical reply CAS")
+        report = {
+            "eligible": 0, "audience_only": 0, "skipped_existing": 0,
+            "skipped_no_sibling": 0, "conflicting_signals": 0,
+            "failed": 0, "dry_run": bool(dry_run),
+        }
+        rows = self._store.get_all_canonical_turns(conversation_id)
+        group_audiences: dict[int, set[str]] = {}
+        for row in rows:
+            if not (row.user_content or "").strip():
+                continue
+            if int(row.audience_attribution_version or 0) <= 0:
+                continue
+            audience = (row.audience_conversation_id or "").strip()
+            if audience:
+                group_audiences.setdefault(
+                    int(row.turn_group_number), set(),
+                ).add(audience)
+        updates: dict[str, dict] = {}
+        for row in rows:
+            if limit is not None and len(updates) >= limit:
+                break
+            if (row.user_content or "").strip():
+                continue
+            if not (row.assistant_content or "").strip():
+                continue
+            report["eligible"] += 1
+            if int(row.audience_attribution_version or 0) > 0:
+                report["skipped_existing"] += 1
+                continue
+            audiences = group_audiences.get(int(row.turn_group_number), set())
+            if not audiences:
+                report["skipped_no_sibling"] += 1
+                continue
+            if len(audiences) > 1:
+                report["conflicting_signals"] += 1
+                continue
+            if not row.canonical_turn_id:
+                report["failed"] += 1
+                continue
+            report["audience_only"] += 1
+            updates[row.canonical_turn_id] = {
+                "audience_conversation_id": next(iter(audiences)),
+                "audience_attribution_version": 1,
+            }
+        if dry_run:
+            report["updated"] = len(updates)
+            return report
+        epoch = self._store.get_lifecycle_epoch(conversation_id)
+        report["updated"] = int(cas(
+            conversation_id, updates, expected_lifecycle_epoch=epoch,
+        )) if updates else 0
+        return report
+
     def backfill_fact_authors(
         self,
         conversation_id: str,

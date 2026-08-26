@@ -77,6 +77,28 @@ _EMPTY_REPLY_EDGE: dict = {
     "audience_attribution_version": 0,
 }
 
+
+def _audience_only_edge(audience_conversation_id: str) -> dict:
+    """Audience provenance for an assistant physical row.
+
+    The reply edge is speaker attribution and stays user-only, but the
+    audience is a property of the request's PROVED route, and both halves
+    of a turn were produced inside the same proved channel. An assistant
+    row without audience provenance is categorically invisible to every
+    audience-scoped read even though admission has no role rule. Every
+    speaker-attribution field stays empty; an unproved route keeps the
+    empty edge exactly as before.
+    """
+    audience = (audience_conversation_id or "").strip()
+    if not audience:
+        return dict(_EMPTY_REPLY_EDGE)
+    from ..types import AUDIENCE_ATTRIBUTION_VERSION
+
+    edge = dict(_EMPTY_REPLY_EDGE)
+    edge["audience_conversation_id"] = audience
+    edge["audience_attribution_version"] = AUDIENCE_ATTRIBUTION_VERSION
+    return edge
+
 # The reply-edge columns, in one place, so the CAS and the full-row rewrites
 # cannot drift apart. A full-row upsert defaults every omitted column away, so
 # a rewrite that forgets one of these silently erases the edge.
@@ -367,6 +389,13 @@ class IngestReconciler:
                     sender_actor_id=assistant_sender_actor_id,
                     fact_signals=fact_signals,
                     code_refs=code_refs,
+                    # The pair's proved audience is request provenance, not
+                    # speaker attribution: the assistant half was produced
+                    # inside the same proved route as the user half. All
+                    # reply/speaker fields stay empty.
+                    **_audience_only_edge(
+                        edge.get("audience_conversation_id", "")
+                    ),
                 ),
             ]
             # Same resolution the batch path runs: a reply target named by the
@@ -1072,7 +1101,7 @@ class IngestReconciler:
             edge = (
                 self._derive_reply_edge(message, actor_key, audience_id)
                 if is_user
-                else _EMPTY_REPLY_EDGE
+                else _audience_only_edge(audience_id)
             )
             if is_user:
                 # Audience provenance for a user row comes from the ORDERED

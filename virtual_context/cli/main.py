@@ -1912,7 +1912,10 @@ def _cmd_admin_actor_operation(args, method_name: str, total_keys: tuple[str, ..
         sys.exit(1)
 
     kwargs = {"config": config}
-    if method_name in {"backfill_actors", "backfill_reply_roles"}:
+    if method_name in {
+        "backfill_actors", "backfill_reply_roles",
+        "backfill_assistant_audience",
+    }:
         class _NoopEmbeddingProvider:
             @staticmethod
             def get_embed_fn():
@@ -1989,6 +1992,16 @@ def cmd_admin_backfill_reply_roles(args):
         "skipped_no_raw", "skipped_no_reply", "resolved_by_message_id",
         "resolved_by_target_sender_id", "resolved_by_unique_label",
         "unresolved_label", "conflicting_signals", "failed",
+    ))
+
+
+def cmd_admin_backfill_assistant_audience(args):
+    # Dry-run by default: the shared shell reads ``dry_run``, and this
+    # surface inverts ``--apply`` into it rather than exposing ``--dry-run``.
+    args.dry_run = not bool(getattr(args, "apply", False))
+    _cmd_admin_actor_operation(args, "backfill_assistant_audience", (
+        "eligible", "updated", "audience_only", "skipped_existing",
+        "skipped_no_sibling", "conflicting_signals", "failed",
     ))
 
 
@@ -2970,6 +2983,29 @@ def main():
         actor_parser.add_argument("--postgres-dsn")
         actor_parser.add_argument("--sqlite-path")
 
+    assistant_audience_parser = admin_sub.add_parser(
+        "backfill-assistant-audience",
+        help="Stamp assistant rows with their sibling user row's proved audience",
+    )
+    assistant_audience_parser.add_argument(
+        "conversation_id", nargs="?", default=None,
+        help="Conversation id (omit with --all-convs-for-tenant)",
+    )
+    assistant_audience_parser.add_argument("--tenant-id", default="")
+    assistant_audience_parser.add_argument(
+        "--all-convs-for-tenant", action="store_true",
+    )
+    assistant_audience_parser.add_argument(
+        "--apply", action="store_true",
+        help="Write the stamps; the default is a dry-run report",
+    )
+    assistant_audience_parser.add_argument("--limit", type=int, default=None)
+    assistant_audience_parser.add_argument(
+        "--storage-backend", choices=("sqlite", "postgres"),
+    )
+    assistant_audience_parser.add_argument("--postgres-dsn")
+    assistant_audience_parser.add_argument("--sqlite-path")
+
     reattribute_parser = admin_sub.add_parser(
         "reattribute-audience",
         help="Rewrite one verified merged audience into its active owner",
@@ -3336,6 +3372,8 @@ def main():
             cmd_admin_backfill_actors(args)
         elif args.admin_command == "backfill-reply-roles":
             cmd_admin_backfill_reply_roles(args)
+        elif args.admin_command == "backfill-assistant-audience":
+            cmd_admin_backfill_assistant_audience(args)
         elif args.admin_command == "backfill-fact-authors":
             cmd_admin_backfill_fact_authors(args)
         elif args.admin_command == "rebuild-actor-cards":
