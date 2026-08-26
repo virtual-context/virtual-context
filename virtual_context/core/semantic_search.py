@@ -149,44 +149,18 @@ class SemanticSearchManager:
                     return None
                 self._embed_fn = fn
             else:
-                # Original lazy-load path for backward compat
-                try:
-                    import os
-                    import sys
+                # Original lazy-load path for backward compat, served from
+                # the process-wide model cache.
+                from .embedding_provider import get_shared_embed_fn
 
-                    from sentence_transformers import SentenceTransformer
-
-                    model_name = self._config.retriever.embedding_model
-
-                    # Suppress progress bar output during model loading.
-                    old_stderr = sys.stderr
-                    try:
-                        sys.stderr = open(os.devnull, "w")
-                        model = SentenceTransformer(model_name)
-                    finally:
-                        try:
-                            sys.stderr.close()
-                        except Exception:
-                            pass
-                        sys.stderr = old_stderr
-
-                    def embed(texts: list[str]) -> list[list[float]]:
-                        return model.encode(
-                            texts, convert_to_numpy=True, show_progress_bar=False,
-                        ).tolist()
-
-                    self._embed_fn = embed
-                except ImportError:
+                fn = get_shared_embed_fn(
+                    self._config.retriever.embedding_model,
+                )
+                if fn is None:
                     logger.debug(
-                        "sentence-transformers not installed, context bleed gate disabled"
+                        "embedding model unavailable, semantic search disabled"
                     )
-                    self._embed_fn = None
-                except Exception:
-                    logger.debug(
-                        "Failed to load embedding model, semantic search disabled",
-                        exc_info=True,
-                    )
-                    self._embed_fn = None
+                self._embed_fn = fn
         return self._embed_fn
 
     def embed_and_store_chunks(

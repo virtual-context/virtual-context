@@ -5,9 +5,79 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import threading
 from typing import Callable
 
 logger = logging.getLogger(__name__)
+
+
+# One loaded sentence-transformer per (process, model_name). Every consumer
+# instance used to perform its own lazy load, so a process holding many
+# engines — a pooled multi-tenant host, a test worker — paid a full torch
+# model load per instance and ratcheted resident memory with every one.
+# Only SUCCESSFUL loads are cached: a transient failure stays a per-caller
+# condition rather than poisoning the process, and the ImportError-disabled
+# path keeps its per-instance semantics.
+_PROCESS_MODEL_CACHE: dict[str, Callable[[list[str]], list[list[float]]]] = {}
+_PROCESS_MODEL_LOCK = threading.Lock()
+
+
+def get_shared_embed_fn(
+    model_name: str,
+) -> Callable[[list[str]], list[list[float]]] | None:
+    """Return the process-wide embed callable for *model_name*.
+
+    Double-checked locking bounds concurrent first-touch to exactly one
+    load; the losers wait only for the load window. Encoding is NOT
+    serialized: the model is used for inference only and the returned
+    closure is stateless. ``None`` means the load failed (package missing
+    or model unavailable) and nothing was cached.
+    """
+    fn = _PROCESS_MODEL_CACHE.get(model_name)
+    if fn is not None:
+        return fn
+    with _PROCESS_MODEL_LOCK:
+        fn = _PROCESS_MODEL_CACHE.get(model_name)
+        if fn is not None:
+            return fn
+        fn = _load_sentence_transformer(model_name)
+        if fn is not None:
+            _PROCESS_MODEL_CACHE[model_name] = fn
+        return fn
+
+
+def _load_sentence_transformer(
+    model_name: str,
+) -> Callable[[list[str]], list[list[float]]] | None:
+    try:
+        from sentence_transformers import SentenceTransformer
+
+        old_stderr = sys.stderr
+        try:
+            sys.stderr = open(os.devnull, "w")
+            model = SentenceTransformer(model_name)
+        finally:
+            try:
+                sys.stderr.close()
+            except Exception:
+                pass
+            sys.stderr = old_stderr
+
+        def embed(texts: list[str]) -> list[list[float]]:
+            return model.encode(
+                texts, convert_to_numpy=True, show_progress_bar=False,
+            ).tolist()
+
+        logger.info("EmbeddingProvider: loaded model %s", model_name)
+        return embed
+    except ImportError:
+        logger.debug("sentence-transformers not installed, embeddings disabled")
+        return None
+    except Exception:
+        logger.debug(
+            "Failed to load embedding model %s", model_name, exc_info=True,
+        )
+        return None
 
 
 class EmbeddingProvider:
@@ -62,35 +132,10 @@ class EmbeddingProvider:
         if self._load_failed:
             return None
 
-        try:
-            from sentence_transformers import SentenceTransformer
-
-            old_stderr = sys.stderr
-            try:
-                sys.stderr = open(os.devnull, "w")
-                model = SentenceTransformer(self._model_name)
-            finally:
-                try:
-                    sys.stderr.close()
-                except Exception:
-                    pass
-                sys.stderr = old_stderr
-
-            def embed(texts: list[str]) -> list[list[float]]:
-                return model.encode(
-                    texts, convert_to_numpy=True, show_progress_bar=False,
-                ).tolist()
-
-            self._embed_fn = embed
-            self._loaded = True
-            logger.info("EmbeddingProvider: loaded model %s", self._model_name)
-            return self._embed_fn
-
-        except ImportError:
-            logger.debug("sentence-transformers not installed, embeddings disabled")
+        fn = get_shared_embed_fn(self._model_name)
+        if fn is None:
             self._load_failed = True
             return None
-        except Exception:
-            logger.debug("Failed to load embedding model %s", self._model_name, exc_info=True)
-            self._load_failed = True
-            return None
+        self._embed_fn = fn
+        self._loaded = True
+        return fn

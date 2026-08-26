@@ -59,19 +59,15 @@ class EmbeddingTagGenerator:
 
     @staticmethod
     def _load_model(model_name: str) -> Callable[[list[str]], list[list[float]]]:
-        try:
-            from sentence_transformers import SentenceTransformer
-        except ImportError:
+        from .embedding_provider import get_shared_embed_fn
+
+        fn = get_shared_embed_fn(model_name)
+        if fn is None:
             raise ImportError(
                 "sentence-transformers not installed. "
                 "Install with: pip install virtual-context[embeddings]"
             )
-        model = SentenceTransformer(model_name)
-
-        def embed(texts: list[str]) -> list[list[float]]:
-            return model.encode(texts, convert_to_numpy=True).tolist()
-
-        return embed
+        return fn
 
     @staticmethod
     def _dedupe_tags(tags: list[str] | None) -> list[str]:
