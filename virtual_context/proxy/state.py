@@ -4345,8 +4345,10 @@ class ProxyState:
                     if not gap_messages:
                         break
                     logger.info(
-                        "Ingestion catch-up: %d gap turns (have=%d, need=%d)",
+                        "Ingestion catch-up: %d gap turns (have=%d, need=%d) "
+                        "conv=%s",
                         self._history_turn_count(gap_messages), have, needed,
+                        conversation_id[:12],
                     )
                     self._ingestion_progress = (have, needed)
                     self._ingest_messages_with_progress(gap_messages, baseline=have, cumulative_total=needed)
@@ -4356,7 +4358,10 @@ class ProxyState:
 
             except _IngestionCancelled as e:
                 cancelled = True
-                logger.info("Ingestion cancelled at %d/%d", e.done, e.total)
+                logger.info(
+                    "Ingestion cancelled at %d/%d conv=%s",
+                    e.done, e.total, conversation_id[:12],
+                )
             except StaleConversationWriteError as e:
                 cancelled = True
                 logger.info(
@@ -4367,7 +4372,8 @@ class ProxyState:
             except Exception as e:
                 logger.error(
                     "Legacy pair-based ingestion errored (falling through "
-                    "to row-based DB sweep): %s",
+                    "to row-based DB sweep) conv=%s: %s",
+                    conversation_id[:12],
                     e,
                     exc_info=True,
                 )
