@@ -7,7 +7,9 @@ self-inflicted per-request tax that grows with vocabulary. The bound is
 now a constructor argument with an environment override
 (``VC_TAG_EMBEDDING_RUNTIME_MAX_PER_MODEL``), parsed once at
 construction; an invalid value fails loudly rather than silently
-falling back.
+falling back. The default is sized against measured runtime
+vocabularies (the largest observed conversation holds ~7,000 runtime
+entries).
 """
 from __future__ import annotations
 
@@ -30,9 +32,9 @@ def _fill(provider: SessionStateProvider, count: int) -> None:
         provider._remember_runtime_tag_embedding("m", f"tag-{i}", [0.5])
 
 
-def test_default_bound_is_unchanged():
+def test_default_bound_holds_measured_runtime_vocabularies():
     provider = _provider()
-    assert provider._tag_embedding_runtime_max_per_model == 5000
+    assert provider._tag_embedding_runtime_max_per_model == 10000
 
 
 def test_constructor_bound_governs_eviction():
@@ -61,7 +63,7 @@ def test_argument_wins_over_environment(monkeypatch):
 def test_blank_environment_keeps_the_default(monkeypatch, raw):
     monkeypatch.setenv("VC_TAG_EMBEDDING_RUNTIME_MAX_PER_MODEL", raw)
     provider = _provider()
-    assert provider._tag_embedding_runtime_max_per_model == 5000
+    assert provider._tag_embedding_runtime_max_per_model == 10000
 
 
 @pytest.mark.parametrize("raw", ["banana", "0", "-5"])

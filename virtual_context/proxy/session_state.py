@@ -11,6 +11,7 @@ import hashlib
 import json
 import logging
 import math
+import threading
 from collections import OrderedDict
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -124,6 +125,18 @@ class SessionState:
         )
 
 
+# The tag-vector runtime cache is PROCESS-GLOBAL: values are keyed by
+# (model_name, tag) and are content-derived — the same tag text embeds to
+# the same vector for every conversation and tenant — so there is nothing
+# per-instance about them, while the cost of materializing them from the
+# shared cache is CPU that scales with vocabulary and was being paid per
+# provider instance. Tag NAMES are user content; holding them process-wide
+# is the same exposure class as the shared cache one layer down. Mutation
+# happens under the lock; readers receive copies.
+_PROCESS_TAG_VECTOR_CACHE: dict[str, OrderedDict[str, list[float]]] = {}
+_PROCESS_TAG_VECTOR_LOCK = threading.Lock()
+
+
 class SessionStateProvider:
     """Redis-backed session state. Load at request start, save at request end."""
 
@@ -132,7 +145,15 @@ class SessionStateProvider:
     _TAG_EMBEDDING_CACHE_TTL_SECONDS = 24 * 60 * 60
     _TAG_SUMMARY_EMBEDDING_SNAPSHOT_TTL_SECONDS = 24 * 60 * 60
     _CONTEXT_HINT_CACHE_TTL_SECONDS = 6 * 60 * 60
-    _TAG_EMBEDDING_RUNTIME_MAX_PER_MODEL = 5000
+    # Default sized against measured RUNTIME vocabularies, which run about
+    # a thousand entries above durable counts (live, uncompacted tags):
+    # the largest observed conversation holds ~7,000 runtime entries, so
+    # 10,000 keeps every measured single conversation resident with margin
+    # while bounding worst-case per-process residency. Several outlier
+    # conversations sharing one process can exceed it and degrade to LRU
+    # re-materialization; raise via the environment override if that shows
+    # up in the embedding breakdown instrumentation.
+    _TAG_EMBEDDING_RUNTIME_MAX_PER_MODEL = 10000
     _TAG_EMBEDDING_RUNTIME_MAX_ENV = "VC_TAG_EMBEDDING_RUNTIME_MAX_PER_MODEL"
 
     def __init__(
@@ -174,7 +195,6 @@ class SessionStateProvider:
                 f"integer, got {resolved_cap!r}"
             )
         self._tag_embedding_runtime_max_per_model = int(resolved_cap)
-        self._tag_embedding_runtime_cache: dict[str, OrderedDict[str, list[float]]] = {}
         self._tag_stats_runtime_cache: dict[str, list[TagStats]] = {}
         self._tag_summary_embedding_snapshot_runtime_cache: dict[str, dict[str, list[float]]] = {}
 
@@ -197,11 +217,26 @@ class SessionStateProvider:
     def _context_hint_cache_key(self, conversation_id: str, cache_key: str) -> str:
         return f"vc:context_hint:{conversation_id}:{cache_key}"
 
+    @property
+    def _tag_embedding_runtime_cache(
+        self,
+    ) -> dict[str, OrderedDict[str, list[float]]]:
+        """Alias for the process-global vector cache.
+
+        Kept as an instance-shaped surface so existing callers (and the
+        clearing pattern in tests) keep working; there is exactly one
+        store per process.
+        """
+        return _PROCESS_TAG_VECTOR_CACHE
+
     def _runtime_tag_cache(self, model_name: str) -> OrderedDict[str, list[float]]:
-        cache = self._tag_embedding_runtime_cache.get(model_name)
+        cache = _PROCESS_TAG_VECTOR_CACHE.get(model_name)
         if cache is None:
-            cache = OrderedDict()
-            self._tag_embedding_runtime_cache[model_name] = cache
+            with _PROCESS_TAG_VECTOR_LOCK:
+                cache = _PROCESS_TAG_VECTOR_CACHE.get(model_name)
+                if cache is None:
+                    cache = OrderedDict()
+                    _PROCESS_TAG_VECTOR_CACHE[model_name] = cache
         return cache
 
     def _remember_runtime_tag_embedding(
@@ -210,11 +245,16 @@ class SessionStateProvider:
         tag: str,
         embedding: list[float],
     ) -> None:
+        # The store is shared across every provider and engine in the
+        # process, so all mutation happens under the lock. The bound is the
+        # inserting provider's resolved bound; deployments configure one
+        # value per process.
         cache = self._runtime_tag_cache(model_name)
-        cache[tag] = list(embedding)
-        cache.move_to_end(tag)
-        while len(cache) > self._tag_embedding_runtime_max_per_model:
-            cache.popitem(last=False)
+        with _PROCESS_TAG_VECTOR_LOCK:
+            cache[tag] = list(embedding)
+            cache.move_to_end(tag)
+            while len(cache) > self._tag_embedding_runtime_max_per_model:
+                cache.popitem(last=False)
 
     @staticmethod
     def _clone_tag_stats(stats: list[TagStats]) -> list[TagStats]:
@@ -805,13 +845,14 @@ class SessionStateProvider:
         loaded: dict[str, list[float]] = {}
         runtime_cache = self._runtime_tag_cache(model_name)
         missing: list[str] = []
-        for tag in unique_tags:
-            cached = runtime_cache.get(tag)
-            if cached is None:
-                missing.append(tag)
-                continue
-            runtime_cache.move_to_end(tag)
-            loaded[tag] = list(cached)
+        with _PROCESS_TAG_VECTOR_LOCK:
+            for tag in unique_tags:
+                cached = runtime_cache.get(tag)
+                if cached is None:
+                    missing.append(tag)
+                    continue
+                runtime_cache.move_to_end(tag)
+                loaded[tag] = list(cached)
         if not missing:
             return loaded
 

@@ -176,3 +176,19 @@ class MockTagGenerator:
             source="mock",
         )
 
+
+@pytest.fixture(autouse=True)
+def _fresh_process_tag_vector_cache():
+    """The tag-vector runtime cache is process-global; without a per-test
+    reset, one test's vectors leak into the next test's cache-hit
+    assertions inside the same worker process."""
+    try:
+        from virtual_context.proxy import session_state as _ss
+        cache = getattr(_ss, "_PROCESS_TAG_VECTOR_CACHE", None)
+    except Exception:
+        cache = None
+    if cache is not None:
+        cache.clear()
+    yield
+    if cache is not None:
+        cache.clear()
