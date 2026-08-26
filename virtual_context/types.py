@@ -958,6 +958,40 @@ class SpeakerRetrievalContext:
             original_active_user_text=original_active_user_text or "",
         )
 
+    @classmethod
+    def for_owner_conversation(
+        cls,
+        tenant_id: str,
+        owner_conversation_id: str,
+        *,
+        requester_actor_id: str = "",
+        original_active_user_text: str = "",
+    ) -> "SpeakerRetrievalContext":
+        """Authority for a single-participant conversation addressed as itself.
+
+        The request arrives on the owner conversation, the audience IS the
+        owner, and there is no channel dimension: the empty channel with
+        scope ``channel`` requires exact empty-channel equality on source
+        rows, so channel-bearing rows stay invisible. Callers must have
+        proved the route — the tenant-scoped resolver returned the owner
+        itself — before constructing this; the constructor stays pure and
+        a blank owner yields the explicit ineligible sentinel, never a
+        partial context.
+        """
+        owner = (owner_conversation_id or "").strip()
+        if not owner:
+            return cls.ineligible()
+        return cls(
+            tenant_id=tenant_id or "",
+            owner_conversation_id=owner,
+            audience_conversation_id=owner,
+            audience_channel_id="",
+            audience_channel_scope="channel",
+            request_origin_channel_id="",
+            requester_actor_id=requester_actor_id or "",
+            original_active_user_text=original_active_user_text or "",
+        )
+
 
 # ---------------------------------------------------------------------------
 # Speaker roster

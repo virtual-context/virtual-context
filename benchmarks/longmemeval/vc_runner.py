@@ -56,15 +56,10 @@ def benchmark_speaker_context(
     owner-routed DM shape: the audience IS the conversation, with no
     channel dimension (empty channel, exact-match scope).
     """
-    conv = engine.config.conversation_id
     tenant_raw = getattr(engine.config, "tenant_id", "")
-    return SpeakerRetrievalContext(
-        tenant_id=tenant_raw if isinstance(tenant_raw, str) else "",
-        owner_conversation_id=conv,
-        audience_conversation_id=conv,
-        audience_channel_id="",
-        audience_channel_scope="channel",
-        request_origin_channel_id="",
+    return SpeakerRetrievalContext.for_owner_conversation(
+        tenant_raw if isinstance(tenant_raw, str) else "",
+        engine.config.conversation_id,
         original_active_user_text=question_text or "",
     )
 
