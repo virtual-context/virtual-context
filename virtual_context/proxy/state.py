@@ -3348,6 +3348,35 @@ class ProxyState:
         if new_turns <= old_turns * (1 + threshold):
             return False  # Not enough growth — likely aging, not widening
 
+        # The reset's premise is that the incoming payload IS the client's
+        # authoritative full history, so re-ingesting from it can rebuild
+        # everything the purge destroys. A payload holding fewer ingestible
+        # entries than the durable canonical record cannot be that history:
+        # on single-turn completion lanes the payload is a working window
+        # (newest turns, post-compaction survivors), and the in-memory
+        # baseline counters above undercount what is durably stored. The
+        # comparison is therefore against the DURABLE count, never the
+        # worker-local one, and a smaller payload suppresses the reset —
+        # destroying more than the payload can rebuild is never correct.
+        payload_entries = len(history_messages)
+        try:
+            durable_entries = int(
+                self.engine._store.read_progress_snapshot(
+                    conversation_id,
+                ).total_ingestible,
+            )
+        except Exception:
+            durable_entries = 0
+        if payload_entries < durable_entries:
+            logger.warning(
+                "HISTORY_WIDENING_SUPPRESSED conversation=%s payload_entries=%d "
+                "durable_entries=%d old_turns=%d new_turns=%d: the payload "
+                "cannot rebuild the durable history; skipping reset",
+                conversation_id[:12], payload_entries, durable_entries,
+                old_turns, new_turns,
+            )
+            return False
+
         logger.info(
             "HISTORY_WIDENED conversation=%s old_hash=%s new_hash=%s old_turns=%d new_turns=%d "
             "threshold=%.0f%% — clearing state and re-ingesting",

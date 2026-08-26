@@ -614,6 +614,7 @@ Use `pytest -m regression` to run all regression tests.
 | `test_assistant_audience_stamping.py` | BUG-058 |
 | `test_benchmark_retrieval_authority.py` | BUG-059 |
 | `test_prepare_user_message_strip.py` | BUG-060 |
+| `test_history_widening_guard.py` | BUG-061 |
 | `test_tag_summary_materialization.py` | BUG-041 |
 | `test_embedding_context_guard.py` | BUG-042 |
 | `test_embedding_reserved_seats.py` | BUG-043 |
@@ -726,3 +727,13 @@ Use `pytest -m regression` to run all regression tests.
   - `test_benchmark_retrieval_authority.py::test_benchmark_context_passes_quote_search_request_gate`
   - `test_benchmark_retrieval_authority.py::test_benchmark_context_is_scoped_to_its_own_conversation`
   - `test_benchmark_retrieval_authority.py::test_ineligible_sentinel_still_fails_the_gate`
+
+### BUG-061 — the widening reset destroys history the payload cannot rebuild
+
+- **Symptom**: on the single-turn completion flow, a prepare whose window starts at a different first turn and holds more pairs than the worker-local baseline trips the widening reset, which purges every table for the conversation (`HISTORY_WIDENED` then `delete_conversation`) — including turns the incoming window does not contain. A newest-turns-only client loses its whole durable history; the subsequent rebuild is refused by strict-tagging admission, leaving zero rows.
+- **Root cause**: the reset's premise is that the incoming payload is the client's authoritative full history, so a full re-ingest can rebuild everything the purge destroys. On the single-turn completion lane the payload is a working window, not a history assertion, and the trigger compared against worker-local in-memory counters that undercount the durable store — the first-turn hash trivially differs and the growth ratio is trivially satisfied for any windowed client.
+- **Fix**: before destroying anything, the reset compares the payload's ingestible entry count against the DURABLE canonical count from the progress snapshot — never the worker-local counters. A smaller payload suppresses the reset with a `HISTORY_WIDENING_SUPPRESSED` warning carrying both counts; a payload at least as large as the durable record keeps the existing reset behavior, so authoritative proxy-lane widening is unchanged.
+- **Known deviation, out of scope here**: the reset still purges via a direct `delete_conversation` call rather than the sanctioned deletion path; recorded for the payload-shape class review.
+- **Tests**:
+  - `test_history_widening_guard.py::test_smaller_payload_never_resets_durable_history`
+  - `test_history_widening_guard.py::test_genuine_widening_still_resets`
