@@ -77,6 +77,43 @@ _ACTOR_CARD_SEMANTIC_CONTRACT = (
 )
 
 
+_ACTOR_CARD_JUDGMENT_RULES = (
+    "Register and sincerity: group banter, jokes, sarcasm, hyperbole, and "
+    "performative provocations are not evidence of goals, plans, "
+    "preferences, or facts, however literal the wording. Read every source "
+    "message in its surrounding register; when the register is plausibly "
+    "non-serious, the material must not be proposed or admitted unless "
+    "later evidence corroborates it seriously: repetition in a non-joking "
+    "register, concrete steps taken, or explicit confirmation. "
+    "A question or one-shot service request the actor sent is never an "
+    "active_goal and never a fact about the actor: an interrogative or a "
+    "single imperative as the sole support for active_goal must be "
+    "rejected, and explicit transience markers such as 'for today' or "
+    "'this once' are decisive against durability. At most the topic of "
+    "recurring requests may inform relevant_history. "
+    "active_goal admits only the author's first-person intent, stated by "
+    "the author about themselves in a serious register. A question or "
+    "statement about a third party is never the author's goal, and never "
+    "becomes any card entry without that person's own cited utterance. "
+    "The durability bar applies to every kind, not only communication "
+    "preferences and interaction style: an active_goal or "
+    "relevant_history entry requires stated lasting intent or consistent "
+    "support across distinct actor-authored messages; a single mention in "
+    "a non-serious or transient frame is not durable. "
+)
+
+_ACTOR_CARD_CONFIDENCE_SCALE = (
+    "Confidence is calibrated evidence strength, not enthusiasm: reserve "
+    "1.0 for explicitly stated, repeated, uncontradicted evidence; a claim "
+    "supported by a single message must not exceed 0.7; anything whose "
+    "register is arguably non-serious must not exceed 0.4. "
+)
+
+# A claim resting on exactly one cited source is capped in code regardless
+# of what the curator asserted: single-message evidence cannot be maximal.
+_ACTOR_CARD_SINGLE_SOURCE_CONFIDENCE_CAP = 0.8
+
+
 def _format_rejection_counts(rejected) -> str:
     """Render rejection counts for a log line without JSON quoting.
 
@@ -949,6 +986,15 @@ class CompactionPipeline:
                 rejected["missing_citations"] += 1
                 continue
 
+            # Single-message evidence cannot be maximal regardless of what
+            # the curator asserted: cap it in code so the stored number
+            # stays honest even when the model ignores the calibration
+            # instruction.
+            if len(fact_ids) + len(turn_ids) == 1:
+                confidence = min(
+                    confidence, _ACTOR_CARD_SINGLE_SOURCE_CONFIDENCE_CAP,
+                )
+
             scope = (
                 CARD_SCOPE_CROSS_CONTEXT
                 if kind in CARD_CROSS_CONTEXT_KINDS
@@ -1545,7 +1591,7 @@ class CompactionPipeline:
             "explicitly and unambiguously asks that particular information "
             "not be retained or reused, do not propose it for the card. Do not "
             "infer such a request from the topic, from a DM, or from context. "
-        ) + _ACTOR_CARD_SEMANTIC_CONTRACT
+        ) + _ACTOR_CARD_SEMANTIC_CONTRACT + _ACTOR_CARD_JUDGMENT_RULES + _ACTOR_CARD_CONFIDENCE_SCALE
         user = json.dumps({
             "facts": prompt_facts,
             "turns": prompt_turns,
@@ -2128,7 +2174,7 @@ class CompactionPipeline:
             "DM, or from context. A visibly truncated turn cannot prove a "
             "claim whose qualifier may be in omitted text. When uncertain, "
             "reject. "
-        ) + _ACTOR_CARD_SEMANTIC_CONTRACT
+        ) + _ACTOR_CARD_SEMANTIC_CONTRACT + _ACTOR_CARD_JUDGMENT_RULES
         user = json.dumps({
             "curator_substantive_claim": curator_substantive,
             "candidates": candidates,
