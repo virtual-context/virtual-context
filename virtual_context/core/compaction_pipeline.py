@@ -45,7 +45,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _ACTOR_CARD_CITATION_LIMIT = 16
-_ACTOR_CARD_POLICY_VERSION = 13
+_ACTOR_CARD_POLICY_VERSION = 14
 _ACTOR_CARD_SEMANTIC_CONTRACT = (
     "Semantic contract for every candidate: communication_pref means only "
     "how this actor wants the agent to communicate, respond, format answers, "
