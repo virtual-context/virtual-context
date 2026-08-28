@@ -143,3 +143,43 @@ def test_multi_source_entry_confidence_is_uncapped(store):
     )
     assert pipeline._rebuild_actor_card(OPTICS) == 1
     assert _stored_confidences(store) == [1.0]
+
+
+@pytest.mark.regression("BUG-063")
+def test_carryover_single_source_confidence_is_clamped(store):
+    """A carried-over cross-context entry keeps its immutable body but not
+    an over-cap confidence: the evidence invariant (one cited message can
+    never support more than the cap) applies to every admitted entry,
+    whichever path produced it."""
+    from virtual_context.types import CARD_KIND_COMMUNICATION_PREF
+    from tests.test_actor_cards import (
+        CARD_SCOPE_CROSS_CONTEXT,
+        _entry,
+        _turn_source,
+    )
+
+    _conversation(store, "guild")
+    _turn(store, "ct-1", "guild", OPTICS, "guild", "chan-a",
+          content="I am working through a structured strength program.")
+    store.upsert_actor_profile_from_turn(
+        "guild", OPTICS, "Optics", seen_at=_now(),
+    )
+
+    legacy = _entry(
+        "e-legacy", CARD_KIND_COMMUNICATION_PREF,
+        "Prefers rapid replies from the agent.",
+        scope=CARD_SCOPE_CROSS_CONTEXT, confidence=0.98,
+    )
+    assert store.replace_actor_card(
+        "t1", OPTICS,
+        [(legacy, [_turn_source("e-legacy", "guild", "guild", "ct-1", "chan-a")])],
+        input_hash="legacy-hash",
+        expected_source_epochs={"guild": 1},
+    )
+
+    pipeline = _card_pipeline(
+        store, _goal_curator(0.5, ["ct-1"]), admission=_AdmitAll(),
+    )
+    assert pipeline._rebuild_actor_card(OPTICS) >= 1
+    confs = _stored_confidences(store)
+    assert confs and max(confs) <= 0.8, confs

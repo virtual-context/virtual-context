@@ -45,7 +45,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _ACTOR_CARD_CITATION_LIMIT = 16
-_ACTOR_CARD_POLICY_VERSION = 14
+_ACTOR_CARD_POLICY_VERSION = 15
 _ACTOR_CARD_SEMANTIC_CONTRACT = (
     "Semantic contract for every candidate: communication_pref means only "
     "how this actor wants the agent to communicate, respond, format answers, "
@@ -1359,6 +1359,21 @@ class CompactionPipeline:
                 "actor card coverage gate found a substantive actor "
                 "without an admitted entry"
             )
+
+        # The single-source confidence cap is an EVIDENCE invariant, not a
+        # curation-vintage one: a stored number must never exceed what one
+        # cited message supports, whichever path produced the entry. Fresh
+        # entries were capped at normalization; carried-over cross-context
+        # entries arrive with their originally stored confidence, so this
+        # final pass clamps every admitted entry with exactly one source.
+        # Confidence is not part of the entry's immutable body or identity
+        # digest, so the clamp changes no id and rewrites no body.
+        for entry, entry_sources in normalized:
+            if len(entry_sources) == 1:
+                entry.confidence = min(
+                    float(entry.confidence or 0.0),
+                    _ACTOR_CARD_SINGLE_SOURCE_CONFIDENCE_CAP,
+                )
 
         expected_epochs: dict[str, int] = {}
         for source in [*fact_sources, *turn_sources]:
