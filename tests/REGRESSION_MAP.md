@@ -617,6 +617,7 @@ Use `pytest -m regression` to run all regression tests.
 | `test_history_widening_guard.py` | BUG-061 |
 | `test_actor_card_admission_quality.py` | BUG-063 |
 | `test_card_availability_and_adjudication.py` | BUG-064, BUG-065 |
+| `test_render_escape_host_attribution.py` | BUG-066 |
 | `test_tag_summary_materialization.py` | BUG-041 |
 | `test_embedding_context_guard.py` | BUG-042 |
 | `test_embedding_reserved_seats.py` | BUG-043 |
@@ -774,3 +775,11 @@ Use `pytest -m regression` to run all regression tests.
 - **Fix**: each prompt message now carries the paired agent reply (bounded, keyed by turn group) on both surfaces, fresh and carryover; the judgment rules make the agent's live adjudication the admission signal — honored requests may be preferences, refused or deferred requests reject as `agent_refused`, a behavior-change request with no visible honored signal rejects the same way, and safety-posture requests reject as `safety_posture_request` for any actor; both reasons join the validated enum, and the policy version bump re-judges existing carried-over entries on the next rebuild.
 - **Tests**:
   - `test_card_availability_and_adjudication.py` (reply plumbing on both surfaces, reject-only token acceptance, judgment-rule pins)
+
+### BUG-066 — host-attribution lookalikes render verbatim into model-facing context
+
+- **Symptom**: a participant who types a lookalike of a trusted attribution wrapper (`<message-speaker ...>`, `<current-speaker ...>`, `<vc-prepared-context ...>`) gets it back verbatim inside rendered context — assembled prepend, tool results, MCP responses — where downstream consumers treat such wrappers as trusted host metadata, so one participant can forge another's attribution.
+- **Root cause**: stored conversation content is exact-source by design and no model-facing render boundary escaped the host-attribution tag set; the message lane must stay byte-exact for turn-hash alignment, but rendered egress had no equivalent constraint and simply inherited exactness.
+- **Fix**: `core/render_escape.py` escapes the leading `<` of the recognized tag set to the literal `\u003c` characters, idempotently, in a plain-text form and a serialized-JSON form (doubled backslash so a decode still carries the escape); applied at the assembler's prepend composition, at the `execute_vc_tool` result boundary, and via a decorator on every MCP tool/resource/prompt. Never applied at ingest, in storage, or in the message lane.
+- **Tests**:
+  - `test_render_escape_host_attribution.py` (prepend and tool-result egress escape parse-stably; message lane stays byte-exact; all five tags case-insensitively; idempotence and plain/serialized composability; MCP decorator behavior and a source lint pinning it on every registration)

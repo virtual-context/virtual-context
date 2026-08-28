@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
+from .render_escape import escape_host_attribution_markup
 from .speaker_roster import (
     build_speaker_roster,
     evict_least_recent,
@@ -1593,7 +1594,10 @@ class ContextAssembler:
                 parts.append(facts_text)
             if recent_conversation_text:
                 parts.append(recent_conversation_text)
-            return "\n\n".join(parts)
+            # Model-facing egress: stored member text can contain
+            # host-attribution lookalikes; escape them here, never in the
+            # message lane, whose byte identity feeds turn-hash alignment.
+            return escape_host_attribution_markup("\n\n".join(parts))
 
         prepend_text = _build_prepend()
         _note("build_prepend", _stage)

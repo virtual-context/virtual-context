@@ -12,6 +12,7 @@ from ..core.speaker_labels import (
     annotate_aggregate_entry,
     strip_to_structural_speaker_fields,
 )
+from ..core.render_escape import escape_host_attribution_markup
 from ..core.summary_identity import (
     render_summary_for_model,
     sanitize_summary_payload_for_model,
@@ -19,6 +20,25 @@ from ..core.summary_identity import (
 from ..types import SpeakerRetrievalContext
 
 logger = logging.getLogger(__name__)
+
+
+def _escaped_render(fn):
+    """Escape host-attribution lookalikes in a tool's model-facing text.
+
+    Stored member text is exact-source, so a typed lookalike of a trusted
+    attribution wrapper would otherwise reach the model verbatim. The
+    escape is idempotent and applies only at this render egress.
+    """
+    import functools
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        result = fn(*args, **kwargs)
+        if isinstance(result, str):
+            return escape_host_attribution_markup(result)
+        return result
+
+    return wrapper
 
 mcp = FastMCP(
     "virtual-context",
@@ -63,6 +83,7 @@ def _stateless_speaker_exposure(engine, result):
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
+@_escaped_render
 def recall_context(
     message: str,
     active_tags: list[str] | None = None,
@@ -113,6 +134,7 @@ def recall_context(
 
 
 @mcp.tool()
+@_escaped_render
 def compact_context(
     messages: list[dict],
 ) -> str:
@@ -148,6 +170,7 @@ def compact_context(
 
 
 @mcp.tool()
+@_escaped_render
 def expand_topic(
     tag: str, depth: str = "full", collapse_tags: list[str] | None = None,
 ) -> str:
@@ -197,6 +220,7 @@ def expand_topic(
 
 
 @mcp.tool()
+@_escaped_render
 def recall_all() -> str:
     """List all stored conversation topics at once.
 
@@ -223,6 +247,7 @@ def recall_all() -> str:
 
 
 @mcp.tool()
+@_escaped_render
 def remember_when(query: str, time_range: dict, max_results: int = 12, mode: str = "auto") -> str:
     """Find memory by topic within a time window.
 
@@ -242,6 +267,7 @@ def remember_when(query: str, time_range: dict, max_results: int = 12, mode: str
 
 
 @mcp.tool()
+@_escaped_render
 def find_quote(query: str, mode: str = "lookup", channel: str = "") -> str:
     """Find direct quote-like evidence from raw conversation turns.
 
@@ -278,6 +304,7 @@ def find_quote(query: str, mode: str = "lookup", channel: str = "") -> str:
 
 
 @mcp.tool()
+@_escaped_render
 def search_summaries(query: str, mode: str = "lookup") -> str:
     """Search summaries, segment text, and related stored context.
 
@@ -297,6 +324,7 @@ def search_summaries(query: str, mode: str = "lookup") -> str:
 
 
 @mcp.tool()
+@_escaped_render
 def domain_status() -> str:
     """Show statistics for all stored tags/domains.
 
@@ -325,6 +353,7 @@ def domain_status() -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.resource("virtualcontext://domains")
+@_escaped_render
 def list_domains() -> str:
     """List all stored tags/domains with their statistics."""
     engine = _get_engine()
@@ -336,6 +365,7 @@ def list_domains() -> str:
 
 
 @mcp.resource("virtualcontext://domains/{tag}")
+@_escaped_render
 def get_domain_summaries(tag: str) -> str:
     """Get all stored summaries for a specific tag/domain."""
     engine = _get_engine()
@@ -360,6 +390,7 @@ def get_domain_summaries(tag: str) -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.prompt()
+@_escaped_render
 def recall(topic: str) -> str:
     """Recall stored context about a specific topic.
 
@@ -372,6 +403,7 @@ def recall(topic: str) -> str:
 
 
 @mcp.prompt()
+@_escaped_render
 def summarize_conversation() -> str:
     """Request a conversation summary for compaction.
 

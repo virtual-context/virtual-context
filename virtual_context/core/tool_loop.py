@@ -24,6 +24,7 @@ from ..types import (
     ToolLoopResult,
     is_valid_speaker_handle,
 )
+from .render_escape import escape_host_attribution_in_serialized_json
 from .quote_search import SpeakerConditioning
 from .quote_search import find_quote as _conditioned_find_quote
 from .speaker_labels import (
@@ -1242,6 +1243,40 @@ def _render_recall_all_payload(
 
 
 def execute_vc_tool(
+    engine: VirtualContextEngine,
+    name: str,
+    tool_input: dict,
+    *,
+    intent_context: str = "",
+    presented_segment_refs: set[str] | None = None,
+    presented_fact_ids: set[str] | None = None,
+    tool_runtime: VCToolRuntime | None = None,
+    speaker_context: SpeakerRetrievalContext | None = None,
+    roster_snapshot=None,
+) -> str:
+    """Execute a VC paging tool and return a JSON result string.
+
+    The serialized result is the model-facing egress for every tool, so
+    host-attribution lookalikes inside stored member text are escaped
+    here, in the parse-stable serialized form: a consumer that decodes
+    the JSON still reads the escaped sequence.
+    """
+    return escape_host_attribution_in_serialized_json(
+        _execute_vc_tool_unescaped(
+            engine,
+            name,
+            tool_input,
+            intent_context=intent_context,
+            presented_segment_refs=presented_segment_refs,
+            presented_fact_ids=presented_fact_ids,
+            tool_runtime=tool_runtime,
+            speaker_context=speaker_context,
+            roster_snapshot=roster_snapshot,
+        )
+    )
+
+
+def _execute_vc_tool_unescaped(
     engine: VirtualContextEngine,
     name: str,
     tool_input: dict,
