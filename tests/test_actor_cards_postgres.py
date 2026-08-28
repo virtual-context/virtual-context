@@ -430,6 +430,39 @@ def test_pg_rebuild_failure_backoff_status_round_trips(store):
     ) == []
 
 
+@pytest.mark.regression("BUG-064")
+def test_pg_coverage_disagreement_increments_instead_of_terminal_jump(store):
+    w = World(store)
+    store.mark_actor_card_dirty(
+        w.tenant,
+        w.optics,
+        build_input_hash="building:cov-input",
+    )
+    store.record_actor_card_rebuild_status(
+        w.tenant,
+        w.optics,
+        attempted_at=_now(),
+        input_hash="cov-input",
+        source_count=479,
+        raw_entry_count=4,
+        accepted_entry_count=0,
+        rejected_counts={},
+        outcome="coverage_disagreement",
+        response_hash="response",
+        written_count=0,
+    )
+    status = store.get_actor_card_rebuild_status(w.tenant, w.optics)
+    assert status is not None
+    assert status["failure_count"] == 1, (
+        "a coverage disagreement is one failed attempt, not an instant "
+        "terminal count"
+    )
+    assert store.list_due_actor_card_rebuilds(
+        w.tenant,
+        due_at="9999-01-01T00:00:00+00:00",
+    ) == [w.optics]
+
+
 def test_pg_dm_entry_is_not_served_in_the_guild(store):
     w = World(store)
     _build(w)

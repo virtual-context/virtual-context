@@ -14639,15 +14639,15 @@ class PostgresStore(ContextStore):
                 "stale_or_rejected_write",
             }
             if outcome in failed_outcomes:
-                if outcome in {"coverage_disagreement", "coverage_gap"}:
-                    failure_count = 3
-                else:
-                    failure_count = (
-                        int(previous["failure_count"] or 0) + 1
-                        if previous is not None
-                        and (previous["input_hash"] or "") == input_hash
-                        else 1
-                    )
+                # Coverage outcomes increment like any other failure; the
+                # instant-terminal jump made a substantive-but-nothing-durable
+                # actor permanently cardless on the first disagreement.
+                failure_count = (
+                    int(previous["failure_count"] or 0) + 1
+                    if previous is not None
+                    and (previous["input_hash"] or "") == input_hash
+                    else 1
+                )
                 attempted = (
                     _str_to_dt(attempted_at)
                     or datetime.now(timezone.utc)
