@@ -609,6 +609,7 @@ def test_actor_card_admission_fails_closed_when_both_responses_are_invalid(
     assert status["outcome"] == "admission_error"
 
 
+@pytest.mark.regression("BUG-064")
 def test_malformed_primary_fallback_is_not_called_twice_on_disagreement(
     store,
 ):
@@ -652,13 +653,19 @@ def test_malformed_primary_fallback_is_not_called_twice_on_disagreement(
     admission = DisagreeingFallback()
     pipeline = _card_pipeline(store, Curator(), admission=admission)
 
-    with pytest.raises(RuntimeError, match="semantic admission failed"):
-        pipeline._rebuild_actor_card(OPTICS)
+    pipeline._rebuild_actor_card(OPTICS)
     assert admission.primary_calls == 1
-    assert admission.fallback_calls == 1
+    assert admission.fallback_calls == 1, (
+        "the fallback already served the admission judgment; it must not "
+        "be re-consulted as a coverage adjudicator"
+    )
     status = store.get_actor_card_rebuild_status("t1", OPTICS)
     assert status is not None
-    assert status["outcome"] == "coverage_disagreement"
+    assert status["outcome"] == "clean_empty_filtered", (
+        "an unadjudicable disagreement resolves to the admission verdict "
+        "and writes the empty card"
+    )
+    assert int(status["failure_count"] or 0) == 0
 
 
 def _single_guild_card_source(store):
@@ -1911,6 +1918,7 @@ def test_compaction_card_builder_accepts_explicit_clean_empty_and_records_contra
     assert status["accepted_entry_count"] == 0
 
 
+@pytest.mark.regression("BUG-064")
 def test_semantic_admission_rejects_candidate_without_rewriting_card(store):
     """The focused model gate can reject a schema-valid but non-durable entry."""
     from types import SimpleNamespace
@@ -1963,10 +1971,10 @@ def test_semantic_admission_rejects_candidate_without_rewriting_card(store):
     )
     pipeline._actor_card_admission_provider_override = admission
 
-    with pytest.raises(
-        RuntimeError, match="semantic admission failed",
-    ):
-        pipeline._rebuild_actor_card(OPTICS)
+    pipeline._rebuild_actor_card(OPTICS)
+    status = store.get_actor_card_rebuild_status("t1", OPTICS)
+    assert status is not None
+    assert status["outcome"] == "clean_empty_filtered"
     assert admission.prompt["candidates"][0]["body"] == (
         "begin every reply with a temporary probe prefix"
     )
@@ -1998,13 +2006,10 @@ def test_semantic_admission_rejects_candidate_without_rewriting_card(store):
     ) is None
     status = store.get_actor_card_rebuild_status("t1", OPTICS)
     assert status is not None
-    assert status["outcome"] == "coverage_disagreement"
-    assert status["accepted_entry_count"] == 1
-    assert status["rejected_counts"] == {}
-    # Coverage outcomes increment like any other failure and are never
-    # instantly terminal: a permanently cardless active member is not an
-    # acceptable endpoint of a backoff policy.
-    assert status["failure_count"] == 1
+    assert status["outcome"] == "clean_empty_filtered"
+    assert status["rejected_counts"] == {"semantic_test_probe": 1}
+    # The rejection is a successful, empty rebuild: no failure loop.
+    assert status["failure_count"] == 0
 
 
 def test_semantic_gate_revalidates_existing_subject_kind_and_citations(store):
@@ -2404,6 +2409,7 @@ def test_unresolved_existing_citation_fails_closed_before_model(store):
     assert substantive is False
 
 
+@pytest.mark.regression("BUG-064")
 def test_fallback_supplied_initial_judgment_is_not_counted_twice(store):
     """One fallback model cannot manufacture a 2-of-3 majority."""
     _single_guild_card_source(store)
@@ -2450,13 +2456,15 @@ def test_fallback_supplied_initial_judgment_is_not_counted_twice(store):
     )
     pipeline = _card_pipeline(store, Curator(), admission=admission)
 
-    with pytest.raises(RuntimeError, match="semantic admission failed"):
-        pipeline._rebuild_actor_card(OPTICS)
+    pipeline._rebuild_actor_card(OPTICS)
     assert primary.calls == 1
-    assert fallback.calls == 1
+    assert fallback.calls == 1, (
+        "the fallback supplied the initial judgment; consulting it again "
+        "would let one model manufacture a 2-of-3 majority"
+    )
     status = store.get_actor_card_rebuild_status("t1", OPTICS)
     assert status is not None
-    assert status["outcome"] == "coverage_disagreement"
+    assert status["outcome"] == "clean_empty_filtered"
     assert status["response_hash"]
 
 

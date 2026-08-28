@@ -319,3 +319,47 @@ def test_judgment_rules_cover_agent_adjudication():
     assert "honored" in rules
     assert "safety" in rules
     assert "agent_refused" in rules or "safety_posture_request" in rules
+
+
+@pytest.mark.regression("BUG-064")
+def test_disagreement_without_adjudicator_resolves_conservatively(store):
+    """When the coverage adjudicator is unavailable (the admission call
+    already used its fallback, or no fallback exists), the disagreement
+    resolves to the JUDGE's verdict instead of failing the rebuild: the
+    conservative gate decides, the (possibly empty) card writes, and no
+    failure loop begins."""
+    _conversation(store, "guild")
+    _grouped_turn(store, "ct-cited", "guild", OPTICS, "guild", 0,
+                  user_text="give me a workout for today")
+    store.upsert_actor_profile_from_turn(
+        "guild", OPTICS, "Optics", seen_at=_now(),
+    )
+
+    class DisagreeingJudge:
+        """Judge says non-substantive while the curator said substantive;
+        no complete_fallback attribute -> no adjudicator available."""
+
+        def complete(self, **kwargs):
+            prompt = json.loads(kwargs["user"])
+            decisions = [{
+                "candidate_id": c["candidate_id"],
+                "admit": False,
+                "reason": "not_durable",
+            } for c in prompt["candidates"]]
+            return json.dumps(_admission(
+                decisions, substantive=False,
+                coverage_reason="no_durable_context",
+            )), {}
+
+    pipeline = _card_pipeline(
+        store, _one_pref_curator()(), admission=DisagreeingJudge(),
+    )
+    pipeline._rebuild_actor_card(OPTICS)
+
+    assert _flags(store) == (0, 0), (
+        "an unresolvable coverage disagreement must resolve to the judge's "
+        "verdict and clear the card flags, not wedge the rebuild"
+    )
+    status = store.get_actor_card_rebuild_status("t1", OPTICS)
+    assert status["outcome"] != "coverage_disagreement", status
+    assert int(status["failure_count"] or 0) == 0, status

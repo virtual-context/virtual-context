@@ -2433,58 +2433,77 @@ class CompactionPipeline:
                 admission_source == "fallback"
                 or not callable(complete_fallback)
             ):
-                raise _ActorCardCoverageError(
-                    "actor-card curator and admission coverage decisions disagree",
-                    response_text,
+                # No third adjudicator is available: the fallback already
+                # served the admission call, or the provider has none.
+                # Resolve to the admission judgment instead of failing the
+                # rebuild. The admission decisions are the stricter,
+                # internally consistent gate; a boolean coverage flag must
+                # never wedge an active actor into a retry loop.
+                logger.warning(
+                    "ACTOR_CARD_COVERAGE_RESOLVED_CONSERVATIVE curator=%s "
+                    "admission=%s admission_source=%s",
+                    curator_substantive,
+                    independently_substantive,
+                    admission_source,
                 )
-            adjudication_text = ""
-            try:
-                adjudication_text, _usage = complete_fallback(**request_kwargs)
-                adjudicated_substantive, adjudicated_decisions = (
-                    _parse_admission(adjudication_text)
-                )
-            except Exception as exc:
-                combined = json.dumps(
+                response_text = json.dumps(
                     {
                         "primary": response_text,
-                        "adjudicator": (
-                            getattr(exc, "response_text", "")
-                            or adjudication_text
-                        ),
-                        "selected": "error",
-                        "error_type": type(exc).__name__,
+                        "selected": "admission_conservative",
                     },
                     separators=(",", ":"),
                 )
-                raise _ActorCardAdmissionError(
-                    "actor-card coverage adjudicator failed",
-                    combined,
-                ) from exc
-            # With boolean coverage and an initial disagreement, the third
-            # judgment necessarily agrees with either the curator or the
-            # primary admission model. Select that two-of-three result and
-            # its internally consistent candidate decisions.
-            selected = "primary"
-            if adjudicated_substantive == curator_substantive:
-                independently_substantive = adjudicated_substantive
-                decisions = adjudicated_decisions
-                selected = "curator_fallback"
-            logger.warning(
-                "ACTOR_CARD_COVERAGE_ADJUDICATED curator=%s primary=%s "
-                "fallback=%s selected=%s",
-                curator_substantive,
-                primary_substantive,
-                adjudicated_substantive,
-                selected,
-            )
-            response_text = json.dumps(
-                {
-                    "primary": response_text,
-                    "adjudicator": adjudication_text,
-                    "selected": selected,
-                },
-                separators=(",", ":"),
-            )
+            else:
+                adjudication_text = ""
+                try:
+                    adjudication_text, _usage = complete_fallback(
+                        **request_kwargs
+                    )
+                    adjudicated_substantive, adjudicated_decisions = (
+                        _parse_admission(adjudication_text)
+                    )
+                except Exception as exc:
+                    combined = json.dumps(
+                        {
+                            "primary": response_text,
+                            "adjudicator": (
+                                getattr(exc, "response_text", "")
+                                or adjudication_text
+                            ),
+                            "selected": "error",
+                            "error_type": type(exc).__name__,
+                        },
+                        separators=(",", ":"),
+                    )
+                    raise _ActorCardAdmissionError(
+                        "actor-card coverage adjudicator failed",
+                        combined,
+                    ) from exc
+                # With boolean coverage and an initial disagreement, the
+                # third judgment necessarily agrees with either the curator
+                # or the primary admission model. Select that two-of-three
+                # result and its internally consistent candidate decisions.
+                selected = "primary"
+                if adjudicated_substantive == curator_substantive:
+                    independently_substantive = adjudicated_substantive
+                    decisions = adjudicated_decisions
+                    selected = "curator_fallback"
+                logger.warning(
+                    "ACTOR_CARD_COVERAGE_ADJUDICATED curator=%s primary=%s "
+                    "fallback=%s selected=%s",
+                    curator_substantive,
+                    primary_substantive,
+                    adjudicated_substantive,
+                    selected,
+                )
+                response_text = json.dumps(
+                    {
+                        "primary": response_text,
+                        "adjudicator": adjudication_text,
+                        "selected": selected,
+                    },
+                    separators=(",", ":"),
+                )
 
         admitted: list[
             tuple["ActorCardEntry", list["ActorCardEntrySource"]]
