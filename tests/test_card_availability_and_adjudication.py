@@ -363,3 +363,58 @@ def test_disagreement_without_adjudicator_resolves_conservatively(store):
     status = store.get_actor_card_rebuild_status("t1", OPTICS)
     assert status["outcome"] != "coverage_disagreement", status
     assert int(status["failure_count"] or 0) == 0, status
+
+
+@pytest.mark.regression("BUG-064")
+def test_coverage_disagreement_at_three_failures_is_not_terminally_suppressed(
+    store,
+):
+    """Three recorded coverage disagreements with an unchanged input hash
+    must not put the rebuild into terminal suppression: the next attempt
+    still runs and a successful write clears the failure state."""
+    _conversation(store, "guild")
+    _grouped_turn(store, "ct-cited", "guild", OPTICS, "guild", 0,
+                  user_text="give me a workout for today")
+    store.upsert_actor_profile_from_turn(
+        "guild", OPTICS, "Optics", seen_at=_now(),
+    )
+
+    curator_cls = _one_pref_curator()
+    pipeline = _card_pipeline(store, curator_cls(), admission=_AdmitAll())
+    pipeline._rebuild_actor_card(OPTICS)
+    first_calls = curator_cls.calls
+    assert first_calls >= 1
+    status = store.get_actor_card_rebuild_status("t1", OPTICS)
+    assert status is not None
+    input_hash = status["input_hash"]
+    assert input_hash
+
+    for _ in range(3):
+        store.record_actor_card_rebuild_status(
+            "t1", OPTICS,
+            attempted_at="2000-01-01T00:00:00+00:00",
+            input_hash=input_hash,
+            source_count=479,
+            raw_entry_count=4,
+            accepted_entry_count=0,
+            rejected_counts={},
+            outcome="coverage_disagreement",
+            response_hash="response",
+            written_count=0,
+        )
+    seeded = store.get_actor_card_rebuild_status("t1", OPTICS)
+    assert seeded["failure_count"] == 3
+    assert seeded["outcome"] == "coverage_disagreement"
+    store.mark_actor_card_dirty(
+        "t1", OPTICS, build_input_hash=f"building:{input_hash}",
+    )
+
+    pipeline._rebuild_actor_card(OPTICS)
+    assert curator_cls.calls > first_calls, (
+        "a coverage disagreement at three failures must not terminally "
+        "suppress the rebuild"
+    )
+    assert _flags(store) == (0, 0)
+    cleared = store.get_actor_card_rebuild_status("t1", OPTICS)
+    assert cleared["outcome"] not in {"coverage_disagreement", "coverage_gap"}
+    assert int(cleared["failure_count"] or 0) == 0
