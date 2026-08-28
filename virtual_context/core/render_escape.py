@@ -33,6 +33,25 @@ HOST_ATTRIBUTION_TAGS: tuple[str, ...] = (
     "vc-prepared-context",
 )
 
+# Wrapper tags this package itself emits around rendered context. These
+# must NEVER join the escape pattern above: the egress escape runs after
+# composition, where the genuine wrappers are already present. Member
+# text that lands inside or adjacent to these blocks is neutralized by
+# escaping angle brackets at each insertion point instead, and a lint
+# test pins this declaration against the render modules so a new
+# emission cannot appear without its insertion lanes being audited.
+ENGINE_EMITTED_TAGS: tuple[str, ...] = (
+    "actor-card",
+    "canonical-source-transcript",
+    "context-topics",
+    "facts",
+    "historical-source-transcript",
+    "recent-conversation",
+    "speaker-roster",
+    "structured-summary",
+    "virtual-context",
+)
+
 _TAG_ALTERNATION = "|".join(HOST_ATTRIBUTION_TAGS)
 
 # Matches only the leading "<" of an opening or closing host tag; the

@@ -617,7 +617,7 @@ Use `pytest -m regression` to run all regression tests.
 | `test_history_widening_guard.py` | BUG-061 |
 | `test_actor_card_admission_quality.py` | BUG-063 |
 | `test_card_availability_and_adjudication.py` | BUG-064, BUG-065 |
-| `test_render_escape_host_attribution.py` | BUG-066 |
+| `test_render_escape_host_attribution.py` | BUG-066, BUG-067 |
 | `test_tag_summary_materialization.py` | BUG-041 |
 | `test_embedding_context_guard.py` | BUG-042 |
 | `test_embedding_reserved_seats.py` | BUG-043 |
@@ -783,3 +783,12 @@ Use `pytest -m regression` to run all regression tests.
 - **Fix**: `core/render_escape.py` escapes the leading `<` of the recognized tag set to the literal `\u003c` characters, idempotently, in a plain-text form and a serialized-JSON form (doubled backslash so a decode still carries the escape); applied at the assembler's prepend composition, at the `execute_vc_tool` result boundary, and via a decorator on every MCP tool/resource/prompt. Never applied at ingest, in storage, or in the message lane.
 - **Tests**:
   - `test_render_escape_host_attribution.py` (prepend and tool-result egress escape parse-stably; message lane stays byte-exact; all five tags case-insensitively; idempotence and plain/serialized composability; MCP decorator behavior and a source lint pinning it on every registration)
+
+### BUG-067 — fact prompt lines render raw markup; emitted wrapper set undeclared
+
+- **Symptom**: `Fact.format_for_prompt` composed extracted fields (subject, verb, object, what, and the rest) with no angle-bracket escaping, so member text quoted into a fact field could open a forged wrapper lookalike wherever fact lines render into model-facing text; separately, the set of wrapper tags the render modules emit was undeclared, so a new emission could appear with unaudited insertion lanes.
+- **Root cause**: fact fields are extracted from conversation content but the prompt rendering treated them as plain prose, unlike every other member-text lane, which escapes brackets at insertion; no test pinned the emitted-tag inventory, and manual inventories repeatedly undercounted it (five, then six, against nine found by scan).
+- **Fix**: the composed fact line escapes angle brackets to literal `\u003c` / `\u003e` at the prompt boundary only — stored fields and `embed_text` stay byte-exact so existing embeddings do not drift; `ENGINE_EMITTED_TAGS` declares the nine-tag closed set in `core/render_escape.py`, with an AST-based lint test asserting the render modules emit exactly that set.
+- **Tests**:
+  - `test_render_escape_host_attribution.py::test_fact_prompt_line_escapes_engine_tag_lookalikes` (escape at render; embed text raw)
+  - `test_render_escape_host_attribution.py::test_emitted_wrapper_tag_set_is_closed_and_declared` (closed-set lint, drift fails both directions)

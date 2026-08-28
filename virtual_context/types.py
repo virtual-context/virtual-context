@@ -224,7 +224,11 @@ class Fact:
             line += f" [why: {self.why}]"
         if self.status and self.status != "active":
             line += f" [status: {self.status}]"
-        return line
+        # Fields are extracted from conversation text, so a quoted markup
+        # lookalike could open a forged wrapper inside a rendered context
+        # block. Emit angle brackets as literal escapes at this prompt
+        # boundary only; stored fields and embed_text stay exact.
+        return line.replace("<", "\\u003c").replace(">", "\\u003e")
 
     def embed_text(self) -> str:
         """Composite text embedded for dense fact retrieval.
