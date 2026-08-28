@@ -616,6 +616,7 @@ Use `pytest -m regression` to run all regression tests.
 | `test_prepare_user_message_strip.py` | BUG-060 |
 | `test_history_widening_guard.py` | BUG-061 |
 | `test_actor_card_admission_quality.py` | BUG-063 |
+| `test_card_availability_and_adjudication.py` | BUG-064, BUG-065 |
 | `test_tag_summary_materialization.py` | BUG-041 |
 | `test_embedding_context_guard.py` | BUG-042 |
 | `test_embedding_reserved_seats.py` | BUG-043 |
@@ -754,3 +755,20 @@ Use `pytest -m regression` to run all regression tests.
 - **Fix**: a shared judgment-rules block appended to both the curation and admission prompts (register/sincerity test with a serious-corroboration escape hatch; a question or single imperative is never an active_goal, with transience markers decisive; active_goal restricted to the author's first-person intent, third-party subjects excluded absent their own cited utterance; the durability bar extended to every kind), a calibrated confidence scale added to the curation prompt, and a code-enforced cap: an entry citing exactly one source is stored at no more than 0.8 regardless of the asserted value. Duplicate-merge max() is unchanged.
 - **Tests**:
   - `test_actor_card_admission_quality.py` (prompt-contract pins on both surfaces, confidence-scale pin, single-source cap on fresh AND carried-over entries, multi-source uncapped guard)
+
+### BUG-064 — active actors are cardless: enrichment invalidation and a terminal coverage gate
+
+- **Symptom**: the guild's most active members carry `card_invalid=1` almost continuously and serving fails closed to nothing, while rebuild attempts end `written=0` with `failure_count=3` on the first coverage failure — permanently cardless members with repeated model spend.
+- **Root cause**: the canonical_turns UPDATE trigger's authorship arms set `card_invalid` on a change to ANY of the author's rows, so provenance enrichment one-way fills (actor CAS upgrades, audience stamping, alignment updates) on uncited rows invalidated continuously; `get_actor_card` returns None on invalid; the coverage gate hard-failed a substantive actor whose entries the hardened admission gate correctly rejects; the status recorder jumped coverage outcomes straight to the terminal failure count; and the invalid flag clears only on a successful write.
+- **Fix**: invalidation is citation-scoped — the authorship arms of the UPDATE and DELETE triggers (both backends) set `card_dirty` only, the citation arms keep dirty+invalid, and read-time source re-verification remains; a substantive actor with zero durable entries now writes the (possibly empty) card as outcome `no_durable_entries`, clearing both flags; coverage outcomes increment failure counts normally and are excluded from terminal suppression while keeping timed retry backoff.
+- **Tests**:
+  - `test_card_availability_and_adjudication.py` (uncited enrichment/delete keep serving; cited update/delete still invalidate; empty-card success clears flags with zero failure count; coverage increments normally)
+  - `test_actor_cards.py::test_semantic_admission_rejects_candidate_without_rewriting_card` (superseded instant-terminal pin updated)
+
+### BUG-065 — refused agent-directed requests admitted as card preferences
+
+- **Symptom**: a member's card carried "not use a safety shield", "assume they know all the risks of Tren and don't mention them", and a harmful-advocacy persona as high-confidence communication preferences — requests the agent refused live, deferring to the authority holder.
+- **Root cause**: the curation and admission inputs were actor-authored only, so the judge structurally could not see the agent's refusal, and the semantic contract's instruction-recasting rule routed agent-directed requests into communication_pref regardless of the live outcome.
+- **Fix**: each prompt message now carries the paired agent reply (bounded, keyed by turn group) on both surfaces, fresh and carryover; the judgment rules make the agent's live adjudication the admission signal — honored requests may be preferences, refused or deferred requests reject as `agent_refused`, a behavior-change request with no visible honored signal rejects the same way, and safety-posture requests reject as `safety_posture_request` for any actor; both reasons join the validated enum, and the policy version bump re-judges existing carried-over entries on the next rebuild.
+- **Tests**:
+  - `test_card_availability_and_adjudication.py` (reply plumbing on both surfaces, reject-only token acceptance, judgment-rule pins)

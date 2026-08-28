@@ -2486,8 +2486,11 @@ CREATE TABLE IF NOT EXISTS request_captures (
             BEFORE DELETE ON canonical_turns
             FOR EACH ROW
             BEGIN
+                -- Authorship arm: losing one of the author's rows queues a
+                -- re-curation but cannot falsify entries that never cited
+                -- it; invalidation is reserved for the citation arm below.
                 UPDATE actor_profiles
-                   SET card_dirty = 1, card_invalid = 1,
+                   SET card_dirty = 1,
                        card_build_marker = ''
                  WHERE actor_id = OLD.sender_actor_id
                    AND OLD.sender_actor_id <> ''
@@ -2537,8 +2540,13 @@ CREATE TABLE IF NOT EXISTS request_captures (
               OR OLD.created_at IS NOT NEW.created_at
               OR OLD.first_seen_at IS NOT NEW.first_seen_at
             BEGIN
+                -- Authorship arms: a change to ANY of the author's rows —
+                -- including provenance enrichment one-way fills on rows no
+                -- card cites — queues re-curation only. Invalidation is the
+                -- citation arm's job: only a change to a row a card CITES
+                -- can falsify a rendered claim.
                 UPDATE actor_profiles
-                   SET card_dirty = 1, card_invalid = 1,
+                   SET card_dirty = 1,
                        card_build_marker = ''
                  WHERE actor_id = OLD.sender_actor_id
                    AND OLD.sender_actor_id <> ''
@@ -2548,7 +2556,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
                         WHERE conversation_id = OLD.conversation_id
                    );
                 UPDATE actor_profiles
-                   SET card_dirty = 1, card_invalid = 1,
+                   SET card_dirty = 1,
                        card_build_marker = ''
                  WHERE actor_id = NEW.sender_actor_id
                    AND NEW.sender_actor_id <> ''
@@ -13482,15 +13490,15 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 "stale_or_rejected_write",
             }
             if outcome in failed_outcomes:
-                if outcome in {"coverage_disagreement", "coverage_gap"}:
-                    failure_count = 3
-                else:
-                    failure_count = (
-                        int(previous["failure_count"] or 0) + 1
-                        if previous is not None
-                        and (previous["input_hash"] or "") == input_hash
-                        else 1
-                    )
+                # Coverage outcomes increment like any other failure; the
+                # instant-terminal jump made a substantive-but-nothing-durable
+                # actor permanently cardless on the first disagreement.
+                failure_count = (
+                    int(previous["failure_count"] or 0) + 1
+                    if previous is not None
+                    and (previous["input_hash"] or "") == input_hash
+                    else 1
+                )
                 attempted = (
                     _parse_sequence_timestamp(attempted_at)
                     or datetime.now(timezone.utc)

@@ -3125,8 +3125,12 @@ class PostgresStore(ContextStore):
                         RETURN NEW;
                     END IF;
 
+                    -- Authorship arms: changes to ANY of the author's
+                    -- rows (including provenance enrichment on rows no card
+                    -- cites) queue a re-curation only. Invalidation is the
+                    -- citation arm's job below.
                     UPDATE actor_profiles p
-                       SET card_dirty = 1, card_invalid = 1,
+                       SET card_dirty = 1,
                            card_build_marker = ''
                       FROM conversations c
                      WHERE c.conversation_id = OLD.conversation_id
@@ -3136,7 +3140,7 @@ class PostgresStore(ContextStore):
 
                     IF TG_OP = 'UPDATE' THEN
                         UPDATE actor_profiles p
-                           SET card_dirty = 1, card_invalid = 1,
+                           SET card_dirty = 1,
                                card_build_marker = ''
                           FROM conversations c
                          WHERE c.conversation_id = NEW.conversation_id

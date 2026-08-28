@@ -2001,7 +2001,10 @@ def test_semantic_admission_rejects_candidate_without_rewriting_card(store):
     assert status["outcome"] == "coverage_disagreement"
     assert status["accepted_entry_count"] == 1
     assert status["rejected_counts"] == {}
-    assert status["failure_count"] == 3
+    # Coverage outcomes increment like any other failure and are never
+    # instantly terminal: a permanently cardless active member is not an
+    # acceptable endpoint of a backoff policy.
+    assert status["failure_count"] == 1
 
 
 def test_semantic_gate_revalidates_existing_subject_kind_and_citations(store):
