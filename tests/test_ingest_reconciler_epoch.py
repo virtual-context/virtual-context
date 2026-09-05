@@ -87,34 +87,45 @@ def test_ingest_batch_rejects_stale_epoch_at_entry(tmp_path: Path):
 
 
 def test_ingest_batch_rolls_back_on_resurrect_race(tmp_path: Path, monkeypatch):
-    """Simulate a resurrect landing DURING ingest_prepared_turns — the
-    commit-time check must catch it and purge the just-written rows."""
+    """A changed epoch at the commit-time check rolls back the ingest."""
     s = SQLiteStore(tmp_path / "vc.db")
     s.upsert_conversation(tenant_id="t", conversation_id="c")
     rec = _reconciler(s)
-    # Patch _ingest_prepared_turns_locked to bump epoch right after its writes land.
+    # SQLite now keeps BEGIN IMMEDIATE throughout reconciliation, so a real
+    # second-connection resurrection writer cannot interleave here (covered
+    # by test_sqlite_reconcile_transactions). Inject the changed epoch within
+    # this transaction to exercise the defensive commit-time check without
+    # attempting a nested lifecycle transaction or releasing the writer lock.
     orig = rec._ingest_prepared_turns_locked
 
     def patched(*args, **kwargs):
         result = orig(*args, **kwargs)
-        s.mark_conversation_deleted("c")
-        s.increment_lifecycle_epoch_on_resurrect("c")
+        assert result.turns_written > 0
+        conn = s._get_conn()
+        assert conn.in_transaction
+        conn.execute(
+            "UPDATE conversations SET lifecycle_epoch = 2 WHERE conversation_id = 'c'",
+        )
         return result
 
     monkeypatch.setattr(rec, "_ingest_prepared_turns_locked", patched)
-    with pytest.raises(LifecycleEpochMismatch):
+    with pytest.raises(LifecycleEpochMismatch) as mismatch:
         rec.ingest_batch(
             conversation_id="c",
             body={"messages": [{"role": "user", "content": "hi"}]},
             fmt=_fmt(),
             expected_lifecycle_epoch=1,
         )
+    assert mismatch.value.expected == 1
+    assert mismatch.value.observed == 2
     # Rows written under the old lifecycle were rolled back.
     with s._get_conn() as conn:
         n = conn.execute(
             "SELECT COUNT(*) FROM canonical_turns WHERE conversation_id='c'"
         ).fetchone()[0]
     assert n == 0
+    # The injected epoch update belonged to the aborted transaction too.
+    assert s.get_lifecycle_epoch("c") == 1
 
 
 def test_delete_canonical_turns_by_batch_id(tmp_path: Path):
