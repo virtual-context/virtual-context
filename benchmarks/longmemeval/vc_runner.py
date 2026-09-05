@@ -15,6 +15,7 @@ from virtual_context.engine import VirtualContextEngine
 from virtual_context.types import Message, SpeakerRetrievalContext
 
 from .cost import BudgetTracker
+from .cache_manifest import build_manifest, prepare_cache, write_manifest
 from .dataset import LongMemEvalQuestion
 
 logger = logging.getLogger(__name__)
@@ -534,8 +535,8 @@ def _question_block(
 def _clear_compaction_state(cache_dir: str, question_id: str) -> None:
     """Clear compacted segments and tag summaries but keep TurnTagIndex.
 
-    This allows re-running compaction with a new prompt without re-ingesting
-    (re-tagging) all turns — saving significant Haiku cost and time.
+    Recompaction may retain tags only within the same pipeline fingerprint.
+    Changed prompts, source, data or models select a new cache and re-ingest.
     """
     import sqlite3
     db_path = Path(cache_dir) / "store.db"
@@ -604,8 +605,8 @@ def run_vc(
 
     Steps: convert sessions → ingest_history → compact_manual loop → on_message_inbound → query reader
 
-    When a cached ingestion+compaction exists for this question_id, steps 2-4
-    are skipped entirely (~10 min saved). Use fresh=True to force re-ingestion.
+    Completed caches are reused only when source bytes, dataset, and memory
+    configuration match. Use fresh=True to restart this pipeline's cache.
 
     Parameters
     ----------
@@ -661,16 +662,9 @@ def run_vc(
 
     timings: dict[str, float] = {}
 
-    # 1. Build engine — use stable cache dir for resumable state
-    q_cache_dir = _cache_dir_for(question.question_id, cache_dir)
-    if fresh and q_cache_dir.exists():
-        shutil.rmtree(q_cache_dir)
-        logger.info("VC [%s]: cleared cache (--fresh)", question.question_id)
-    q_cache_dir.mkdir(parents=True, exist_ok=True)
-    storage_dir = str(q_cache_dir)
-
-    if recompact and not fresh:
-        _clear_compaction_state(storage_dir, question.question_id)
+    # Identify the memory pipeline before selecting a reusable cache.
+    question_cache_dir = _cache_dir_for(question.question_id, cache_dir)
+    storage_dir = str(question_cache_dir)
 
     cfg_dict = _build_vc_config(
         context_window=context_window,
@@ -691,6 +685,16 @@ def run_vc(
         supersession_provider=supersession_provider,
         supersession_model=supersession_model,
     )
+    pipeline_manifest = build_manifest(question, cfg_dict)
+    q_cache_dir, cache_complete = prepare_cache(
+        question_cache_dir, pipeline_manifest, fresh=fresh, recompact=recompact,
+    )
+    storage_dir = str(q_cache_dir)
+    cfg_dict["storage_root"] = storage_dir
+    cfg_dict["storage"]["sqlite"]["path"] = str(q_cache_dir / "store.db")
+    cfg_dict["storage"]["filesystem"]["root"] = str(q_cache_dir / "store")
+    if recompact and not fresh:
+        _clear_compaction_state(storage_dir, question.question_id)
     config = load_config(config_dict=cfg_dict)
     engine = VirtualContextEngine(config=config)
 
@@ -713,11 +717,11 @@ def run_vc(
 
     # 3. Check if we can resume from cached state
     #    Three modes:
-    #    - fully cached: compacted_prefix_messages > 0 → skip ingestion + compaction
+    #    - fully cached: matching completed manifest → skip memory preprocessing
     #    - recompact: compacted_prefix_messages == 0 but TurnTagIndex has entries → skip ingestion, re-compact
     #    - fresh: nothing cached → ingest + compact
     n_index_entries = len(engine._turn_tag_index.entries)
-    fully_cached = engine._engine_state.compacted_prefix_messages > 0
+    fully_cached = cache_complete
     tags_only = not fully_cached and n_index_entries > 0
 
     if fully_cached:
@@ -786,11 +790,13 @@ def run_vc(
                     question.question_id, compaction_events, total_segments, total_tokens_freed, timings["compact_s"])
 
         # 3c. Persist engine state for future cache hits
-        engine._save_state(messages)
+        if engine._save_state(messages) is not True:
+            engine.close()
+            raise RuntimeError("Benchmark cache checkpoint failed; rerun with --fresh")
         logger.info("VC [%s]: saved state to %s", question.question_id, storage_dir)
 
     # 3d. Supersession pass — deduplicate facts across sessions
-    if supersession and engine._supersession_checker:
+    if not fully_cached and supersession and engine._supersession_checker:
         t0 = time.time()
         all_facts = engine._store.query_facts(limit=9999)
         logger.info("VC [%s]: running supersession over %d facts...", question.question_id, len(all_facts))
@@ -798,6 +804,8 @@ def run_vc(
         timings["supersession_s"] = round(time.time() - t0, 1)
         logger.info("VC [%s]: supersession done — %d facts superseded in %.1fs",
                     question.question_id, superseded_count, timings["supersession_s"])
+
+    write_manifest(q_cache_dir, pipeline_manifest, complete=True)
 
     cached = fully_cached  # backward compat for downstream references
 
@@ -1053,6 +1061,7 @@ def run_vc(
 
     return {
         "hypothesis": hypothesis,
+        "cache_fingerprint": pipeline_manifest["fingerprint"],
         "input_tokens": reader_input,
         "output_tokens": reader_output,
         "haiku_input_tokens": haiku_input,
@@ -1095,14 +1104,8 @@ def run_vc_ingest_only(
     """Run ingest + compact only, skip reader and judge. Returns stats dict."""
     timings: dict[str, float] = {}
 
-    cache_dir = _cache_dir_for(question.question_id, cache_dir)
-    if fresh and cache_dir.exists():
-        shutil.rmtree(cache_dir)
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    storage_dir = str(cache_dir)
-
-    if recompact and not fresh:
-        _clear_compaction_state(storage_dir, question.question_id)
+    question_cache_dir = _cache_dir_for(question.question_id, cache_dir)
+    storage_dir = str(question_cache_dir)
 
     # Resolve internal provider credentials
     chosen_summarizer_provider = summarizer_provider or tagger_provider
@@ -1128,6 +1131,16 @@ def run_vc_ingest_only(
         supersession_provider=supersession_provider,
         supersession_model=supersession_model,
     )
+    pipeline_manifest = build_manifest(question, cfg_dict)
+    cache_dir, cache_complete = prepare_cache(
+        question_cache_dir, pipeline_manifest, fresh=fresh, recompact=recompact,
+    )
+    storage_dir = str(cache_dir)
+    cfg_dict["storage_root"] = storage_dir
+    cfg_dict["storage"]["sqlite"]["path"] = str(cache_dir / "store.db")
+    cfg_dict["storage"]["filesystem"]["root"] = str(cache_dir / "store")
+    if recompact and not fresh:
+        _clear_compaction_state(storage_dir, question.question_id)
     config = load_config(config_dict=cfg_dict)
     engine = VirtualContextEngine(config=config)
 
@@ -1145,7 +1158,7 @@ def run_vc_ingest_only(
 
     # Check cache status
     n_index_entries = len(engine._turn_tag_index.entries)
-    fully_cached = engine._engine_state.compacted_prefix_messages > 0
+    fully_cached = cache_complete
 
     if fully_cached:
         logger.info("VC [%s]: CACHE HIT — skipping ingest+compact", question.question_id)
@@ -1182,11 +1195,13 @@ def run_vc_ingest_only(
             compaction_events += 1
         timings["compact_s"] = round(time.time() - t0, 1)
 
-        engine._save_state(messages)
+        if engine._save_state(messages) is not True:
+            engine.close()
+            raise RuntimeError("Benchmark cache checkpoint failed; rerun with --fresh")
 
-    # Supersession pass — runs on cached or freshly compacted stores
+    # Supersession is part of the cached pipeline, not a mutation on cache hits.
     superseded_count = 0
-    if supersession and engine._supersession_checker:
+    if not fully_cached and supersession and engine._supersession_checker:
         t0 = time.time()
         all_facts = engine._store.query_facts(limit=9999)
         logger.info("VC [%s]: running supersession over %d facts...", question.question_id, len(all_facts))
@@ -1194,14 +1209,17 @@ def run_vc_ingest_only(
         timings["supersession_s"] = round(time.time() - t0, 1)
         logger.info("VC [%s]: supersession done — %d facts superseded in %.1fs",
                     question.question_id, superseded_count, timings["supersession_s"])
-    elif not supersession and fully_cached:
+    elif fully_cached:
         engine.close()
         return {
             "turns_ingested": turns_ingested,
             "compaction_events": 0,
             "cached": True,
+            "cache_fingerprint": pipeline_manifest["fingerprint"],
             "timings": timings,
         }
+
+    write_manifest(cache_dir, pipeline_manifest, complete=True)
 
     # Persist full telemetry breakdown
     telem = engine.get_telemetry()
@@ -1219,5 +1237,6 @@ def run_vc_ingest_only(
         "compaction_events": compaction_events,
         "superseded_facts": superseded_count,
         "cached": fully_cached,
+        "cache_fingerprint": pipeline_manifest["fingerprint"],
         "timings": timings,
     }

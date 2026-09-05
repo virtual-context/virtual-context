@@ -8,7 +8,14 @@ Virtual-context is evaluated against established long-conversation memory benchm
 
 [LongMemEval](https://github.com/xiaowu0162/LongMemEval) (ICLR 2025) tests long-term memory across many chat sessions: a large haystack of prior sessions is ingested, then questions probe facts stated anywhere in that history. Questions span six categories: knowledge-update, multi-session, temporal-reasoning, single-session-user, single-session-assistant, and single-session-preference.
 
-**Results** (100 questions from LongMemEval-500, 5 batches of 20): virtual-context answered 95/100 correctly vs. 33/100 for the same reader model given the full raw history. Average tokens per question dropped 55% (52,347 vs. 117,582), and average cost per question dropped from $0.36 to $0.16. The full per-question table is in the [README](../README.md#benchmark-results).
+**Historical results** (100 questions from LongMemEval-500, 5 batches of 20): virtual-context answered 95/100 correctly vs. 33/100 for the same reader model given the full raw history. Average tokens per question dropped 55% (52,347 vs. 117,582), and average cost per question dropped from $0.36 to $0.16. The full per-question table is in the [README](../README.md#benchmark-results).
+
+These are historical claims, not a measurement of the current source-bound
+pipeline. The [frozen claim record](../benchmarks/longmemeval/historical-claims.yaml)
+identifies the exact published source bytes and marks missing original run
+provenance explicitly. It does not retroactively attest the old cache or scores.
+New runs require the content-addressed pipeline manifest described below.
+
 
 ### LoCoMo
 
@@ -123,3 +130,29 @@ Example regression areas (full descriptions in `tests/REGRESSION_MAP.md`):
 - **BUG-018**: Recent context turns pollute the inbound tagger after compaction
 - **BUG-036**: Sort-key insertion gaps exhaust under repeated mid-history inserts
 - **BUG-041**: Compaction materialized tag summaries for only a subset of segment tags
+
+### Cache provenance
+
+LongMemEval memory caches live below a content fingerprint of the dataset,
+engine and harness source bytes, and non-secret memory configuration. A cache
+is reusable only after its ingestion/compaction pipeline records completion.
+Model, prompt, code, or input changes select a separate cache; changing reader
+settings alone can reuse matching memory. Legacy caches are preserved but are
+not trusted without a manifest. Interrupted runs require `--fresh` for that
+fingerprint. `--recompact` rebuilds compaction within a matching fingerprint;
+it does not reuse old tagging across changed pipeline configurations.
+
+## Offline context contracts and resource measurements
+
+The [versioned context corpus](../benchmarks/context_contracts/README.md) exercises
+corrections, plans, author and channel isolation, assistant decisions, tool
+artifacts, Unicode and out-of-order source arrival against real SQLite storage.
+It reports source recall, actual rendered attribution, correction coverage,
+abstention, delivered tokens, paging and retrieval work across layer ablations.
+Controlled embeddings and proposals make these reproducible mechanism tests;
+they do not measure an external model's answer quality.
+
+The companion `benchmarks.context_contracts.resources` command measures peak
+process memory, payload hydration and timings using generated archives in fresh
+processes. PostgreSQL runs require an explicitly named scratch DSN and an already
+migrated vector cache. It never selects a production database by default.

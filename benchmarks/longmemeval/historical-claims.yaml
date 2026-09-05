@@ -1,0 +1,28 @@
+schema_version: 1
+status: historical_claims_without_original_run_manifest
+captured_on: '2026-09-05'
+claim_source:
+  repository_commit: 5f293764fda5bb79e43fec2675a2ba67eeac0e98
+  path: README.md
+  sha256: 64bd5cd51d8aab62d3160b3c244a5f4781d46b964cadde8b18f9076074930840
+reported:
+  benchmark: LongMemEval-500 subset
+  question_count: 100
+  sampling_seeds:
+  - 42
+  - 99
+  - 777
+  - 1234
+  - 2025
+  correct_memory: 95
+  correct_raw_history: 33
+  mean_tokens_memory: 52347
+  mean_tokens_raw_history: 117582
+run_provenance:
+  engine_revision: null
+  dataset_sha256: null
+  memory_cache_manifest: null
+  original_machine_readable_results: null
+interpretation: Frozen record of the published claim. Original run artifacts were
+  not available in the tracked repository. This record does not attest current accuracy,
+  reproduce the run, or convert historical caches into valid cache hits.
