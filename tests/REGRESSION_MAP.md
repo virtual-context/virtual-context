@@ -792,3 +792,13 @@ Use `pytest -m regression` to run all regression tests.
 - **Tests**:
   - `test_render_escape_host_attribution.py::test_fact_prompt_line_escapes_engine_tag_lookalikes` (escape at render; embed text raw)
   - `test_render_escape_host_attribution.py::test_emitted_wrapper_tag_set_is_closed_and_declared` (closed-set lint, drift fails both directions)
+
+### BUG-068 — actor card style observations become repeated speech habits
+
+- **Symptom**: an interaction-style observation turns into the same address term on consecutive replies.
+- **Cause**: the influence-only wrapper did not explain the distinct purposes of preferences, interaction style, goals and history.
+- **Fix**: constant orientation before the entries lets style guide register naturally while forbidding quoted entries and per-message verbal tics. Preferences direct the response; goals/history guide relevance and depth. JSON scalar bodies and angle-bracket escaping remain unchanged.
+- **Tests**:
+  - `test_actor_card_assembly.py::test_actor_card_orientation_precedes_entries`
+  - `test_actor_card_assembly.py::test_actor_card_render_golden`
+  - `test_actor_card_assembly.py::test_card_scalars_cannot_escape_the_wrapper`

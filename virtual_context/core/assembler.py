@@ -223,6 +223,18 @@ class ContextAssembler:
         '<actor-card mode="influence-only" quote="forbidden" '
         'precedence="newer-conversation-wins">'
     )
+    _CARD_ORIENTATION = (
+        "communication_pref: how this person wants you to respond. Follow it.\n"
+        "interaction_style: how this person talks. Let it set your register with them, "
+        "the way a person naturally meets someone's energy: formality, warmth, humor, "
+        "pacing, how much slang is welcome. Influence, not a script. Never quote an "
+        "entry, never repeat a signature word or phrase from it as a per-message habit, "
+        "and never let one entry produce the same tic in consecutive replies. A term "
+        "the person uses may surface occasionally and in your own voice; if you notice "
+        "yourself using it every turn, stop.\n"
+        "active_goal / relevant_history: context for relevance and depth. Not a "
+        "checklist to mention."
+    )
     _CARD_CLOSE = "</actor-card>"
 
     @staticmethod
@@ -254,7 +266,7 @@ class ContextAssembler:
             ensure_ascii=False,
         )
         payload = payload.replace("<", "\\u003c").replace(">", "\\u003e")
-        return f"{self._CARD_OPEN}\n{payload}\n{self._CARD_CLOSE}"
+        return f"{self._CARD_OPEN}\n{self._CARD_ORIENTATION}\n{payload}\n{self._CARD_CLOSE}"
 
     def _build_actor_card(
         self,

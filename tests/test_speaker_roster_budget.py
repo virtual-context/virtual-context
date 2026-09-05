@@ -152,6 +152,8 @@ def _assembler(store, *, roster_enabled=True, roster_max_tokens=2000,
         speaker_roster_enabled=roster_enabled,
         speaker_roster_max_tokens=roster_max_tokens,
         actor_card_enabled=card_enabled,
+        # This fixture counts characters, including the fixed card orientation.
+        actor_card_max_tokens=2000,
     )
     return ContextAssembler(
         config=config,
