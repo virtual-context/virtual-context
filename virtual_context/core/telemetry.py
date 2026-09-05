@@ -5,7 +5,7 @@ from __future__ import annotations
 import dataclasses
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from .model_catalog import ModelCatalog
 

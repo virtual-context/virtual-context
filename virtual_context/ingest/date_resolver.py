@@ -209,7 +209,7 @@ def normalize_fact_text(text: str, session_date_str: str) -> str:
                     "RETURN_AS_TIMEZONE_AWARE": False,
                 })
                 if resolved:
-                    date_str = resolved.strftime(f"on %A, %B %-d, %Y")
+                    date_str = resolved.strftime("on %A, %B %-d, %Y")
                     replacements.append((pat, date_str))
             except Exception:
                 pass

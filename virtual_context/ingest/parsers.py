@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Callable
 
 
 def parse_pdf(path: Path) -> str:
@@ -48,8 +49,6 @@ def parse_xlsx(path: Path) -> str:
 def parse_text(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="replace")
 
-
-from typing import Callable
 
 DISPATCH: dict[str, Callable] = {
     ".pdf": parse_pdf,

@@ -2675,7 +2675,6 @@ class TemporalResolver:
         item_value_kinds = self._value_kinds(item_values)
         shared_value_kinds = anchor_value_kinds & item_value_kinds
         shared_values = anchor_values & item_values
-        unmatched_values = item_values - anchor_values
         anchor_bonus = self._anchor_text_bonus(text, anchor_text)
         same_date = item_date == anchor_date
         same_segment = bool(anchor_segment_ref and item_segment_ref and item_segment_ref == anchor_segment_ref)

@@ -8,7 +8,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
 from ..engine import VirtualContextEngine
-from ..types import AssembledContext, CompactionReport, Message
+from ..types import AssembledContext, Message
 from .chat_provider import ChatProvider
 from .state import TurnRecord, save_session
 

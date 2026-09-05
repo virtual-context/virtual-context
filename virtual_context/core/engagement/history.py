@@ -37,7 +37,7 @@ try:  # the driver's exception type must not leak past this module
 except Exception:  # pragma: no cover - psycopg absent
     class _UNIQUE_VIOLATION(Exception):
         pass
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from collections.abc import Mapping
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo

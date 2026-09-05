@@ -12,7 +12,6 @@ from .tag_generator import TagGenerator, detect_temporal_heuristic
 from .turn_tag_index import TurnTagIndex
 from ..patterns import DEFAULT_TEMPORAL_PATTERNS
 from ..types import (
-    Message,
     RetrievalCostReport,
     RetrievalResult,
     RetrieverConfig,

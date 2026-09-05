@@ -56,8 +56,8 @@ def create_token_counter(mode: str = "estimate") -> Callable[[str], int]:
 
     if mode.startswith("callable:"):
         raise ValueError(
-            f"The 'callable:' token counter mode has been removed for security reasons. "
-            f"Use 'estimate', 'tiktoken', or 'anthropic' instead."
+            "The 'callable:' token counter mode has been removed for security reasons. "
+            "Use 'estimate', 'tiktoken', or 'anthropic' instead."
         )
 
     raise ValueError(f"Unknown token counter mode: {mode}")

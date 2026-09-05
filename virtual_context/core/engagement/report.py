@@ -15,7 +15,6 @@ question the report answers before deciding what it licenses.
 
 from __future__ import annotations
 
-from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
 

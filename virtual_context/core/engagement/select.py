@@ -19,7 +19,7 @@ import random
 from collections import Counter
 
 from .candidates import Rejection
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 # Named reasons, shipped. Tests assert against these symbols so a reason

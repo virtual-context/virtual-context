@@ -5,9 +5,9 @@ from __future__ import annotations
 import logging
 import re
 import time
-from typing import TYPE_CHECKING, Callable, Protocol, runtime_checkable
+from typing import Callable, Protocol, runtime_checkable
 
-from ..patterns import DEFAULT_TEMPORAL_PATTERNS
+from ..patterns import DEFAULT_TEMPORAL_PATTERNS as DEFAULT_TEMPORAL_PATTERNS
 from ..types import (
     FactSignal,
     KeywordTagConfig,

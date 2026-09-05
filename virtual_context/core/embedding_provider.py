@@ -71,7 +71,7 @@ def _load_sentence_transformer(
         logger.info("EmbeddingProvider: loaded model %s", model_name)
         return embed
     except ImportError:
-        logger.debug("sentence-transformers not installed, embeddings disabled")
+        logger.info('Local embeddings unavailable; install "virtual-context[embeddings]" to enable them')
         return None
     except Exception:
         logger.debug(

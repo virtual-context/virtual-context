@@ -9,8 +9,6 @@ import uuid
 from datetime import datetime, timezone
 from typing import Callable
 
-logger = logging.getLogger(__name__)
-
 from .tag_generator import TagGenerator
 from ..types import (
     Message,
@@ -23,6 +21,8 @@ from ..types import (
     get_actor_id,
     get_sender_name,
 )
+
+logger = logging.getLogger(__name__)
 
 _SESSION_RE = re.compile(r'\[Session from ([^\]]+)\]')
 

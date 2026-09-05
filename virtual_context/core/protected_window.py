@@ -26,7 +26,7 @@ They are unit-testable in isolation.
 from __future__ import annotations
 
 import hashlib
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import TYPE_CHECKING, Iterable, Optional
 
 from ..types import Message, get_current_conversation_info, get_origin_channel
