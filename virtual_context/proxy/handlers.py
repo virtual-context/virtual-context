@@ -6,11 +6,12 @@ _handle_non_streaming — the core request forwarding logic.
 
 from __future__ import annotations
 
+import asyncio
+import codecs
 import json
 import logging
 import time
 from contextlib import ExitStack
-from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -19,34 +20,89 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from ..core.coverage_report import build_conversation_coverage_report
 from ..core.tool_loop import (
-    is_vc_tool,
     execute_vc_tool,
 )
-from ..types import Message, SpeakerRetrievalContext
+from ..types import SpeakerRetrievalContext
 
 from .formats import get_format
-from .message_filter import sanitize_chain_snapshot_messages
+from .continuation import ContinuationError, ContinuationSession
+from .request_context import RequestContext, provider_identity
+from .response_codec import collect_response, response_events
+from .message_filter import (
+    PayloadBudgetExceeded,
+    admit_provider_payload,
+    sanitize_chain_snapshot_messages,
+)
 from .helpers import (
     _forward_headers,
     _extract_delta_text,
     _extract_assistant_text,
     _extract_assistant_raw_content,
-    _inject_context,
     _inject_conversation_marker,
-    _parse_sse_events,
-    _build_continuation_request,
-    _emit_text_as_sse,
-    _emit_tool_use_as_sse,
-    _emit_message_end_sse,
-    _emit_text_as_responses_sse,
-    _emit_tool_use_as_responses_sse,
-    _emit_response_done_sse,
     _dump_session_state,
 )
 from .metrics import ProxyMetrics
 from .state import ProxyState
 
 logger = logging.getLogger(__name__)
+
+
+def _handler_upstream_limit(body: dict, state, upstream_limit: int) -> int:
+    """Resolve once, including lightweight requests that skip preparation."""
+    if type(upstream_limit) is int and upstream_limit > 0:
+        return upstream_limit
+    from ..model_limits import resolve_upstream_limit
+
+    instance = getattr(state, "_instance_upstream_limit", 0)
+    proxy_config = getattr(getattr(getattr(state, "engine", None), "config", None), "proxy", None)
+    global_limit = getattr(proxy_config, "upstream_context_limit", 0)
+    return resolve_upstream_limit(
+        body.get("model", ""),
+        instance if type(instance) is int else 0,
+        global_limit if type(global_limit) is int else 0,
+    )
+
+
+def _request_context(body, state, *, request_context=None, metrics=None, turn=0,
+                     request_turn=0, turn_id="", conversation_id="", api_format="anthropic",
+                     upstream_limit=0, speaker_context=None, roster_snapshot=None, provider=""):
+    if request_context is not None:
+        return request_context
+    return RequestContext.create(
+        body=body, state=state, metrics=metrics, turn=turn, request_turn=request_turn,
+        turn_id=turn_id, conversation_id=conversation_id,
+        api_format=api_format, provider=provider_identity(provider),
+        upstream_limit=_handler_upstream_limit(body, state, upstream_limit),
+        output_allowance=get_format(api_format).output_token_allowance(body),
+        speaker_context=speaker_context, roster_snapshot=roster_snapshot,
+    )
+
+
+def _continuation_session(context, state):
+    return ContinuationSession(context, state, runtime_factory=_ProxyToolRuntime, execute_tool=execute_vc_tool)
+
+
+async def _admit_initial(body, context, session):
+    try:
+        return (await asyncio.to_thread(admit_provider_payload, body, context.upstream_limit, get_format(context.api_format)))[0]
+    except BaseException:
+        if session:
+            await session.close()
+        raise
+
+
+async def _collect_and_continue(client, url, headers, body, response, session):
+    """The only internal tool loop, used by JSON and SSE transports."""
+    while True:
+        data = await collect_response(response, session.context.api_format)
+        if response.status_code >= 300:
+            return data, response
+        next_body, visible = await session.advance(body, data)
+        if next_body is None:
+            return visible, response
+        body = await session.admit(next_body)
+        request = client.build_request("POST", url, headers=headers, json=body)
+        response = await client.send(request, stream=True)
 
 
 def _mark_request_observed(state: ProxyState | None) -> None:
@@ -563,6 +619,9 @@ async def _handle_streaming(
     skip_marker_injection: bool = False,
     speaker_context: SpeakerRetrievalContext | None = None,
     roster_snapshot=None,
+    upstream_limit: int = 0,
+    request_context: RequestContext | None = None,
+    continuation_session: ContinuationSession | None = None,
 ) -> StreamingResponse | JSONResponse:
     """Forward SSE stream, accumulating assistant text for on_turn_complete.
 
@@ -586,7 +645,14 @@ async def _handle_streaming(
     reinterpreted. ``None`` means no roster was emitted and no tool may
     surface a handle.
     """
-    _MAX_CONTINUATION_LOOPS = 5
+    context = _request_context(body, state, request_context=request_context, metrics=metrics,
+        turn=turn, request_turn=request_turn, turn_id=turn_id, conversation_id=conversation_id,
+        api_format=api_format, upstream_limit=upstream_limit, speaker_context=speaker_context,
+        roster_snapshot=roster_snapshot, provider=url)
+    upstream_limit = context.upstream_limit
+    metrics, speaker_context, roster_snapshot = context.metrics, context.speaker_context, context.roster_snapshot
+    session = continuation_session or (_continuation_session(context, state) if state else None)
+    body = await _admit_initial(body, context, session)
 
     headers = dict(headers)
     headers.pop("accept-encoding", None)
@@ -595,12 +661,19 @@ async def _handle_streaming(
     # body streams lazily via aiter_bytes().
     t_upstream = time.monotonic()
     req = client.build_request("POST", url, headers=headers, json=body)
-    upstream = await client.send(req, stream=True)
+    try:
+        upstream = await client.send(req, stream=True)
+    except BaseException:
+        if session:
+            await session.close()
+        raise
 
     # Non-2xx: drain body and return as JSON error (not broken SSE)
     if upstream.status_code >= 300:
         error_bytes = await upstream.aread()
         await upstream.aclose()
+        if session:
+            await session.close()
         upstream_ms = round((time.monotonic() - t_upstream) * 1000, 1)
         if metrics:
             metrics.record({
@@ -632,6 +705,33 @@ async def _handle_streaming(
     resp_headers = _forward_headers(dict(upstream.headers))
     resp_headers.setdefault("cache-control", "no-cache")
     resp_headers.setdefault("x-accel-buffering", "no")
+
+    if paging_enabled and session:
+        async def managed_stream():
+            try:
+                result = await _handle_non_streaming(
+                    client, url, headers, body, api_format, state,
+                    request_context=context, continuation_session=session,
+                    initial_response=upstream, source_streaming=True,
+                    intercept_vc_tools=True, metrics=metrics, turn=turn,
+                    request_turn=request_turn, turn_id=turn_id,
+                    conversation_id=conversation_id, overhead_ms=overhead_ms,
+                    passthrough=passthrough, skip_marker_injection=skip_marker_injection,
+                    response_log_path=response_log_path, session_log_path=session_log_path,
+                    request_log_dir=request_log_dir, log_prefix=log_prefix,
+                )
+                value = json.loads(result.body)
+                if result.status_code >= 300:
+                    yield ("event: error\ndata: " + json.dumps({"type": "error", "error": value.get("error", value)}) + "\n\n").encode()
+                else:
+                    for event in response_events(value, api_format):
+                        yield event
+            except PayloadBudgetExceeded as exc:
+                yield ("event: error\ndata: " + json.dumps({"type": "error", "error": {"type": "context_budget_exceeded", "message": str(exc)}}) + "\n\n").encode()
+            finally:
+                await upstream.aclose()
+                await session.close()
+        return StreamingResponse(managed_stream(), status_code=upstream.status_code, headers=resp_headers)
 
     # ----- shared post-stream processing -----
     def _post_stream(text_chunks, raw_events, usage=None):
@@ -670,7 +770,7 @@ async def _handle_streaming(
         if state and hasattr(state.engine, '_telemetry'):
             _model = body.get("model", "unknown")
             _out_tok = len(assistant_text) // 4 if assistant_text else 0
-            _in_tok = state._last_enriched_payload_tokens or 0
+            _in_tok = context.payload_tokens
             state.engine._telemetry.log(
                 component="proxy_upstream",
                 model=_model,
@@ -704,826 +804,10 @@ async def _handle_streaming(
         raw_events: list[str] = []
 
         # ---------------------------------------------------------------
-        # Paging path: event-level forwarding with VC tool interception
-        # ---------------------------------------------------------------
-        if paging_enabled:
-            buf = b""
-            vc_tools: list[dict] = []          # [{id, name, input}]
-            non_vc_tools: list[dict] = []      # [{id, name}]
-            all_content_blocks: list[dict] = []  # for continuation
-            forwarded_block_count = 0
-            suppressing = False
-            current_vc_tool: dict | None = None
-            current_text_parts: list[str] = []
-            suppressed_raw: list[bytes] = []
-            need_continuation = False
-            _stream_usage: dict = {}  # accumulate input/output tokens
-
-            # --- EXPERIMENTAL: decoupled upstream read via asyncio.Queue ---
-            # Reads from Anthropic in a background task, yields to client from queue.
-            # This prevents client backpressure from blocking upstream reads.
-            import asyncio as _asyncio
-            _upstream_q: _asyncio.Queue = _asyncio.Queue(maxsize=1000)
-            _upstream_done = _asyncio.Event()
-            _upstream_error: list = []
-
-            async def _upstream_reader():
-                """Background task: read from Anthropic, put chunks in queue."""
-                try:
-                    async for raw_chunk in upstream.aiter_bytes():
-                        await _upstream_q.put(raw_chunk)
-                except Exception as e:
-                    _upstream_error.append(e)
-                finally:
-                    _upstream_done.set()
-
-            _reader_task = _asyncio.create_task(_upstream_reader())
-
-            _pg_stream_t0 = time.monotonic()
-            _pg_first_chunk = True
-            _pg_chunk_count = 0
-            _pg_total_bytes = 0
-            _pg_last_chunk_at = _pg_stream_t0
-            _pg_max_gap = 0.0
-            _pg_max_yield_time = 0.0
-            try:
-                while True:
-                    # Wait for a chunk or upstream completion
-                    try:
-                        raw_chunk = await _asyncio.wait_for(
-                            _upstream_q.get(), timeout=5.0,
-                        )
-                    except _asyncio.TimeoutError:
-                        if _upstream_done.is_set() and _upstream_q.empty():
-                            break
-                        # Log queue state during waits
-                        _pg_now = time.monotonic()
-                        _elapsed = _pg_now - _pg_stream_t0
-                        if _elapsed > 30.0 and _pg_chunk_count < 5:
-                            logger.warning(
-                                "STREAM_QUEUE_WAIT conv=%s turn=%d elapsed=%.1fs chunks=%d qsize=%d reader_done=%s",
-                                conversation_id[:12], turn, _elapsed,
-                                _pg_chunk_count, _upstream_q.qsize(), _upstream_done.is_set(),
-                            )
-                        continue
-
-                    _pg_now = time.monotonic()
-                    _pg_gap = _pg_now - _pg_last_chunk_at
-                    if _pg_gap > _pg_max_gap:
-                        _pg_max_gap = _pg_gap
-                    _pg_last_chunk_at = _pg_now
-                    _pg_chunk_count += 1
-                    _pg_total_bytes += len(raw_chunk)
-                    if _pg_first_chunk:
-                        _pg_first_chunk = False
-                        logger.info(
-                            "STREAM_FIRST_BYTE conv=%s turn=%d after=%.1fs (paging/decoupled)",
-                            conversation_id[:12], turn, _pg_now - _pg_stream_t0,
-                        )
-                    if _pg_gap > 30.0:
-                        logger.warning(
-                            "STREAM_STALL conv=%s turn=%d gap=%.1fs chunks=%d bytes=%d elapsed=%.1fs (paging/decoupled)",
-                            conversation_id[:12], turn, _pg_gap,
-                            _pg_chunk_count, _pg_total_bytes, _pg_now - _pg_stream_t0,
-                        )
-                    raw_events.append(
-                        raw_chunk.decode("utf-8", errors="replace"),
-                    )
-                    buf += raw_chunk
-                    events, buf = _parse_sse_events(buf)
-
-                    for _evt_type, data_str, raw_bytes in events:
-                        if not data_str or data_str.strip() == "[DONE]":
-                            _yt0 = time.monotonic()
-                            yield raw_bytes
-                            _yt = time.monotonic() - _yt0
-                            if _yt > 1.0:
-                                logger.warning(
-                                    "STREAM_YIELD_SLOW conv=%s turn=%d yield_time=%.1fs (empty/done event)",
-                                    conversation_id[:12], turn, _yt,
-                                )
-                            if _yt > _pg_max_yield_time:
-                                _pg_max_yield_time = _yt
-                            continue
-
-                        try:
-                            data = json.loads(data_str)
-                        except json.JSONDecodeError:
-                            yield raw_bytes
-                            continue
-
-                        dtype = data.get("type", "")
-
-                        # -- message_start: extract input_tokens --
-                        if dtype == "message_start":
-                            msg_usage = data.get("message", {}).get("usage", {})
-                            _extract_usage(msg_usage, _stream_usage)
-
-                        # -- content_block_start --
-                        if dtype == "content_block_start":
-                            block = data.get("content_block", {})
-                            btype = block.get("type", "")
-                            if (
-                                btype == "tool_use"
-                                and is_vc_tool(block.get("name", ""))
-                            ):
-                                suppressing = True
-                                current_vc_tool = {
-                                    "id": block["id"],
-                                    "name": block["name"],
-                                    "input_parts": [],
-                                }
-                                suppressed_raw.append(raw_bytes)
-                                continue
-                            elif btype == "tool_use":
-                                non_vc_tools.append({
-                                    "id": block["id"],
-                                    "name": block["name"],
-                                })
-                            elif btype == "text":
-                                current_text_parts = []
-
-                        # -- content_block_delta --
-                        elif dtype == "content_block_delta":
-                            if suppressing:
-                                delta = data.get("delta", {})
-                                if delta.get("type") == "input_json_delta":
-                                    current_vc_tool["input_parts"].append(
-                                        delta.get("partial_json", ""),
-                                    )
-                                suppressed_raw.append(raw_bytes)
-                                continue
-                            else:
-                                dt = _extract_delta_text(data, "anthropic")
-                                if dt:
-                                    text_chunks.append(dt)
-                                    current_text_parts.append(dt)
-
-                        # -- content_block_stop --
-                        elif dtype == "content_block_stop":
-                            if suppressing:
-                                if current_vc_tool:
-                                    input_str = "".join(
-                                        current_vc_tool["input_parts"],
-                                    )
-                                    try:
-                                        parsed_input = json.loads(input_str)
-                                    except json.JSONDecodeError:
-                                        parsed_input = {}
-                                    vc_tools.append({
-                                        "id": current_vc_tool["id"],
-                                        "name": current_vc_tool["name"],
-                                        "input": parsed_input,
-                                    })
-                                    all_content_blocks.append({
-                                        "type": "tool_use",
-                                        "id": current_vc_tool["id"],
-                                        "name": current_vc_tool["name"],
-                                        "input": parsed_input,
-                                    })
-                                    current_vc_tool = None
-                                suppressing = False
-                                suppressed_raw.append(raw_bytes)
-                                continue
-                            else:
-                                # Finalize text block
-                                if current_text_parts:
-                                    all_content_blocks.append({
-                                        "type": "text",
-                                        "text": "".join(current_text_parts),
-                                    })
-                                    current_text_parts = []
-                                # Count ALL forwarded blocks (text, thinking, etc.)
-                                # so continuation emits use correct indices.
-                                forwarded_block_count += 1
-
-                        # -- message_delta: extract output_tokens --
-                        elif dtype == "message_delta":
-                            delta_usage = data.get("usage", {})
-                            if "output_tokens" in delta_usage:
-                                _stream_usage["output_tokens"] = delta_usage["output_tokens"]
-                            sr = data.get("delta", {}).get("stop_reason")
-                            if sr == "tool_use" and vc_tools:
-                                if non_vc_tools:
-                                    # BAIL: mixed VC + non-VC tools
-                                    logger.warning(
-                                        "Mixed VC + non-VC tools in "
-                                        "response — passing all through",
-                                    )
-                                    for s in suppressed_raw:
-                                        yield s
-                                    suppressed_raw.clear()
-                                    vc_tools.clear()
-                                    need_continuation = False
-                                else:
-                                    # All VC — suppress, handle after
-                                    # message_stop
-                                    need_continuation = True
-                                    suppressed_raw.append(raw_bytes)
-                                    continue
-
-                        # -- message_stop --
-                        elif dtype == "message_stop":
-                            if need_continuation:
-                                suppressed_raw.append(raw_bytes)
-                                continue
-
-                        # ===== Responses API events =====
-
-                        # -- response.output_item.added --
-                        elif dtype == "response.output_item.added":
-                            item = data.get("item", {})
-                            itype = item.get("type", "")
-                            if (
-                                itype == "function_call"
-                                and is_vc_tool(item.get("name", ""))
-                            ):
-                                suppressing = True
-                                current_vc_tool = {
-                                    "id": item.get(
-                                        "call_id", item.get("id", ""),
-                                    ),
-                                    "name": item["name"],
-                                    "input_parts": [],
-                                }
-                                suppressed_raw.append(raw_bytes)
-                                continue
-                            elif itype == "function_call":
-                                non_vc_tools.append({
-                                    "id": item.get(
-                                        "call_id", item.get("id", ""),
-                                    ),
-                                    "name": item.get("name", ""),
-                                })
-
-                        # -- response.function_call_arguments.delta --
-                        elif dtype == (
-                            "response.function_call_arguments.delta"
-                        ):
-                            if suppressing and current_vc_tool:
-                                current_vc_tool["input_parts"].append(
-                                    data.get("delta", ""),
-                                )
-                                suppressed_raw.append(raw_bytes)
-                                continue
-
-                        # -- response.function_call_arguments.done --
-                        elif dtype == (
-                            "response.function_call_arguments.done"
-                        ):
-                            if suppressing and current_vc_tool:
-                                args_str = data.get(
-                                    "arguments",
-                                    "".join(
-                                        current_vc_tool["input_parts"],
-                                    ),
-                                )
-                                try:
-                                    parsed_input = json.loads(args_str)
-                                except json.JSONDecodeError:
-                                    parsed_input = {}
-                                vc_tools.append({
-                                    "id": current_vc_tool["id"],
-                                    "name": current_vc_tool["name"],
-                                    "input": parsed_input,
-                                })
-                                all_content_blocks.append({
-                                    "type": "function_call",
-                                    "call_id": current_vc_tool["id"],
-                                    "name": current_vc_tool["name"],
-                                    "arguments": args_str,
-                                })
-                                current_vc_tool = None
-                                suppressing = False
-                                suppressed_raw.append(raw_bytes)
-                                continue
-
-                        # -- response.output_text.delta --
-                        elif dtype == "response.output_text.delta":
-                            dt = data.get("delta", "")
-                            if dt:
-                                text_chunks.append(dt)
-                                current_text_parts.append(dt)
-
-                        # -- response.output_item.done --
-                        elif dtype == "response.output_item.done":
-                            if suppressing:
-                                suppressed_raw.append(raw_bytes)
-                                continue
-                            item = data.get("item", {})
-                            if item.get("type") == "message":
-                                if current_text_parts:
-                                    all_content_blocks.append({
-                                        "type": "message",
-                                        "role": "assistant",
-                                        "content": [{
-                                            "type": "output_text",
-                                            "text": "".join(
-                                                current_text_parts,
-                                            ),
-                                        }],
-                                    })
-                                    current_text_parts = []
-                                    forwarded_block_count += 1
-
-                        # -- response.completed --
-                        elif dtype == "response.completed":
-                            resp = data.get("response", {})
-                            output = resp.get("output", [])
-                            has_vc = any(
-                                it.get("type") == "function_call"
-                                and is_vc_tool(it.get("name", ""))
-                                for it in output
-                            )
-                            if has_vc and vc_tools:
-                                has_non_vc = any(
-                                    it.get("type") == "function_call"
-                                    and not is_vc_tool(it.get("name", ""))
-                                    for it in output
-                                )
-                                if has_non_vc:
-                                    logger.warning(
-                                        "Mixed VC + non-VC tools in "
-                                        "Responses API — passing through",
-                                    )
-                                    for s in suppressed_raw:
-                                        yield s
-                                    suppressed_raw.clear()
-                                    vc_tools.clear()
-                                    need_continuation = False
-                                else:
-                                    need_continuation = True
-                                    suppressed_raw.append(raw_bytes)
-                                    continue
-
-                        # Default: forward event to client
-                        _yt0 = time.monotonic()
-                        yield raw_bytes
-                        _yt = time.monotonic() - _yt0
-                        if _yt > 1.0:
-                            logger.warning(
-                                "STREAM_YIELD_SLOW conv=%s turn=%d yield_time=%.1fs dtype=%s",
-                                conversation_id[:12], turn, _yt, dtype,
-                            )
-                        if _yt > _pg_max_yield_time:
-                            _pg_max_yield_time = _yt
-
-                # Wait for reader task to finish
-                if not _reader_task.done():
-                    _reader_task.cancel()
-                    try:
-                        await _reader_task
-                    except (_asyncio.CancelledError, Exception):
-                        pass
-
-            finally:
-                _pg_elapsed = time.monotonic() - _pg_stream_t0
-                logger.info(
-                    "STREAM_END conv=%s turn=%d elapsed=%.1fs chunks=%d bytes=%d max_gap=%.1fs max_yield=%.1fs reader_err=%s (paging/decoupled)",
-                    conversation_id[:12], turn, _pg_elapsed,
-                    _pg_chunk_count, _pg_total_bytes, _pg_max_gap,
-                    _pg_max_yield_time, _upstream_error or "none",
-                )
-                if _pg_elapsed > 60.0:
-                    logger.warning(
-                        "STREAM_SLOW conv=%s turn=%d elapsed=%.1fs max_gap=%.1fs chunks=%d (paging) — investigate",
-                        conversation_id[:12], turn, _pg_elapsed, _pg_max_gap, _pg_chunk_count,
-                    )
-                await upstream.aclose()
-
-            # --- Continuation phase ---
-            if need_continuation and vc_tools and state:
-                cont_body: dict | None = None
-                cont_data: dict | None = None
-                loop_content_blocks: list[dict] = []
-                tool_runtime = _ProxyToolRuntime(
-                    engine=state.engine,
-                    api_format=api_format,
-                    conversation_id=conversation_id,
-                    get_target_body=lambda: cont_body if cont_body is not None else body,
-                    speaker_context=speaker_context,
-                )
-
-                for loop_i in range(_MAX_CONTINUATION_LOOPS):
-                    # Execute VC tools
-                    import uuid as _uuid
-                    _group_id = _uuid.uuid4().hex[:12]
-                    tool_results: list[dict] = []
-                    for tool in vc_tools:
-                        t_tool = time.monotonic()
-                        tool_name = tool["name"]
-                        tool_input = tool["input"]
-                        result_str = execute_vc_tool(
-                            state.engine,
-                            tool_name,
-                            tool_input,
-                            tool_runtime=tool_runtime,
-                            speaker_context=speaker_context,
-                            roster_snapshot=roster_snapshot,
-                        )
-                        tool_ms = round(
-                            (time.monotonic() - t_tool) * 1000, 1,
-                        )
-                        _input_preview = json.dumps(tool_input)[:120]
-                        _result_preview = result_str[:200].replace("\n", " ")
-                        logger.info(
-                            "TOOL_CALL %s %dms input=%s result_len=%d preview=%s",
-                            tool_name, tool_ms, _input_preview,
-                            len(result_str), _result_preview,
-                        )
-                        if metrics:
-                            metrics.record({
-                                "type": "tool_intercept",
-                                "turn": turn,
-                                "tool_name": tool_name,
-                                "tool_input": tool_input,
-                                "result": result_str[:200],
-                                "duration_ms": tool_ms,
-                                "continuation_count": loop_i + 1,
-                                "conversation_id": conversation_id,
-                                "group_id": _group_id,
-                            })
-                        # Persist full tool call to store
-                        try:
-                            state.engine._store.save_tool_call({
-                                "conversation_id": conversation_id,
-                                "request_turn": request_turn or turn,
-                                "round": loop_i + 1,
-                                "group_id": _group_id,
-                                "tool_name": tool_name,
-                                "tool_input": tool_input,
-                                "tool_result": result_str,
-                                "result_length": len(result_str),
-                                "duration_ms": tool_ms,
-                                "found": "not found" not in result_str.lower()[:100] if result_str else None,
-                                "timestamp": datetime.now(timezone.utc).isoformat(),
-                            })
-                        except Exception:
-                            pass
-                        if api_format == "openai_responses":
-                            tool_results.append({
-                                "type": "function_call_output",
-                                "call_id": tool["id"],
-                                "output": result_str,
-                            })
-                        else:
-                            tool_results.append({
-                                "type": "tool_result",
-                                "tool_use_id": tool["id"],
-                                "content": result_str,
-                            })
-
-                    # Re-assemble context with updated working set
-                    # so the LLM sees the expanded content in this
-                    # turn (not deferred to next turn).
-                    new_prepend = state.engine.reassemble_context(
-                        speaker_context=speaker_context,
-                    )
-                    reassembled_body = _inject_context(
-                        body, new_prepend, api_format,
-                    ) if new_prepend else body
-
-                    # Build or extend continuation request
-                    if cont_body is None:
-                        cont_body = _build_continuation_request(
-                            reassembled_body,
-                            all_content_blocks,
-                            tool_results,
-                        )
-                    else:
-                        if api_format == "openai_responses":
-                            # Update instructions with re-assembled context
-                            if (
-                                new_prepend
-                                and "instructions" in reassembled_body
-                            ):
-                                cont_body["instructions"] = (
-                                    reassembled_body["instructions"]
-                                )
-                            # Append function_call items + results to input
-                            for block in loop_content_blocks:
-                                if block.get("type") == "function_call":
-                                    cont_body["input"].append(block)
-                            cont_body["input"].extend(tool_results)
-                        else:
-                            # Anthropic / default
-                            if (
-                                new_prepend
-                                and "system" in reassembled_body
-                            ):
-                                cont_body["system"] = (
-                                    reassembled_body["system"]
-                                )
-                            cont_body["messages"].append({
-                                "role": "assistant",
-                                "content": loop_content_blocks,
-                            })
-                            cont_body["messages"].append({
-                                "role": "user",
-                                "content": tool_results,
-                            })
-
-                    # Send continuation — streaming for Responses API
-                    # (Codex requires stream=true), non-streaming otherwise.
-                    _cont_is_streaming = cont_body.get("stream", False)
-                    if _cont_is_streaming:
-                        cont_resp = await client.send(
-                            client.build_request(
-                                "POST", url, headers=headers, json=cont_body,
-                            ),
-                            stream=True,
-                        )
-                    else:
-                        cont_resp = await client.post(
-                            url, headers=headers, json=cont_body,
-                        )
-
-                    # Log continuation request/response to disk
-                    _cont_resp_text: str | None = None
-                    if _cont_is_streaming and cont_resp.status_code == 200:
-                        # Collect SSE stream → extract response.completed
-                        _cont_chunks: list[str] = []
-                        cont_data = {}
-                        async for line in cont_resp.aiter_lines():
-                            _cont_chunks.append(line)
-                            if not line.startswith("data: "):
-                                continue
-                            payload = line[6:]
-                            if payload == "[DONE]":
-                                break
-                            try:
-                                evt = json.loads(payload)
-                            except json.JSONDecodeError:
-                                continue
-                            if evt.get("type") == "response.completed":
-                                cont_data = evt.get("response", {})
-                        await cont_resp.aclose()
-                        _cont_resp_text = json.dumps(cont_data, ensure_ascii=False)
-                    else:
-                        if _cont_is_streaming:
-                            await cont_resp.aread()
-                        _cont_resp_text = cont_resp.text
-
-                    if request_log_dir and log_prefix:
-                        _cn = loop_i + 1
-                        try:
-                            _cdir = Path(request_log_dir)
-                            _cdir.joinpath(
-                                f"{log_prefix}.continuation-{_cn}.request.json"
-                            ).write_text(
-                                json.dumps(cont_body, ensure_ascii=False, indent=2),
-                                encoding="utf-8",
-                            )
-                            _cdir.joinpath(
-                                f"{log_prefix}.continuation-{_cn}.response.json"
-                            ).write_text(
-                                _cont_resp_text or "", encoding="utf-8",
-                            )
-                        except Exception:
-                            logger.debug("continuation log write failed", exc_info=True)  # never let logging break the request
-
-                    logger.info(
-                        "CONTINUATION round=%d status=%d tools=%s",
-                        loop_i + 1,
-                        cont_resp.status_code,
-                        [t["name"] for t in vc_tools],
-                    )
-
-                    if cont_resp.status_code >= 300:
-                        _err_body = ""
-                        try:
-                            _err_body = (await cont_resp.aread()).decode("utf-8", errors="replace")[:500]
-                        except Exception:
-                            pass
-                        logger.error(
-                            "Continuation failed: %d body=%s",
-                            cont_resp.status_code,
-                            _err_body,
-                        )
-                        if _cont_is_streaming:
-                            try:
-                                await cont_resp.aclose()
-                            except Exception:
-                                logger.debug("continuation response close failed", exc_info=True)
-                        break
-
-                    if not _cont_is_streaming:
-                        cont_data = cont_resp.json()
-
-                    if api_format == "openai_responses":
-                        # Responses API: output array, no stop_reason
-                        output = cont_data.get("output", [])
-                        loop_content_blocks = output
-                        tool_blocks = [
-                            b for b in output
-                            if b.get("type") == "function_call"
-                        ]
-                        vc_next = [
-                            b for b in tool_blocks
-                            if is_vc_tool(b.get("name", ""))
-                        ]
-                        has_tools = bool(tool_blocks)
-
-                        # Emit text from message items
-                        for item in output:
-                            if item.get("type") != "message":
-                                continue
-                            for part in item.get("content", []):
-                                if part.get("type") == "output_text":
-                                    t = part.get("text", "")
-                                    if t:
-                                        text_chunks.append(t)
-                                        for sse_evt in (
-                                            _emit_text_as_responses_sse(
-                                                t,
-                                                forwarded_block_count,
-                                            )
-                                        ):
-                                            yield sse_evt
-                                        forwarded_block_count += 1
-
-                        # More VC-only tool calls → loop
-                        if (
-                            has_tools
-                            and vc_next
-                            and all(
-                                is_vc_tool(b.get("name", ""))
-                                for b in tool_blocks
-                            )
-                        ):
-                            fmt_obj = get_format("openai_responses")
-                            vc_tools = [
-                                {
-                                    "id": c["id"],
-                                    "name": c["name"],
-                                    "input": c["input"],
-                                }
-                                for c in fmt_obj.extract_tool_calls(
-                                    output,
-                                )
-                                if is_vc_tool(c["name"])
-                            ]
-                            continue
-
-                        # Done — forward non-VC tools
-                        non_vc_in_cont = [
-                            b for b in tool_blocks
-                            if not is_vc_tool(b.get("name", ""))
-                        ]
-                        if non_vc_in_cont:
-                            fmt_obj = get_format("openai_responses")
-                            for nvc in fmt_obj.extract_tool_calls(
-                                non_vc_in_cont,
-                            ):
-                                for sse_evt in (
-                                    _emit_tool_use_as_responses_sse(
-                                        nvc,
-                                        forwarded_block_count,
-                                    )
-                                ):
-                                    yield sse_evt
-                                forwarded_block_count += 1
-                        break
-
-                    else:
-                        # Anthropic / default
-                        stop_reason = cont_data.get(
-                            "stop_reason", "end_turn",
-                        )
-                        content = cont_data.get("content", [])
-                        loop_content_blocks = content
-
-                        text_blocks = [
-                            b for b in content
-                            if b.get("type") == "text"
-                        ]
-                        tool_blocks = [
-                            b for b in content
-                            if b.get("type") == "tool_use"
-                        ]
-                        vc_next = [
-                            b for b in tool_blocks
-                            if is_vc_tool(b.get("name", ""))
-                        ]
-
-                        for tb in text_blocks:
-                            t = tb.get("text", "")
-                            if not t:
-                                continue
-                            # Non-streaming continuations may embed
-                            # <thinking>...</thinking> as literal text.
-                            # Split into proper thinking + text blocks.
-                            import re as _re
-                            _think_match = _re.match(
-                                r"<thinking>([\s\S]*?)</thinking>\s*",
-                                t,
-                            )
-                            if _think_match:
-                                t = t[_think_match.end():]
-                            if t.strip():
-                                text_chunks.append(t)
-                                for sse_evt in _emit_text_as_sse(
-                                    t, forwarded_block_count,
-                                ):
-                                    yield sse_evt
-                                forwarded_block_count += 1
-
-                        # More VC-only tool calls → loop
-                        if (
-                            stop_reason == "tool_use"
-                            and vc_next
-                            and all(
-                                is_vc_tool(b.get("name", ""))
-                                for b in tool_blocks
-                            )
-                        ):
-                            vc_tools = [
-                                {
-                                    "id": b["id"],
-                                    "name": b["name"],
-                                    "input": b.get("input", {}),
-                                }
-                                for b in vc_next
-                            ]
-                            continue
-
-                        # Done — forward non-VC tools
-                        non_vc_in_cont = [
-                            b for b in tool_blocks
-                            if not is_vc_tool(b.get("name", ""))
-                        ]
-                        if non_vc_in_cont:
-                            for nvc in non_vc_in_cont:
-                                for sse_evt in _emit_tool_use_as_sse(
-                                    nvc, forwarded_block_count,
-                                ):
-                                    yield sse_evt
-                                forwarded_block_count += 1
-                        break
-
-                # Emit end events (format-aware)
-                cont_usage = (
-                    cont_data.get("usage") if cont_data else None
-                )
-                if api_format == "openai_responses":
-                    # Collect all forwarded output items
-                    _final_output: list[dict] = []
-                    if cont_data:
-                        for item in cont_data.get("output", []):
-                            if item.get("type") == "function_call":
-                                if not is_vc_tool(
-                                    item.get("name", ""),
-                                ):
-                                    _final_output.append(item)
-                            else:
-                                _final_output.append(item)
-                    for sse_evt in _emit_response_done_sse(
-                        _final_output, usage=cont_usage,
-                    ):
-                        yield sse_evt
-                else:
-                    cont_stop = "end_turn"
-                    if cont_data:
-                        raw_stop = cont_data.get(
-                            "stop_reason", "end_turn",
-                        )
-                        non_vc_forwarded = any(
-                            b.get("type") == "tool_use"
-                            and not is_vc_tool(b.get("name", ""))
-                            for b in cont_data.get("content", [])
-                        )
-                        if raw_stop == "tool_use" and non_vc_forwarded:
-                            cont_stop = "tool_use"
-                    for sse_evt in _emit_message_end_sse(
-                        cont_stop, usage=cont_usage,
-                    ):
-                        yield sse_evt
-
-            # Post-stream processing
-            assistant_text, _ = _post_stream(text_chunks, raw_events, usage=_stream_usage)
-            _mark_request_observed(state)
-            if state and assistant_text and not state.is_conversation_deleted():
-                state.conversation_history.append(
-                    Message(role="assistant", content=assistant_text,
-                            timestamp=datetime.now(timezone.utc),
-                            raw_content=all_content_blocks if all_content_blocks else None),
-                )
-                if not passthrough:
-                    state.fire_turn_complete(
-                        list(state.conversation_history),
-                        payload_tokens=state._last_enriched_payload_tokens or None,
-                        turn_id=turn_id,
-                    )
-
-            if session_log_path and state:
-                _dump_session_state(state, session_log_path)
-
-            return  # exit — don't fall through to raw-byte path
-
-        # ---------------------------------------------------------------
         # Non-paging path: raw-byte forwarding (unchanged)
         # ---------------------------------------------------------------
         line_buf = ""
+        utf8_decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         _raw_usage: dict = {}
         np_content_blocks: list[dict] = []
         np_current_text_parts: list[str] = []
@@ -1535,6 +819,7 @@ async def _handle_streaming(
         _stream_total_bytes = 0
         _stream_last_chunk_at = _stream_t0
         _stream_max_gap = 0.0
+        received_all = False
         try:
             async for raw_chunk in upstream.aiter_bytes():
                 _now = time.monotonic()
@@ -1565,7 +850,7 @@ async def _handle_streaming(
                 yield raw_chunk  # forward raw bytes unchanged
 
                 # Side-channel: parse for text accumulation + log capture
-                decoded = raw_chunk.decode("utf-8", errors="replace")
+                decoded = utf8_decoder.decode(raw_chunk)
                 raw_events.append(decoded)
                 line_buf += decoded
                 while "\n" in line_buf:
@@ -1628,6 +913,7 @@ async def _handle_streaming(
                                     np_current_text_parts = []
                         except json.JSONDecodeError:
                             pass
+            received_all = True
         finally:
             _stream_elapsed = time.monotonic() - _stream_t0
             logger.info(
@@ -1641,28 +927,20 @@ async def _handle_streaming(
                     conversation_id[:12], turn, _stream_elapsed, _stream_max_gap, _stream_chunk_count,
                 )
             await upstream.aclose()
-            assistant_text, _ = _post_stream(text_chunks, raw_events, usage=_raw_usage)
-            _mark_request_observed(state)
-            if state and assistant_text and not state.is_conversation_deleted():
-                state.conversation_history.append(
-                    Message(role="assistant", content=assistant_text,
-                            timestamp=datetime.now(timezone.utc),
-                            raw_content=np_content_blocks if np_content_blocks else None)
-                )
-                if not passthrough:
-                    state.fire_turn_complete(
-                        list(state.conversation_history),
-                        payload_tokens=state._last_enriched_payload_tokens or None,
-                        turn_id=turn_id,
-                    )
-
-                # Inject session marker as a final SSE delta so the client SDK
-                # accumulates it into the stored assistant message.
-                # Skip if the inbound already had a marker — never overwrite.
-                if not skip_marker_injection:
-                    _marker_sid = state.engine.config.conversation_id
-                    _fmt = get_format(api_format)
-                    yield _fmt.emit_conversation_marker_sse(_marker_sid)
+            if received_all:
+                assistant_text, _ = _post_stream(text_chunks, raw_events, usage=_raw_usage)
+                completion_live = True
+                if session:
+                    try:
+                        session.persist_completed(assistant_text, np_content_blocks or None, passthrough=passthrough)
+                    except ContinuationError:
+                        # Provider bytes have already reached the client.
+                        # A deletion/epoch change suppresses this side effect
+                        # and marker; it must not corrupt the delivered stream.
+                        completion_live = False
+                        logger.info("STREAM_COMPLETION_SKIPPED conv=%s: request authority expired", conversation_id[:12])
+                if completion_live and state and assistant_text and not skip_marker_injection and not state.is_conversation_deleted():
+                    yield get_format(api_format).emit_conversation_marker_sse(context.conversation_id)
 
             # Session state dump (after response + history update)
             if session_log_path and state:
@@ -1711,22 +989,51 @@ async def _handle_non_streaming(
     log_prefix: str = "",
     skip_marker_injection: bool = False,
     speaker_context: SpeakerRetrievalContext | None = None,
+    roster_snapshot=None,
+    upstream_limit: int = 0,
+    intercept_vc_tools: bool = False,
+    request_context: RequestContext | None = None,
+    continuation_session: ContinuationSession | None = None,
+    initial_response=None,
+    source_streaming: bool = False,
 ) -> JSONResponse:
     """Forward JSON response, parse assistant text, fire on_turn_complete.
 
-    ``speaker_context`` is the request-owned retrieval authority. This
-    handler performs no local VC tool interception today, so the context is
-    accepted and retained for the interception loop that will need it; it is
-    unused until then.
+    Internal memory tools run with this request's speaker context and roster;
+    only the final provider answer or client-owned tools reach the client.
     """
+    context = _request_context(body, state, request_context=request_context, metrics=metrics,
+        turn=turn, request_turn=request_turn, turn_id=turn_id, conversation_id=conversation_id,
+        api_format=api_format, upstream_limit=upstream_limit, speaker_context=speaker_context,
+        roster_snapshot=roster_snapshot, provider=url)
+    upstream_limit = context.upstream_limit
+    metrics, speaker_context, roster_snapshot = context.metrics, context.speaker_context, context.roster_snapshot
+    session = continuation_session or (_continuation_session(context, state) if state else None)
+    body = await _admit_initial(body, context, session)
     t_upstream = time.monotonic()
-    resp = await client.request("POST", url, headers=headers, json=body)
-    upstream_ms = round((time.monotonic() - t_upstream) * 1000, 1)
-
+    resp = initial_response
     try:
-        response_body = resp.json()
-    except Exception:
-        return JSONResponse(content=resp.text, status_code=resp.status_code)
+        if resp is None:
+            resp = await client.send(client.build_request("POST", url, headers=headers, json=body), stream=True)
+        if intercept_vc_tools and session:
+            response_body, resp = await _collect_and_continue(client, url, headers, body, resp, session)
+        else:
+            response_body = await collect_response(resp, api_format)
+        if session:
+            session.assert_live()
+            if resp.status_code >= 300:
+                await session.close()
+    except ContinuationError as exc:
+        if session:
+            await session.close()
+        return JSONResponse(status_code=exc.status_code, content={"error": {"type": "memory_tool_error", "message": str(exc)}})
+    except BaseException:
+        if session:
+            await session.close()
+        if resp is not None:
+            await resp.aclose()
+        raise
+    upstream_ms = round((time.monotonic() - t_upstream) * 1000, 1)
 
     # 3-from-llm: raw upstream response before any modification
     if request_log_dir and log_prefix:
@@ -1744,11 +1051,20 @@ async def _handle_non_streaming(
     _ns_raw = response_body.get("usage", {})
     _ns_usage: dict = {}
     _extract_usage(_ns_raw, _ns_usage)
+    if session:
+        if intercept_vc_tools:
+            input_tokens, output_tokens = session.usage
+            _ns_usage.update(session.cache_usage)
+        else:
+            input_tokens, output_tokens = session.adapter.extract_usage(response_body)
+            input_tokens = _ns_usage.get("input_tokens", input_tokens)
+        _ns_usage["input_tokens"] = input_tokens or 0
+        _ns_usage["output_tokens"] = output_tokens or 0
     if metrics:
         metrics.capture_response(
             turn, response_body,
             upstream_input_tokens=_ns_usage.get("input_tokens", 0),
-            upstream_output_tokens=_ns_raw.get("output_tokens", 0),
+            upstream_output_tokens=_ns_usage.get("output_tokens", _ns_raw.get("output_tokens", 0)),
             cache_creation_input_tokens=_ns_usage.get("cache_creation_input_tokens", 0),
             cache_read_input_tokens=_ns_usage.get("cache_read_input_tokens", 0),
             conversation_id=conversation_id,
@@ -1756,21 +1072,15 @@ async def _handle_non_streaming(
         )
 
     # Extract and record assistant text
-    assistant_text = _extract_assistant_text(response_body, api_format)
-    _mark_request_observed(state)
-    if state and assistant_text and not state.is_conversation_deleted():
-        state.conversation_history.append(
-            Message(role="assistant", content=assistant_text,
-                    timestamp=datetime.now(timezone.utc),
-                    raw_content=_extract_assistant_raw_content(response_body, api_format))
-        )
-        if not passthrough:
-            state.fire_turn_complete(
-                list(state.conversation_history),
-                payload_tokens=state._last_enriched_payload_tokens or None,
-                turn_id=turn_id,
-            )
-
+    assistant_text = session.public_text(response_body) if session and intercept_vc_tools else _extract_assistant_text(response_body, api_format)
+    if session and resp.status_code < 300:
+        try:
+            session.persist_completed(assistant_text, _extract_assistant_raw_content(response_body, api_format), passthrough=passthrough)
+            await session.close(consume=True)
+        except BaseException:
+            await session.close()
+            raise
+    if state and assistant_text and resp.status_code < 300 and not session.deferred and not state.is_conversation_deleted():
         # Inject session marker into the response body so the client stores it.
         # Skip if the inbound payload already had a marker — never overwrite
         # an established conversation identity with a new one.
@@ -1786,7 +1096,7 @@ async def _handle_non_streaming(
             "turn_id": turn_id,
             "upstream_ms": upstream_ms,
             "total_ms": round(overhead_ms + upstream_ms, 1),
-            "streaming": False,
+            "streaming": source_streaming,
             "conversation_id": conversation_id,
             "input_tokens": _ns_usage.get("input_tokens", 0),
             "upstream_input_tokens": _ns_usage.get("input_tokens", 0),
@@ -1798,7 +1108,7 @@ async def _handle_non_streaming(
     if state and hasattr(state.engine, '_telemetry'):
         _model = body.get("model", "unknown")
         _out_tok = len(assistant_text) // 4 if assistant_text else 0
-        _in_tok = getattr(state, '_last_enriched_payload_tokens', 0) or 0
+        _in_tok = context.payload_tokens
         state.engine._telemetry.log(
             component="proxy_upstream",
             model=_model,
@@ -2210,7 +1520,7 @@ def _handle_vclabel(label: str, conv_id: str, state, tenant_registry, tenant_id)
             current = labels.get(conv_id, "")
             if current:
                 return f"Current label: {current}"
-            return f"No label set. Use VCLABEL <name> to set one."
+            return "No label set. Use VCLABEL <name> to set one."
         return "Labels not available (no tenant registry)."
 
     if not tenant_registry or not tenant_id:
@@ -2456,7 +1766,7 @@ def _handle_vcrecall(
     promoted = []
     for tag in sorted(matched_tags)[:5]:  # cap at 5 to avoid budget explosion
         try:
-            result = engine.expand_topic(tag=tag, depth="full")
+            result = engine.expand_topic(tag=tag, depth="full", speaker_context=speaker_context or SpeakerRetrievalContext.ineligible())
             if result and not result.get("error"):
                 tokens = result.get("tokens", 0)
                 promoted.append(f"  {tag} ({tokens:,} tokens)")

@@ -6,10 +6,12 @@ import threading
 from unittest.mock import MagicMock, patch
 
 import pytest
+import httpx
 
 from virtual_context.proxy.metrics import ProxyMetrics
 from virtual_context.proxy.server import ProxyState, create_app
 from virtual_context.types import AssembledContext, ConversationStats
+from virtual_context.config import load_config
 
 
 # ---------------------------------------------------------------------------
@@ -232,7 +234,12 @@ def mock_engine():
     engine._store.get_all_tags.return_value = []
     from virtual_context.types import EngineState
     engine._engine_state = EngineState()
-    engine.config = MagicMock()
+    engine.config = load_config(config_dict={"context_window": 120000})
+    engine.config.proxy.upstream_context_limit = 120000
+    engine.config.monitor.defer_payload_mutation = False
+    engine.config.monitor.fill_pass_enabled = False
+    engine.config.paging.enabled = False
+    engine.config.tool_output.enabled = False
     engine.config.monitor.context_window = 120000
     engine.config.conversation_id = "test-session"
     engine.config.monitor.soft_threshold = 0.7
@@ -330,11 +337,8 @@ class TestMetricsIntegration:
             "model": "gpt-4o",
         }
 
-        with patch("virtual_context.proxy.server.httpx.AsyncClient.request") as mock_req:
-            mock_resp = MagicMock()
-            mock_resp.json.return_value = upstream_response
-            mock_resp.status_code = 200
-            mock_resp.headers = {"content-type": "application/json"}
+        with patch("virtual_context.proxy.server.httpx.AsyncClient.send") as mock_req:
+            mock_resp = httpx.Response(200, json=upstream_response)
             mock_req.return_value = mock_resp
 
             resp = client.post(
@@ -345,6 +349,7 @@ class TestMetricsIntegration:
                 },
             )
             assert resp.status_code == 200
+
 
         # Access the app's metrics directly (avoid SSE streaming deadlocks)
         # The metrics are stored in the app's route closures — check via snapshot
@@ -601,7 +606,6 @@ class TestDashboardShutdown:
 
     def test_shutdown_route_before_catchall(self, test_client):
         """POST /dashboard/shutdown is not captured by the proxy catch-all."""
-        import signal
         client, engine = test_client
         with patch("os.kill") as mock_kill:
             resp = client.post("/dashboard/shutdown")
@@ -977,11 +981,8 @@ class TestDashboardRequestInspect:
         upstream_response = {
             "choices": [{"message": {"content": "OK"}}],
         }
-        with patch("virtual_context.proxy.server.httpx.AsyncClient.request") as mock_req:
-            mock_resp = MagicMock()
-            mock_resp.json.return_value = upstream_response
-            mock_resp.status_code = 200
-            mock_resp.headers = {"content-type": "application/json"}
+        with patch("virtual_context.proxy.server.httpx.AsyncClient.send") as mock_req:
+            mock_resp = httpx.Response(200, json=upstream_response)
             mock_req.return_value = mock_resp
 
             # Send a chat request to trigger capture
@@ -1007,6 +1008,7 @@ class TestDashboardRequestInspect:
         assert len(data["messages"]) == 1
         assert data["messages"][0]["content"] == "Hello world"
 
+
     def test_get_request_not_found(self, test_client):
         client, _ = test_client
         resp = client.get("/dashboard/requests/999")
@@ -1017,11 +1019,8 @@ class TestDashboardRequestInspect:
         upstream_response = {
             "choices": [{"message": {"content": "OK"}}],
         }
-        with patch("virtual_context.proxy.server.httpx.AsyncClient.request") as mock_req:
-            mock_resp = MagicMock()
-            mock_resp.json.return_value = upstream_response
-            mock_resp.status_code = 200
-            mock_resp.headers = {"content-type": "application/json"}
+        with patch("virtual_context.proxy.server.httpx.AsyncClient.send") as mock_req:
+            mock_resp = httpx.Response(200, json=upstream_response)
             mock_req.return_value = mock_resp
 
             client.post(
@@ -1039,9 +1038,11 @@ class TestDashboardRequestInspect:
         assert "messages" not in data[0]  # summary excludes full messages
         assert "message_count" in data[0]
 
+
     def test_request_inspect_not_captured_by_catchall(self, test_client):
         client, engine = test_client
         resp = client.get("/dashboard/requests/0")
+        assert resp.status_code == 404
         # Should hit the dashboard route, not the catch-all proxy
         engine.on_message_inbound.assert_not_called()
 

@@ -23,6 +23,7 @@ import logging
 import os
 import time
 import uuid
+from dataclasses import replace
 from datetime import datetime, timezone
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
@@ -34,7 +35,7 @@ from fastapi.responses import JSONResponse
 
 from ..engine import VirtualContextEngine
 from ..core.exceptions import ConversationReconcileBusy
-from ..core.tool_loop import (
+from ..core.tool_loop import (  # noqa: F401 — compatibility exports
     VC_TOOL_NAMES,  # noqa: F401 — re-exported
     vc_tool_definitions,
     is_vc_tool,
@@ -61,7 +62,7 @@ from .formats import (
     PayloadFormat,  # noqa: F401 — re-exported
     TurnGroup,
     detect_format,
-    get_format,
+    get_format,  # noqa: F401 — compatibility export
     summarize_payload_accounting,
     summarize_raw_payload_entries,
 )
@@ -96,7 +97,11 @@ from .helpers import (  # noqa: F401 — re-exported for tests
     _dump_session_state,
 )
 from .message_filter import filter_body_messages as _filter_body_messages  # noqa: F401
+from .message_filter import PayloadBudgetExceeded, admit_provider_payload
 from .metrics import ProxyMetrics
+from .request_context import RequestContext, history_checkpoint, provider_identity
+from .continuation import ContinuationError
+from .handlers import _continuation_session, _handler_upstream_limit
 
 # --- Re-exported so existing imports from proxy.server still work ---
 from .state import SessionState, _IngestionCancelled, ProxyState  # noqa: F401
@@ -594,10 +599,10 @@ async def prepare_payload(
     in ``catch_all()``. Pure extraction — identical behaviour to the original.
     """
     import asyncio
-    import time
 
     _prepare_started = time.monotonic()
     _prep_breakdown: dict[str, float] = {}
+    _history_checkpoint = "[]"
 
     def _note_prep(stage: str, started_at: float) -> float:
         elapsed = round((time.monotonic() - started_at) * 1000, 1)
@@ -941,7 +946,7 @@ async def prepare_payload(
         _extract_ingestible_messages as _extract_ingestible_messages_raw,
     )
 
-    def _extract_ingestible_messages(payload: dict) -> list:
+    def _extract_ingestible_messages(payload: dict) -> list:  # noqa: F811 — request-scoped admission wraps the public compatibility helper
         """Parse the payload and stamp the RAW caller key on every message.
 
         The tagger derives an actor id from ``Message.metadata``, but the
@@ -981,6 +986,11 @@ async def prepare_payload(
         (message for message in reversed(_request_messages) if message.role == "user"),
         None,
     )
+    if state is not None:
+        _completion_history = list(state._completed_history_messages(_request_messages))
+        if _active_user is not None:
+            _completion_history.append(_active_user)
+        _history_checkpoint = history_checkpoint(_completion_history)
     _audience_conversation_id = await asyncio.to_thread(
         _resolve_request_audience,
         state,
@@ -1070,6 +1080,7 @@ async def prepare_payload(
             inbound_bytes=0,
             outbound_bytes=0,
             metadata=_vc_meta,
+            request_history_json=_history_checkpoint,
             is_vcattach=(_vc_cmd == "ATTACH"),
             vcattach_target_id="",
             vcattach_label=_vc_arg if _vc_cmd == "ATTACH" else "",
@@ -1079,7 +1090,7 @@ async def prepare_payload(
         )
 
     # Resolve upstream context window limit for this model
-    from .helpers import (
+    from .helpers import (  # noqa: F811 — resolve patched helpers at request time
         _inject_context,
         _inject_vc_tools,
     )
@@ -1372,6 +1383,11 @@ async def prepare_payload(
                     })
 
             # Compute outbound tokens (after trim + tool interception)
+            body, _admission_trimmed = await asyncio.to_thread(
+                admit_provider_payload, body, _upstream_limit, fmt,
+            )
+            if _admission_trimmed:
+                _pt_outbound_json = ""
             if not _pt_outbound_json:
                 _pt_outbound_json, _outbound_bytes, _outbound_tokens = await _serialize_payload_and_estimate(
                     body,
@@ -1504,6 +1520,7 @@ async def prepare_payload(
                 inbound_bytes=_inbound_bytes,
                 outbound_bytes=_outbound_bytes,
                 metadata=_prepare_meta,
+                request_history_json=_history_checkpoint,
                 speaker_context=_speaker_context,
             )
 
@@ -2317,7 +2334,7 @@ async def prepare_payload(
                     _fill_target = int(state.engine.config.monitor.context_window * _soft)
 
             # Clamp: never exceed inbound, never exceed upstream - max_tokens
-            _max_tokens = body.get("max_tokens", 0) or 0
+            _max_tokens = fmt.output_token_allowance(body)
             _fill_target = min(_fill_target, inbound_tokens, _upstream_limit - _max_tokens)
 
             _summary_ratio = getattr(
@@ -2444,11 +2461,12 @@ async def prepare_payload(
     # Upstream context enforcement — trim if enriched payload exceeds upstream limit
     _upstream_trimmed = 0
     _pre_trim_tokens = outbound_tokens
-    _prompt_limit = _upstream_limit - body.get("max_tokens", 4096)
+    _prompt_limit = max(0, _upstream_limit - fmt.output_token_allowance(enriched_body))
     _upstream_trim_stage = time.monotonic()
     if outbound_tokens > _prompt_limit:
-        from .message_filter import trim_to_upstream_limit
-        enriched_body, _upstream_trimmed = trim_to_upstream_limit(enriched_body, _upstream_limit, fmt)
+        enriched_body, _upstream_trimmed = await asyncio.to_thread(
+            admit_provider_payload, enriched_body, _upstream_limit, fmt,
+        )
         if _upstream_trimmed:
             _outbound_json, _outbound_bytes, outbound_tokens = await _serialize_payload_and_estimate(
                 enriched_body,
@@ -2471,15 +2489,6 @@ async def prepare_payload(
     _note_prep("upstream_trim", _upstream_trim_stage)
     if outbound_tokens > _prompt_limit:
         _overflow = outbound_tokens - _prompt_limit
-        logger.error(
-            "UPSTREAM_LIMIT_EXCEEDED: payload=%dt still exceeds prompt_limit=%dt by %dt after trim "
-            "(trimmed_pairs=%d, context_window=%dt). Continuing with oversized payload.",
-            outbound_tokens,
-            _prompt_limit,
-            _overflow,
-            _upstream_trimmed,
-            _upstream_limit,
-        )
         metrics.record({
             "type": "upstream_limit_exceeded",
             "final_tokens": outbound_tokens,
@@ -2488,6 +2497,7 @@ async def prepare_payload(
             "overflow": _overflow,
             "pairs_trimmed": _upstream_trimmed,
         })
+        raise PayloadBudgetExceeded(outbound_tokens, _prompt_limit)
 
     # PROXY-025: Over-budget alert
     if state and _effective_budget > 0 and outbound_tokens > _effective_budget:
@@ -2759,6 +2769,7 @@ async def prepare_payload(
         inbound_bytes=_inbound_bytes,
         outbound_bytes=_outbound_bytes,
         metadata=_prepare_meta,
+        request_history_json=_history_checkpoint,
         speaker_context=_speaker_context,
         speaker_roster_snapshot=_roster_snapshot,
     )
@@ -3056,6 +3067,20 @@ def create_app(
     # requests to per-tenant engines. Default None = use local registry.
     app.state.state_resolver = None
 
+    @app.exception_handler(PayloadBudgetExceeded)
+    async def _payload_budget_exceeded_handler(
+        _request: Request, exc: PayloadBudgetExceeded,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=413,
+            content={"error": {
+                "type": "context_budget_exceeded",
+                "message": str(exc),
+                "input_tokens": exc.input_tokens,
+                "input_limit": exc.input_limit,
+            }},
+        )
+
     @app.exception_handler(ConversationReconcileBusy)
     async def _conversation_reconcile_busy_handler(
         _request: Request,
@@ -3073,6 +3098,12 @@ def create_app(
             },
             headers={"Retry-After": "1"},
         )
+
+    @app.exception_handler(ContinuationError)
+    async def _continuation_error_handler(_request: Request, exc: ContinuationError):
+        return JSONResponse(status_code=exc.status_code, content={"error": {
+            "type": "memory_tool_error", "message": str(exc),
+        }})
 
     # Register dashboard routes BEFORE the catch-all so /dashboard is not swallowed
     # Dashboard uses the default state for settings and config access
@@ -3183,9 +3214,7 @@ def create_app(
 
         # In multi-tenant mode, use the tenant's metrics so captures
         # (request, enriched, response) land on the correct instance.
-        nonlocal metrics
-        if state and state.metrics:
-            metrics = state.metrics
+        request_metrics = state.metrics if state and state.metrics else metrics
 
         # Use format-specific token counter (anthropic tokenizer for Anthropic,
         # tiktoken for others, with fallback chain)
@@ -3194,7 +3223,39 @@ def create_app(
 
         api_format = fmt.name
         user_message = fmt.extract_user_message(body)
-        is_streaming = body.get("stream", False)
+        is_streaming = bool(body.get("stream", False)) or (api_format == "gemini" and ":streamGenerateContent" in path)
+        conversation_id = state.engine.config.conversation_id if state else ""
+        tenant_id = getattr(request.state, "tenant_id", None)
+        if tenant_id is None and state:
+            tenant_id = getattr(state.engine.config, "tenant_id", "")
+        context = RequestContext.create(
+            body=body, state=state, tenant_id=tenant_id if isinstance(tenant_id, str) else "",
+            conversation_id=conversation_id, audience_route=inbound_conversation_id or conversation_id,
+            provider=provider_identity(url), api_format=api_format, metrics=request_metrics,
+            upstream_limit=_handler_upstream_limit(body, state, 0),
+            output_allowance=fmt.output_token_allowance(body),
+            speaker_context=SpeakerRetrievalContext.ineligible(),
+        )
+        if state:
+            continuation = _continuation_session(context, state)
+            resumed = await continuation.resume(body)
+            if resumed is not None:
+                # Hidden provider evidence bypasses source ingest, compaction and
+                # role derivation. Only this exact continuation can consume it.
+                handler = _handle_streaming if is_streaming else _handle_non_streaming
+                options = {"paging_enabled": True} if is_streaming else {"intercept_vc_tools": True}
+                try:
+                    return await handler(
+                        client, url, fwd_headers, resumed, api_format, state,
+                        request_context=continuation.context, continuation_session=continuation,
+                        metrics=request_metrics, turn=continuation.context.turn,
+                        request_turn=continuation.context.request_turn, turn_id=continuation.context.turn_id,
+                        conversation_id=conversation_id, skip_marker_injection=bool(inbound_conversation_id),
+                        **options,
+                    )
+                except BaseException:
+                    await continuation.close()
+                    raise
 
         import datetime as _dt
         _payload_kb = round(len(body_bytes) / 1024, 1)
@@ -3212,12 +3273,13 @@ def create_app(
             _skip_sid = state.engine.config.conversation_id if state else ""
             _skip_turn = len(state.engine._turn_tag_index.entries) if state else 0
             _skip_turn_id = uuid.uuid4().hex[:12]
+            context = replace(context, turn=_skip_turn, turn_id=_skip_turn_id)
             # No active user was selected, so no authority was derived —
             # explicit ineligible context rather than a silent default.
             if is_streaming:
                 return await _handle_streaming(
                     client, url, fwd_headers, body, api_format, state,
-                    metrics=metrics, turn=_skip_turn, request_turn=0, turn_id=_skip_turn_id,
+                    request_context=context, metrics=request_metrics, turn=_skip_turn, request_turn=0, turn_id=_skip_turn_id,
                     conversation_id=_skip_sid, response_log_path=_response_log_path,
                     session_log_path=_session_log_path,
                     request_log_dir=_effective_log_dir, log_prefix=_log_prefix,
@@ -3226,7 +3288,7 @@ def create_app(
             else:
                 return await _handle_non_streaming(
                     client, url, fwd_headers, body, api_format, state,
-                    metrics=metrics, turn=_skip_turn, request_turn=0, turn_id=_skip_turn_id,
+                    request_context=context, metrics=request_metrics, turn=_skip_turn, request_turn=0, turn_id=_skip_turn_id,
                     conversation_id=_skip_sid, response_log_path=_response_log_path,
                     session_log_path=_session_log_path,
                     request_log_dir=_effective_log_dir, log_prefix=_log_prefix,
@@ -3237,11 +3299,19 @@ def create_app(
         # Enrichment: passthrough or active path via prepare_payload()
         # ---------------------------------------------------------------
         result = await prepare_payload(
-            body, state, fmt, metrics,
+            body, state, fmt, request_metrics,
             body_bytes=body_bytes,
             inbound_conversation_id=inbound_conversation_id,
             log_dir=_effective_log_dir,
             log_prefix=_log_prefix,
+        )
+
+        context = replace(
+            context, turn=result.turn, request_turn=result.request_turn, turn_id=result.turn_id,
+            conversation_id=result.conversation_id, upstream_limit=result.upstream_limit,
+            speaker_context=result.speaker_context, roster_snapshot=result.speaker_roster_snapshot,
+            payload_tokens=getattr(result, "outbound_tokens", 0),
+            history_json=getattr(result, "request_history_json", context.history_json),
         )
 
         if result.vc_command:
@@ -3257,24 +3327,28 @@ def create_app(
             if result.is_streaming:
                 return await _handle_streaming(
                     client, url, fwd_headers, result.body, result.api_format, state,
-                    metrics=metrics, turn=result.turn, request_turn=result.request_turn, turn_id=result.turn_id,
+                    request_context=context, metrics=request_metrics, turn=result.turn, request_turn=result.request_turn, turn_id=result.turn_id,
                     conversation_id=result.conversation_id,
                     passthrough=True, response_log_path=_response_log_path,
                     session_log_path=_session_log_path,
                     request_log_dir=_effective_log_dir, log_prefix=_log_prefix,
                     skip_marker_injection=bool(inbound_conversation_id),
                     speaker_context=result.speaker_context,
+                    upstream_limit=result.upstream_limit,
+                    roster_snapshot=result.speaker_roster_snapshot,
                 )
             else:
                 return await _handle_non_streaming(
                     client, url, fwd_headers, result.body, result.api_format, state,
-                    metrics=metrics, turn=result.turn, request_turn=result.request_turn, turn_id=result.turn_id,
+                    request_context=context, metrics=request_metrics, turn=result.turn, request_turn=result.request_turn, turn_id=result.turn_id,
                     conversation_id=result.conversation_id,
                     passthrough=True, response_log_path=_response_log_path,
                     session_log_path=_session_log_path,
                     request_log_dir=_effective_log_dir, log_prefix=_log_prefix,
                     skip_marker_injection=bool(inbound_conversation_id),
                     speaker_context=result.speaker_context,
+                    upstream_limit=result.upstream_limit,
+                    roster_snapshot=result.speaker_roster_snapshot,
                 )
         else:
             _intercept_vc_tools = result.paging_enabled or result.tool_output_find_quote or result.restore_tool_injected
@@ -3282,7 +3356,7 @@ def create_app(
             if result.is_streaming:
                 return await _handle_streaming(
                     client, url, fwd_headers, result.enriched_body, result.api_format, state,
-                    metrics=metrics, turn=result.turn, request_turn=result.request_turn, turn_id=result.turn_id,
+                    request_context=context, metrics=request_metrics, turn=result.turn, request_turn=result.request_turn, turn_id=result.turn_id,
                     overhead_ms=result.overhead_ms,
                     conversation_id=result.conversation_id,
                     response_log_path=_response_log_path,
@@ -3292,12 +3366,14 @@ def create_app(
                     log_prefix=_log_prefix if _effective_log_dir else "",
                     skip_marker_injection=bool(inbound_conversation_id),
                     speaker_context=result.speaker_context,
+                    upstream_limit=result.upstream_limit,
                     roster_snapshot=result.speaker_roster_snapshot,
                 )
             else:
                 return await _handle_non_streaming(
                     client, url, fwd_headers, result.enriched_body, result.api_format, state,
-                    metrics=metrics, turn=result.turn, request_turn=result.request_turn, turn_id=result.turn_id,
+                    intercept_vc_tools=_intercept_vc_tools,
+                    request_context=context, metrics=request_metrics, turn=result.turn, request_turn=result.request_turn, turn_id=result.turn_id,
                     overhead_ms=result.overhead_ms,
                     conversation_id=result.conversation_id,
                     response_log_path=_response_log_path,
@@ -3305,6 +3381,8 @@ def create_app(
                     request_log_dir=_effective_log_dir, log_prefix=_log_prefix,
                     skip_marker_injection=bool(inbound_conversation_id),
                     speaker_context=result.speaker_context,
+                    upstream_limit=result.upstream_limit,
+                    roster_snapshot=result.speaker_roster_snapshot,
                 )
 
     return app

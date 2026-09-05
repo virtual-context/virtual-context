@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import json
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
+from proxy_http_helpers import upstream_rounds
 
 from virtual_context.proxy.server import (
-    ProxyState,
-    _build_continuation_request,
     _emit_message_end_sse,
     _emit_text_as_sse,
     _emit_tool_use_as_sse,
@@ -17,9 +16,9 @@ from virtual_context.proxy.server import (
     create_app,
 )
 from virtual_context.config import load_config
-from virtual_context.proxy.metrics import ProxyMetrics
 from virtual_context.core.turn_tag_index import TurnTagIndex
-from virtual_context.types import AssembledContext, Message
+from virtual_context.types import AssembledContext, EngineState
+from virtual_context.storage.sqlite import SQLiteStore
 
 
 # ---------------------------------------------------------------------------
@@ -31,6 +30,15 @@ from virtual_context.types import AssembledContext, Message
 def mock_engine():
     """Create a mock VirtualContextEngine."""
     engine = MagicMock()
+    engine.config = load_config(config_dict={"context_window": 200000})
+    engine.config.proxy.upstream_context_limit = 200000
+    engine.config.monitor.defer_payload_mutation = False
+    engine.config.monitor.fill_pass_enabled = False
+    engine.config.paging.enabled = False
+    engine.config.tool_output.enabled = False
+    engine._turn_tag_index = TurnTagIndex()
+    engine._engine_state = EngineState()
+    engine._session_state_provider = None
     assembled = AssembledContext(prepend_text="mock context here")
     engine.on_message_inbound.return_value = assembled
     engine.on_turn_complete.return_value = None
@@ -556,6 +564,9 @@ def paging_test_client(tmp_path):
         real_config.paging = PagingConfig(enabled=True, autonomous_models=["opus", "sonnet"])
         engine = MagicMock()
         engine.config = real_config
+        engine._store = SQLiteStore(db_path)
+        engine._store.upsert_conversation(tenant_id="", conversation_id=real_config.conversation_id)
+        engine._engine_state = EngineState(lifecycle_epoch=1)
         engine.on_message_inbound.return_value = AssembledContext()
         engine.on_turn_complete.return_value = None
         engine.tag_turn.return_value = None
@@ -578,6 +589,7 @@ def paging_test_client(tmp_path):
         app = create_app(upstream="http://fake:9999", config_path=None)
     with TestClient(app) as client:
         yield client, engine
+    engine._store.close()
 
 class TestStreamInterception:
     """Integration tests for Phase 6 stream interception."""
@@ -655,38 +667,36 @@ class TestStreamInterception:
         async def mock_post(url, **kwargs):
             return cont_response
 
-        with patch("virtual_context.proxy.server.httpx.AsyncClient.send", side_effect=mock_send):
-            with patch("virtual_context.proxy.server.httpx.AsyncClient.build_request"):
-                with patch("virtual_context.proxy.server.httpx.AsyncClient.post", side_effect=mock_post):
-                    resp = client.post(
-                        "/v1/messages",
-                        json={
-                            "model": "claude-3",
-                            "system": "test",
-                            "stream": True,
-                            "messages": [{"role": "user", "content": "Tell me about the database"}],
-                        },
-                    )
+        with upstream_rounds(mock_resp, mock_post):
+            resp = client.post(
+                "/v1/messages",
+                json={
+                    "model": "claude-3",
+                    "system": "test",
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "Tell me about the database"}],
+                },
+            )
 
-                    assert resp.status_code == 200
-                    body = resp.content
+            assert resp.status_code == 200
+            body = resp.content
 
-                    # Text before tool should be forwarded
-                    assert b"Let me check" in body
+            # Text before tool should be forwarded
+            assert b"Let me check" in body
 
-                    # VC tool_use events should NOT be visible to client
-                    assert b"vc_expand_topic" not in body
+            # VC tool_use events should NOT be visible to client
+            assert b"vc_expand_topic" not in body
 
-                    # Continuation text should be emitted
-                    assert b"Here is the database detail" in body
+            # Continuation text should be emitted
+            assert b"Here is the database detail" in body
 
-                    # Engine expand_topic should have been called
-                    engine.expand_topic.assert_called_once_with(
-                        tag="database", depth="full",
-                    )
+            # Engine expand_topic should have been called
+            engine.expand_topic.assert_called_once_with(
+                    tag="database", depth="full", speaker_context=ANY,
+            )
 
     def test_mixed_tools_pass_through(self, paging_test_client):
-        """Mixed VC + non-VC tools → BAIL: all events forwarded to client."""
+        """Mixed calls execute memory tools and durably defer client tools."""
         client, engine = paging_test_client
 
         # Build a stream with both a VC tool and a non-VC tool
@@ -763,12 +773,13 @@ class TestStreamInterception:
                 assert resp.status_code == 200
                 body = resp.content
 
-                # Both tools should be visible (BAIL path)
+                # Only client obligations are visible; VC results stay private.
                 assert b"web_search" in body
-                assert b"vc_expand_topic" in body
+                assert b"vc_expand_topic" not in body
+                assert b"vcx_" in body
 
-                # Engine should NOT have been called (BAIL)
-                engine.expand_topic.assert_not_called()
+                engine.expand_topic.assert_called_once()
+                assert engine._store.list_pending_exchanges(engine.config.conversation_id, now=0)
 
     def test_no_preceding_text_tool_only(self, paging_test_client):
         """LLM calls VC tool with no text first — still intercepted."""
@@ -801,22 +812,20 @@ class TestStreamInterception:
         async def mock_post(url, **kwargs):
             return cont_response
 
-        with patch("virtual_context.proxy.server.httpx.AsyncClient.send", return_value=mock_resp):
-            with patch("virtual_context.proxy.server.httpx.AsyncClient.build_request"):
-                with patch("virtual_context.proxy.server.httpx.AsyncClient.post", side_effect=mock_post):
-                    resp = client.post(
-                        "/v1/messages",
-                        json={
-                            "model": "claude-3",
-                            "system": "test",
-                            "stream": True,
-                            "messages": [{"role": "user", "content": "Show API details"}],
-                        },
-                    )
+        with upstream_rounds(mock_resp, mock_post):
+            resp = client.post(
+                "/v1/messages",
+                json={
+                    "model": "claude-3",
+                    "system": "test",
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "Show API details"}],
+                },
+            )
 
-                    body = resp.content
-                    assert b"API details here" in body
-                    engine.expand_topic.assert_called_once()
+            body = resp.content
+            assert b"API details here" in body
+            engine.expand_topic.assert_called_once()
 
     def test_nested_tool_calls_loop(self, paging_test_client):
         """Continuation that triggers another VC tool call loops correctly."""
@@ -869,24 +878,22 @@ class TestStreamInterception:
         async def mock_post(url, **kwargs):
             return make_cont_response()
 
-        with patch("virtual_context.proxy.server.httpx.AsyncClient.send", return_value=mock_resp):
-            with patch("virtual_context.proxy.server.httpx.AsyncClient.build_request"):
-                with patch("virtual_context.proxy.server.httpx.AsyncClient.post", side_effect=mock_post):
-                    resp = client.post(
-                        "/v1/messages",
-                        json={
-                            "model": "claude-3",
-                            "system": "test",
-                            "stream": True,
-                            "messages": [{"role": "user", "content": "Expand everything"}],
-                        },
-                    )
+        with upstream_rounds(mock_resp, mock_post):
+            resp = client.post(
+                "/v1/messages",
+                json={
+                    "model": "claude-3",
+                    "system": "test",
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "Expand everything"}],
+                },
+            )
 
-                    body = resp.content
-                    assert b"Expanding more" in body
-                    assert b"All done" in body
-                    # expand_topic called twice: once for initial, once for nested
-                    assert engine.expand_topic.call_count == 2
+            body = resp.content
+            assert b"Expanding more" in body
+            assert b"All done" in body
+            # expand_topic called twice: once for initial, once for nested
+            assert engine.expand_topic.call_count == 2
 
     def test_max_continuation_loops_respected(self, paging_test_client):
         """Continuation loops cap at 5 even if model keeps calling tools."""
@@ -925,22 +932,20 @@ class TestStreamInterception:
         async def mock_post(url, **kwargs):
             return make_cont_response()
 
-        with patch("virtual_context.proxy.server.httpx.AsyncClient.send", return_value=mock_resp):
-            with patch("virtual_context.proxy.server.httpx.AsyncClient.build_request"):
-                with patch("virtual_context.proxy.server.httpx.AsyncClient.post", side_effect=mock_post):
-                    resp = client.post(
-                        "/v1/messages",
-                        json={
-                            "model": "claude-3",
-                            "system": "test",
-                            "stream": True,
-                            "messages": [{"role": "user", "content": "Loop test"}],
-                        },
-                    )
+        with upstream_rounds(mock_resp, mock_post):
+            resp = client.post(
+                "/v1/messages",
+                json={
+                    "model": "claude-3",
+                    "system": "test",
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "Loop test"}],
+                },
+            )
 
-                    # Should cap at 5: 1 initial + 5 continuations = 6 total expand_topic calls
-                    # (initial tool + 5 loops)
-                    assert engine.expand_topic.call_count <= 6
+            assert resp.status_code == 200
+            assert b"memory tool round limit" in resp.content
+            assert engine.expand_topic.call_count == 5
 
     def test_tool_intercept_metric_recorded(self, paging_test_client):
         """Tool intercept events are recorded in metrics."""
@@ -971,19 +976,19 @@ class TestStreamInterception:
         async def mock_post(url, **kwargs):
             return cont_response
 
-        with patch("virtual_context.proxy.server.httpx.AsyncClient.send", return_value=mock_resp):
-            with patch("virtual_context.proxy.server.httpx.AsyncClient.build_request"):
-                with patch("virtual_context.proxy.server.httpx.AsyncClient.post", side_effect=mock_post):
-                    resp = client.post(
-                        "/v1/messages",
-                        json={
-                            "model": "claude-3",
-                            "system": "test",
-                            "stream": True,
-                            "messages": [{"role": "user", "content": "Check db"}],
-                        },
-                    )
+        with upstream_rounds(mock_resp, mock_post):
+            resp = client.post(
+                "/v1/messages",
+                json={
+                    "model": "claude-3",
+                    "system": "test",
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "Check db"}],
+                },
+            )
 
+        assert resp.status_code == 200
+        assert b"Done" in resp.content
         # Check metrics — we need to access the app's metrics
         # The test client doesn't expose metrics directly, but
         # engine.expand_topic was called → tool interception happened
@@ -1049,7 +1054,6 @@ class TestStreamInterception:
 
         captured_body = {}
 
-        original_build_request = None
 
         def capture_build_request(method, url, **kwargs):
             if "json" in kwargs:
@@ -1071,6 +1075,7 @@ class TestStreamInterception:
                     },
                 )
 
+        assert resp.status_code == 200
         # Verify VC tools were injected into the outbound body
         tools = captured_body.get("tools", [])
         tool_names = {t["name"] for t in tools}
@@ -1137,10 +1142,10 @@ class TestContinuationBailForward:
 
         # Initial stream: text + VC tool_use
         sse_data = _build_tool_use_sse_stream(
-            text_before="Let me page that in instead of guessing.",
+            text_before="Loading the synthetic widget specification.",
             tool_name="vc_expand_topic",
             tool_id="toolu_01",
-            tool_input={"tag": "health-protocol", "depth": "full"},
+            tool_input={"tag": "widget-specification", "depth": "full"},
         )
 
         mock_resp = AsyncMock()
@@ -1166,12 +1171,12 @@ class TestContinuationBailForward:
                 resp.json.return_value = {
                     "stop_reason": "tool_use",
                     "content": [
-                        {"type": "text", "text": "Now searching memory..."},
+                        {"type": "text", "text": "Searching the fixture catalog..."},
                         {
                             "type": "tool_use",
                             "id": "toolu_02",
                             "name": "memory_search",
-                            "input": {"query": "magnesium glycinate 400mg"},
+                            "input": {"query": "synthetic widget model-q capacity 80 units"},
                         },
                     ],
                 }
@@ -1185,40 +1190,38 @@ class TestContinuationBailForward:
         async def mock_post(url, **kwargs):
             return make_cont_response()
 
-        with patch("virtual_context.proxy.server.httpx.AsyncClient.send", return_value=mock_resp):
-            with patch("virtual_context.proxy.server.httpx.AsyncClient.build_request"):
-                with patch("virtual_context.proxy.server.httpx.AsyncClient.post", side_effect=mock_post):
-                    resp = client.post(
-                        "/v1/messages",
-                        json={
-                            "model": "claude-opus-4-6",
-                            "system": "test",
-                            "stream": True,
-                            "messages": [{"role": "user", "content": "what did you recommend after magnesium?"}],
-                        },
-                    )
+        with upstream_rounds(mock_resp, mock_post):
+            resp = client.post(
+                "/v1/messages",
+                json={
+                    "model": "claude-opus-4-6",
+                    "system": "test",
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "Find the next synthetic widget revision."}],
+                },
+            )
 
-                    assert resp.status_code == 200
-                    body = resp.content
+            assert resp.status_code == 200
+            body = resp.content
 
-                    # Original text should be forwarded
-                    assert b"Let me page that in instead of guessing" in body
+            # Original text should be forwarded
+            assert b"Loading the synthetic widget specification" in body
 
-                    # Continuation text should be forwarded
-                    assert b"Now searching memory" in body
+            # Continuation text should be forwarded
+            assert b"Searching the fixture catalog" in body
 
-                    # Non-VC tool should be forwarded to client
-                    assert b"memory_search" in body
-                    assert b"magnesium glycinate 400mg" in body
+            # Non-VC tool should be forwarded to client
+            assert b"memory_search" in body
+            assert b"synthetic widget model-q capacity 80 units" in body
 
-                    # VC tool should NOT be visible
-                    assert b"vc_expand_topic" not in body
+            # VC tool should NOT be visible
+            assert b"vc_expand_topic" not in body
 
-                    # stop_reason should be tool_use (not end_turn)
-                    assert b'"stop_reason": "tool_use"' in body or b'"stop_reason":"tool_use"' in body
+            # stop_reason should be tool_use (not end_turn)
+            assert b'"stop_reason": "tool_use"' in body or b'"stop_reason":"tool_use"' in body
 
-                    # VC tool was still executed
-                    engine.expand_topic.assert_called_once()
+            # VC tool was still executed
+            engine.expand_topic.assert_called_once()
 
     @pytest.mark.regression("PROXY-015")
     def test_multiple_vc_then_non_vc_all_forwarded(self, paging_test_client):
@@ -1282,30 +1285,27 @@ class TestContinuationBailForward:
         async def mock_post(url, **kwargs):
             return make_cont_response()
 
-        with patch("virtual_context.proxy.server.httpx.AsyncClient.send", return_value=mock_resp):
-            with patch("virtual_context.proxy.server.httpx.AsyncClient.build_request"):
-                with patch("virtual_context.proxy.server.httpx.AsyncClient.post", side_effect=mock_post):
-                    resp = client.post(
-                        "/v1/messages",
-                        json={
-                            "model": "claude-opus-4-6",
-                            "system": "test",
-                            "stream": True,
-                            "messages": [{"role": "user", "content": "expand all"}],
-                        },
-                    )
+        with upstream_rounds(mock_resp, mock_post):
+            resp = client.post(
+                "/v1/messages",
+                json={
+                    "model": "claude-opus-4-6",
+                    "system": "test",
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "expand all"}],
+                },
+            )
 
-                    body = resp.content
+            body = resp.content
 
-                    # Non-VC tool forwarded
-                    assert b"web_search" in body
+            # Non-VC tool forwarded
+            assert b"web_search" in body
 
-                    # VC tools NOT visible
-                    assert b"vc_expand_topic" not in body
+            # VC tools NOT visible
+            assert b"vc_expand_topic" not in body
 
-                    # Both VC tools executed
-                    assert engine.expand_topic.call_count == 2
+            # Both VC tools executed
+            assert engine.expand_topic.call_count == 2
 
-                    # stop_reason=tool_use
-                    assert b'"stop_reason": "tool_use"' in body or b'"stop_reason":"tool_use"' in body
-
+            # stop_reason=tool_use
+            assert b'"stop_reason": "tool_use"' in body or b'"stop_reason":"tool_use"' in body

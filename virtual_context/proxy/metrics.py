@@ -6,7 +6,6 @@ import json
 import logging
 import re
 import sqlite3
-import statistics
 import threading
 import time
 from collections import deque

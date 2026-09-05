@@ -17,7 +17,7 @@ from .metrics import ProxyMetrics
 from .state import ProxyState
 
 if TYPE_CHECKING:
-    from ..engine import VirtualContextEngine
+    from ..core.store import ContextStore
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +40,7 @@ class SessionRegistry:
         upstream: str,
         metrics: ProxyMetrics,
         *,
-        store: "Store | None" = None,
+        store: "ContextStore | None" = None,
         session_cache=None,
         embedding_provider=None,
     ) -> None:

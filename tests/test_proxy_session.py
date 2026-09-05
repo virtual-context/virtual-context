@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import httpx
 
 from virtual_context.proxy.server import (
     ProxyState,
@@ -17,7 +18,6 @@ from virtual_context.proxy.server import (
     _strip_conversation_markers,
     create_app,
 )
-from virtual_context.config import load_config
 from virtual_context.proxy.metrics import ProxyMetrics
 from virtual_context.proxy.session_state import SessionState as SharedSessionState
 from virtual_context.core.turn_tag_index import TurnTagIndex
@@ -291,11 +291,8 @@ class TestStreamingSessionMarker:
             "model": "claude-3",
         }
 
-        with patch("virtual_context.proxy.server.httpx.AsyncClient.request") as mock_req:
-            mock_resp = MagicMock()
-            mock_resp.json.return_value = upstream_response
-            mock_resp.status_code = 200
-            mock_resp.headers = {"content-type": "application/json"}
+        with patch("virtual_context.proxy.server.httpx.AsyncClient.send") as mock_req:
+            mock_resp = httpx.Response(200, json=upstream_response)
             mock_req.return_value = mock_resp
 
             resp = client.post(
@@ -312,6 +309,7 @@ class TestStreamingSessionMarker:
             # The last text block should contain the session marker
             text = data["content"][-1]["text"]
             assert "<!-- vc:conversation=" in text
+
 
 
 # ---------------------------------------------------------------------------
@@ -1486,7 +1484,6 @@ class TestSessionStateMachine:
         import time
 
         ingestion_calls = []
-        progress_events = []
 
         def slow_ingest(pairs, progress_callback=None, turn_offset=0, **kwargs):
             """Simulate slow ingestion — record each call's pair count."""

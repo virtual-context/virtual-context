@@ -1752,13 +1752,14 @@ def _execute_vc_tool_unescaped(
             # Collapse specified tags first to free budget
             collapse_results = []
             for ctag in tool_input.get("collapse_tags") or []:
-                cr = engine.collapse_topic(tag=ctag, depth="summary")
+                cr = engine.collapse_topic(tag=ctag, depth="summary", speaker_context=speaker_context)
                 if cr.get("tokens_freed", 0) > 0:
                     collapse_results.append(cr)
 
             result = engine.expand_topic(
                 tag=tool_input.get("tag", ""),
                 depth=tool_input.get("depth", "full"),
+                speaker_context=speaker_context,
             )
 
             # Merge collapse info into expand result

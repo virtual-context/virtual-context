@@ -982,8 +982,6 @@ async def _call_llm(
 
 
 def _get_provider_config(engine) -> dict:
-    from ..providers.generic_openai import GenericOpenAIProvider
-
     provider = engine._llm_provider
 
     def _redact(key: str) -> str:

@@ -15,8 +15,12 @@ import threading
 from collections import OrderedDict
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 from ..types import TagStats
+
+if TYPE_CHECKING:
+    from ..types import EngineStateSnapshot
 
 logger = logging.getLogger(__name__)
 

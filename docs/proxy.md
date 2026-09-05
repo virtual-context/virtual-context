@@ -391,3 +391,13 @@ The baseline simulation models what a naive system would spend on input tokens. 
 4. Accumulate across all turns for the session total
 
 This runs both server-side (in `snapshot()`) and client-side (in the dashboard JS) for consistency.
+
+### Internal tools on non-streaming requests
+
+Non-streaming requests can execute proxy-owned memory tools and continue to a
+final provider answer. Client-owned tool calls pass through when they are the
+only calls in the response. A single non-streaming response mixing client and
+memory calls returns an explicit upstream-protocol error: the proxy cannot
+supply the unavailable client-tool results or give the client an internal
+memory-tool obligation. Continuations obey the configured round limit and
+provider input/output allowance.

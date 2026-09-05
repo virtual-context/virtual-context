@@ -10,6 +10,7 @@ from concurrent.futures import Future
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
+import httpx
 
 from virtual_context.proxy.server import (
     ProxyState,
@@ -305,7 +306,7 @@ class TestResponseTimestamping:
         }
 
         client = MagicMock()
-        client.request = AsyncMock(return_value=response)
+        client.send = AsyncMock(return_value=httpx.Response(200, json=response.json()))
 
         state = MagicMock()
         state.is_conversation_deleted.return_value = False
@@ -437,11 +438,8 @@ class TestIntegration:
             "model": "gpt-4o",
         }
 
-        with patch("virtual_context.proxy.server.httpx.AsyncClient.request") as mock_req:
-            mock_resp = MagicMock()
-            mock_resp.json.return_value = upstream_response
-            mock_resp.status_code = 200
-            mock_resp.headers = {"content-type": "application/json"}
+        with patch("virtual_context.proxy.server.httpx.AsyncClient.send") as mock_req:
+            mock_resp = httpx.Response(200, json=upstream_response)
             mock_req.return_value = mock_resp
 
             resp = client.post(
@@ -457,9 +455,10 @@ class TestIntegration:
 
             # Verify the forwarded body has context injected
             call_kwargs = mock_req.call_args
-            forwarded_body = call_kwargs.kwargs.get("json") or call_kwargs[1].get("json")
+            forwarded_body = json.loads(call_kwargs.args[0].content)
             assert forwarded_body["messages"][0]["role"] == "system"
             assert "mock context here" in forwarded_body["messages"][0]["content"]
+
 
     def test_engine_failure_forwards_unmodified(self, test_client):
         """If engine fails, request is forwarded without enrichment."""
@@ -470,11 +469,8 @@ class TestIntegration:
             "choices": [{"message": {"content": "OK"}}],
         }
 
-        with patch("virtual_context.proxy.server.httpx.AsyncClient.request") as mock_req:
-            mock_resp = MagicMock()
-            mock_resp.json.return_value = upstream_response
-            mock_resp.status_code = 200
-            mock_resp.headers = {"content-type": "application/json"}
+        with patch("virtual_context.proxy.server.httpx.AsyncClient.send") as mock_req:
+            mock_resp = httpx.Response(200, json=upstream_response)
             mock_req.return_value = mock_resp
 
             resp = client.post(
@@ -488,9 +484,10 @@ class TestIntegration:
             assert resp.status_code == 200
             # Body should not have virtual-context injected
             call_kwargs = mock_req.call_args
-            forwarded_body = call_kwargs.kwargs.get("json") or call_kwargs[1].get("json")
+            forwarded_body = json.loads(call_kwargs.args[0].content)
             # No system message injected since prepend_text is empty
             assert forwarded_body["messages"][0]["role"] == "user"
+
 
     def test_anthropic_format_detection(self, test_client):
         """Anthropic request format is detected and context injected into system field."""
@@ -501,11 +498,8 @@ class TestIntegration:
             "model": "claude-3",
         }
 
-        with patch("virtual_context.proxy.server.httpx.AsyncClient.request") as mock_req:
-            mock_resp = MagicMock()
-            mock_resp.json.return_value = upstream_response
-            mock_resp.status_code = 200
-            mock_resp.headers = {"content-type": "application/json"}
+        with patch("virtual_context.proxy.server.httpx.AsyncClient.send") as mock_req:
+            mock_resp = httpx.Response(200, json=upstream_response)
             mock_req.return_value = mock_resp
 
             resp = client.post(
@@ -519,10 +513,11 @@ class TestIntegration:
 
             assert resp.status_code == 200
             call_kwargs = mock_req.call_args
-            forwarded_body = call_kwargs.kwargs.get("json") or call_kwargs[1].get("json")
+            forwarded_body = json.loads(call_kwargs.args[0].content)
             assert "<system-reminder>" in forwarded_body["system"]
             assert "mock context here" in forwarded_body["system"]
             assert "Be helpful" in forwarded_body["system"]
+
 
     def test_no_messages_key_passthrough(self, test_client):
         """POST without messages array is passed through."""
@@ -1793,7 +1788,6 @@ class TestCompactionConcurrencyGuard:
 
         # The dashboard routes close over a `state` variable. We can access it
         # by inspecting the route's endpoint closure.
-        from virtual_context.proxy.dashboard import register_dashboard_routes
         # Find the compact route and extract the state from its closure
         state = None
         for route in app.routes:

@@ -25,7 +25,11 @@ import re
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from typing import NamedTuple
+from datetime import datetime
+from typing import TYPE_CHECKING, NamedTuple
+
+if TYPE_CHECKING:
+    from ..types import Message
 
 # ---------------------------------------------------------------------------
 # Shared helpers (provider-agnostic) — canonical definitions in _envelope.py
@@ -654,6 +658,25 @@ class PayloadFormat(ABC):
     def set_token_counter(self, counter: Callable[[str], int]) -> None:
         """Replace the default chars//4 estimator with an accurate counter (e.g. tiktoken)."""
         self._count = counter
+
+    def output_token_allowance(self, body: dict) -> int:
+        """Return the provider's requested output reservation for admission.
+
+        Keep the historical 4096-token allowance when a client omits its
+        provider-specific setting. Invalid settings remain the provider's
+        validation responsibility and cannot disable our reservation.
+        """
+        if self.name == "gemini":
+            settings = body.get("generationConfig", body.get("generation_config", {}))
+            settings = settings if isinstance(settings, dict) else {}
+            value = settings.get("maxOutputTokens", settings.get("max_output_tokens"))
+        elif self.name == "openai_responses":
+            value = body.get("max_output_tokens")
+        elif self.name == "openai":
+            value = body.get("max_completion_tokens", body.get("max_tokens"))
+        else:
+            value = body.get("max_tokens")
+        return value if type(value) is int and value >= 0 else 4096
 
     @property
     @abstractmethod

@@ -1091,6 +1091,33 @@ def _get_message_key(fmt) -> str:
     return "messages"
 
 
+class PayloadBudgetExceeded(ValueError):
+    """The protected input cannot fit the provider's remaining context."""
+
+    def __init__(self, input_tokens: int, input_limit: int):
+        self.input_tokens = input_tokens
+        self.input_limit = input_limit
+        super().__init__(
+            f"Protected input requires {input_tokens} tokens; "
+            f"only {input_limit} tokens remain after reserving output."
+        )
+
+
+def admit_provider_payload(body: dict, upstream_limit: int, fmt) -> tuple[dict, int]:
+    """Trim eligible history, then reject any remaining input overflow.
+
+    System instructions, trusted context and the protected recent turns are
+    never silently truncated. The same admission rule applies before the
+    initial provider call and after tool results grow a continuation.
+    """
+    input_limit = max(0, upstream_limit - fmt.output_token_allowance(body))
+    result, removed = trim_to_upstream_limit(body, input_limit, fmt)
+    actual = fmt.estimate_payload_tokens(result)
+    if actual > input_limit:
+        raise PayloadBudgetExceeded(actual, input_limit)
+    return result, removed
+
+
 def trim_to_upstream_limit(
     body: dict,
     upstream_limit: int,

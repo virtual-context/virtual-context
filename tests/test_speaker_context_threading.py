@@ -18,6 +18,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from proxy_http_helpers import upstream_rounds
 
 from virtual_context.config import load_config
 from virtual_context.core.tool_loop import (
@@ -307,9 +308,7 @@ class TestProxyStreamingContextThreading:
 
         with patch("virtual_context.proxy.server.prepare_payload", new=capturing_prepare), \
                 patch("virtual_context.proxy.handlers.execute_vc_tool", new=spy_execute), \
-                patch("virtual_context.proxy.server.httpx.AsyncClient.send", side_effect=mock_send), \
-                patch("virtual_context.proxy.server.httpx.AsyncClient.build_request"), \
-                patch("virtual_context.proxy.server.httpx.AsyncClient.post", side_effect=mock_post):
+                upstream_rounds(mock_resp, mock_post):
             resp = client.post(
                 "/v1/messages",
                 json={
@@ -431,9 +430,7 @@ class TestProxyRosterSnapshotThreading:
 
         with patch("virtual_context.proxy.server.prepare_payload", new=capturing_prepare), \
                 patch("virtual_context.proxy.handlers.execute_vc_tool", new=spy_execute), \
-                patch("virtual_context.proxy.server.httpx.AsyncClient.send", side_effect=mock_send), \
-                patch("virtual_context.proxy.server.httpx.AsyncClient.build_request"), \
-                patch("virtual_context.proxy.server.httpx.AsyncClient.post", side_effect=mock_post):
+                upstream_rounds(mock_resp, mock_post):
             resp = client.post(
                 "/v1/messages",
                 json={

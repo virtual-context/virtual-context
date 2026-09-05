@@ -302,7 +302,7 @@ class ProxyState:
             for item in engine._restored_conversation_history:
                 if isinstance(item, dict):
                     # Redis restore — full Message dicts with metadata, timestamps, raw_content
-                    from datetime import datetime, timezone
+                    from datetime import datetime
                     ts = item.get("timestamp")
                     if isinstance(ts, str) and ts:
                         try:

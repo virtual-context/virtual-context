@@ -20,6 +20,21 @@ from virtual_context.core.summary_identity import (
     render_summaries_for_model,
 )
 
+from virtual_context.core.tool_loop import (
+    VC_TOOL_NAMES,
+    _tool_result_has_dates_or_numeric_values,
+    AnthropicAdapter,
+    GeminiAdapter,
+    OpenAIAdapter,
+    OpenAICodexAdapter,
+    vc_tool_definitions_for_runtime,
+    execute_vc_tool,
+    get_adapter,
+    is_vc_tool,
+    run_tool_loop,
+    vc_tool_definitions,
+)
+from virtual_context.core.tool_query import ToolQueryRunner
 
 def _mock_engine(**overrides):
     """Create a MagicMock engine with a real SearchConfig on config.search."""
@@ -78,21 +93,7 @@ def _historical_source_payload(excerpt: str) -> dict:
     assert excerpt.endswith(suffix)
     return json.loads(excerpt[len(prefix):-len(suffix)])
 
-from virtual_context.core.tool_loop import (
-    VC_TOOL_NAMES,
-    _tool_result_has_dates_or_numeric_values,
-    AnthropicAdapter,
-    GeminiAdapter,
-    OpenAIAdapter,
-    OpenAICodexAdapter,
-    vc_tool_definitions_for_runtime,
-    execute_vc_tool,
-    get_adapter,
-    is_vc_tool,
-    run_tool_loop,
-    vc_tool_definitions,
-)
-from virtual_context.core.tool_query import ToolQueryRunner
+
 
 
 # ---------------------------------------------------------------------------
@@ -200,7 +201,7 @@ class TestExecuteVCTool:
         engine = MagicMock()
         engine.expand_topic.return_value = {"tag": "db", "depth": "full", "tokens_added": 500}
         result = execute_vc_tool(engine, "vc_expand_topic", {"tag": "db", "depth": "full"})
-        engine.expand_topic.assert_called_once_with(tag="db", depth="full")
+        engine.expand_topic.assert_called_once_with(tag="db", depth="full", speaker_context=None)
         parsed = json.loads(result)
         assert parsed["tag"] == "db"
         assert parsed["tokens_added"] == 500
@@ -213,8 +214,8 @@ class TestExecuteVCTool:
             engine, "vc_expand_topic",
             {"tag": "db", "depth": "full", "collapse_tags": ["api"]},
         )
-        engine.collapse_topic.assert_called_once_with(tag="api", depth="summary")
-        engine.expand_topic.assert_called_once_with(tag="db", depth="full")
+        engine.collapse_topic.assert_called_once_with(tag="api", depth="summary", speaker_context=None)
+        engine.expand_topic.assert_called_once_with(tag="db", depth="full", speaker_context=None)
         parsed = json.loads(result)
         assert parsed["tokens_added"] == 500
         assert parsed["collapsed"] == [{"tag": "api", "depth": "summary", "tokens_freed": 300}]
@@ -1007,7 +1008,7 @@ class TestToolResultVerificationHint:
         engine = MagicMock()
         engine.expand_topic.return_value = {}
         execute_vc_tool(engine, "vc_expand_topic", {"tag": "t"})
-        engine.expand_topic.assert_called_once_with(tag="t", depth="full")
+        engine.expand_topic.assert_called_once_with(tag="t", depth="full", speaker_context=None)
 
     def test_restore_uses_runtime(self):
         engine = MagicMock()

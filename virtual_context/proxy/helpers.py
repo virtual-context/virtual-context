@@ -11,8 +11,6 @@ import json as _json
 import logging
 from typing import TYPE_CHECKING
 
-logger = logging.getLogger(__name__)
-
 from ..types import Message
 from .formats import (
     detect_format,
@@ -27,13 +25,15 @@ if TYPE_CHECKING:
 # Constants — canonical definitions in _envelope.py
 # ---------------------------------------------------------------------------
 
-from ._envelope import (  # noqa: E402
+from ._envelope import (  # noqa: E402, F401 — compatibility exports from proxy.server
     _VC_PROMPT_MARKER,
     _VC_CONVERSATION_RE,
     _last_text_block,
     _strip_vc_prompt,
     _strip_envelope,
 )
+
+logger = logging.getLogger(__name__)
 
 _HOP_BY_HOP = frozenset({
     "host", "connection", "transfer-encoding", "keep-alive",
