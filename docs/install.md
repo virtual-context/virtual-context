@@ -5,7 +5,7 @@ This page provides copy-paste install commands for macOS/Linux and Windows, plus
 ## Requirements
 
 - Python **3.11 or newer**. On older Pythons, pip will refuse to resolve the package.
-- All core dependencies (including the proxy server) ship in the base install.
+- The base install includes the engine, SQLite storage, filesystem utilities, HTTP providers, and exact token counting. Server, UI, MCP, and local embedding features are optional.
 
 ## pip
 
@@ -16,14 +16,33 @@ pip install virtual-context
 Optional extras for specific storage backends and features:
 
 ```bash
-pip install "virtual-context[postgres]"   # PostgreSQL backend (psycopg + pool)
-pip install "virtual-context[redis]"      # Redis session cache for the proxy
-pip install "virtual-context[neo4j]"      # Neo4j backend
-pip install "virtual-context[falkordb]"   # FalkorDB backend
-pip install "virtual-context[all]"        # postgres + redis
+pip install "virtual-context[proxy]"             # HTTP proxy and dashboard
+pip install "virtual-context[embeddings]"        # Local semantic search (PyTorch)
+pip install "virtual-context[tui]"               # Terminal chat UI
+pip install "virtual-context[mcp]"               # MCP server
+pip install "virtual-context[postgres]"          # PostgreSQL backend
+pip install "virtual-context[redis]"             # Redis session cache
+pip install "virtual-context[providers]"         # Optional provider SDK integrations
+pip install "virtual-context[neo4j]"             # Direct Neo4j utilities
+pip install "virtual-context[falkordb]"          # Direct FalkorDB utilities
+pip install "virtual-context[proxy,embeddings]"  # Typical local daemon
+pip install "virtual-context[all]"               # Every optional feature
 ```
 
-The `storage.backend: postgres` configuration requires the `postgres` extra.
+The `storage.backend: postgres` configuration requires the `postgres` extra. Local embedding models load only on first use; installing the base engine does not install PyTorch or download model weights. HTTP provider integrations work without provider SDKs. `bridge` remains an alias for `proxy`; `tiktoken` remains an accepted compatibility extra because exact token counting is included in the base package.
+
+### Reproducible source installs
+
+The checked-in `uv.lock` pins the complete dependency graph, including optional features and artifact hashes. Select only the features needed by that environment:
+
+```bash
+python -m pip install uv==0.9.30
+uv sync --locked                                      # Base engine
+uv sync --locked --extra proxy --extra embeddings     # Local daemon
+uv sync --locked --extra all --extra dev               # Complete development environment
+```
+
+Use `uv lock --check` to verify that dependency metadata and the lock agree. Update the lock alongside any dependency changes. Deployment builds should install from this lock with their selected extras; unconstrained `pip install` commands above are for released packages.
 
 ### Config discovery
 
@@ -31,7 +50,7 @@ Commands look for a config file named `virtual-context.yaml` (also accepted: `.y
 
 ## macOS / Linux (install script)
 
-Install the CLI:
+Install the CLI, proxy, and local embedding support:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/virtual-context/virtual-context/main/scripts/install.sh | bash

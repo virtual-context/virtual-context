@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PACKAGE_NAME="virtual-context"
+PACKAGE_NAME="virtual-context[proxy,embeddings]"
 
 log() {
   printf "[virtual-context] %s\n" "$*"

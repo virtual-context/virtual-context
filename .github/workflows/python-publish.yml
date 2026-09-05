@@ -9,7 +9,11 @@ permissions:
   id-token: write
 
 jobs:
+  contracts:
+    uses: ./.github/workflows/contracts.yml
+
   publish:
+    needs: contracts
     runs-on: ubuntu-latest
     environment:
       name: pypi

@@ -20,29 +20,24 @@ dependencies = [
     "pyyaml>=6.0",
     "httpx[http2]>=0.27",
     "dateparser>=1.2",
-    "anthropic>=0.40",
-    "openai>=1.50",
-    "sentence-transformers>=3.0",
-    "torch>=2.0",
     "tiktoken>=0.7",
-    "uvicorn>=0.30",
-    "fastapi>=0.115",
-    "mcp>=1.0",
-    "textual>=3.0",
-    "rich>=13.0",
-    "Pillow>=10.0",
 ]
 
 [project.optional-dependencies]
+embeddings = ["sentence-transformers>=3.0", "torch>=2.0"]
+proxy = ["uvicorn>=0.30", "fastapi>=0.115", "Pillow>=10.0"]
+tui = ["textual>=3.0", "rich>=13.0"]
+mcp = ["mcp>=1.0"]
+# The runtime providers use HTTP directly. SDKs are for integrations and tests.
+providers = ["anthropic>=0.40", "openai>=1.50"]
 postgres = ["psycopg[binary]>=3.1", "psycopg-pool>=3.1"]
 neo4j = ["neo4j>=5.0"]
 falkordb = ["falkordb>=1.0"]
 redis = ["redis>=5.0"]
-all = [
-    "psycopg[binary]>=3.1",
-    "psycopg-pool>=3.1",
-    "redis>=5.0",
-]
+# Compatibility with existing deployment install commands.
+bridge = ["virtual-context[proxy]"]
+tiktoken = []
+all = ["virtual-context[embeddings,proxy,tui,mcp,providers,postgres,redis,neo4j,falkordb]"]
 dev = [
     "pytest>=8.0",
     "pytest-timeout>=2.3",
@@ -94,7 +89,7 @@ line-length = 100
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "--ignore=tests/ollama --ignore=tests/haiku --ignore=tests/tui -m 'not slow' -n auto"
+addopts = "--ignore=tests/ollama --ignore=tests/haiku --ignore=tests/tui -m 'not slow'"
 markers = [
     "ollama: tests requiring a running Ollama instance with qwen3:4b-instruct-2507-fp16",
     "haiku: tests requiring ANTHROPIC_API_KEY for Haiku integration",

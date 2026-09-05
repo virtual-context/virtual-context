@@ -29,6 +29,7 @@ infrastructure/
 scripts/*
 !scripts/install.ps1
 !scripts/install.sh
+!scripts/check_contracts.py
 !scripts/apply_canonical_repair_artifact_20260802.py
 !scripts/export_discord_guild_transcript_20260802.py
 !scripts/extend_men_vast_disposition_20260802.py
@@ -50,7 +51,6 @@ diagnostics/
 specs/
 tests_timing_report.md
 tests_by_section.sh
-uv.lock
 extraneous/paper/virtual_context_paper_latest.md
 extraneous/paper/data/
 extraneous/paper/*.zip

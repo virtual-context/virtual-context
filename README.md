@@ -271,7 +271,7 @@ Every conversation gets a stable identity that survives restarts, deploys, and c
 
 The engine is built to be operated, not only demoed:
 
-- **Storage**: SQLite by default; PostgreSQL (`pip install "virtual-context[postgres]"`) for multi-worker deployments; filesystem, Neo4j, and FalkorDB backends exist for special cases.
+- **Storage**: SQLite by default; PostgreSQL (`pip install "virtual-context[postgres]"`) for multi-worker deployments; both support fact relationships. Filesystem, Neo4j, and FalkorDB classes remain direct utilities, not engine backends.
 - **Multi-worker safety**: many workers can serve one conversation against shared Postgres. Compactions run under leased, fenced operations so a stalled worker cannot clobber a takeover; conversation lifecycle changes are epoch-guarded; schema bootstrap is serialized under an advisory lock; a backlog sweeper catches conversations whose traffic pattern never triggers inline compaction.
 - **Dashboard security**: dashboard endpoints are unauthenticated until you set `VC_DASHBOARD_TOKEN`; the default bind is loopback-only. Set the token before binding a non-loopback address.
 - **Operator tooling**: `virtual-context admin` ships sixteen guarded, idempotent backfill and repair commands (re-tagging, re-summarizing, attribution backfills, embedding reindexes), with explicit storage targeting and per-command dry-run semantics. `DATABASE_URL` lets them run bare inside a container with no config file mounted.
@@ -330,6 +330,8 @@ A terminal chat with live context visualization: tag panel, budget bar, turn ins
 ## Benchmark results
 
 ### LongMemEval (100 questions)
+
+Historical results; [run-provenance limits](docs/benchmarks.md#longmemeval) apply.
 
 100 random questions from [LongMemEval-500](https://github.com/xiaowu0162/LongMemEval) (5 batches of 20, seeds 42/99/777/1234/2025).
 
@@ -489,9 +491,9 @@ Also validated against adversarial internal stress tests (100-turn conversations
 git clone https://github.com/virtual-context/virtual-context.git
 cd virtual-context
 python -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
-python -m pytest tests/ -v --ignore=tests/ollama    # ~4,600 unit tests
-python -m pytest tests/ollama/ -v -m ollama          # integration (requires a local LLM)
+python -m pip install uv==0.9.30
+uv sync --locked --extra all --extra dev
+.venv/bin/python scripts/check_contracts.py
 ```
 
 ## License

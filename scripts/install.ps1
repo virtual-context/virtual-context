@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 
-$PackageName = "virtual-context"
+$PackageName = "virtual-context[proxy,embeddings]"
 
 function Write-Info {
     param([string]$Message)
