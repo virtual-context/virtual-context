@@ -140,20 +140,18 @@ The summarization LLM is separate from the upstream provider. You can use a chea
 
 ```yaml
 storage:
-  backend: "sqlite"                 # "sqlite", "postgres", "neo4j", or "falkordb"
+  backend: "sqlite"                 # "sqlite" or "postgres"
   sqlite:
     path: ".virtualcontext/store.db"
   postgres:
     dsn: "postgresql://user:pass@host:5432/vc"
-  neo4j:
-    uri: "bolt://localhost:7687"
-    user: "neo4j"
-    password: "password"
 ```
 
 SQLite is the default and requires no setup. PostgreSQL (requires the
 `postgres` extra) is recommended for multi-worker proxy deployments.
-Neo4j/FalkorDB adds graph-based fact traversal. `FilesystemStore` remains a
+Both support fact traversal with `facts.graph_links: true`. Neo4j/FalkorDB
+remain direct graph utilities; they are rejected as engine backends because
+they lack atomic conversation lifecycle writes. `FilesystemStore` remains a
 direct Markdown archival/test utility, but it is not accepted as an engine
 backend because it cannot persist the canonical source rows required by
 source-bound SUMMARY, SEGMENTS, and FULL rendering.
@@ -426,3 +424,15 @@ Reports missing required fields, invalid types, and cross-field constraint viola
 | `DATABASE_URL` | Postgres DSN fallback for the CLI. Storage precedence: explicit storage flag (`--postgres-dsn` / `--sqlite-path`) > `-c` config > `DATABASE_URL`, consulted only when neither flag nor config was given. Lets `admin` subcommands run bare inside a container that has the environment but no mounted config file |
 | `VC_DATA_DIR` | Data directory for deployments whose store has no local database path (default `/data/tenants`). Media originals saved by image compression land under `$VC_DATA_DIR/media/`, per conversation, and are cleaned up when a conversation is deleted |
 | `VIRTUAL_CONTEXT_CONFIG` | Config file path override, read by the MCP server only; the CLI uses `-c` and auto-discovery |
+
+### Native semantic ranking
+
+`retrieval.vector_search_enabled` defaults to `false`. When enabled it requires
+PostgreSQL, `retrieval.embedding_model: all-MiniLM-L6-v2`, and the explicit
+`admin migrate-semantic-vectors --apply` migration. It ranks canonical and
+segment chunks by exact vector distance in PostgreSQL and retrieves bounded
+pages of candidate metadata. This does not enable approximate nearest-neighbor
+search. SQLite continues to use the scoped local fallback.
+
+See [native vector search](native-vector-search.md) for the storage contract and
+required remote rollout evidence.

@@ -255,8 +255,9 @@ def test_roster_charged_exactly_once_and_totals_add_up():
     assert bd["speaker_roster"] == _tc(out.speaker_roster_text)
     assert out.total_tokens == (
         bd["core"] + bd["context_hint"] + bd["tags"] + bd["facts"]
-        + bd["speaker_roster"] + bd["conversation"]
+        + bd["speaker_roster"] + bd["conversation"] + bd.get("serialization", 0)
     )
+    assert out.prepend_text.count(out.speaker_roster_text) == 1
 
 
 def test_wrapper_inclusive_cap_drops_whole_least_recent_entries():

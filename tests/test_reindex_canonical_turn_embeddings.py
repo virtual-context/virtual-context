@@ -86,6 +86,7 @@ class _ReindexStore:
 
     def store_canonical_turn_chunk_embeddings(
         self, conversation_id, turn_number, side, chunks, canonical_turn_id=None,
+        *, embedding_model="",
     ):
         self.stored.append((conversation_id, side, canonical_turn_id,
                             [c.text for c in chunks]))

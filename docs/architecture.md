@@ -164,14 +164,16 @@ Group conversations carry per-message sender identity. The envelope parser claim
 
 ## Storage Backends
 
-Four engine backends are accepted: `sqlite`, `postgres`, `neo4j`, `falkordb`.
+Two engine backends are accepted: `sqlite` and `postgres`. Both support fact relationships with `facts.graph_links: true`.
 
 - **SQLite** (default): single-file, zero-config. Suitable for single-user and development.
 - **FilesystemStore utility**: segments as Markdown files with YAML frontmatter
   for direct archival/test use. It is not an engine backend because it does not
   host the canonical turns required to prove model-visible layered summaries.
 - **PostgreSQL**: the multi-worker backend. Canonical turns, fencing, epochs, and the sweeper queries all run here in production deployments.
-- **Neo4j / FalkorDB**: graph-backed fact relationships and traversal queries.
+- **Neo4j / FalkorDB utilities**: direct graph utilities only. They cannot provide
+  atomic conversation lifecycle writes across the canonical and fact stores, so
+  engine configuration rejects them before connecting.
 
 The engine backends share the `Store` protocol. Model-facing context never
 degrades to an unproved filesystem projection.

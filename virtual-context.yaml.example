@@ -223,21 +223,11 @@ providers:
 # =====================================================================================
 
 storage:
-  backend: "sqlite"                                 # "sqlite" | "filesystem" | "postgres" | "neo4j" | "falkordb"
+  backend: "sqlite"                                 # "sqlite" | "postgres"
   sqlite:
     path: ".virtualcontext/store.db"
-  filesystem:
-    root: ".virtualcontext/store"
   # postgres:
   #   dsn: ""
-  # neo4j:
-  #   uri: ""
-  #   user: "neo4j"
-  #   password: ""
-  # falkordb:
-  #   host: "localhost"
-  #   port: 6379
-  #   password: ""
 
 # =====================================================================================
 # SEARCH — find_quote excerpt and snippet lengths
@@ -349,6 +339,7 @@ retrieval:
   anchorless_lookback: 6                            # recent turns for working set
   inbound_tagger_type: "embedding"                  # "embedding" or "llm"
   embedding_model: "all-MiniLM-L6-v2"
+  vector_search_enabled: false                     # PostgreSQL only; migrate and verify before enabling
   embedding_threshold: 0.3
   scoring:
     # 3-signal RRF fusion weights/limits use built-in defaults; override here.

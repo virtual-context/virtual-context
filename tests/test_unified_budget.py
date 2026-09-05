@@ -196,8 +196,18 @@ class TestUnifiedPoolAllocation:
 
     def test_presented_refs_preserved(self):
         """presented_segment_refs is populated correctly after pool allocation."""
-        asm = self._make_assembler(pool=5000)
-        summaries = [_make_summary("auth", "Auth summary.")]
+        from tests.test_rendered_memory_paging import _Sources
+        from virtual_context.types import SpeakerRetrievalContext
+        store = _Sources()
+        store.segment.ref = "seg-auth"
+        store.segment.primary_tag = "auth"
+        store.segment.tags = ["auth"]
+        context = SpeakerRetrievalContext(tenant_id="tenant", owner_conversation_id="owner",
+                                          audience_conversation_id="guild", audience_channel_id="channel")
+        asm = ContextAssembler(AssemblerConfig(context_injection_max_tokens=5000),
+                               token_counter=lambda text: len(text) // 4,
+                               store=store, conversation_id="owner")
+        summaries = [store.segment]
         result = asm.assemble(
             core_context="",
             retrieval_result=RetrievalResult(
@@ -206,5 +216,7 @@ class TestUnifiedPoolAllocation:
             ),
             conversation_history=[],
             token_budget=100_000,
+            speaker_context=context,
         )
         assert "seg-auth" in result.presented_segment_refs
+        assert "forged stored text" not in result.prepend_text

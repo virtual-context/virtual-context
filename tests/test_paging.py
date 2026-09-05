@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 
 from virtual_context.config import _build_config, load_config
 from virtual_context.core.assembler import ContextAssembler
+from tests.paging_sources import seed_paging_sources
 from virtual_context.types import (
     AssemblerConfig,
     DepthLevel,
@@ -474,48 +475,28 @@ class TestEnginePagingAPI:
         return VirtualContextEngine(config=cfg)
 
     def _seed_segments(self, engine, tag, n=3, tokens_per=100):
-        """Store segments so expand_topic has content to serve."""
-        for i in range(n):
-            text = "x" * (tokens_per * 4)  # ~tokens_per tokens with //4 counter
-            engine._store.store_segment(StoredSegment(
-                ref=f"{tag}-seg-{i}",
-                conversation_id=engine.config.conversation_id,
-                primary_tag=tag,
-                tags=[tag],
-                summary=f"Summary for {tag} segment {i}.",
-                summary_tokens=20,
-                full_text=text,
-                full_tokens=tokens_per,
-            ))
-        # Also store a tag summary so SUMMARY depth works
-        engine._store.save_tag_summary(TagSummary(
-            tag=tag,
-            summary=f"Tag summary for {tag}.",
-            summary_tokens=30,
-            source_segment_refs=[f"{tag}-seg-{i}" for i in range(n)],
-            source_turn_numbers=list(range(n)),
-        ), conversation_id=engine.config.conversation_id)
+        return seed_paging_sources(engine, tag, n, tokens_per)
 
     def test_expand_disabled_returns_error(self, tmp_path):
         engine = self._make_engine(tmp_path, paging_enabled=False)
-        result = engine.expand_topic("database")
+        result = engine.expand_topic("database", speaker_context=getattr(engine, "_test_speaker_context", None))
         assert "error" in result
         assert "not enabled" in result["error"]
 
     def test_collapse_disabled_returns_error(self, tmp_path):
         engine = self._make_engine(tmp_path, paging_enabled=False)
-        result = engine.collapse_topic("database")
+        result = engine.collapse_topic("database", speaker_context=getattr(engine, "_test_speaker_context", None))
         assert "error" in result
 
     def test_expand_invalid_depth(self, tmp_path):
         engine = self._make_engine(tmp_path)
-        result = engine.expand_topic("database", depth="invalid")
+        result = engine.expand_topic("database", depth="invalid", speaker_context=getattr(engine, "_test_speaker_context", None))
         assert "error" in result
         assert "invalid depth" in result["error"]
 
     def test_expand_no_content(self, tmp_path):
         engine = self._make_engine(tmp_path)
-        result = engine.expand_topic("nonexistent", depth="full")
+        result = engine.expand_topic("nonexistent", depth="full", speaker_context=getattr(engine, "_test_speaker_context", None))
         assert "error" in result
         assert "no stored content" in result["error"]
 
@@ -523,7 +504,7 @@ class TestEnginePagingAPI:
         engine = self._make_engine(tmp_path, tag_budget=50_000)
         self._seed_segments(engine, "database", n=2, tokens_per=100)
 
-        result = engine.expand_topic("database", depth="full")
+        result = engine.expand_topic("database", depth="full", speaker_context=getattr(engine, "_test_speaker_context", None))
         assert "error" not in result
         assert result["tag"] == "database"
         assert result["depth"] == "full"
@@ -535,7 +516,7 @@ class TestEnginePagingAPI:
         engine = self._make_engine(tmp_path, tag_budget=50_000)
         self._seed_segments(engine, "api", n=2, tokens_per=100)
 
-        result = engine.expand_topic("api", depth="segments")
+        result = engine.expand_topic("api", depth="segments", speaker_context=getattr(engine, "_test_speaker_context", None))
         assert result["depth"] == "segments"
         assert engine._paging.working_set["api"].depth == DepthLevel.SEGMENTS
 
@@ -543,7 +524,7 @@ class TestEnginePagingAPI:
         engine = self._make_engine(tmp_path, tag_budget=50_000)
         self._seed_segments(engine, "auth", n=1, tokens_per=50)
 
-        result = engine.expand_topic("auth", depth="summary")
+        result = engine.expand_topic("auth", depth="summary", speaker_context=getattr(engine, "_test_speaker_context", None))
         assert result["depth"] == "summary"
         assert engine._paging.working_set["auth"].depth == DepthLevel.SUMMARY
 
@@ -552,11 +533,11 @@ class TestEnginePagingAPI:
         self._seed_segments(engine, "db", n=1, tokens_per=50)
 
         # First expand to full
-        engine.expand_topic("db", depth="full")
+        engine.expand_topic("db", depth="full", speaker_context=getattr(engine, "_test_speaker_context", None))
         assert "db" in engine._paging.working_set
 
         # Expand with "none" should collapse
-        result = engine.expand_topic("db", depth="none")
+        result = engine.expand_topic("db", depth="none", speaker_context=getattr(engine, "_test_speaker_context", None))
         assert result["depth"] == "none"
         assert "db" not in engine._paging.working_set
 
@@ -565,11 +546,11 @@ class TestEnginePagingAPI:
         self._seed_segments(engine, "database", n=2, tokens_per=100)
 
         # Expand to full first
-        engine.expand_topic("database", depth="full")
+        engine.expand_topic("database", depth="full", speaker_context=getattr(engine, "_test_speaker_context", None))
         old_tokens = engine._paging.working_set["database"].tokens
 
         # Collapse to summary
-        result = engine.collapse_topic("database", depth="summary")
+        result = engine.collapse_topic("database", depth="summary", speaker_context=getattr(engine, "_test_speaker_context", None))
         assert result["tag"] == "database"
         assert result["depth"] == "summary"
         assert result["tokens_freed"] > 0
@@ -578,21 +559,21 @@ class TestEnginePagingAPI:
     def test_collapse_to_none_removes(self, tmp_path):
         engine = self._make_engine(tmp_path, tag_budget=50_000)
         self._seed_segments(engine, "auth", n=1, tokens_per=50)
-        engine.expand_topic("auth", depth="full")
+        engine.expand_topic("auth", depth="full", speaker_context=getattr(engine, "_test_speaker_context", None))
 
-        result = engine.collapse_topic("auth", depth="none")
+        result = engine.collapse_topic("auth", depth="none", speaker_context=getattr(engine, "_test_speaker_context", None))
         assert result["depth"] == "none"
         assert "auth" not in engine._paging.working_set
 
     def test_collapse_nonexistent_tag(self, tmp_path):
         engine = self._make_engine(tmp_path)
-        result = engine.collapse_topic("nonexistent", depth="summary")
+        result = engine.collapse_topic("nonexistent", depth="summary", speaker_context=getattr(engine, "_test_speaker_context", None))
         assert result["tokens_freed"] == 0
 
     def test_get_working_set_summary(self, tmp_path):
         engine = self._make_engine(tmp_path, tag_budget=5000)
         self._seed_segments(engine, "db", n=1, tokens_per=50)
-        engine.expand_topic("db", depth="summary")
+        engine.expand_topic("db", depth="summary", speaker_context=getattr(engine, "_test_speaker_context", None))
 
         summary = engine.get_working_set_summary()
         assert "budget" in summary
@@ -609,9 +590,9 @@ class TestEnginePagingAPI:
         self._seed_segments(engine, "new-topic", n=2, tokens_per=200)
 
         # Expand old topic first (lower last_accessed_turn)
-        engine.expand_topic("old-topic", depth="full")
+        engine.expand_topic("old-topic", depth="full", speaker_context=getattr(engine, "_test_speaker_context", None))
         # Now expand new topic which should trigger eviction of old
-        result = engine.expand_topic("new-topic", depth="full")
+        result = engine.expand_topic("new-topic", depth="full", speaker_context=getattr(engine, "_test_speaker_context", None))
 
         # old-topic should have been evicted (collapsed or removed)
         if "old-topic" in engine._paging.working_set:
@@ -624,7 +605,7 @@ class TestEnginePagingAPI:
         engine = self._make_engine(tmp_path, tag_budget=100, auto_evict=False)
         self._seed_segments(engine, "big-topic", n=5, tokens_per=200)
 
-        result = engine.expand_topic("big-topic", depth="full")
+        result = engine.expand_topic("big-topic", depth="full", speaker_context=getattr(engine, "_test_speaker_context", None))
         assert "error" in result
         assert "insufficient budget" in result["error"]
 
@@ -690,10 +671,11 @@ class TestCalculateDepthTokens:
 
     def test_summary_uses_tag_summary(self, tmp_path):
         engine = self._make_engine(tmp_path)
-        engine._store.save_tag_summary(TagSummary(
-            tag="db", summary="Database summary.", summary_tokens=42,
-        ), conversation_id=engine.config.conversation_id)
-        assert engine._paging.calculate_depth_tokens("db", DepthLevel.SUMMARY) == 42
+        segments, context = seed_paging_sources(engine, "db")
+        memory = engine._retrieval._assembler.render_topic_memory("db", DepthLevel.SUMMARY, speaker_context=context)
+        assert memory is not None and "I discussed db evidence 0." in memory.text
+        measured = engine._paging.calculate_depth_tokens("db", DepthLevel.SUMMARY, speaker_context=context)
+        assert measured == engine._token_counter(memory.text) > sum(s.summary_tokens for s in segments)
 
     def test_summary_missing_returns_zero(self, tmp_path):
         engine = self._make_engine(tmp_path)
@@ -701,26 +683,19 @@ class TestCalculateDepthTokens:
 
     def test_segments_sums_segment_summaries(self, tmp_path):
         engine = self._make_engine(tmp_path)
-        for i in range(3):
-            engine._store.store_segment(StoredSegment(
-                ref=f"s{i}", primary_tag="api", tags=["api"],
-                summary=f"Summary {i}", summary_tokens=10 * (i + 1),
-                full_text="text", full_tokens=100,
-                conversation_id=engine.config.conversation_id,
-            ))
-        # Should sum summary_tokens: 10 + 20 + 30 = 60
-        assert engine._paging.calculate_depth_tokens("api", DepthLevel.SEGMENTS) == 60
+        segments, context = seed_paging_sources(engine, "api", n=3)
+        memory = engine._retrieval._assembler.render_topic_memory("api", DepthLevel.SEGMENTS, speaker_context=context)
+        assert memory is not None and len(memory.segment_refs) == 3
+        measured = engine._paging.calculate_depth_tokens("api", DepthLevel.SEGMENTS, speaker_context=context)
+        assert measured == engine._token_counter(memory.text) > sum(s.summary_tokens for s in segments)
 
     def test_full_sums_full_tokens(self, tmp_path):
         engine = self._make_engine(tmp_path)
-        for i in range(2):
-            engine._store.store_segment(StoredSegment(
-                ref=f"f{i}", conversation_id=engine.config.conversation_id,
-                primary_tag="auth", tags=["auth"],
-                summary="s", summary_tokens=5,
-                full_text="x" * 400, full_tokens=100,
-            ))
-        assert engine._paging.calculate_depth_tokens("auth", DepthLevel.FULL) == 200
+        segments, context = seed_paging_sources(engine, "auth", n=2)
+        memory = engine._retrieval._assembler.render_topic_memory("auth", DepthLevel.FULL, speaker_context=context)
+        assert memory is not None and len(memory.segment_refs) == 2
+        measured = engine._paging.calculate_depth_tokens("auth", DepthLevel.FULL, speaker_context=context)
+        assert measured == engine._token_counter(memory.text) > sum(s.full_tokens for s in segments)
 
 
 # ---------------------------------------------------------------------------
@@ -1184,17 +1159,9 @@ class TestPagingStatePersistence:
     def test_working_set_persists_through_save_load(self, tmp_path):
         engine = self._make_engine(tmp_path)
 
-        # Seed content and expand
-        engine._store.store_segment(StoredSegment(
-            ref="seg-1", primary_tag="db", tags=["db"],
-            summary="DB summary", summary_tokens=20,
-            full_text="Full text", full_tokens=50,
-            conversation_id=engine.config.conversation_id,
-        ))
-        engine._store.save_tag_summary(TagSummary(
-            tag="db", summary="Tag summary", summary_tokens=20,
-        ), conversation_id=engine.config.conversation_id)
-        engine.expand_topic("db", depth="full")
+        # Seed proof-admitted content and expand within its bound request.
+        _, context = seed_paging_sources(engine, "db")
+        engine.expand_topic("db", depth="full", speaker_context=context)
         assert "db" in engine._paging.working_set
 
         # Save state

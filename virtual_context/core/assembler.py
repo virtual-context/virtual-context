@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
 from .render_escape import escape_host_attribution_markup
+from .rendered_memory import RenderedMemory, rendered_memory
 from .speaker_roster import (
     build_speaker_roster,
     evict_least_recent,
@@ -688,6 +689,7 @@ class ContextAssembler:
         max_context_tokens: int | None = None,
         request_roles=None,
         speaker_context=None,
+        _render_only: bool = False,
     ) -> AssembledContext:
         """Build final context within token budget.
 
@@ -708,7 +710,11 @@ class ContextAssembler:
         def _note(stage: str, started_at: float) -> None:
             _breakdown[stage] = round((time.monotonic() - started_at) * 1000, 1)
 
-        core_budget = self.config.core_context_max_tokens
+        token_budget = max(0, int(token_budget))
+        injection_budget = token_budget
+        if max_context_tokens is not None:
+            injection_budget = min(injection_budget, max(0, int(max_context_tokens)))
+        core_budget = min(self.config.core_context_max_tokens, injection_budget)
 
         # Truncate core context to budget
         _stage = time.monotonic()
@@ -738,8 +744,11 @@ class ContextAssembler:
         # Also collect tags from full_segments that might not be in summaries
         if full_segments:
             for tag in full_segments:
-                if tag not in summaries_by_tag:
-                    summaries_by_tag[tag] = []
+                existing_refs = {getattr(item, "ref", "") for item in summaries_by_tag.get(tag, [])}
+                summaries_by_tag.setdefault(tag, []).extend(
+                    segment for segment in full_segments[tag]
+                    if segment.ref not in existing_refs
+                )
         _note("prepare_summary_groups", _stage)
 
         # Sort tags by priority (higher priority first)
@@ -1242,6 +1251,7 @@ class ContextAssembler:
         _stage = time.monotonic()
         _built_sections: dict[str, str] = {}
         _section_tokens: dict[str, int] = {}
+        _memories: dict[str, RenderedMemory] = {}
         for tag, (render_depth, items) in section_specs.items():
             if render_depth == "full":
                 section = self._format_full_section(
@@ -1265,9 +1275,25 @@ class ContextAssembler:
                     rendered_summary_by_object=rendered_by_depth.get("summary"),
                     newest_first=tag in newest_first_atomic_tags,
                 )
-            _built_sections[tag] = section
-            _section_tokens[tag] = self.token_counter(section)
+            section = escape_host_attribution_markup(section)
+            proofs = rendered_by_depth.get(render_depth, {})
+            memory = rendered_memory(
+                tag=tag, depth=render_depth, text=section,
+                renderings=(proofs.get(id(item), SUMMARY_ATTRIBUTION_QUARANTINE) for item in items),
+                segment_refs=(str(getattr(item, "ref", "") or "") for item in items
+                              if getattr(proofs.get(id(item)), "_presented_source_ids", ())),
+                conversation_id=self._conversation_id,
+                scope=roster_context or speaker_context, token_counter=self.token_counter,
+            )
+            _memories[tag] = memory
+            _built_sections[tag] = memory.text
+            _section_tokens[tag] = memory.measured_cost
         _note("build_tag_sections", _stage)
+        if _render_only:
+            return AssembledContext(
+                tag_sections=_built_sections,
+                rendered_memories=tuple(_memories.values()),
+            )
 
         # Score all candidates
         _stage = time.monotonic()
@@ -1518,20 +1544,6 @@ class ContextAssembler:
             )
         _note("format_facts", _stage)
 
-        # Track presented segment refs
-        _stage = time.monotonic()
-        presented_refs: set[str] = set()
-        for s in retrieval_result.summaries:
-            if s.primary_tag in tag_sections and s.ref:
-                presented_refs.add(s.ref)
-        if full_segments:
-            for tag, segs in full_segments.items():
-                if tag in tag_sections:
-                    for seg in segs:
-                        if seg.ref:
-                            presented_refs.add(seg.ref)
-        _note("track_presented_refs", _stage)
-
         # Conversation budget = remaining tokens
         conversation_budget = (
             token_budget - core_tokens - tag_tokens - hint_tokens
@@ -1570,7 +1582,6 @@ class ContextAssembler:
         recent_conversation_message_tokens = self._native_recent_tokens(
             recent_conversation_messages,
         )
-        conv_tokens = client_tokens + recent_conversation_tokens
         _note("count_conversation_tokens", _stage)
 
         # Build prepend text (core + card + context hint + tag sections + facts).
@@ -1602,32 +1613,40 @@ class ContextAssembler:
         prepend_text = _build_prepend()
         _note("build_prepend", _stage)
 
-        # Hard budget cap: if prepend_text exceeds token_budget,
-        # drop least-relevant tag sections until it fits.
+        # The serialized representation is authoritative: component token
+        # counts are not additive, escaping may grow text, and the caller's
+        # available headroom may be smaller than the full context window.
+        # Evidence wrappers are removed whole, never sliced into invalid or
+        # misleading partial evidence.
         _stage = time.monotonic()
         prepend_tokens = self.token_counter(prepend_text)
-        if prepend_tokens > token_budget:
+        prepend_limit = max(0, injection_budget - recent_conversation_message_tokens)
+        if prepend_tokens + recent_conversation_message_tokens > injection_budget:
             logger.error(
                 "Assembled context (%d tokens) exceeds token_budget (%d). "
                 "Consider increasing context_window or reducing assembly config "
                 "values (tag_context_max_tokens=%d, facts_max_tokens=%d). "
                 "Truncating least-relevant tag sections to fit.",
-                prepend_tokens, token_budget,
+                prepend_tokens + recent_conversation_message_tokens, injection_budget,
                 self.config.tag_context_max_tokens,
                 self.config.facts_max_tokens,
             )
-            # Drop tags from end (least relevant — sorted_tags is priority-ordered)
-            for drop_tag in reversed(sorted_tags):
+            for drop_tag in sorted(
+                tag_sections,
+                key=lambda tag: retrieval_result.retrieval_scores.get(
+                    tag, float(self._tag_priority(tag)),
+                ),
+            ):
                 if drop_tag not in tag_sections:
                     continue
                 dropped_tokens = self.token_counter(tag_sections[drop_tag])
                 logger.info("Tag '%s' DROP (hard cap: %dt over budget %dt, freeing %dt)",
-                            drop_tag, prepend_tokens, token_budget, dropped_tokens)
+                            drop_tag, prepend_tokens, prepend_limit, dropped_tokens)
                 del tag_sections[drop_tag]
                 tag_tokens -= dropped_tokens
                 prepend_text = _build_prepend()
                 prepend_tokens = self.token_counter(prepend_text)
-                if prepend_tokens <= token_budget:
+                if prepend_tokens <= prepend_limit:
                     break
 
             # Still over after tag eviction: drop whole least-recent roster
@@ -1637,7 +1656,7 @@ class ContextAssembler:
             # the wrapper goes with it — nothing is emitted and no dynamic
             # speaker parameter may be exposed for this request.
             while (
-                prepend_tokens > token_budget
+                prepend_tokens > prepend_limit
                 and roster_snapshot is not None
                 and roster_snapshot.entries
             ):
@@ -1656,7 +1675,7 @@ class ContextAssembler:
             # entries, in the same stable order, and rebuild. Never truncate an
             # entry. The whole-prepend recount is authoritative because token
             # counts need not be additive across the "\n\n" separators.
-            while prepend_tokens > token_budget and card_entries:
+            while prepend_tokens > prepend_limit and card_entries:
                 card_entries.remove(min(card_entries, key=self._card_sort_key))
                 actor_card_text = self._render_actor_card(card_entries)
                 card_tokens = (
@@ -1664,12 +1683,84 @@ class ContextAssembler:
                 )
                 prepend_text = _build_prepend()
                 prepend_tokens = self.token_counter(prepend_text)
+
+            if prepend_tokens > prepend_limit and context_hint:
+                context_hint = ""
+                hint_tokens = 0
+                prepend_text = _build_prepend()
+                prepend_tokens = self.token_counter(prepend_text)
+
+            if (
+                prepend_tokens + recent_conversation_message_tokens > injection_budget
+                and recent_conversation_tokens
+            ):
+                # Rebudget DB recovery through its whole-group renderer. Its
+                # native requester rows and reference-only peer rows retain
+                # their established authority and pairing rules.
+                recent_conversation_text = ""
+                base_tokens = self.token_counter(_build_prepend())
+                recent_limit = min(
+                    recent_conversation_tokens,
+                    max(0, injection_budget - base_tokens),
+                )
+                while True:
+                    (
+                        recent_conversation_text,
+                        recent_conversation_tokens,
+                        _rendered_recent,
+                        recent_conversation_messages,
+                    ) = self._build_recent_conversation(
+                        db_recent_history, request_roles, recent_limit,
+                    )
+                    recent_conversation_message_tokens = self._native_recent_tokens(
+                        recent_conversation_messages,
+                    )
+                    prepend_text = _build_prepend()
+                    prepend_tokens = self.token_counter(prepend_text)
+                    overflow = (
+                        prepend_tokens + recent_conversation_message_tokens
+                        - injection_budget
+                    )
+                    if overflow <= 0 or recent_limit <= 0:
+                        break
+                    recent_limit = max(0, recent_limit - max(1, overflow))
+                prepend_limit = max(
+                    0, injection_budget - recent_conversation_message_tokens,
+                )
+
+            if prepend_tokens > prepend_limit and core:
+                # Only the plain core-text component is prefix-truncated.
+                # Count its escaped, joined representation on every probe.
+                original_core = core
+                low, high = 0, len(original_core)
+                core = ""
+                while low < high:
+                    middle = (low + high + 1) // 2
+                    core = original_core[:middle]
+                    if self.token_counter(_build_prepend()) <= prepend_limit:
+                        low = middle
+                    else:
+                        high = middle - 1
+                core = original_core[:low]
+                core_tokens = self.token_counter(core)
+                prepend_text = _build_prepend()
+                prepend_tokens = self.token_counter(prepend_text)
         _note("hard_cap_trim", _stage)
 
-        total_tokens = (
-            core_tokens + hint_tokens + tag_tokens + facts_tokens_actual
-            + card_tokens + roster_tokens + conv_tokens
+        # The final prepend may differ from component sums because of JSON
+        # escaping and separators. Reconcile payload budget and telemetry with
+        # these actual bytes rather than the earlier reservations.
+        trimmed = self._trim_conversation(
+            payload_history,
+            token_budget - prepend_tokens - recent_conversation_message_tokens,
         )
+        client_tokens = sum(self.token_counter(message.content) for message in trimmed)
+        total_tokens = prepend_tokens + recent_conversation_message_tokens + client_tokens
+
+        _stage = time.monotonic()
+        admitted_memories = tuple(_memories[tag] for tag in tag_sections)
+        presented_refs = {ref for memory in admitted_memories for ref in memory.segment_refs}
+        _note("track_presented_refs", _stage)
 
         # Compute presented_tags from rendered <virtual-context tags="..."> headers
         _stage = time.monotonic()
@@ -1718,10 +1809,15 @@ class ContextAssembler:
             _budget_breakdown["speaker_roster"] = roster_tokens
         if recent_conversation_tokens:
             _budget_breakdown["recent_conversation"] = recent_conversation_tokens
+        serialization_tokens = total_tokens - sum(_budget_breakdown.values())
+        if serialization_tokens:
+            _budget_breakdown["serialization"] = serialization_tokens
 
         return AssembledContext(
             core_context=core,
+            context_hint=context_hint,
             tag_sections=tag_sections,
+            rendered_memories=admitted_memories,
             facts_text=facts_text,
             # DB-recent rows are intentionally absent even when rendered.  A
             # future consumer may safely serialize this field without turning
@@ -1765,6 +1861,30 @@ class ContextAssembler:
         enforces is not the budget the other ships.
         """
         return "<facts>\n" + "\n".join(lines) + "\n</facts>"
+
+    def render_topic_memory(
+        self, tag: str, depth: DepthLevel, *, speaker_context=None,
+    ) -> RenderedMemory | None:
+        """Use the assembly proof/selection/formatting path for paging costs.
+
+        No proof is cached: source corrections and scope changes are checked
+        again on each call. The render-only branch bypasses admission budgets,
+        so oversized topics are rejected whole by the paging transaction.
+        """
+        if depth == DepthLevel.NONE or not getattr(speaker_context, "eligible", False):
+            return None
+        segments = self._store.get_segments_by_tags(
+            tags=[tag], min_overlap=1, limit=500, conversation_id=self._conversation_id,
+        )
+        result = self.assemble(
+            core_context="", retrieval_result=RetrievalResult(),
+            conversation_history=[], token_budget=0,
+            working_set={tag: WorkingSetEntry(tag=tag, depth=depth)},
+            full_segments={tag: segments}, speaker_context=speaker_context,
+            _render_only=True,
+        )
+        return next((memory for memory in result.rendered_memories
+                     if memory.tag == tag and memory.presented_source_ids), None)
 
     def _format_facts(self, facts: list[Fact], max_tokens: int) -> str:
         text, _, _ = self._format_facts_admitted(facts, max_tokens)
@@ -1947,12 +2067,22 @@ class ContextAssembler:
         return result
 
     def _truncate_core(self, core: str, max_tokens: int) -> str:
+        if max_tokens <= 0:
+            return ""
         if self.token_counter(core) <= max_tokens:
             return core
 
-        # Rough char estimate: 4 chars per token
-        max_chars = max_tokens * 4
-        return core[:max_chars]
+        # A character estimate can exceed the budget by several times for
+        # Unicode or source code. Every accepted prefix is tokenizer-measured;
+        # the search need not find the longest possible BPE prefix to be safe.
+        low, high = 0, len(core)
+        while low < high:
+            middle = (low + high + 1) // 2
+            if self.token_counter(core[:middle]) <= max_tokens:
+                low = middle
+            else:
+                high = middle - 1
+        return core[:low]
 
     def _tag_priority(self, tag: str) -> int:
         for rule in self.tag_rules:

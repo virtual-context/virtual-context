@@ -327,6 +327,7 @@ class TestGateOnAggregateAnnotation:
 
     def test_expand_topic_result_exposes_unknown_scope(self, tmp_path):
         from virtual_context.engine import VirtualContextEngine
+        from tests.paging_sources import seed_paging_sources
 
         config = VirtualContextConfig(
             conversation_id=OWNER,
@@ -338,35 +339,18 @@ class TestGateOnAggregateAnnotation:
             search=SearchConfig(tool_guard_enabled=False),
         )
         paging_engine = VirtualContextEngine(config=config)
-        paging_engine._store.store_segment(StoredSegment(
-            ref="boston-seg-0",
-            conversation_id=OWNER,
-            primary_tag="boston",
-            tags=["boston"],
-            summary="Summary of Boston travel.",
-            summary_tokens=20,
-            full_text="Long conversation text about Boston travel plans.",
-            full_tokens=50,
-        ))
-        paging_engine._store.save_tag_summary(
-            TagSummary(
-                tag="boston",
-                summary="Trips to Boston and related plans.",
-                summary_tokens=8,
-                description="Boston travel",
-            ),
-            conversation_id=OWNER,
-        )
+        context = _ctx()
+        seed_paging_sources(paging_engine, "boston", context=context)
 
-        # Reach working-set steady state, then pin gate-off parity: with
-        # the gate off a supplied context changes nothing.
-        execute_vc_tool(paging_engine, "vc_expand_topic", {"tag": "boston"})
+        # Reach steady state under one proved request, then pin annotation
+        # gate parity without changing the independent source authority.
+        execute_vc_tool(paging_engine, "vc_expand_topic", {"tag": "boston"}, speaker_context=context)
         legacy = execute_vc_tool(
-            paging_engine, "vc_expand_topic", {"tag": "boston"},
+            paging_engine, "vc_expand_topic", {"tag": "boston"}, speaker_context=context,
         )
         gated_off = execute_vc_tool(
             paging_engine, "vc_expand_topic", {"tag": "boston"},
-            speaker_context=_ctx(),
+            speaker_context=context,
         )
         assert gated_off == legacy
         assert "speaker_scope" not in legacy
@@ -374,7 +358,7 @@ class TestGateOnAggregateAnnotation:
         paging_engine.config.search.speaker_annotations_enabled = True
         out = execute_vc_tool(
             paging_engine, "vc_expand_topic", {"tag": "boston"},
-            speaker_context=_ctx(),
+            speaker_context=context,
         )
         payload = json.loads(out)
         assert "error" not in payload

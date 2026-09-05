@@ -10,6 +10,11 @@ import re
 from datetime import date, datetime, timedelta, timezone
 from collections.abc import Callable, Collection
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .proxy.formats import PayloadFormat
+    from .proxy.session_state import SessionState
 
 from .config import load_config
 from .core.assembler import ContextAssembler
@@ -23,6 +28,7 @@ from .core.telemetry import TelemetryLedger
 from .core.monitor import ContextMonitor
 from .core.retriever import ContextRetriever
 from .core.segmenter import TopicSegmenter, pair_messages_into_turns
+from .core.store_capabilities import capabilities_of
 from .core.summary_identity import sanitize_summary_payload_for_model
 from .core.tag_canonicalizer import TagCanonicalizer
 from .core.tag_generator import build_tag_generator, TagGenerator
@@ -38,12 +44,24 @@ from .types import (
     EngineStateSnapshot,
     Message,
     RetrievalResult,
+    RequestRoles,
     SpeakerRetrievalContext,
     SplitResult,
     ToolLoopResult,
     TurnTagEntry,
     VirtualContextConfig,
 )
+
+from .core.compaction_pipeline import CompactionPipeline
+from .core.conversation_store import ConversationStoreView, StaleConversationWriteError
+from .core.exceptions import CanonicalSourceConflict
+from .core.event_bus import ProgressEventBus
+from .core.lifecycle_epoch import LifecycleEpochMismatch
+from .core.paging_manager import PagingManager
+from .core.retrieval_assembler import RetrievalAssembler
+from .core.semantic_search import SemanticSearchManager
+from .core.tagging_pipeline import TaggingPipeline
+
 
 logger = logging.getLogger(__name__)
 
@@ -99,15 +117,6 @@ def _restored_flushed_prefix_messages(
     return int(flushed_prefix_messages or 0)
 
 
-from .core.compaction_pipeline import CompactionPipeline
-from .core.conversation_store import ConversationStoreView, StaleConversationWriteError
-from .core.exceptions import CanonicalSourceConflict
-from .core.event_bus import ProgressEventBus
-from .core.lifecycle_epoch import LifecycleEpochMismatch
-from .core.paging_manager import PagingManager
-from .core.retrieval_assembler import RetrievalAssembler
-from .core.semantic_search import SemanticSearchManager
-from .core.tagging_pipeline import TaggingPipeline
 
 
 class VirtualContextEngine:
@@ -431,7 +440,8 @@ class VirtualContextEngine:
         if self._session_state_provider:
             _conv_id = self.config.conversation_id
             _provider = self._session_state_provider
-            _tool_tag_cb = lambda: _provider.next_tool_tag(_conv_id)
+            def _tool_tag_cb():
+                return _provider.next_tool_tag(_conv_id)
         self._tagging = TaggingPipeline(
             tag_generator=self._tag_generator,
             turn_tag_index=self._turn_tag_index,
@@ -884,37 +894,11 @@ class VirtualContextEngine:
                 segments=pg, facts=pg, fact_links=fact_links,
                 state=pg, search=pg,
             )
-        elif self.config.storage.backend == "neo4j":
-            from .storage.neo4j import Neo4jFactStore
-            neo = Neo4jFactStore(
-                uri=self.config.storage.neo4j_uri,
-                auth=(self.config.storage.neo4j_user, self.config.storage.neo4j_password),
-            )
-            # Fallback: use Postgres if configured, otherwise SQLite
-            if self.config.storage.postgres_dsn:
-                from .storage.postgres import PostgresStore
-                fallback = PostgresStore(dsn=self.config.storage.postgres_dsn)
-            else:
-                fallback = SQLiteStore(db_path=self.config.storage.sqlite_path)
-            store = CompositeStore(
-                segments=fallback, facts=neo, fact_links=neo,
-                state=fallback, search=fallback,
-            )
-        elif self.config.storage.backend == "falkordb":
-            from .storage.falkordb import FalkorDBFactStore
-            fdb = FalkorDBFactStore(
-                host=self.config.storage.falkordb_host,
-                port=self.config.storage.falkordb_port,
-                password=self.config.storage.falkordb_password,
-            )
-            if self.config.storage.postgres_dsn:
-                from .storage.postgres import PostgresStore
-                fallback = PostgresStore(dsn=self.config.storage.postgres_dsn)
-            else:
-                fallback = SQLiteStore(db_path=self.config.storage.sqlite_path)
-            store = CompositeStore(
-                segments=fallback, facts=fdb, fact_links=fdb,
-                state=fallback, search=fallback,
+        elif self.config.storage.backend in {"neo4j", "falkordb"}:
+            raise ValueError(
+                f"storage.backend={self.config.storage.backend} cannot provide "
+                "conversation-scoped atomic fact and canonical lifecycle writes; "
+                "use sqlite or postgres (both support facts.graph_links)."
             )
         elif self.config.storage.backend == "filesystem":
             raise ValueError(
@@ -926,6 +910,10 @@ class VirtualContextEngine:
         else:
             raise ValueError(f"Unsupported storage backend: {self.config.storage.backend}")
 
+        store.capabilities.require(
+            "conversation_scope", "canonical_sources", "lifecycle_fencing",
+            "atomic_fact_mutation", "audience_proofs", "streaming_embeddings",
+        )
         return store
 
     def _validate_actor_card_store(self, store) -> None:
@@ -1336,6 +1324,8 @@ class VirtualContextEngine:
         # canonical rows cannot be loaded, letting the caller keep the cached
         # value it already has.
         try:
+            if capabilities_of(self._store).canonical_sources:
+                return self._store.get_compaction_watermark(conversation_id)
             rows = list(self._store.get_all_canonical_turns(conversation_id))
         except Exception:
             logger.warning(
@@ -1442,7 +1432,11 @@ class VirtualContextEngine:
             for turn_number, pair_rows in paired_rows
             if not pair_rows or not all(getattr(row, "tagged_at", None) for row in pair_rows)
         ]
-        compacted_prefix_messages, last_compacted_turn = self._canonical_prefix_watermark(paired_rows)
+        derived = (self._derive_compacted_prefix_messages_from_rows(conversation_id)
+                   if capabilities_of(self._store).canonical_sources else None)
+        compacted_prefix_messages, last_compacted_turn = (
+            derived if derived is not None else self._canonical_prefix_watermark(paired_rows)
+        )
         self._engine_state.compacted_prefix_messages = compacted_prefix_messages
         # flushed_prefix_messages is session-scoped; preserve whatever was
         # restored from checkpoint/session state but clamp it to the derived
@@ -1705,7 +1699,7 @@ class VirtualContextEngine:
 
     # ---- SessionStateProvider integration ----
 
-    def hydrate_from_session_state(self, state) -> None:
+    def hydrate_from_session_state(self, state: SessionState) -> None:
         """Inject checkpoint state from SessionStateProvider before processing.
 
         IMPORTANT: After replacing _turn_tag_index and _engine_state, this method
@@ -1713,8 +1707,6 @@ class VirtualContextEngine:
         search operate on the new objects. Follows the same pattern as
         ProxyState._rebind_engine_references().
         """
-        from .proxy.session_state import SessionState  # noqa: F811
-
         # Engine state markers (including tool_tag_counter for fallback continuity)
         self._engine_state.tool_tag_counter = state.tool_tag_counter
         self._engine_state.compacted_prefix_messages = state.compacted_prefix_messages
@@ -1880,6 +1872,12 @@ class VirtualContextEngine:
         # and turn_tag_entries can also be reconstructed from
         # canonical_turns. Apply the same loaded-is-sentinel +
         # derived-is-positive recovery shape.
+        # A healthy checkpoint needs the scalar watermark refresh above,
+        # not a second full-history body read to rediscover non-sentinels.
+        if (self._engine_state.last_completed_turn > 0
+                and self._engine_state.last_indexed_turn > 0
+                and self._turn_tag_index.entries):
+            return
         try:
             _rows = list(self._store.get_all_canonical_turns(
                 self.config.conversation_id,
@@ -4762,11 +4760,11 @@ class VirtualContextEngine:
     # Paging API: expand / collapse / working set
     # ------------------------------------------------------------------
 
-    def expand_topic(self, tag: str, depth: str = "full") -> dict:
-        return self._paging.expand_topic(tag, depth)
+    def expand_topic(self, tag: str, depth: str = "full", *, speaker_context=None) -> dict:
+        return self._paging.expand_topic(tag, depth, speaker_context=speaker_context)
 
-    def collapse_topic(self, tag: str, depth: str = "summary") -> dict:
-        return self._paging.collapse_topic(tag, depth)
+    def collapse_topic(self, tag: str, depth: str = "summary", *, speaker_context=None) -> dict:
+        return self._paging.collapse_topic(tag, depth, speaker_context=speaker_context)
 
     def recall_all(self) -> dict:
         return self._retrieval.recall_all()

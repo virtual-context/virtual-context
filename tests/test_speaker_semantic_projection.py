@@ -13,6 +13,7 @@ the admin reindex owns the repair.
 from __future__ import annotations
 
 import logging
+from dataclasses import asdict
 
 from virtual_context.config import VirtualContextConfig
 from virtual_context.core.semantic_search import SemanticSearchManager
@@ -84,11 +85,15 @@ class _SpeakerStore:
         self.hydration_contexts: list[object] = []
         self.hydration_batches: list[list[tuple[str, str]]] = []
 
-    def get_all_canonical_turn_chunk_embeddings(
-        self, conversation_id=None, *, speaker_context=_NOT_PASSED,
+    def get_canonical_turn_chunk_embedding_page(
+        self, *, conversation_id=None, speaker_context=None, limit=200, after=None,
     ):
-        self.enumeration_contexts.append(speaker_context)
-        return list(self._chunks)
+        if after is not None:
+            return []
+        self.enumeration_contexts.append(_NOT_PASSED if speaker_context is None else speaker_context)
+        return [dict(asdict(chunk), cursor=(index,),
+                     physical_row=self._rows.get((chunk.conversation_id, chunk.canonical_turn_id)))
+                for index, chunk in enumerate(self._chunks)]
 
     def get_canonical_turn_rows_by_id(self, keys, *, speaker_context):
         self.hydration_contexts.append(speaker_context)
@@ -284,8 +289,9 @@ class TestNoneContextLegacyBranch:
         results = _semantic(store).semantic_canonical_turn_search(
             "MATCH", max_results=5, conversation_id="c",
         )
-        # Legacy unscoped hydration is the logical seam, exactly as shipped.
-        assert store.logical_calls == 1
+        # Unscoped legacy display uses the page's exact physical row too;
+        # physical ordinals are not logical group IDs.
+        assert store.logical_calls == 0
         assert results[0].text == "User: toes MATCH"
         # The physical batch lookup is never called, and the legacy
         # enumeration call carries no speaker kwarg at all.
@@ -352,6 +358,7 @@ class _WriteStore:
 
     def store_canonical_turn_chunk_embeddings(
         self, conversation_id, turn_number, side, chunks, canonical_turn_id=None,
+        *, embedding_model="",
     ):
         self.writes.append(
             (side, canonical_turn_id, [c.side for c in chunks],

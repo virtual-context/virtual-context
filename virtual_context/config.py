@@ -373,6 +373,9 @@ def _build_config(raw: dict[str, Any], *, validate: bool = True) -> VirtualConte
         anchorless_lookback=retrieval_raw.get("anchorless_lookback", _ret_defaults.anchorless_lookback),
         inbound_tagger_type=retrieval_raw.get("inbound_tagger_type", _ret_defaults.inbound_tagger_type),
         embedding_model=retrieval_raw.get("embedding_model", _ret_defaults.embedding_model),
+        vector_search_enabled=retrieval_raw.get(
+            "vector_search_enabled", _ret_defaults.vector_search_enabled,
+        ),
         embedding_threshold=retrieval_raw.get("embedding_threshold", _ret_defaults.embedding_threshold),
         fact_dense_retrieval=retrieval_raw.get("fact_dense_retrieval", _ret_defaults.fact_dense_retrieval),
         fact_dense_top_n=retrieval_raw.get("fact_dense_top_n", _ret_defaults.fact_dense_top_n),
@@ -703,12 +706,20 @@ def validate_config(config: VirtualContextConfig) -> list[str]:
     # hydration. FilesystemStore remains available as a direct archival/test
     # utility, but it does not host canonical turns and therefore cannot be an
     # engine backend without silently quarantining SUMMARY/SEGMENTS/FULL.
-    _valid_backends = ("sqlite", "postgres", "neo4j", "falkordb")
+    _valid_backends = ("sqlite", "postgres")
     if config.storage.backend not in _valid_backends:
         errors.append(
             f"storage.backend must be one of {_valid_backends}, "
             f"got '{config.storage.backend}'"
         )
+
+    if type(config.retriever.vector_search_enabled) is not bool:
+        errors.append("retrieval.vector_search_enabled must be a boolean")
+    elif config.retriever.vector_search_enabled:
+        if config.storage.backend != "postgres":
+            errors.append("retrieval.vector_search_enabled requires storage.backend=postgres")
+        if config.retriever.embedding_model != "all-MiniLM-L6-v2":
+            errors.append("retrieval.vector_search_enabled requires all-MiniLM-L6-v2")
 
     # Paging autonomous_models
     if not isinstance(config.paging.autonomous_models, list):

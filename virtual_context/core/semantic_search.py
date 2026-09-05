@@ -7,6 +7,9 @@ and cosine-similarity search.
 from __future__ import annotations
 
 import logging
+import math
+from collections.abc import Iterator
+from dataclasses import dataclass
 from typing import Callable
 
 from ..types import (
@@ -28,6 +31,31 @@ from .store import ContextStore
 logger = logging.getLogger(__name__)
 
 _EMBED_NOT_LOADED = object()  # sentinel for lazy embed function loading
+_NATIVE_VECTOR_PAGE_SIZE = 200
+
+
+@dataclass(frozen=True)
+class _ScoredTurnChunk:
+    """Native-search metadata consumed by the existing source renderer.
+
+    No embedding field: vectors stay inside the database on this path.
+    """
+
+    conversation_id: str
+    canonical_turn_id: str
+    turn_number: int
+    side: str
+    text: str
+
+    @classmethod
+    def from_row(cls, row: dict, conversation_id: str | None) -> _ScoredTurnChunk:
+        return cls(
+            conversation_id=row.get("conversation_id") or conversation_id or "",
+            canonical_turn_id=row.get("canonical_turn_id") or "",
+            turn_number=int(row.get("turn_number", -1)),
+            side=row.get("side") or "",
+            text=row.get("text") or "",
+        )
 
 
 def chunk_segment_text(full_text: str, max_words: int = 250, min_words: int = 20) -> list[str]:
@@ -163,6 +191,230 @@ class SemanticSearchManager:
                 self._embed_fn = fn
         return self._embed_fn
 
+    def _native_vector_enabled(self) -> bool:
+        return bool(getattr(self._config.retriever, "vector_search_enabled", False))
+
+    def _native_embedding_pages(
+        self,
+        query: str,
+        method_name: str,
+        *,
+        conversation_id: str | None,
+        speaker_context: SpeakerRetrievalContext | None = None,
+    ) -> Iterator[list[dict]]:
+        """Stream exact DB-ranked pages without an embedding materialization fallback.
+
+        Enabling native search is an operational contract. A missing migration
+        or query failure must remain visible instead of silently restoring the
+        unbounded Python scan the operator explicitly opted out of.
+        """
+        ready = getattr(self._store, "vector_search_ready", None)
+        search = getattr(self._store, method_name, None)
+        migration_hint = (
+            "Native vector search is unavailable. Run `virtual-context admin migrate-semantic-vectors` "
+            "for this PostgreSQL store and verify its configured embedding model, "
+            "or explicitly disable retrieval.vector_search_enabled."
+        )
+        try:
+            supported = callable(ready) and ready(self._config.retriever.embedding_model) is True
+        except Exception as exc:
+            logger.error("VECTOR_SEARCH_CAPABILITY_FAILED method=%s", method_name, exc_info=True)
+            raise RuntimeError(migration_hint) from exc
+        if not supported or not callable(search):
+            logger.error("VECTOR_SEARCH_UNAVAILABLE method=%s", method_name)
+            raise RuntimeError(migration_hint)
+
+        embed_fn = self.get_embed_fn()
+        if embed_fn is None:
+            return
+        try:
+            query_vec = embed_fn([query])[0]
+        except Exception:
+            logger.debug("Failed to embed query for native semantic search", exc_info=True)
+            return
+        if not query_vec or not any(value != 0.0 for value in query_vec):
+            return
+        if not all(math.isfinite(value) for value in query_vec):
+            raise ValueError("Native vector search requires a finite query embedding")
+
+        after = None
+        while True:
+            kwargs = {
+                "conversation_id": conversation_id,
+                "limit": _NATIVE_VECTOR_PAGE_SIZE,
+                "after": after,
+                "min_similarity": 0.25,
+            }
+            if speaker_context is not None:
+                kwargs["speaker_context"] = speaker_context
+            try:
+                page = search(query_vec, **kwargs)
+            except Exception as exc:
+                logger.error("VECTOR_SEARCH_QUERY_FAILED method=%s", method_name, exc_info=True)
+                raise RuntimeError(migration_hint) from exc
+            if not page:
+                return
+            next_cursor = page[-1].get("cursor")
+            if next_cursor is None or (after is not None and next_cursor <= after):
+                raise RuntimeError("Native vector search returned a non-advancing page cursor")
+            yield page
+            after = next_cursor
+
+    def _native_segment_search(
+        self, query: str, max_results: int, conversation_id: str | None,
+    ) -> list[QuoteResult]:
+        results: list[QuoteResult] = []
+        seen_refs: set[str] = set()
+        for page in self._native_embedding_pages(
+            query, "search_segment_chunks_by_embedding", conversation_id=conversation_id,
+        ):
+            for candidate in page:
+                ref = candidate["segment_ref"]
+                similarity = float(candidate["similarity"])
+                if ref in seen_refs or not similarity >= 0.25:
+                    continue
+                segment = self._store.get_segment(ref, conversation_id=conversation_id)
+                if segment is None:
+                    continue
+                seen_refs.add(ref)
+                results.append(QuoteResult(
+                    text=candidate["text"], tag=segment.primary_tag,
+                    segment_ref=ref, tags=segment.tags, match_type="semantic",
+                    similarity=round(similarity, 3), session_date=segment.metadata.session_date,
+                ))
+                if len(results) >= max_results:
+                    return results
+        return results
+
+    def _native_speaker_turn_search(
+        self, query: str, *, max_results: int, conversation_id: str | None,
+        channel: str, speaker_context: SpeakerRetrievalContext,
+    ) -> list[QuoteResult]:
+        results: list[QuoteResult] = []
+        seen: set[tuple[str, str, str]] = set()
+        wanted_channel = (channel or "").strip()
+        skipped_no_row = 0
+        for page in self._native_embedding_pages(
+            query, "search_speaker_turn_chunks_by_embedding",
+            conversation_id=conversation_id, speaker_context=speaker_context,
+        ):
+            chunks = [
+                (float(candidate["similarity"]), _ScoredTurnChunk.from_row(candidate, conversation_id))
+                for candidate in page
+                if float(candidate["similarity"]) >= 0.25
+            ]
+            keys = list(dict.fromkeys(
+                (chunk.conversation_id, chunk.canonical_turn_id)
+                for _similarity, chunk in chunks
+                if chunk.conversation_id and chunk.canonical_turn_id
+                and (chunk.conversation_id, chunk.canonical_turn_id, chunk.side) not in seen
+            ))
+            physical = self._store.get_canonical_turn_rows_by_id(
+                keys, speaker_context=speaker_context,
+            ) if keys else {}
+            for similarity, chunk in chunks:
+                identity = (chunk.conversation_id, chunk.canonical_turn_id, chunk.side)
+                if identity in seen:
+                    continue
+                row = physical.get((chunk.conversation_id, chunk.canonical_turn_id))
+                if row is None:
+                    skipped_no_row += 1
+                    continue
+                if wanted_channel and not channel_matches(
+                    wanted_channel, row.origin_channel_id, row.origin_channel_label,
+                ):
+                    continue
+                seen.add(identity)
+                results.append(self._format_physical_semantic_result(
+                    similarity, chunk, row, channel=wanted_channel,
+                ))
+                if len(results) >= max_results:
+                    break
+            if len(results) >= max_results:
+                break
+        if skipped_no_row:
+            logger.warning(
+                "SEMANTIC_CHUNK_NO_PHYSICAL_ROW conv=%s skipped=%d",
+                (conversation_id or "")[:12], skipped_no_row,
+            )
+        return results
+
+    def _native_canonical_turn_search(
+        self, query: str, *, max_results: int, conversation_id: str | None,
+        channel: str,
+    ) -> list[QuoteResult]:
+        results: list[QuoteResult] = []
+        seen: set[tuple] = set()
+        wanted_channel = (channel or "").strip()
+        for page in self._native_embedding_pages(
+            query, "search_canonical_turn_chunks_by_embedding", conversation_id=conversation_id,
+        ):
+            candidates = [
+                (candidate, _ScoredTurnChunk.from_row(candidate, conversation_id))
+                for candidate in page
+                if candidate.get("side") != "subject"
+                and float(candidate["similarity"]) >= 0.25
+            ]
+            for candidate, chunk in candidates:
+                identity = (chunk.conversation_id, chunk.canonical_turn_id, chunk.side)
+                # Ordinal turn numbers are not logical group IDs. Both
+                # unscoped and channel-local legacy results use the exact
+                # physical source projected by the bounded storage page.
+                row = candidate.get("physical_row")
+                if row is None or (
+                    row.conversation_id != chunk.conversation_id
+                    or row.canonical_turn_id != chunk.canonical_turn_id
+                    or (wanted_channel and not channel_matches(
+                        wanted_channel, row.origin_channel_id, row.origin_channel_label,
+                    ))
+                ):
+                    continue
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                results.append(self._format_legacy_semantic_result(
+                    float(candidate["similarity"]), chunk, row, channel=wanted_channel,
+                ))
+                if len(results) >= max_results:
+                    return results
+        return results
+
+    @staticmethod
+    def _format_legacy_semantic_result(
+        similarity: float,
+        chunk: CanonicalTurnChunkEmbedding | _ScoredTurnChunk,
+        row: CanonicalTurnRow,
+        *,
+        channel: str = "",
+    ) -> QuoteResult:
+        """Keep legacy turn labels while rendering the exact physical source."""
+        if chunk.side == "user":
+            content = row.user_content
+            excerpt, matched_side = f"User: {content or ''}".strip(), "user"
+        elif chunk.side == "assistant":
+            content = row.assistant_content
+            excerpt, matched_side = f"Assistant: {content or ''}".strip(), "assistant"
+        else:
+            excerpt = f"User: {row.user_content or ''}\n\nAssistant: {row.assistant_content or ''}".strip()
+            matched_side = "unknown"
+        turn_number = chunk.turn_number
+        if channel:
+            excerpt = channel_excerpt_prefix(
+                row.origin_channel_id, row.origin_channel_label,
+            ) + excerpt
+            if row.turn_number >= 0:
+                turn_number = row.turn_number
+        return QuoteResult(
+            text=excerpt,
+            tag=row.primary_tag,
+            segment_ref=(f"canonical_turn_{chunk.canonical_turn_id}"
+                         if chunk.canonical_turn_id else f"turn_{turn_number}"),
+            tags=list(row.tags or []),
+            match_type="full_text_semantic", similarity=round(similarity, 3),
+            session_date=row.session_date,
+            source_scope="turn", turn_number=turn_number, matched_side=matched_side,
+        )
+
     def embed_and_store_chunks(
         self,
         stored: StoredSegment,
@@ -234,6 +486,7 @@ class SemanticSearchManager:
             owner_worker_id=owner_worker_id,
             lifecycle_epoch=lifecycle_epoch,
             conversation_id=conversation_id,
+            embedding_model=self._config.retriever.embedding_model,
         )
         logger.debug("Stored %d chunk embeddings for segment %s", len(chunk_embeddings), stored.ref)
 
@@ -303,6 +556,7 @@ class SemanticSearchManager:
                     side,
                     chunk_embeddings,
                     canonical_turn_id=canonical_turn_id,
+                    embedding_model=self._config.retriever.embedding_model,
                 )
             except Exception:
                 complete = False
@@ -314,35 +568,6 @@ class SemanticSearchManager:
                     exc_info=True,
                 )
         return complete
-
-    def _physical_rows_by_canonical_id(
-        self,
-        conversation_ids: set[str],
-    ) -> dict[tuple[str, str], CanonicalTurnRow]:
-        """Physical canonical rows keyed by conversation and canonical id.
-
-        ``get_canonical_turn_rows`` returns LOGICAL rows keyed by
-        ``turn_group_number`` after merging siblings, so an assistant chunk at
-        physical ordinal 1 can hydrate logical group 1 — a different row. A
-        channel filter must never inherit a sibling's provenance or excerpt,
-        so scoped search resolves the physical row the chunk actually points
-        at. The raw loader already returns physical rows.
-        """
-        physical: dict[tuple[str, str], CanonicalTurnRow] = {}
-        for conversation_id in conversation_ids:
-            try:
-                rows = self._store.get_all_canonical_turns(conversation_id)
-            except Exception:
-                logger.debug(
-                    "Failed to load physical canonical rows for channel scoping",
-                )
-                continue
-            for row in rows:
-                if not row.canonical_turn_id:
-                    continue
-                row_conversation_id = row.conversation_id or conversation_id
-                physical[(row_conversation_id, row.canonical_turn_id)] = row
-        return physical
 
     def semantic_canonical_turn_search(
         self,
@@ -356,8 +581,8 @@ class SemanticSearchManager:
         """Run semantic retrieval over canonical turn chunks.
 
         ``speaker_context`` is the branch selector. ``None`` runs the shipped
-        legacy branch unchanged: legacy chunk enumeration, logical hydration
-        on the unscoped path, and no ``subject``-side consumption. A non-None
+        legacy branch: turn-label presentation from exact physical source
+        hydration, and no ``subject``-side consumption. A non-None
         context selects the physical role-local branch, which threads the
         same immutable context through candidate enumeration and one batched
         physical-row hydration.
@@ -367,6 +592,8 @@ class SemanticSearchManager:
         ``max_results`` in-channel results are accepted, so a global top hit
         outside the channel cannot starve a lower-ranked in-channel one.
         """
+        if max_results <= 0:
+            return []
         if speaker_context is not None:
             return self._speaker_semantic_turn_search(
                 query,
@@ -375,183 +602,16 @@ class SemanticSearchManager:
                 channel=channel,
                 speaker_context=speaker_context,
             )
+        if self._native_vector_enabled():
+            return self._native_canonical_turn_search(
+                query, max_results=max_results, conversation_id=conversation_id,
+                channel=channel,
+            )
 
-        embed_fn = self.get_embed_fn()
-        if embed_fn is None:
-            return []
-
-        all_chunks = self._store.get_all_canonical_turn_chunk_embeddings(
-            conversation_id=conversation_id,
+        return self._stream_canonical_turn_search(
+            query, max_results=max_results, conversation_id=conversation_id,
+            channel=channel, speaker_context=None,
         )
-        # The reply-target lane is shadow data for the physical branch only:
-        # the legacy branch must not let it surface or shift ranking.
-        all_chunks = [chunk for chunk in all_chunks if chunk.side != "subject"]
-        if not all_chunks:
-            return []
-
-        try:
-            query_vec = embed_fn([query])[0]
-        except Exception:
-            logger.debug("Failed to embed query for semantic turn search")
-            return []
-
-        scored: list[tuple[float, CanonicalTurnChunkEmbedding]] = []
-        for chunk in all_chunks:
-            sim = cosine_similarity(query_vec, chunk.embedding)
-            if sim >= 0.25:
-                scored.append((sim, chunk))
-        scored.sort(key=lambda item: item[0], reverse=True)
-
-        wanted_channel = (channel or "").strip()
-        if wanted_channel:
-            return self._scoped_semantic_turn_results(
-                scored,
-                max_results=max_results,
-                conversation_id=conversation_id,
-                channel=wanted_channel,
-            )
-
-        grouped: list[QuoteResult] = []
-        seen_turn_sides: set[tuple[int, str]] = set()
-        for sim, chunk in scored:
-            identity = (chunk.turn_number, chunk.side)
-            if identity in seen_turn_sides:
-                continue
-            seen_turn_sides.add(identity)
-            row = self._store.get_canonical_turn_rows(
-                conversation_id or "",
-                [chunk.turn_number],
-            ).get(chunk.turn_number)
-            if row is None:
-                if chunk.side == "user":
-                    excerpt = f"User: {chunk.text or ''}".strip()
-                    matched_side = "user"
-                elif chunk.side == "assistant":
-                    excerpt = f"Assistant: {chunk.text or ''}".strip()
-                    matched_side = "assistant"
-                else:
-                    excerpt = (chunk.text or "").strip()
-                    matched_side = "unknown"
-            else:
-                user_text = row.user_content or ""
-                assistant_text = row.assistant_content or ""
-                if chunk.side == "user":
-                    excerpt = f"User: {user_text or ''}".strip()
-                    matched_side = "user"
-                elif chunk.side == "assistant":
-                    excerpt = f"Assistant: {assistant_text or ''}".strip()
-                    matched_side = "assistant"
-                else:
-                    excerpt = (
-                        f"User: {user_text or ''}\n\n"
-                        f"Assistant: {assistant_text or ''}"
-                    ).strip()
-                    matched_side = "unknown"
-            grouped.append(
-                QuoteResult(
-                    text=excerpt,
-                    tag=(row.primary_tag if row is not None else "_general"),
-                    segment_ref=f"turn_{chunk.turn_number}",
-                    tags=list(row.tags if row is not None else []),
-                    match_type="full_text_semantic",
-                    similarity=round(sim, 3),
-                    session_date=(row.session_date if row is not None else ""),
-                    source_scope="turn",
-                    turn_number=chunk.turn_number,
-                    matched_side=matched_side,
-                )
-            )
-            if len(grouped) >= max_results:
-                break
-        return grouped
-
-    def _scoped_semantic_turn_results(
-        self,
-        scored: list[tuple[float, CanonicalTurnChunkEmbedding]],
-        *,
-        max_results: int,
-        conversation_id: str | None,
-        channel: str,
-    ) -> list[QuoteResult]:
-        """Accept only in-channel chunks, formatting from the physical row.
-
-        A chunk whose physical row is missing or out of channel is rejected
-        and the scan continues, so the channel filter bites before the
-        acceptance limit rather than after it.
-        """
-        if conversation_id is None:
-            physical_conversation_ids = {
-                chunk.conversation_id
-                for _similarity, chunk in scored
-                if chunk.conversation_id
-            }
-        else:
-            physical_conversation_ids = {conversation_id}
-        physical = self._physical_rows_by_canonical_id(physical_conversation_ids)
-        results: list[QuoteResult] = []
-        seen_turn_sides: set[tuple[str, str, str]] = set()
-        for sim, chunk in scored:
-            if len(results) >= max_results:
-                break
-            chunk_conversation_id = chunk.conversation_id or conversation_id or ""
-            identity = (
-                chunk_conversation_id,
-                chunk.canonical_turn_id or "",
-                chunk.side,
-            )
-            if identity in seen_turn_sides:
-                continue
-            row = physical.get((
-                chunk_conversation_id,
-                chunk.canonical_turn_id or "",
-            ))
-            if row is None:
-                # No physical row to prove provenance: never guess.
-                continue
-            if not channel_matches(
-                channel, row.origin_channel_id, row.origin_channel_label,
-            ):
-                continue
-            seen_turn_sides.add(identity)
-
-            # Format from THIS physical row so a sibling half cannot supply
-            # its excerpt. Semantic user chunks keep the ``User:`` label; the
-            # shipped semantic path never gained sender formatting.
-            user_text = row.user_content or ""
-            assistant_text = row.assistant_content or ""
-            if chunk.side == "user":
-                excerpt = f"User: {user_text}".strip()
-                matched_side = "user"
-            elif chunk.side == "assistant":
-                excerpt = f"Assistant: {assistant_text}".strip()
-                matched_side = "assistant"
-            else:
-                excerpt = (
-                    f"User: {user_text}\n\nAssistant: {assistant_text}"
-                ).strip()
-                matched_side = "unknown"
-            excerpt = channel_excerpt_prefix(
-                row.origin_channel_id, row.origin_channel_label,
-            ) + excerpt
-            turn_number = (
-                row.turn_number if row.turn_number >= 0 else chunk.turn_number
-            )
-
-            results.append(
-                QuoteResult(
-                    text=excerpt,
-                    tag=row.primary_tag,
-                    segment_ref=f"turn_{turn_number}",
-                    tags=list(row.tags or []),
-                    match_type="full_text_semantic",
-                    similarity=round(sim, 3),
-                    session_date=row.session_date,
-                    source_scope="turn",
-                    turn_number=turn_number,
-                    matched_side=matched_side,
-                )
-            )
-        return results
 
     def _speaker_semantic_turn_search(
         self,
@@ -573,95 +633,129 @@ class SemanticSearchManager:
         is missing or inadmissible proves nothing: it is skipped and
         reported, and the admin reindex owns the repair.
         """
+        if max_results <= 0:
+            return []
+        if self._native_vector_enabled():
+            return self._native_speaker_turn_search(
+                query, max_results=max_results, conversation_id=conversation_id,
+                channel=channel, speaker_context=speaker_context,
+            )
+        return self._stream_canonical_turn_search(
+            query, max_results=max_results, conversation_id=conversation_id,
+            channel=channel, speaker_context=speaker_context,
+        )
+
+    def _embedding_pages(
+        self, method_name: str, *, conversation_id: str | None,
+        speaker_context: SpeakerRetrievalContext | None = None,
+    ) -> Iterator[list[dict]]:
+        """Hydrate one keyset page, never an archive-sized embedding list."""
+        getter = getattr(self._store, method_name)
+        after = None
+        while True:
+            kwargs = dict(conversation_id=conversation_id, limit=200, after=after)
+            if method_name == "get_canonical_turn_chunk_embedding_page":
+                kwargs["speaker_context"] = speaker_context
+            page = getter(**kwargs)
+            if not page:
+                return
+            cursor = page[-1].get("cursor")
+            if cursor is None or (after is not None and tuple(cursor) <= after):
+                raise RuntimeError("Embedding page cursor did not advance")
+            if len(page) > 200:
+                raise RuntimeError("Embedding store exceeded its page limit")
+            after = tuple(cursor)
+            yield page
+
+    def _query_vector(self, query: str) -> list[float] | None:
         embed_fn = self.get_embed_fn()
         if embed_fn is None:
-            return []
-
-        all_chunks = self._store.get_all_canonical_turn_chunk_embeddings(
-            conversation_id=conversation_id,
-            speaker_context=speaker_context,
-        )
-        if not all_chunks:
-            return []
-
+            return None
         try:
-            query_vec = embed_fn([query])[0]
+            vector = embed_fn([query])[0]
         except Exception:
-            logger.debug("Failed to embed query for semantic turn search")
+            logger.debug("Failed to embed semantic query")
+            return None
+        if not vector or not any(vector) or not all(math.isfinite(x) for x in vector):
+            return None
+        return vector
+
+    @staticmethod
+    def _keep_best_result(top: dict, identity: tuple, score: float, sequence: int,
+                          result: QuoteResult, limit: int) -> None:
+        """Bound result state by requested distinct hits, retaining stable ties."""
+        rank = (score, -sequence)
+        existing = top.get(identity)
+        if existing is not None and existing[0] >= rank:
+            return
+        if existing is None and len(top) >= limit:
+            weakest = min(top, key=lambda key: top[key][0])
+            if top[weakest][0] >= rank:
+                return
+            del top[weakest]
+        top[identity] = (rank, result)
+
+    def _stream_canonical_turn_search(
+        self, query: str, *, max_results: int, conversation_id: str | None,
+        channel: str, speaker_context: SpeakerRetrievalContext | None,
+    ) -> list[QuoteResult]:
+        vector = self._query_vector(query)
+        if vector is None:
             return []
-
-        scored: list[tuple[float, CanonicalTurnChunkEmbedding]] = []
-        for chunk in all_chunks:
-            sim = cosine_similarity(query_vec, chunk.embedding)
-            if sim >= 0.25:
-                scored.append((sim, chunk))
-        scored.sort(key=lambda item: item[0], reverse=True)
-        if not scored:
-            return []
-
-        # Best chunk per physical identity and side; the ranking order above
-        # makes the first occurrence the winning one.
-        deduped: list[tuple[float, CanonicalTurnChunkEmbedding]] = []
-        seen: set[tuple[str, str, str]] = set()
-        for sim, chunk in scored:
-            chunk_conversation_id = chunk.conversation_id or conversation_id or ""
-            identity = (
-                chunk_conversation_id,
-                chunk.canonical_turn_id or "",
-                chunk.side,
-            )
-            if identity in seen:
-                continue
-            seen.add(identity)
-            deduped.append((sim, chunk))
-
-        keys: list[tuple[str, str]] = []
-        keys_seen: set[tuple[str, str]] = set()
-        for _sim, chunk in deduped:
-            chunk_conversation_id = chunk.conversation_id or conversation_id or ""
-            key = (chunk_conversation_id, chunk.canonical_turn_id or "")
-            if not key[0] or not key[1] or key in keys_seen:
-                continue
-            keys_seen.add(key)
-            keys.append(key)
-        physical: dict[tuple[str, str], CanonicalTurnRow] = {}
-        if keys:
-            physical = self._store.get_canonical_turn_rows_by_id(
-                keys, speaker_context=speaker_context,
-            )
-
+        top: dict = {}
+        sequence = 0
+        missing = 0
         wanted_channel = (channel or "").strip()
-        results: list[QuoteResult] = []
-        skipped_no_row = 0
-        for sim, chunk in deduped:
-            if len(results) >= max_results:
-                break
-            chunk_conversation_id = chunk.conversation_id or conversation_id or ""
-            row = physical.get((chunk_conversation_id, chunk.canonical_turn_id or ""))
-            if row is None:
-                skipped_no_row += 1
-                continue
-            if wanted_channel and not channel_matches(
-                wanted_channel, row.origin_channel_id, row.origin_channel_label,
-            ):
-                continue
-            results.append(
-                self._format_physical_semantic_result(
-                    sim, chunk, row, channel=wanted_channel,
-                )
-            )
-        if skipped_no_row:
-            logger.warning(
-                "SEMANTIC_CHUNK_NO_PHYSICAL_ROW conv=%s skipped=%d",
-                (conversation_id or "")[:12],
-                skipped_no_row,
-            )
-        return results
+        for page in self._embedding_pages(
+            "get_canonical_turn_chunk_embedding_page",
+            conversation_id=conversation_id, speaker_context=speaker_context,
+        ):
+            candidates = []
+            for candidate in page:
+                sequence += 1
+                if speaker_context is None and candidate.get("side") == "subject":
+                    continue
+                score = cosine_similarity(vector, candidate["embedding"])
+                if math.isfinite(score) and score >= 0.25:
+                    candidates.append((sequence, score, candidate,
+                                       _ScoredTurnChunk.from_row(candidate, conversation_id)))
+            if speaker_context is not None:
+                keys = list(dict.fromkeys(
+                    (chunk.conversation_id, chunk.canonical_turn_id)
+                    for _, _, _, chunk in candidates
+                ))
+                physical = self._store.get_canonical_turn_rows_by_id(
+                    keys, speaker_context=speaker_context,
+                ) if keys else {}
+            for order, score, candidate, chunk in candidates:
+                physical_key = (chunk.conversation_id, chunk.canonical_turn_id)
+                if speaker_context is not None:
+                    row = physical.get(physical_key)
+                else:
+                    row = candidate.get("physical_row")
+                    if row is not None and (row.conversation_id, row.canonical_turn_id) != physical_key:
+                        row = None
+                if row is None:
+                    missing += 1
+                    continue
+                if wanted_channel and not channel_matches(
+                    wanted_channel, row.origin_channel_id, row.origin_channel_label,
+                ):
+                    continue
+                identity = (*physical_key, chunk.side)
+                formatter = (self._format_physical_semantic_result
+                             if speaker_context is not None else self._format_legacy_semantic_result)
+                result = formatter(score, chunk, row, channel=wanted_channel)
+                self._keep_best_result(top, identity, score, order, result, max_results)
+        if missing:
+            logger.warning("SEMANTIC_CHUNK_NO_PHYSICAL_ROW conv=%s skipped=%d",
+                           (conversation_id or "")[:12], missing)
+        return [value[1] for value in sorted(top.values(), key=lambda item: item[0], reverse=True)]
 
     def _format_physical_semantic_result(
         self,
         sim: float,
-        chunk: CanonicalTurnChunkEmbedding,
+        chunk: CanonicalTurnChunkEmbedding | _ScoredTurnChunk,
         row: CanonicalTurnRow,
         *,
         channel: str,
@@ -740,72 +834,66 @@ class SemanticSearchManager:
         self, query: str, max_results: int = 5,
         conversation_id: str | None = None,
     ) -> list[QuoteResult]:
-        embed_fn = self.get_embed_fn()
-        if embed_fn is None:
+        if max_results <= 0:
             return []
-
-        all_chunks = self._store.get_all_chunk_embeddings()
-        if not all_chunks:
-            # Lazy backfill: embed all existing segments if chunks table is empty
-            all_chunks = self.backfill_chunk_embeddings(conversation_id=conversation_id)
-            if not all_chunks:
-                return []
-
-        try:
-            query_vec = embed_fn([query])[0]
-        except Exception:
-            logger.debug("Failed to embed query for semantic search")
+        if self._native_vector_enabled():
+            return self._native_segment_search(query, max_results, conversation_id)
+        vector = self._query_vector(query)
+        if vector is None:
             return []
-
-        # Score all chunks
-        scored: list[tuple[float, ChunkEmbedding]] = []
-        for chunk in all_chunks:
-            sim = cosine_similarity(query_vec, chunk.embedding)
-            if sim >= 0.25:
-                scored.append((sim, chunk))
-
-        scored.sort(key=lambda x: x[0], reverse=True)
-
-        # Deduplicate by segment_ref (best chunk per segment)
-        seen_refs: set[str] = set()
-        results: list[QuoteResult] = []
-        for sim, chunk in scored:
-            if chunk.segment_ref in seen_refs:
-                continue
-            seen_refs.add(chunk.segment_ref)
-            # Look up segment tags and metadata; conversation_id filter
-            # naturally excludes chunks from other conversations (get_segment
-            # returns None for non-matching conversation).
-            seg = self._store.get_segment(chunk.segment_ref, conversation_id=conversation_id)
-            if seg is None:
-                continue
-            results.append(QuoteResult(
-                text=chunk.text,
-                tag=seg.primary_tag,
-                segment_ref=chunk.segment_ref,
-                tags=seg.tags,
-                match_type="semantic",
-                similarity=round(sim, 3),
-                session_date=seg.metadata.session_date if seg else "",
-            ))
-            if len(results) >= max_results:
+        top: dict = {}
+        sequence = 0
+        found_chunks = False
+        for attempt in range(2):
+            for page in self._embedding_pages(
+                "get_segment_chunk_embedding_page", conversation_id=conversation_id,
+            ):
+                found_chunks = True
+                for candidate in page:
+                    sequence += 1
+                    score = cosine_similarity(vector, candidate["embedding"])
+                    if not math.isfinite(score) or score < 0.25:
+                        continue
+                    ref = candidate["segment_ref"]
+                    if all(key in candidate for key in ("conversation_id", "primary_tag", "tags", "session_date")):
+                        # Built-in page stores join/check the live scoped
+                        # source before returning these small metadata fields.
+                        if conversation_id is not None and candidate["conversation_id"] != conversation_id:
+                            continue
+                        tag, tags, session_date = candidate["primary_tag"], candidate["tags"], candidate["session_date"]
+                    else:
+                        # Compatibility for third-party stores implementing
+                        # the original page contract without display metadata.
+                        segment = self._store.get_segment(ref, conversation_id=conversation_id)
+                        if segment is None:
+                            continue
+                        tag, tags, session_date = segment.primary_tag, segment.tags, segment.metadata.session_date
+                    result = QuoteResult(
+                        text=candidate["text"], tag=tag,
+                        segment_ref=ref, tags=tags, match_type="semantic",
+                        similarity=round(score, 3), session_date=session_date,
+                    )
+                    self._keep_best_result(top, (ref,), score, sequence, result, max_results)
+            if found_chunks or attempt:
                 break
-
-        return results
+            # Lazy repair writes bounded segment batches; it does not return
+            # an archive-sized collection to the search caller.
+            self.backfill_chunk_embeddings(conversation_id=conversation_id)
+        return [value[1] for value in sorted(top.values(), key=lambda item: item[0], reverse=True)]
 
     def backfill_chunk_embeddings(
         self, conversation_id: str | None = None,
-    ) -> list[ChunkEmbedding]:
+    ) -> int:
         embed_fn = self.get_embed_fn()
         if embed_fn is None:
-            return []
+            return 0
 
         all_tags = self._store.get_all_tags(conversation_id=conversation_id)
         if not all_tags:
-            return []
+            return 0
 
         logger.info("Backfilling chunk embeddings for semantic search...")
-        all_chunks: list[ChunkEmbedding] = []
+        chunk_count = 0
         for tag_stat in all_tags:
             segments = self._store.get_segments_by_tags(
                 [tag_stat.tag], limit=100, conversation_id=conversation_id,
@@ -827,11 +915,14 @@ class SemanticSearchManager:
                     )
                     for i, (text, vec) in enumerate(zip(chunks, vectors))
                 ]
-                self._store.store_chunk_embeddings(seg.ref, chunk_embeddings)
-                all_chunks.extend(chunk_embeddings)
+                self._store.store_chunk_embeddings(
+                    seg.ref, chunk_embeddings,
+                    embedding_model=self._config.retriever.embedding_model,
+                )
+                chunk_count += len(chunk_embeddings)
 
-        logger.info("Backfilled %d chunk embeddings", len(all_chunks))
-        return all_chunks
+        logger.info("Backfilled %d chunk embeddings", chunk_count)
+        return chunk_count
 
     def context_is_relevant(
         self, current_text: str, context_pairs: list[str],

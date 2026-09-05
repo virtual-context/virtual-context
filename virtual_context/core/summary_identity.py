@@ -18,6 +18,7 @@ FULL depth reconstructs the exact role-separated canonical transcript.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from .rendered_memory import MemorySourceVersion
 import json
 import re
 import unicodedata
@@ -282,11 +283,17 @@ class _RequestLocalSummaryRendering(str):
         *,
         speaker_context: "SpeakerRetrievalContext",
         _token: object,
+        source_versions: tuple = (),
+        presented_source_ids: tuple[str, ...] = (),
+        evidence_kind: str = "",
     ) -> "_RequestLocalSummaryRendering":
         if _token is not _REQUEST_LOCAL_RENDERING_TOKEN:
             raise TypeError("request-local summary renderings are internal")
         rendered = str.__new__(cls, value)
         rendered._speaker_context = speaker_context
+        rendered._source_versions = source_versions
+        rendered._presented_source_ids = presented_source_ids
+        rendered._evidence_kind = evidence_kind
         return rendered
 
     def __copy__(self) -> "_RequestLocalSummaryRendering":
@@ -301,6 +308,9 @@ def _mark_request_local_summary_rendering(
     text: str,
     *,
     speaker_context: "SpeakerRetrievalContext",
+    source_versions: tuple = (),
+    presented_source_ids: tuple[str, ...] = (),
+    evidence_kind: str = "",
 ) -> str:
     """Carry successful exact-row proof to the next model boundary."""
     if (
@@ -312,6 +322,9 @@ def _mark_request_local_summary_rendering(
         text,
         speaker_context=speaker_context,
         _token=_REQUEST_LOCAL_RENDERING_TOKEN,
+        source_versions=source_versions,
+        presented_source_ids=presented_source_ids,
+        evidence_kind=evidence_kind,
     )
 
 
@@ -628,6 +641,7 @@ class HistoricalSourceLane:
     session_date: str = ""
     requester_match: str = "unproved"
     actor_id: str = field(default="", repr=False)
+    canonical_turn_id: str = field(default="", repr=False)
 
 
 @dataclass(frozen=True)
@@ -719,6 +733,7 @@ class ValidatedClaimSource:
     session_date: str = ""
     requester_match: str = "unproved"
     actor_id: str = field(default="", repr=False)
+    canonical_turn_id: str = field(default="", repr=False)
 
 
 @dataclass(frozen=True)
@@ -1250,6 +1265,7 @@ def resolve_summary_source_projections(
                         session_date=session_date,
                         requester_match=requester_match(actor),
                         actor_id=actor,
+                        canonical_turn_id=str(getattr(row, "canonical_turn_id", "")),
                     ))
 
             # Historical assistant output is itself model-generated and can
@@ -1494,6 +1510,7 @@ def _validate_structured_claim(
                 actor_id, speaker_context,
             ),
             actor_id=actor_id,
+            canonical_turn_id=str(getattr(row, "canonical_turn_id", "")),
         )
 
         # A selected substring can invert its containing sentence (for
@@ -2028,6 +2045,7 @@ def _full_source_projection(
                         actor_id, speaker_context,
                     ),
                     actor_id=actor_id,
+                    canonical_turn_id=str(getattr(row, "canonical_turn_id", "")),
                 ))
         if assistant_content.strip():
             lanes.append(HistoricalSourceLane(
@@ -2036,6 +2054,7 @@ def _full_source_projection(
                 content=assistant_content,
                 session_date=session_date,
                 requester_match="not_applicable",
+                canonical_turn_id=str(getattr(row, "canonical_turn_id", "")),
             ))
     return SummarySourceProjection(
         lanes=tuple(lanes) if mapping_complete else (),
@@ -2286,18 +2305,28 @@ def render_summary_items_for_model(
     for (item, depth), legacy_projection in zip(
         materialized, legacy_projections, strict=True,
     ):
+        dependency_ids = tuple(dict.fromkeys(
+            _canonical_ids_for(item) + _structured_source_ids_for(item)
+        ))
+        versions = tuple(
+            MemorySourceVersion.from_row(rows[(conversation_id, source_id)])
+            for source_id in dependency_ids if (conversation_id, source_id) in rows
+        )
+
+        def mark(text: str, source_ids: Iterable[str], kind: str) -> str:
+            return _mark_request_local_summary_rendering(
+                text, speaker_context=speaker_context, source_versions=versions,
+                presented_source_ids=tuple(dict.fromkeys(source_ids)), evidence_kind=kind,
+            )
+
         if depth == "full":
-            rendered.append(_mark_request_local_summary_rendering(
-                render_full_source_projection_for_model(
-                    _full_source_projection(
-                        item,
-                        rows=rows,
-                        conversation_id=conversation_id,
-                        speaker_context=speaker_context,
-                        colliding_labels=colliding_labels,
-                    ),
-                ),
-                speaker_context=speaker_context,
+            projection = _full_source_projection(
+                item, rows=rows, conversation_id=conversation_id,
+                speaker_context=speaker_context, colliding_labels=colliding_labels,
+            )
+            rendered.append(mark(
+                render_full_source_projection_for_model(projection),
+                (lane.canonical_turn_id for lane in projection.lanes), "canonical_transcript",
             ))
             continue
         if depth not in {"summary", "segments"}:
@@ -2312,9 +2341,14 @@ def render_summary_items_for_model(
         )
         candidate = render_structured_claims_for_model(claims, depth=depth)
         if candidate != SUMMARY_ATTRIBUTION_QUARANTINE:
-            rendered.append(_mark_request_local_summary_rendering(
+            selected_claims = claims[:(
+                _STRUCTURED_SUMMARY_MAX_CLAIMS if depth == "summary"
+                else _STRUCTURED_SEGMENTS_MAX_CLAIMS
+            )]
+            rendered.append(mark(
                 candidate,
-                speaker_context=speaker_context,
+                (source.canonical_turn_id for claim in selected_claims for source in claim.sources),
+                "structured_summary_v1",
             ))
             continue
 
@@ -2346,13 +2380,15 @@ def render_summary_items_for_model(
                 speaker_context=speaker_context,
             )
         )
-        rendered.append(_mark_request_local_summary_rendering(
+        rendered.append(mark(
             (
                 render_source_projection_for_model(legacy_projection)
                 if not is_v1 or v1_segment_snapshot_proved
                 else SUMMARY_ATTRIBUTION_QUARANTINE
             ),
-            speaker_context=speaker_context,
+            (lane.canonical_turn_id for lane in legacy_projection.lanes)
+            if legacy_projection is not None else (),
+            "canonical_human_evidence",
         ))
     return rendered
 

@@ -7,10 +7,12 @@ Extracted from engine.py. No engine-level state mutation.
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from typing import Callable
 
 from ..types import DepthLevel, WorkingSetEntry
 from .store import ContextStore
+from .rendered_memory import RenderedMemory
 
 logger = logging.getLogger(__name__)
 
@@ -35,8 +37,18 @@ class PagingManager:
         self._paging_enabled = paging_enabled
         self._conversation_id = conversation_id
         self.working_set: dict[str, WorkingSetEntry] = {}
+        self.rendered_memories: dict[str, RenderedMemory] = {}
+        self._memory_renderer = None
 
-    def expand_topic(self, tag: str, depth: str = "full") -> dict:
+    def set_memory_renderer(self, renderer: Callable) -> None:
+        self._memory_renderer = renderer
+
+    def render_memory(self, tag: str, depth: DepthLevel, *, speaker_context=None) -> RenderedMemory | None:
+        if depth == DepthLevel.NONE or self._memory_renderer is None:
+            return None
+        return self._memory_renderer(tag, depth, speaker_context=speaker_context)
+
+    def expand_topic(self, tag: str, depth: str = "full", *, speaker_context=None) -> dict:
         """Expand a topic to deeper detail in the working set.
 
         Returns dict with tag, depth, tokens_added, tokens_evicted, evicted_tags.
@@ -50,19 +62,27 @@ class PagingManager:
             return {"error": f"invalid depth: {depth}"}
 
         if target_depth == DepthLevel.NONE:
-            return self.collapse_topic(tag, "none")
+            return self.collapse_topic(tag, "none", speaker_context=speaker_context)
 
         # Calculate token cost at target depth
-        tokens_at_depth = self.calculate_depth_tokens(tag, target_depth)
+        memory = self.render_memory(tag, target_depth, speaker_context=speaker_context)
+        tokens_at_depth = memory.measured_cost if memory is not None else 0
         if tokens_at_depth == 0:
             return {"error": f"no stored content for tag: {tag}"}
 
-        # Current working set total
-        current_total = sum(ws.tokens for ws in self.working_set.values())
-        current_tag_tokens = self.working_set[tag].tokens if tag in self.working_set else 0
+        # Revalidate existing pages too: persisted token estimates and stale
+        # source proofs cannot determine today's admission decision.
+        planned: dict[str, WorkingSetEntry] = {}
+        planned_memories: dict[str, RenderedMemory] = {}
+        for name, entry in self.working_set.items():
+            current_memory = self.render_memory(name, entry.depth, speaker_context=speaker_context)
+            if current_memory is not None:
+                planned_memories[name] = current_memory
+                planned[name] = replace(entry, tokens=current_memory.measured_cost)
+        current_total = sum(entry.tokens for entry in planned.values())
+        current_tag_tokens = planned[tag].tokens if tag in planned else 0
         delta = tokens_at_depth - current_tag_tokens
         budget = self._tag_context_max_tokens
-
         # Auto-evict if over budget
         evicted_tags: list[str] = []
         tokens_evicted = 0
@@ -70,6 +90,9 @@ class PagingManager:
             evicted_tags, tokens_evicted = self._auto_evict(
                 needed=current_total + delta - budget,
                 exclude_tag=tag,
+                working_set=planned,
+                rendered_memories=planned_memories,
+                speaker_context=speaker_context,
             )
 
         # Check if expansion fits after eviction
@@ -79,17 +102,20 @@ class PagingManager:
                 "error": "insufficient budget",
                 "tag": tag,
                 "needed": tokens_at_depth,
-                "available": budget - (current_total - current_tag_tokens - tokens_evicted),
+                "available": max(0, budget - (current_total - current_tag_tokens)),
             }
 
         # Update working set
-        turn = max((ws.last_accessed_turn for ws in self.working_set.values()), default=0)
-        self.working_set[tag] = WorkingSetEntry(
+        turn = max((ws.last_accessed_turn for ws in planned.values()), default=0)
+        planned[tag] = WorkingSetEntry(
             tag=tag,
             depth=target_depth,
             tokens=tokens_at_depth,
             last_accessed_turn=turn + 1,
         )
+        self.working_set = planned
+        planned_memories[tag] = memory
+        self.rendered_memories = planned_memories
 
         return {
             "tag": tag,
@@ -99,7 +125,7 @@ class PagingManager:
             "evicted_tags": evicted_tags,
         }
 
-    def collapse_topic(self, tag: str, depth: str = "summary") -> dict:
+    def collapse_topic(self, tag: str, depth: str = "summary", *, speaker_context=None) -> dict:
         if not self._paging_enabled:
             return {"error": "paging not enabled"}
 
@@ -115,11 +141,17 @@ class PagingManager:
 
         if target_depth == DepthLevel.NONE:
             del self.working_set[tag]
+            self.rendered_memories.pop(tag, None)
             return {"tag": tag, "depth": "none", "tokens_freed": old_tokens}
 
-        new_tokens = self.calculate_depth_tokens(tag, target_depth)
-        self.working_set[tag].depth = target_depth
-        self.working_set[tag].tokens = new_tokens
+        memory = self.render_memory(tag, target_depth, speaker_context=speaker_context)
+        new_tokens = memory.measured_cost if memory is not None else 0
+        if memory is None:
+            return {"error": f"no admitted content for tag: {tag}"}
+        if new_tokens > old_tokens:
+            return self.expand_topic(tag, depth, speaker_context=speaker_context)
+        self.working_set[tag] = replace(self.working_set[tag], depth=target_depth, tokens=new_tokens)
+        self.rendered_memories[tag] = memory
 
         return {
             "tag": tag,
@@ -146,32 +178,25 @@ class PagingManager:
             "entries": entries,
         }
 
-    def calculate_depth_tokens(self, tag: str, depth: DepthLevel) -> int:
-        if depth == DepthLevel.NONE:
-            return 0
+    def calculate_depth_tokens(self, tag: str, depth: DepthLevel, *, speaker_context=None) -> int:
+        memory = self.render_memory(tag, depth, speaker_context=speaker_context)
+        return memory.measured_cost if memory is not None else 0
 
-        if depth == DepthLevel.SUMMARY:
-            ts = self._store.get_tag_summary(tag, conversation_id=self._conversation_id)
-            return ts.summary_tokens if ts else 0
-
-        # SEGMENTS or FULL: need stored segments
-        segments = self._store.get_segments_by_tags(tags=[tag], min_overlap=1, limit=500, conversation_id=self._conversation_id or None)
-        if not segments:
-            return 0
-
-        if depth == DepthLevel.SEGMENTS:
-            return sum(s.summary_tokens for s in segments)
-        else:  # FULL
-            return sum(s.full_tokens or self._token_counter(s.full_text) for s in segments)
-
-    def _auto_evict(self, needed: int, exclude_tag: str = "") -> tuple[list[str], int]:
+    def _auto_evict(
+        self, needed: int, exclude_tag: str = "", *,
+        working_set: dict[str, WorkingSetEntry] | None = None,
+        rendered_memories: dict[str, RenderedMemory] | None = None,
+        speaker_context=None,
+    ) -> tuple[list[str], int]:
         """Auto-evict coldest topics to free `needed` tokens.
 
         Returns (evicted_tag_names, total_tokens_freed).
         """
+        target = self.working_set if working_set is None else working_set
+        memories = self.rendered_memories if rendered_memories is None else rendered_memories
         # Sort by last_accessed_turn ascending (coldest first)
         candidates = sorted(
-            ((tag, ws) for tag, ws in self.working_set.items() if tag != exclude_tag),
+            ((tag, ws) for tag, ws in target.items() if tag != exclude_tag),
             key=lambda x: x[1].last_accessed_turn,
         )
 
@@ -181,16 +206,19 @@ class PagingManager:
             if freed >= needed:
                 break
             # Collapse to SUMMARY (not NONE) to keep minimum context
-            summary_tokens = self.calculate_depth_tokens(tag, DepthLevel.SUMMARY)
+            memory = self.render_memory(tag, DepthLevel.SUMMARY, speaker_context=speaker_context)
+            summary_tokens = memory.measured_cost if memory is not None else 0
             delta = ws.tokens - summary_tokens
-            if delta <= 0:
+            if delta <= 0 or memory is None:
                 # Already at summary or less, remove entirely
                 freed += ws.tokens
-                del self.working_set[tag]
+                del target[tag]
+                memories.pop(tag, None)
             else:
                 freed += delta
-                self.working_set[tag].depth = DepthLevel.SUMMARY
-                self.working_set[tag].tokens = summary_tokens
+                target[tag].depth = DepthLevel.SUMMARY
+                target[tag].tokens = summary_tokens
+                memories[tag] = memory
             evicted.append(tag)
 
         return evicted, freed

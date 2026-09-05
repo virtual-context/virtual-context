@@ -295,8 +295,15 @@ class _FakeSemanticStore:
         self._chunks = chunks
         self.logical_calls = 0
 
-    def get_all_canonical_turn_chunk_embeddings(self, *, conversation_id=None):
-        return self._chunks
+    def get_canonical_turn_chunk_embedding_page(self, *, conversation_id=None,
+                                               speaker_context=None, limit=200, after=None):
+        from dataclasses import asdict
+        physical = {(row.conversation_id, row.canonical_turn_id): row for row in self._rows}
+        return [dict(asdict(chunk), cursor=(index,),
+                     physical_row=physical.get((chunk.conversation_id, chunk.canonical_turn_id)))
+                for index, chunk in enumerate(self._chunks)
+                if (after is None or (index,) > tuple(after))
+                and (conversation_id is None or chunk.conversation_id == conversation_id)][:limit]
 
     def get_all_canonical_turns(self, conversation_id):
         return [
@@ -487,8 +494,8 @@ class TestSemanticChannelFilter:
         )
         assert results[0].text == "[#vasttest] User: toes MATCH"
 
-    def test_unscoped_semantic_search_uses_the_logical_seam_unchanged(self):
-        """I3: the unscoped path is untouched."""
+    def test_unscoped_semantic_search_uses_its_exact_physical_source(self):
+        """Unscoped presentation keeps turn labels without logical hydration."""
         rows = [_physical("ct-1", 0, user_content="toes MATCH",
                           origin_channel_label="#vasttest")]
         chunks = [_chunk("ct-1", 0, "user", "toes MATCH")]
@@ -496,9 +503,8 @@ class TestSemanticChannelFilter:
         results = _semantic(store).semantic_canonical_turn_search(
             "MATCH", max_results=5, conversation_id="c",
         )
-        assert store.logical_calls == 1
-        # No physical row via the logical seam -> chunk-text fallback, and no
-        # channel prefix, exactly as before.
+        assert store.logical_calls == 0
+        # The exact physical row is used, with no channel prefix.
         assert results[0].text == "User: toes MATCH"
 
 

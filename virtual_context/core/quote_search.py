@@ -1357,8 +1357,8 @@ def _candidate_identity(
 ) -> tuple[object, ...]:
     """Dedupe identity for one quote candidate.
 
-    The legacy branch collapses turn results by logical turn number,
-    byte-identically to the shipped behavior. The speaker-aware branch
+    The legacy branch collapses a canonical physical source across sides,
+    using its stable reference before a mutable presentation ordinal. The speaker-aware branch
     dedupes by the physical row and role-local lane instead: duplicate
     message ids, physical sibling rows, logical merging, and VCMERGE may
     not collapse or transfer authorship across physical rows or roles.
@@ -1379,6 +1379,10 @@ def _candidate_identity(
                 canonical_turn_id,
                 getattr(provenance, "source_role", "") or "",
             )
+    if (not speaker_aware and qr.source_scope == "turn"
+            and qr.segment_ref.startswith("canonical_turn_")
+            and qr.segment_ref != "canonical_turn_"):
+        return ("canonical", qr.segment_ref)
     if qr.turn_number is not None:
         return ("turn", qr.turn_number)
     if qr.segment_ref:

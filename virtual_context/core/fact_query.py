@@ -37,7 +37,8 @@ class FactQueryEngine:
         {"made", "created", "built", "crafted", "prepared", "cooked", "baked"},
         {"joined", "enrolled in", "signed up for", "registered for"},
         {"quit", "left", "resigned from", "stopped", "dropped out of"},
-        {"moved to", "relocated to", "settled in", "is moving to"},
+        {"moved to", "relocated to", "settled in"},
+        {"led", "leads", "lead", "is leading"},
     ]
 
     # Pre-built lookup: lowercase verb → set of cluster synonyms
@@ -90,7 +91,10 @@ class FactQueryEngine:
                 if "limit" not in kwargs:
                     kwargs["limit"] = max(50, len(expanded) * 10)
 
-        results = self._store.query_facts(**kwargs)
+        results = [
+            fact for fact in self._store.query_facts(**kwargs)
+            if self._matches_constraints(fact, kwargs)
+        ]
 
         # Semantic search: find additional facts via embedding on 'what'
         # field.  Runs before auto-relax so it can provide precise results
@@ -103,20 +107,17 @@ class FactQueryEngine:
             intent_context=intent_context,
         )
         if sem_all:
-            sem_filtered = sem_all
-            if status_filter:
-                sem_filtered = [f for f in sem_filtered if f.status == status_filter]
-            # Respect the reader's explicit object_contains filter —
-            # semantic search ignores structured constraints when building
-            # candidates, so post-filter here to avoid returning facts
-            # that contradict the reader's request (BUG-032).
-            if orig_object:
-                obj_lower = orig_object.lower()
-                sem_filtered = [
-                    f for f in sem_filtered
-                    if obj_lower in (f.object or "").lower()
-                    or obj_lower in (f.what or "").lower()
-                ]
+            # Semantic similarity discovers candidates; it cannot waive a
+            # structured constraint. Keep a status-independent admitted set
+            # for the explicit all-statuses metadata below.
+            sem_all = [
+                fact for fact in sem_all
+                if self._matches_constraints(fact, kwargs, include_status=False)
+            ]
+            sem_filtered = [
+                fact for fact in sem_all
+                if self._matches_constraints(fact, kwargs)
+            ]
             if sem_filtered:
                 results = results + sem_filtered
                 semantic_note = f"semantic search added {len(sem_filtered)} fact(s)"
@@ -131,13 +132,14 @@ class FactQueryEngine:
             for f in results:
                 seed_tags.update(f.tags)
             if seed_tags:
-                siblings = self._store.query_facts(
-                    subject=orig_subject,
-                    tags=list(seed_tags),
-                    limit=50,
-                    conversation_id=self._config.conversation_id,
-                )
-                new_siblings = [s for s in siblings if s.id not in result_ids]
+                sibling_query = dict(kwargs)
+                sibling_query["tags"] = list(seed_tags)
+                siblings = self._store.query_facts(**sibling_query)
+                new_siblings = [
+                    sibling for sibling in siblings
+                    if sibling.id not in result_ids
+                    and self._matches_constraints(sibling, kwargs)
+                ]
                 if new_siblings:
                     results = results + new_siblings
                     sibling_note = f"tag siblings added {len(new_siblings)} fact(s)"
@@ -157,6 +159,13 @@ class FactQueryEngine:
         if results and intent_context.strip():
             results = self._rerank_facts(results, intent_context)
 
+        # Every candidate source shares the caller's result limit and identity
+        # set. Applying LIMIT only to the first store query silently widens it
+        # again when semantic and sibling candidates are appended.
+        results = list({fact.id: fact for fact in results}.values())
+        result_limit = max(0, int(kwargs.get("limit", 50)))
+        results = results[:result_limit]
+
         # Auto-follow fact links when graph_links is enabled
         linked_facts = []
         _graph_links = getattr(self._config, "facts", None)
@@ -165,7 +174,11 @@ class FactQueryEngine:
             linked_facts = self._store.get_linked_facts(fact_ids, depth=1)
             # Deduplicate — don't include linked facts already in primary results
             primary_ids = set(fact_ids)
-            linked_facts = [lf for lf in linked_facts if lf.fact.id not in primary_ids]
+            linked_facts = [
+                linked for linked in linked_facts
+                if linked.fact.id not in primary_ids
+                and self._matches_constraints(linked.fact, kwargs)
+            ][:result_limit]
 
         if return_meta:
             meta: dict = {
@@ -179,17 +192,18 @@ class FactQueryEngine:
             # When status was filtered, also query without status so the
             # caller can show total_all_statuses — prevents the reader from
             # splitting into per-status calls and never seeing the grand total.
-            if status_filter:
-                # Strip both status and object_contains — we want the
-                # grand total for this verb+subject across all statuses.
-                # object_contains uses strict LIKE at the store layer and
-                # would return 0 when the auto-relax only happened above.
+            if status_filter is not None:
+                # Only the status dimension is relaxed. Object, type,
+                # subject, tags and conversation still define this query.
                 unfiltered = {
                     k: v
                     for k, v in kwargs.items()
-                    if k not in ("status", "object_contains")
+                    if k != "status"
                 }
-                all_facts = self._store.query_facts(**unfiltered)
+                all_facts = [
+                    fact for fact in self._store.query_facts(**unfiltered)
+                    if self._matches_constraints(fact, unfiltered)
+                ]
                 # Merge semantic matches into the unfiltered total
                 if sem_all:
                     all_ids = {f.id for f in all_facts}
@@ -206,13 +220,40 @@ class FactQueryEngine:
             return meta
         return results
 
-    def _expand_verb(self, verb: str) -> list[str] | None:
-        """Find semantically similar verbs in the facts DB via embedding similarity.
+    @staticmethod
+    def _matches_constraints(fact, filters: dict, *, include_status: bool = True) -> bool:
+        """Apply the same hard boundary to every discovery path.
 
-        Also includes manual synonym clusters for contextual synonyms that
-        embeddings miss.  Returns list of matching verbs (including original)
-        if expansions found, None if no expansions.
+        The verb list already contains any explicitly reported synonym
+        expansion. Descriptive ``what`` text is never a substitute for the
+        caller's structured object field.
         """
+        if fact.superseded_by is not None:
+            return False
+        fields = ["conversation_id", "subject", "fact_type"]
+        if include_status:
+            fields.append("status")
+        for field in fields:
+            value = filters.get(field)
+            if value is not None and getattr(fact, field, None) != value:
+                return False
+        object_contains = filters.get("object_contains")
+        if object_contains is not None and (
+            object_contains.casefold() not in (fact.object or "").casefold()
+        ):
+            return False
+        verbs = filters.get("verbs")
+        if verbs is None and filters.get("verb") is not None:
+            verbs = [filters["verb"]]
+        if verbs is not None and not any(
+            verb.casefold() in (fact.verb or "").casefold() for verb in verbs
+        ):
+            return False
+        tags = filters.get("tags")
+        return not tags or bool(set(tags) & set(fact.tags or []))
+
+    def _expand_verb(self, verb: str) -> list[str] | None:
+        """Expand only declared synonyms, preserving the structured verb boundary."""
         all_verbs = self._store.get_unique_fact_verbs(conversation_id=self._config.conversation_id)
         if not all_verbs:
             return None
@@ -224,23 +265,14 @@ class FactQueryEngine:
         # Manual cluster expansion
         cluster = self._VERB_CLUSTER_MAP.get(verb.lower())
         if cluster:
-            for synonym in cluster:
+            for synonym in sorted(cluster):
                 if synonym not in seen and synonym in all_verbs_lower:
                     matches.append(all_verbs_lower[synonym])
                     seen.add(synonym)
 
-        # Embedding-based expansion
-        embed_fn = self._get_embed_fn()
-        if embed_fn is not None:
-            from .math_utils import rank_by_embedding
-
-            scored = rank_by_embedding(
-                verb, all_verbs, all_verbs, embed_fn, threshold=0.53,
-            )
-            for _, v in scored:
-                if v.lower() not in seen:
-                    matches.append(v)
-                    seen.add(v.lower())
+        # A similarity score is candidate discovery, not permission to alter
+        # an explicit verb constraint ("visited" and "planned" are often close).
+        # Only the listed synonyms may expand this structured filter.
 
         return matches if len(matches) > 1 else None
 

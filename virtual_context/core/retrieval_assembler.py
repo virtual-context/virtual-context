@@ -26,12 +26,10 @@ if TYPE_CHECKING:
     from .semantic_search import SemanticSearchManager
     from ..types import (
         AssembledContext,
-        DepthLevel,
         EngineState,
         Message,
         RetrievalResult,
         VirtualContextConfig,
-        WorkingSetEntry,
     )
 
 logger = logging.getLogger(__name__)
@@ -109,6 +107,14 @@ class RetrievalAssembler:
         self._presented_segment_refs: set[str] = set()
         self._context_hint_cache_key: str = ""
         self._context_hint_cache_value: str = ""
+        if callable(getattr(self._paging, "set_memory_renderer", None)):
+            self._paging.set_memory_renderer(self._render_paging_memory)
+
+    def _render_paging_memory(self, tag, depth, *, speaker_context=None):
+        snapshot = self._last_reassembly_snapshot
+        if snapshot is None or not self._reassembly_context_matches(snapshot[4], speaker_context):
+            return None
+        return self._assembler.render_topic_memory(tag, depth, speaker_context=speaker_context)
 
     def _load_tag_stats_snapshot(self) -> list:
         if self._session_state_provider is not None and self.config.conversation_id:
@@ -565,7 +571,6 @@ class RetrievalAssembler:
         }
 
         assembled.matched_tags = message_tags
-        assembled.context_hint = context_hint
         assembled.retrieval_metadata = dict(retrieval_result.retrieval_metadata or {})
         assembled.retrieval_metadata["inbound_total_ms"] = inbound_total_ms
         assembled.retrieval_metadata["inbound_breakdown"] = inbound_breakdown
@@ -667,6 +672,7 @@ class RetrievalAssembler:
             model_name,
             request_roles,
             effective_speaker_context,
+            max_context_tokens,
         )
         self._presented_segment_refs = set(assembled.presented_segment_refs)
 
@@ -718,7 +724,10 @@ class RetrievalAssembler:
         snapshot = self._last_reassembly_snapshot
         if snapshot is None:
             return ""
-        rr, history, model_name, request_roles, cached_speaker_context = snapshot
+        (
+            rr, history, model_name, request_roles, cached_speaker_context,
+            max_context_tokens,
+        ) = snapshot
         if not self._reassembly_context_matches(
             cached_speaker_context, speaker_context,
         ):
@@ -742,6 +751,7 @@ class RetrievalAssembler:
             context_hint=context_hint,
             working_set=ws_param,
             full_segments=full_segments_param,
+            max_context_tokens=max_context_tokens,
             request_roles=request_roles,
             speaker_context=speaker_context,
         )
@@ -1178,17 +1188,13 @@ class RetrievalAssembler:
             return None, None
         ws_param = self._paging.working_set
         full_segments_param: dict = {}
-        seen_refs: set[str] = set()
         for tag, entry in self._paging.working_set.items():
-            if entry.depth in (DepthLevel.SEGMENTS, DepthLevel.FULL):
+            if entry.depth != DepthLevel.NONE:
                 segs = self._store.get_segments_by_tags(
                     tags=[tag], min_overlap=1, limit=500,
                     conversation_id=self.config.conversation_id,
                 )
-                deduped = [s for s in segs if s.ref not in seen_refs]
-                seen_refs.update(s.ref for s in deduped)
-                if deduped:
-                    full_segments_param[tag] = deduped
+                full_segments_param[tag] = segs
         return ws_param, full_segments_param
 
     # ------------------------------------------------------------------
