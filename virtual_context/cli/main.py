@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import platform
 import subprocess
 import sys
@@ -120,7 +121,7 @@ def cmd_compact(args):
         ]
     except (json.JSONDecodeError, KeyError):
         # Treat as alternating user/assistant
-        lines = [l.strip() for l in text.strip().split("\n") if l.strip()]
+        lines = [line.strip() for line in text.strip().split("\n") if line.strip()]
         messages = []
         for i, line in enumerate(lines):
             role = "user" if i % 2 == 0 else "assistant"
@@ -422,7 +423,7 @@ def cmd_proxy(args):
         import uvicorn
         from ..proxy import create_app
     except ImportError:
-        print("Run: pip install virtual-context[bridge]", file=sys.stderr)
+        print('Run: pip install "virtual-context[proxy]"', file=sys.stderr)
         sys.exit(1)
 
     # Suppress CancelledError tracebacks on shutdown. Uvicorn force-cancels
@@ -977,25 +978,25 @@ def _run_instance_wizard() -> tuple[list[dict], list[str]]:
     # Client-specific instructions
     inst = instances[0]
     if "Claude Code" in client:
-        print(f"\n  Claude Code setup:")
-        print(f"    Set this in your environment or .claude/settings.json:")
+        print("\n  Claude Code setup:")
+        print("    Set this in your environment or .claude/settings.json:")
         print(f"    ANTHROPIC_BASE_URL=http://{inst['host']}:{inst['port']}/")
-        print(f"\n    Disable auto-compact in Claude Code:")
-        print(f"    Type /config -> Auto-compact -> disable")
-        print(f"\n    Set VC_DASHBOARD_TOKEN in your environment:")
+        print("\n    Disable auto-compact in Claude Code:")
+        print("    Type /config -> Auto-compact -> disable")
+        print("\n    Set VC_DASHBOARD_TOKEN in your environment:")
         print(f"    export VC_DASHBOARD_TOKEN=\"{dashboard_token}\"")
     elif "Desktop" in client:
-        print(f"\n  Claude Desktop setup:")
-        print(f"    In Claude Desktop settings, set the API base URL to:")
+        print("\n  Claude Desktop setup:")
+        print("    In Claude Desktop settings, set the API base URL to:")
         print(f"    http://{inst['host']}:{inst['port']}/")
     else:
-        print(f"\n  REST API / Custom client:")
+        print("\n  REST API / Custom client:")
         print(f"    Proxy endpoint: http://{inst['host']}:{inst['port']}/")
-        print(f"    Forward your LLM API requests through this proxy.")
+        print("    Forward your LLM API requests through this proxy.")
 
-    print(f"\n  Logs:")
-    print(f"    Proxy: tail -f ~/Library/Logs/virtual-context.log")
-    print(f"    Errors: tail -f ~/Library/Logs/virtual-context.err.log")
+    print("\n  Logs:")
+    print("    Proxy: tail -f ~/Library/Logs/virtual-context.log")
+    print("    Errors: tail -f ~/Library/Logs/virtual-context.err.log")
     print()
 
     return instances, config_paths
@@ -2529,6 +2530,64 @@ def cmd_admin_backfill_session_state_markers(args):
         sys.exit(1)
 
 
+
+def cmd_repair_search_indexes(args):
+    """Check SQLite search indexes; rebuild only with an explicit apply flag."""
+    config = load_config(args.config)
+    if config.storage.backend != "sqlite":
+        raise ValueError("repair-search-indexes requires storage.backend=sqlite")
+    db_path = Path(args.sqlite_path or config.storage.sqlite_path).expanduser()
+    if not db_path.is_file():
+        raise ValueError(f"SQLite database does not exist: {db_path}")
+    from ..storage.maintenance import repair_fts_indexes, sqlite_maintenance_connection
+
+    with sqlite_maintenance_connection(db_path, dry_run=not args.apply) as conn:
+        statuses = repair_fts_indexes(conn, args.index, dry_run=not args.apply)
+    print(json.dumps({"dry_run": not args.apply, "indexes": statuses}, sort_keys=True))
+
+
+def cmd_migrate_read_indexes(args):
+    """Build PostgreSQL bounded-read indexes concurrently after explicit apply."""
+    from ..storage.postgres import PostgresStore
+
+    config = load_config(args.config)
+    if args.postgres_dsn:
+        config.storage.backend = "postgres"
+        config.storage.postgres_dsn = args.postgres_dsn
+    if config.storage.backend != "postgres":
+        raise ValueError("migrate-read-indexes requires storage.backend=postgres")
+    store = PostgresStore(config.storage.postgres_dsn)
+    try:
+        print(json.dumps(store.migrate_bounded_read_indexes(dry_run=not args.apply), sort_keys=True))
+    finally:
+        store.close()
+
+
+def cmd_migrate_semantic_vectors(args):
+    """Prepare the optional PostgreSQL vector cache without activating reads."""
+    from ..storage.postgres import PostgresStore
+
+    config = load_config(args.config)
+    if args.postgres_dsn:
+        config.storage.backend = "postgres"
+        config.storage.postgres_dsn = args.postgres_dsn
+    if config.storage.backend != "postgres":
+        raise ValueError("migrate-semantic-vectors requires storage.backend=postgres")
+    if not 1 <= args.batch_size <= 10000:
+        raise ValueError("batch size must be between 1 and 10000")
+    if config.retriever.embedding_model != "all-MiniLM-L6-v2":
+        raise ValueError("semantic vector migration requires all-MiniLM-L6-v2")
+    store = PostgresStore(config.storage.postgres_dsn)
+    try:
+        result = store.migrate_semantic_vectors(
+            dry_run=not args.apply, batch_size=args.batch_size,
+            model=config.retriever.embedding_model,
+        )
+        print(json.dumps(result, sort_keys=True))
+    finally:
+        store.close()
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="virtual-context",
@@ -2714,6 +2773,34 @@ def main():
         help="Operational primitives (backfills, repairs)",
     )
     admin_sub = admin_parser.add_subparsers(dest="admin_command")
+
+    repair_search_parser = admin_sub.add_parser(
+        "repair-search-indexes", help="Check SQLite FTS integrity and optionally rebuild",
+    )
+    repair_search_parser.add_argument("--sqlite-path", help="Override the SQLite path")
+    repair_search_parser.add_argument(
+        "--index", action="append", help="Check only this FTS index (repeatable)",
+    )
+    repair_search_parser.add_argument(
+        "--apply", action="store_true", help="Rebuild corrupt indexes; default only checks",
+    )
+
+    migrate_read_parser = admin_sub.add_parser(
+        "migrate-read-indexes", help="Prepare PostgreSQL bounded-read indexes concurrently",
+    )
+    migrate_read_parser.add_argument("--postgres-dsn", help="Override the PostgreSQL DSN")
+    migrate_read_parser.add_argument(
+        "--apply", action="store_true", help="Create missing indexes; default only checks",
+    )
+
+    migrate_vector_parser = admin_sub.add_parser(
+        "migrate-semantic-vectors", help="Prepare PostgreSQL native semantic ranking caches",
+    )
+    migrate_vector_parser.add_argument("--postgres-dsn", help="Override the PostgreSQL DSN")
+    migrate_vector_parser.add_argument("--batch-size", type=int, default=1000)
+    migrate_vector_parser.add_argument(
+        "--apply", action="store_true", help="Install and backfill caches; default only checks",
+    )
 
     backfill_ts_parser = admin_sub.add_parser(
         "backfill-tag-summaries",
@@ -3358,7 +3445,13 @@ def main():
             print("Usage: virtual-context config validate")
             sys.exit(1)
     elif args.command == "admin":
-        if args.admin_command == "retag-canonical-turns":
+        if args.admin_command == "repair-search-indexes":
+            cmd_repair_search_indexes(args)
+        elif args.admin_command == "migrate-read-indexes":
+            cmd_migrate_read_indexes(args)
+        elif args.admin_command == "migrate-semantic-vectors":
+            cmd_migrate_semantic_vectors(args)
+        elif args.admin_command == "retag-canonical-turns":
             cmd_admin_retag_canonical_turns(args)
         elif args.admin_command == "backfill-tag-summaries":
             cmd_admin_backfill_tag_summaries(args)

@@ -28,7 +28,6 @@ tests, not against this file in isolation.
 
 from __future__ import annotations
 
-import os
 import pathlib
 import re
 
@@ -45,6 +44,9 @@ _PG_DSN = pg_dsn()
 
 #: The only sanctioned gate variables for Postgres-backed test files.
 _SANCTIONED_VARS = {"DATABASE_URL", "VC_TEST_POSTGRES_URL"}
+# These flags require prerequisites; they never supply a DSN or override its
+# resolver. Missing prerequisites fail mandatory runs instead of skipping.
+_MANDATORY_RUN_FLAGS = {"VC_REQUIRE_PGVECTOR_TESTS", "VC_REQUIRE_STORAGE_DOMAIN_TESTS"}
 
 
 @pytest.mark.skipif(not _PG_DSN, reason="VC_TEST_POSTGRES_URL / DATABASE_URL not set")
@@ -95,7 +97,7 @@ def test_pg_fleet_gates_are_uniform():
             continue
         text = path.read_text()
         vars_read = set(env_read.findall(text))
-        unknown = vars_read - _SANCTIONED_VARS
+        unknown = vars_read - _SANCTIONED_VARS - _MANDATORY_RUN_FLAGS
         if unknown:
             offenders[path.name] = unknown
         # Direct reads of the sanctioned vars honor only one spelling;

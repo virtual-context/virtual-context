@@ -21,9 +21,13 @@ class Neo4jFactStore:
     Fact links are stored as typed relationships between Fact nodes.
     Tags are stored as ``(:Tag)`` nodes connected via ``[:HAS_TAG]`` edges.
 
-    This backend does NOT implement SegmentStore, StateStore, or SearchStore —
-    those fall back to SQLite via CompositeStore.
+    This is a direct graph utility. It cannot share the SQL canonical store's
+    lifecycle and compaction transactions, so engine composition is refused.
     """
+
+    # Direct graph utility only: it cannot atomically share the SQL canonical
+    # store's lifecycle or compaction lease, and must not join an engine store.
+    supports_engine_lifecycle = False
 
     def __init__(self, uri: str, auth: tuple[str, str] = ("neo4j", "")) -> None:
         self._driver = GraphDatabase.driver(uri, auth=auth)

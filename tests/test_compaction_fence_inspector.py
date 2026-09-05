@@ -48,6 +48,7 @@ import pytest
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _PG = _REPO_ROOT / "virtual_context" / "storage" / "postgres.py"
 _SQ = _REPO_ROOT / "virtual_context" / "storage" / "sqlite.py"
+_FACT_MUTATIONS = _REPO_ROOT / "virtual_context" / "storage" / "fact_mutations.py"
 _PIPELINE = _REPO_ROOT / "virtual_context" / "core" / "compaction_pipeline.py"
 _SEMANTIC = _REPO_ROOT / "virtual_context" / "core" / "semantic_search.py"
 _SUPERSESSION = _REPO_ROOT / "virtual_context" / "ingest" / "supersession.py"
@@ -280,7 +281,9 @@ def _function_inserts_active_compaction_op(fn: ast.FunctionDef) -> bool:
 _VALIDATOR_NAME = "_validate_compaction_guard_kwargs"
 
 
-def _function_has_validator_call(fn: ast.FunctionDef) -> bool:
+def _function_has_validator_call(
+    fn: ast.FunctionDef, validator_names=frozenset({_VALIDATOR_NAME}),
+) -> bool:
     """Return True iff the validator is called BEFORE any
     DB-touching statement in the function body.
 
@@ -308,7 +311,9 @@ def _function_has_validator_call(fn: ast.FunctionDef) -> bool:
         )
         for call in calls:
             func = call.func
-            if isinstance(func, ast.Name) and func.id == _VALIDATOR_NAME:
+            if isinstance(func, ast.Name) and func.id in validator_names:
+                return True
+            if isinstance(func, ast.Attribute) and func.attr in validator_names:
                 return True
             if isinstance(func, ast.Attribute) and func.attr in db_call_attrs:
                 return False
@@ -419,8 +424,25 @@ def test_op_fence_validator_present(backend_path):
         f"use them backend-agnostically."
     )
     missing_validator: list[str] = []
+    shared = dict(_walk_functions(_parse(_FACT_MUTATIONS)))
     for qualname, fn in seen.items():
-        if not _function_has_validator_call(fn):
+        if qualname in {"set_fact_superseded", "update_fact_fields"}:
+            # These concrete methods now forward to the shared transaction
+            # service. Check both delegation and its first fact-data guard;
+            # the runtime test below proves partial tuples fail before I/O.
+            delegate = "_" + qualname
+            calls = [node for node in ast.walk(fn) if isinstance(node, ast.Call)
+                     and isinstance(node.func, ast.Attribute) and node.func.attr == delegate]
+            forwards = len(calls) == 1 and all(
+                any(keyword.arg == name and isinstance(keyword.value, ast.Name)
+                    and keyword.value.id == name for keyword in calls[0].keywords)
+                for name in ("operation_id", "owner_worker_id", "lifecycle_epoch")
+            )
+            valid = (forwards and _function_has_validator_call(fn, {delegate})
+                     and _function_has_validator_call(shared[delegate], {"_lock_fact_owners"}))
+        else:
+            valid = _function_has_validator_call(fn)
+        if not valid:
             missing_validator.append(qualname)
     assert not missing_validator, (
         f"{backend_path.name}: OP_FENCE_ALLOWLIST methods missing the "
@@ -768,3 +790,18 @@ class FakeStub:
         "Negative test failed: the synthetic call site should be "
         f"flagged but the inspector reported {offenders}."
     )
+
+
+@pytest.mark.parametrize("supplied", [(1,0,0), (0,1,0), (0,0,1), (1,1,0), (1,0,1), (0,1,1)])
+def test_shared_fact_validator_rejects_partial_guard_before_io(supplied):
+    from types import SimpleNamespace
+    from virtual_context.storage.fact_mutations import FactMutationMixin
+
+    def forbidden_io(*args, **kwargs):
+        pytest.fail("partial compaction guard reached the database")
+    values = tuple(value if present else None for value, present in zip(("op", "worker", 1), supplied))
+    with pytest.raises(ValueError, match="all-None or all-non-None"):
+        FactMutationMixin._lock_fact_owners(
+            SimpleNamespace(_placeholder="?"), SimpleNamespace(execute=forbidden_io),
+            ["fact"], *values, "test",
+        )

@@ -13,17 +13,11 @@ from collections.abc import Collection
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-logger = logging.getLogger(__name__)
-
-
-def _parse_sequence_timestamp(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    try:
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    except Exception:
-        return None
+if TYPE_CHECKING:
+    from ..core.compaction_fence import CompactionFenceMode
+    from ..types import BacklogCandidate, CompactionLeaseClaim
 
 from ..core.canonical_turns import (
     HASH_VERSION,
@@ -43,8 +37,9 @@ from ..core.progress_snapshot import (
 )
 from ..core.canonical_turns import STRIP_WHITESPACE
 from ..core.store import ContextStore
+from .relational import RelationalStoreMixin
 from ..core.exceptions import CanonicalSourceConflict, ConversationLifecycleConflict
-from ..types import AUDIENCE_ATTRIBUTION_VERSION, ChunkEmbedding, ConversationStats, DepthLevel, EngineStateSnapshot, Fact, FactLink, FactSignal, CanonicalTurnChunkEmbedding, CanonicalTurnReconcileRow, CanonicalTurnRow, LinkedFact, QuoteResult, SegmentMetadata, SourceProvenance, SpeakerRetrievalContext, StoredSegment, StoredSummary, TagStats, TagSummary, TemporalStatus, TurnTagEntry, WorkingSetEntry, channel_excerpt_prefix, strip_channel_hash
+from ..types import AUDIENCE_ATTRIBUTION_VERSION, ChunkEmbedding, ConversationStats, DepthLevel, EngineStateSnapshot, Fact, FactLink, FactSignal, CanonicalTurnChunkEmbedding, CanonicalTurnReconcileRow, CanonicalTurnRow, LinkedFact, QuoteResult, SegmentMetadata, SourceProvenance, SpeakerRetrievalContext, StoredSegment, StoredSummary, TagStats, TagSummary, TurnTagEntry, WorkingSetEntry, channel_excerpt_prefix, strip_channel_hash
 from ..types import (
     strict_segment_identity_metadata,
     strict_structured_summary,
@@ -54,7 +49,6 @@ from ..types import (
     CARD_CROSS_CONTEXT_KINDS,
     CARD_KINDS,
     CARD_SCOPES,
-    CARD_SCOPE_SAME_CONVERSATION,
     CARD_SENSITIVITIES,
     RESERVED_SPEAKER_HANDLES,
     ActorCard,
@@ -71,6 +65,17 @@ from ..types import (
 )
 from .helpers import dt_to_str as _dt_to_str, str_to_dt as _str_to_dt, extract_excerpt as _extract_excerpt
 
+
+logger = logging.getLogger(__name__)
+
+
+def _parse_sequence_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except Exception:
+        return None
 
 def _source_actor_platform(actor_id: str) -> str:
     parts = (actor_id or "").strip().split(":", 2)
@@ -1168,7 +1173,7 @@ def _bootstrap_lock(db_path):
                 os.close(handle)
 
 
-class SQLiteStore(ContextStore):
+class SQLiteStore(RelationalStoreMixin, ContextStore):
     """SQLite-based storage with tag-overlap queries and FTS5 search."""
 
     def __init__(
@@ -1196,6 +1201,7 @@ class SQLiteStore(ContextStore):
         self._post_commit_scope = threading.local()
         self.search_config = None  # set by engine after construction
         self._ensure_schema()
+        self._ensure_request_state_schema()
 
     def _enforce_or_observe_mismatch(
         self, *, operation_id: str | None, write_site: str,
@@ -1850,6 +1856,17 @@ class SQLiteStore(ContextStore):
             );
             CREATE INDEX IF NOT EXISTS idx_fact_embeddings_conv_model
                 ON fact_embeddings (conversation_id, model);
+
+            CREATE TRIGGER IF NOT EXISTS facts_embeddings_au
+            AFTER UPDATE OF subject, verb, object, what, conversation_id ON facts
+            WHEN OLD.subject IS NOT NEW.subject
+              OR OLD.verb IS NOT NEW.verb
+              OR OLD.object IS NOT NEW.object
+              OR OLD.what IS NOT NEW.what
+              OR OLD.conversation_id IS NOT NEW.conversation_id
+            BEGIN
+                DELETE FROM fact_embeddings WHERE fact_id = NEW.id;
+            END;
         """)
         # M0 operation_id indexes are declared inside
         # _ensure_compaction_scoping_columns, after the ALTER TABLE that adds
@@ -1912,6 +1929,11 @@ class SQLiteStore(ContextStore):
                 CREATE TRIGGER IF NOT EXISTS tool_outputs_ad AFTER DELETE ON tool_outputs BEGIN
                     INSERT INTO tool_outputs_fts(tool_outputs_fts, rowid, content)
                         VALUES('delete', old.rowid, old.content);
+                END;
+                CREATE TRIGGER IF NOT EXISTS tool_outputs_au AFTER UPDATE ON tool_outputs BEGIN
+                    INSERT INTO tool_outputs_fts(tool_outputs_fts, rowid, content)
+                        VALUES('delete', old.rowid, old.content);
+                    INSERT INTO tool_outputs_fts(rowid, content) VALUES (new.rowid, new.content);
                 END;
             """)
         except sqlite3.OperationalError:
@@ -3491,6 +3513,24 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 )
         return rows
 
+    def repair_fts_indexes(
+        self,
+        index_names: Collection[str] | None = None,
+        *,
+        dry_run: bool = True,
+    ) -> dict[str, str]:
+        """Check selected indexes against their content and repair on request.
+
+        This explicit maintenance operation detects stale postings left by
+        historical REPLACE writes. Only indexes are rebuilt; canonical rows,
+        source content, fact relationships, and embeddings are untouched.
+        Content checks can scan the complete selected indexes, so they are
+        not added to the routine startup check.
+        """
+        from .maintenance import repair_fts_indexes
+
+        return repair_fts_indexes(self._get_conn(), index_names, dry_run=dry_run)
+
     def _repair_fts_if_needed(self, conn: sqlite3.Connection) -> None:
         """Check FTS indexes and rebuild only if corrupted.
 
@@ -3759,7 +3799,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 # INSERT-SELECT form: writes zero rows if the compaction_operation
                 # row no longer matches (status != 'running', owner mismatch, etc).
                 cur = conn.execute(
-                    """INSERT OR REPLACE INTO segments
+                    """INSERT INTO segments
                     (ref, conversation_id, primary_tag, summary, full_text, messages_json,
                      metadata_json, summary_tokens, full_tokens, compression_ratio,
                      compaction_model, created_at, start_timestamp, end_timestamp,
@@ -3770,7 +3810,22 @@ CREATE TABLE IF NOT EXISTS request_captures (
                        AND conversation_id = ?
                        AND status = 'running'
                        AND owner_worker_id = ?
-                       AND lifecycle_epoch = ?""",
+                       AND lifecycle_epoch = ?
+                    ON CONFLICT (ref) DO UPDATE SET
+                        conversation_id = excluded.conversation_id,
+                        primary_tag = excluded.primary_tag,
+                        summary = excluded.summary,
+                        full_text = excluded.full_text,
+                        messages_json = excluded.messages_json,
+                        metadata_json = excluded.metadata_json,
+                        summary_tokens = excluded.summary_tokens,
+                        full_tokens = excluded.full_tokens,
+                        compression_ratio = excluded.compression_ratio,
+                        compaction_model = excluded.compaction_model,
+                        created_at = excluded.created_at,
+                        start_timestamp = excluded.start_timestamp,
+                        end_timestamp = excluded.end_timestamp,
+                        operation_id = excluded.operation_id""",
                     (
                         segment.ref,
                         segment.conversation_id,
@@ -3809,11 +3864,26 @@ CREATE TABLE IF NOT EXISTS request_captures (
             else:
                 # Legacy unconditional path — existing callers and test harnesses.
                 conn.execute(
-                    """INSERT OR REPLACE INTO segments
+                    """INSERT INTO segments
                     (ref, conversation_id, primary_tag, summary, full_text, messages_json,
                      metadata_json, summary_tokens, full_tokens, compression_ratio,
                      compaction_model, created_at, start_timestamp, end_timestamp)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (ref) DO UPDATE SET
+                        conversation_id = excluded.conversation_id,
+                        primary_tag = excluded.primary_tag,
+                        summary = excluded.summary,
+                        full_text = excluded.full_text,
+                        messages_json = excluded.messages_json,
+                        metadata_json = excluded.metadata_json,
+                        summary_tokens = excluded.summary_tokens,
+                        full_tokens = excluded.full_tokens,
+                        compression_ratio = excluded.compression_ratio,
+                        compaction_model = excluded.compaction_model,
+                        created_at = excluded.created_at,
+                        start_timestamp = excluded.start_timestamp,
+                        end_timestamp = excluded.end_timestamp,
+                        operation_id = NULL""",
                     (
                         segment.ref,
                         segment.conversation_id,
@@ -3911,7 +3981,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
             query += " AND s.created_at > ?"
             params.append(_dt_to_str(after))
 
-        query += f"""
+        query += """
             GROUP BY s.ref
             HAVING overlap_count >= ?
             ORDER BY overlap_count DESC, s.created_at DESC
@@ -4859,11 +4929,13 @@ CREATE TABLE IF NOT EXISTS request_captures (
 
     def get_lifecycle_epoch(self, conversation_id: str) -> int:
         """Return the current lifecycle_epoch. Raises KeyError if no row exists."""
-        with self._get_conn() as conn:
-            row = conn.execute(
-                "SELECT lifecycle_epoch FROM conversations WHERE conversation_id = ?",
-                (conversation_id,),
-            ).fetchone()
+        # A connection context manager commits on exit, even for this read.
+        # Reconciliation rechecks the epoch after BEGIN IMMEDIATE and owns
+        # that transaction until the transcript, groups and anchors are done.
+        row = self._get_conn().execute(
+            "SELECT lifecycle_epoch FROM conversations WHERE conversation_id = ?",
+            (conversation_id,),
+        ).fetchone()
         if row is None:
             raise KeyError(conversation_id)
         return int(row[0])
@@ -5951,7 +6023,8 @@ CREATE TABLE IF NOT EXISTS request_captures (
 
         TABLES_SIMPLE = (
             "segments", "canonical_turn_anchors", "canonical_turn_chunks",
-            "ingest_batches", "facts", "fact_embeddings",
+            "ingest_batches", "facts",
+                "fact_decisions", "fact_embeddings",
             "segment_tool_outputs",
         )
         # Tables whose natural key can legitimately collide across sibling
@@ -6390,13 +6463,21 @@ CREATE TABLE IF NOT EXISTS request_captures (
 
             # Per-table moves
             for tbl in TABLES_SIMPLE:
-                cur = conn.execute(
-                    f"UPDATE {tbl} "
-                    f"   SET conversation_id = ?, "
-                    f"       origin_conversation_id = COALESCE(NULLIF(origin_conversation_id, ''), ?) "
-                    f" WHERE conversation_id = ?",
-                    (target_conversation_id, source_conversation_id, source_conversation_id),
-                )
+                if tbl == "fact_decisions":
+                    # Audit payload and original owner stay immutable. Older
+                    # records may honestly have an unknown (empty) origin.
+                    cur = conn.execute(
+                        "UPDATE fact_decisions SET conversation_id=? WHERE conversation_id=?",
+                        (target_conversation_id, source_conversation_id),
+                    )
+                else:
+                    cur = conn.execute(
+                        f"UPDATE {tbl} "
+                        f"   SET conversation_id = ?, "
+                        f"       origin_conversation_id = COALESCE(NULLIF(origin_conversation_id, ''), ?) "
+                        f" WHERE conversation_id = ?",
+                        (target_conversation_id, source_conversation_id, source_conversation_id),
+                    )
                 rows_moved[tbl] = cur.rowcount
 
             # Natural-key conflict tables: drop source rows whose key
@@ -7767,6 +7848,15 @@ CREATE TABLE IF NOT EXISTS request_captures (
                         f"{expected_generation}, current={current_generation}, "
                         f"deleted={current_deleted}"
                     )
+            if expected_generation is None:
+                # Direct deletes also leave a durable tombstone. Old requests
+                # cannot recreate hidden continuation state after the rows vanish.
+                conn.execute("""INSERT INTO conversation_lifecycle
+                    (conversation_id,generation,deleted,updated_at) VALUES (?,1,?,?)
+                    ON CONFLICT (conversation_id) DO UPDATE SET
+                        generation=conversation_lifecycle.generation+1,
+                        deleted=excluded.deleted,updated_at=excluded.updated_at""",
+                    (conversation_id,True,datetime.now(timezone.utc).isoformat()))
             tenant_row = conn.execute(
                 "SELECT tenant_id FROM conversations WHERE conversation_id = ?",
                 (conversation_id,),
@@ -7796,6 +7886,8 @@ CREATE TABLE IF NOT EXISTS request_captures (
             # resurrect a partially deleted conversation.
             for table in (
                 "engine_state",
+                "pending_tool_exchanges",
+                "fact_decisions",
                 "fact_embeddings",
                 "facts",
                 "canonical_turns",
@@ -7965,13 +8057,28 @@ CREATE TABLE IF NOT EXISTS request_captures (
             else:
                 # Legacy unconditional path — existing callers and test harnesses.
                 conn.execute(
-                    """INSERT OR REPLACE INTO tag_summaries
+                    """INSERT INTO tag_summaries
                     (tag, conversation_id, summary, description, code_refs, summary_tokens,
                      source_segment_refs, source_turn_numbers, source_canonical_turn_ids,
                      structured_summary_json,
                      covers_through_turn, covers_through_canonical_turn_id, generated_by_turn_id,
                      created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (tag, conversation_id) DO UPDATE SET
+                        summary = excluded.summary,
+                        description = excluded.description,
+                        code_refs = excluded.code_refs,
+                        summary_tokens = excluded.summary_tokens,
+                        source_segment_refs = excluded.source_segment_refs,
+                        source_turn_numbers = excluded.source_turn_numbers,
+                        source_canonical_turn_ids = excluded.source_canonical_turn_ids,
+                        structured_summary_json = excluded.structured_summary_json,
+                        covers_through_turn = excluded.covers_through_turn,
+                        covers_through_canonical_turn_id = excluded.covers_through_canonical_turn_id,
+                        generated_by_turn_id = excluded.generated_by_turn_id,
+                        created_at = excluded.created_at,
+                        updated_at = excluded.updated_at,
+                        operation_id = NULL""",
                     (
                         tag_summary.tag,
                         conversation_id,
@@ -8139,6 +8246,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
         owner_worker_id: str | None = None,
         lifecycle_epoch: int | None = None,
         conversation_id: str | None = None,
+        embedding_model: str = "",
     ) -> None:
         """Store chunk embeddings for a segment.
 
@@ -8221,11 +8329,15 @@ CREATE TABLE IF NOT EXISTS request_captures (
             conn.rollback()
             raise
 
-    def get_all_chunk_embeddings(self) -> list[ChunkEmbedding]:
+    def get_all_chunk_embeddings(self, conversation_id: str | None = None) -> list[ChunkEmbedding]:
         conn = self._get_conn()
-        rows = conn.execute(
-            "SELECT segment_ref, chunk_index, text, embedding_json FROM segment_chunks ORDER BY segment_ref, chunk_index"
-        ).fetchall()
+        sql = "SELECT chunk.segment_ref, chunk.chunk_index, chunk.text, chunk.embedding_json FROM segment_chunks chunk"
+        params = []
+        if conversation_id is not None:
+            sql += " JOIN segments s ON s.ref=chunk.segment_ref WHERE s.conversation_id=?"
+            params.append(conversation_id)
+        sql += " ORDER BY chunk.segment_ref, chunk.chunk_index"
+        rows = conn.execute(sql, params).fetchall()
         return [
             ChunkEmbedding(
                 segment_ref=row[0],
@@ -8257,6 +8369,8 @@ CREATE TABLE IF NOT EXISTS request_captures (
         side: str,
         chunks: list[CanonicalTurnChunkEmbedding],
         canonical_turn_id: str | None = None,
+        *,
+        embedding_model: str = "",
     ) -> None:
         conn = self._get_conn()
         canonical_turn_id = canonical_turn_id or self._lookup_canonical_turn_id_for_ordinal(conversation_id, turn_number)
@@ -9408,7 +9522,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
                WHERE conversation_id = ? AND sort_key >= ?""",
             (delta, conversation_id, min_sort_key),
         )
-        conn.commit()
+        self._commit_if_unlocked(conn)
         return int(cursor.rowcount or 0)
 
     def update_canonical_turn_senders_if_empty(
@@ -9467,7 +9581,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
                     ),
                 )
             updated += int(cursor.rowcount or 0)
-        conn.commit()
+        self._commit_if_unlocked(conn)
         return updated
 
     def update_canonical_turn_senders_if_matches(
@@ -9600,7 +9714,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 params,
             )
             updated += int(cursor.rowcount or 0)
-        conn.commit()
+        self._commit_if_unlocked(conn)
         return updated
 
     def update_canonical_turn_actors_if_empty(
@@ -9660,7 +9774,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
                     ),
                 )
             updated += int(cursor.rowcount or 0)
-        conn.commit()
+        self._commit_if_unlocked(conn)
         return updated
 
     def update_canonical_turn_reply_roles_if_empty(
@@ -9752,7 +9866,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 params.append(expected_lifecycle_epoch)
             cursor = conn.execute(sql, tuple(params))
             updated += int(cursor.rowcount or 0)
-        conn.commit()
+        self._commit_if_unlocked(conn)
         return updated
 
     def reattribute_canonical_turn_audience(
@@ -11121,7 +11235,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 (turn_group_number, conversation_id, canonical_turn_id, turn_group_number),
             )
             changed += int(cursor.rowcount or 0)
-        conn.commit()
+        self._commit_if_unlocked(conn)
         return changed
 
     def get_canonical_turn_rows(
@@ -11129,14 +11243,10 @@ CREATE TABLE IF NOT EXISTS request_captures (
         conversation_id: str,
         turn_numbers: list[int],
     ) -> dict[int, CanonicalTurnRow]:
-        if not turn_numbers:
-            return {}
-        merged_rows = _merge_canonical_turn_rows(self._load_canonical_turn_rows(conversation_id))
-        return {
-            turn_number: merged_rows[turn_number]
-            for turn_number in turn_numbers
-            if turn_number in merged_rows
-        }
+        from .compaction_reads import load_logical_groups
+        return load_logical_groups(
+            self, conversation_id, turn_numbers, merge_rows=_merge_canonical_turn_rows,
+        )
 
     def get_canonical_turn_rows_by_id(
         self,
@@ -11233,7 +11343,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
         """
         conn = self._get_conn()
         rows = conn.execute(
-            f"""SELECT canonical_turn_id, conversation_id, turn_number,
+            """SELECT canonical_turn_id, conversation_id, turn_number,
                       turn_group_number, sort_key, turn_hash,
                       session_date, sender,
                       origin_channel_id, origin_channel_label, sender_actor_id,
@@ -11305,22 +11415,13 @@ CREATE TABLE IF NOT EXISTS request_captures (
         conversation_id: str,
         *,
         protected_recent_turns: int = 0,
+        limit: int | None = None,
     ) -> list[CanonicalTurnRow]:
-        merged_rows = list(_merge_canonical_turn_rows(self._load_canonical_turn_rows(conversation_id)).values())
-        # Compaction is a completed-turn lifecycle.  Never manufacture an
-        # empty partner for a terminal orphan: doing so both pollutes the
-        # summary and advances a two-message watermark past one real message.
-        uncompacted = [
-            row for row in merged_rows
-            if not row.compacted_at
-            and (row.user_content or "").strip()
-            and (row.assistant_content or "").strip()
-        ]
-        if protected_recent_turns > 0 and len(uncompacted) > protected_recent_turns:
-            uncompacted = uncompacted[:-protected_recent_turns]
-        elif protected_recent_turns > 0:
-            uncompacted = []
-        return uncompacted
+        from .compaction_reads import load_uncompacted_groups
+        return load_uncompacted_groups(
+            self, conversation_id, merge_rows=_merge_canonical_turn_rows,
+            protected_recent_turns=protected_recent_turns, limit=limit,
+        )
 
     def get_recent_canonical_turns(
         self,
@@ -12215,7 +12316,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
                     # can DELETE the op-owned rows on takeover. Per fencing
                     # plan iter-2 P1-2.
                     cur = conn.execute(
-                        """INSERT OR REPLACE INTO facts
+                        """INSERT INTO facts
                         (id, subject, verb, object, status, what, who, when_date,
                          "where", why, fact_type, tags_json, segment_ref, conversation_id,
                          turn_numbers_json, mentioned_at, session_date, superseded_by,
@@ -12228,7 +12329,30 @@ CREATE TABLE IF NOT EXISTS request_captures (
                            AND conversation_id = ?
                            AND status = 'running'
                            AND owner_worker_id = ?
-                           AND lifecycle_epoch = ?""",
+                           AND lifecycle_epoch = ?
+                    ON CONFLICT (id) DO UPDATE SET
+                        subject = excluded.subject,
+                        verb = excluded.verb,
+                        object = excluded.object,
+                        status = excluded.status,
+                        what = excluded.what,
+                        who = excluded.who,
+                        when_date = excluded.when_date,
+                        "where" = excluded."where",
+                        why = excluded.why,
+                        fact_type = excluded.fact_type,
+                        tags_json = excluded.tags_json,
+                        segment_ref = excluded.segment_ref,
+                        conversation_id = excluded.conversation_id,
+                        turn_numbers_json = excluded.turn_numbers_json,
+                        mentioned_at = excluded.mentioned_at,
+                        session_date = excluded.session_date,
+                        superseded_by = excluded.superseded_by,
+                        author_actor_id = excluded.author_actor_id,
+                        author_attribution_version = excluded.author_attribution_version,
+                        author_source_role = excluded.author_source_role,
+                        author_source_message_id = excluded.author_source_message_id,
+                        operation_id = excluded.operation_id""",
                         (
                             fact.id,
                             fact.subject,
@@ -12279,14 +12403,37 @@ CREATE TABLE IF NOT EXISTS request_captures (
                     # Legacy unconditional path — existing callers and
                     # non-compaction write sites.
                     conn.execute(
-                        """INSERT OR REPLACE INTO facts
+                        """INSERT INTO facts
                         (id, subject, verb, object, status, what, who, when_date,
                          "where", why, fact_type, tags_json, segment_ref, conversation_id,
                          turn_numbers_json, mentioned_at, session_date, superseded_by,
                          author_actor_id, author_attribution_version, author_source_role,
                          author_source_message_id)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                                ?, ?, ?, ?)""",
+                                ?, ?, ?, ?)
+                    ON CONFLICT (id) DO UPDATE SET
+                        subject = excluded.subject,
+                        verb = excluded.verb,
+                        object = excluded.object,
+                        status = excluded.status,
+                        what = excluded.what,
+                        who = excluded.who,
+                        when_date = excluded.when_date,
+                        "where" = excluded."where",
+                        why = excluded.why,
+                        fact_type = excluded.fact_type,
+                        tags_json = excluded.tags_json,
+                        segment_ref = excluded.segment_ref,
+                        conversation_id = excluded.conversation_id,
+                        turn_numbers_json = excluded.turn_numbers_json,
+                        mentioned_at = excluded.mentioned_at,
+                        session_date = excluded.session_date,
+                        superseded_by = excluded.superseded_by,
+                        author_actor_id = excluded.author_actor_id,
+                        author_attribution_version = excluded.author_attribution_version,
+                        author_source_role = excluded.author_source_role,
+                        author_source_message_id = excluded.author_source_message_id,
+                        operation_id = NULL""",
                         (
                             fact.id,
                             fact.subject,
@@ -12412,7 +12559,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
             params_list = list(tags) + params
             if conditions:
                 sql += " AND " + " AND ".join(conditions)
-            sql += f" ORDER BY f.mentioned_at DESC LIMIT ?"
+            sql += " ORDER BY f.mentioned_at DESC LIMIT ?"
             params_list.append(limit)
             rows = conn.execute(sql, params_list).fetchall()
         else:
@@ -12551,7 +12698,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
                     # can DELETE the op-owned rows on takeover. Per fencing
                     # plan iter-2 P1-2.
                     cur = conn.execute(
-                        """INSERT OR REPLACE INTO facts
+                        """INSERT INTO facts
                         (id, subject, verb, object, status, what, who, when_date,
                          "where", why, fact_type, tags_json, segment_ref, conversation_id,
                          turn_numbers_json, mentioned_at, session_date, superseded_by,
@@ -12564,7 +12711,30 @@ CREATE TABLE IF NOT EXISTS request_captures (
                            AND conversation_id = ?
                            AND status = 'running'
                            AND owner_worker_id = ?
-                           AND lifecycle_epoch = ?""",
+                           AND lifecycle_epoch = ?
+                    ON CONFLICT (id) DO UPDATE SET
+                        subject = excluded.subject,
+                        verb = excluded.verb,
+                        object = excluded.object,
+                        status = excluded.status,
+                        what = excluded.what,
+                        who = excluded.who,
+                        when_date = excluded.when_date,
+                        "where" = excluded."where",
+                        why = excluded.why,
+                        fact_type = excluded.fact_type,
+                        tags_json = excluded.tags_json,
+                        segment_ref = excluded.segment_ref,
+                        conversation_id = excluded.conversation_id,
+                        turn_numbers_json = excluded.turn_numbers_json,
+                        mentioned_at = excluded.mentioned_at,
+                        session_date = excluded.session_date,
+                        superseded_by = excluded.superseded_by,
+                        author_actor_id = excluded.author_actor_id,
+                        author_attribution_version = excluded.author_attribution_version,
+                        author_source_role = excluded.author_source_role,
+                        author_source_message_id = excluded.author_source_message_id,
+                        operation_id = excluded.operation_id""",
                         (
                             fact.id, fact.subject, fact.verb, fact.object, fact.status,
                             fact.what, fact.who, fact.when_date, fact.where, fact.why,
@@ -12597,14 +12767,37 @@ CREATE TABLE IF NOT EXISTS request_captures (
                         return (0, 0)
                 else:
                     conn.execute(
-                        """INSERT OR REPLACE INTO facts
+                        """INSERT INTO facts
                         (id, subject, verb, object, status, what, who, when_date,
                          "where", why, fact_type, tags_json, segment_ref, conversation_id,
                          turn_numbers_json, mentioned_at, session_date, superseded_by,
                          author_actor_id, author_attribution_version, author_source_role,
                          author_source_message_id)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                                ?, ?, ?, ?)""",
+                                ?, ?, ?, ?)
+                    ON CONFLICT (id) DO UPDATE SET
+                        subject = excluded.subject,
+                        verb = excluded.verb,
+                        object = excluded.object,
+                        status = excluded.status,
+                        what = excluded.what,
+                        who = excluded.who,
+                        when_date = excluded.when_date,
+                        "where" = excluded."where",
+                        why = excluded.why,
+                        fact_type = excluded.fact_type,
+                        tags_json = excluded.tags_json,
+                        segment_ref = excluded.segment_ref,
+                        conversation_id = excluded.conversation_id,
+                        turn_numbers_json = excluded.turn_numbers_json,
+                        mentioned_at = excluded.mentioned_at,
+                        session_date = excluded.session_date,
+                        superseded_by = excluded.superseded_by,
+                        author_actor_id = excluded.author_actor_id,
+                        author_attribution_version = excluded.author_attribution_version,
+                        author_source_role = excluded.author_source_role,
+                        author_source_message_id = excluded.author_source_message_id,
+                        operation_id = NULL""",
                         (
                             fact.id, fact.subject, fact.verb, fact.object, fact.status,
                             fact.what, fact.who, fact.when_date, fact.where, fact.why,
@@ -14262,67 +14455,19 @@ CREATE TABLE IF NOT EXISTS request_captures (
         operation_id: str | None = None,
         owner_worker_id: str | None = None,
         lifecycle_epoch: int | None = None,
-    ) -> None:
-        """Mark ``old_fact_id`` superseded by ``new_fact_id``.
-
-        When all guard kwargs are supplied, the UPDATE is gated on a
-        running ``compaction_operation`` row matching the guard triple
-        AND both endpoint facts belonging to the same conversation as
-        the active op. Blocks cross-conversation supersession pointers
-        per fencing plan §4.3 P1-8 fold.
-        """
-        _validate_compaction_guard_kwargs(
-            operation_id, owner_worker_id, lifecycle_epoch,
+        tenant_id: str | None = None,
+        expected_old_version: str | None = None,
+        expected_new_version: str | None = None,
+        expected_source_versions: tuple[tuple[str, str], ...] | None = None,
+    ) -> bool:
+        return self._set_fact_superseded(
+            old_fact_id, new_fact_id, operation_id=operation_id,
+            owner_worker_id=owner_worker_id, lifecycle_epoch=lifecycle_epoch,
+            tenant_id=tenant_id,
+            expected_old_version=expected_old_version,
+            expected_new_version=expected_new_version,
+            expected_source_versions=expected_source_versions,
         )
-        guard_all = (
-            operation_id is not None
-            and owner_worker_id is not None
-            and lifecycle_epoch is not None
-        )
-        # OFF/OBSERVE tier downgrades the guard so
-        # ``set_fact_superseded`` takes the legacy unguarded UPDATE
-        # path. Per fencing plan §9.1 OFF kill switch.
-        if guard_all and not self._compaction_fence_mode.enforces:
-            guard_all = False
-        conn = self._get_conn()
-        if guard_all:
-            cur = conn.execute(
-                """UPDATE facts
-                      SET superseded_by = ?
-                    WHERE id = ?
-                      AND EXISTS (
-                          SELECT 1
-                            FROM facts f_old, facts f_new,
-                                 compaction_operation co
-                           WHERE f_old.id = ?
-                             AND f_new.id = ?
-                             AND f_old.conversation_id = f_new.conversation_id
-                             AND co.conversation_id = f_old.conversation_id
-                             AND co.operation_id = ?
-                             AND co.owner_worker_id = ?
-                             AND co.lifecycle_epoch = ?
-                             AND co.status = 'running'
-                      )""",
-                (
-                    new_fact_id, old_fact_id,
-                    old_fact_id, new_fact_id,
-                    operation_id, owner_worker_id, lifecycle_epoch,
-                ),
-            )
-            if (cur.rowcount or 0) == 0:
-                if self._compaction_fence_mode.enforces:
-                    conn.rollback()
-                self._enforce_or_observe_mismatch(
-                    operation_id=operation_id,
-                    write_site="set_fact_superseded",
-                )
-                return
-        else:
-            conn.execute(
-                "UPDATE facts SET superseded_by = ? WHERE id = ?",
-                (new_fact_id, old_fact_id),
-            )
-        conn.commit()
 
     def update_fact_fields(
         self,
@@ -14335,91 +14480,13 @@ CREATE TABLE IF NOT EXISTS request_captures (
         operation_id: str | None = None,
         owner_worker_id: str | None = None,
         lifecycle_epoch: int | None = None,
+        tenant_id: str | None = None,
     ) -> bool:
-        """Update mutable fact fields. When all guard kwargs are
-        supplied, the UPDATE only fires if the target fact belongs to
-        the same conversation as the active op (matched on the guard
-        triple at status='running').
-
-        When the mutation changes an embed-text field (``verb``,
-        ``object``, or ``what``; a ``status``-only change is not embed
-        text) the fact's ``fact_embeddings`` row is deleted in the same
-        transaction so a stale vector can never survive the rewrite. A
-        guard-fail rolls the whole transaction back, keeping the old
-        fact and old vector together. Returns ``True`` iff a row was
-        actually updated so callers refresh only after a real update.
-        """
-        from ..types import CompactionLeaseLost
-        _validate_compaction_guard_kwargs(
-            operation_id, owner_worker_id, lifecycle_epoch,
+        return self._update_fact_fields(
+            fact_id, verb, object, status, what, operation_id=operation_id,
+            owner_worker_id=owner_worker_id, lifecycle_epoch=lifecycle_epoch,
+            tenant_id=tenant_id,
         )
-        guard_all = (
-            operation_id is not None
-            and owner_worker_id is not None
-            and lifecycle_epoch is not None
-        )
-        # OFF/OBSERVE tier downgrades the guard so
-        # ``update_fact_fields`` takes the legacy unguarded UPDATE
-        # path. Per fencing plan §9.1 OFF kill switch.
-        if guard_all and not self._compaction_fence_mode.enforces:
-            guard_all = False
-        conn = self._get_conn()
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            _old = conn.execute(
-                "SELECT verb, object, what FROM facts WHERE id = ?", (fact_id,),
-            ).fetchone()
-            _embed_changed = _old is not None and (
-                _old["verb"], _old["object"], _old["what"]
-            ) != (verb, object, what)
-            if guard_all:
-                cur = conn.execute(
-                    """UPDATE facts
-                          SET verb = ?, object = ?, status = ?, what = ?
-                        WHERE id = ?
-                          AND EXISTS (
-                              SELECT 1
-                                FROM facts f, compaction_operation co
-                               WHERE f.id = ?
-                                 AND co.conversation_id = f.conversation_id
-                                 AND co.operation_id = ?
-                                 AND co.owner_worker_id = ?
-                                 AND co.lifecycle_epoch = ?
-                                 AND co.status = 'running'
-                          )""",
-                    (
-                        verb, object, status, what, fact_id,
-                        fact_id, operation_id, owner_worker_id, lifecycle_epoch,
-                    ),
-                )
-                if (cur.rowcount or 0) == 0:
-                    # guard_all is only True at ACTIVE tier, so this
-                    # raises CompactionLeaseLost; the rollback keeps the
-                    # old fact and old vector together.
-                    conn.execute("ROLLBACK")
-                    self._enforce_or_observe_mismatch(
-                        operation_id=operation_id,
-                        write_site="update_fact_fields",
-                    )
-                    return False
-            else:
-                cur = conn.execute(
-                    "UPDATE facts SET verb = ?, object = ?, status = ?, what = ? WHERE id = ?",
-                    (verb, object, status, what, fact_id),
-                )
-            _updated = (cur.rowcount or 0) > 0
-            if _updated and _embed_changed:
-                conn.execute(
-                    "DELETE FROM fact_embeddings WHERE fact_id = ?", (fact_id,),
-                )
-            # FTS5 sync handled by AFTER UPDATE trigger (facts_fts_au)
-            conn.execute("COMMIT")
-            return _updated
-        except CompactionLeaseLost:
-            raise
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise
 
     def get_fact_count_by_tags(self, *, conversation_id: str | None = None) -> dict[str, int]:
         conn = self._get_conn()
@@ -14807,9 +14874,16 @@ CREATE TABLE IF NOT EXISTS request_captures (
     ) -> None:
         conn = self._get_conn()
         conn.execute(
-            """INSERT OR REPLACE INTO tool_outputs
+            """INSERT INTO tool_outputs
             (ref, conversation_id, tool_name, command, turn, content, original_bytes)
-            VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (ref) DO UPDATE SET
+                        conversation_id = excluded.conversation_id,
+                        tool_name = excluded.tool_name,
+                        command = excluded.command,
+                        turn = excluded.turn,
+                        content = excluded.content,
+                        original_bytes = excluded.original_bytes""",
             (ref, conversation_id, tool_name, command, turn, content, original_bytes),
         )
         conn.commit()

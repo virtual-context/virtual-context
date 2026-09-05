@@ -546,17 +546,13 @@ class TestPerWriteFenceModeMatrix:
             )
         assert self._fact_fields(store) == ("v", "o", "w")
 
-    def test_observe_writes_via_legacy_path_no_mismatch_log(
+    def test_observe_revision_writes_and_logs_exact_mismatch(
         self, tmp_path, conv, caplog,
     ):
-        """At OBSERVE the OFF=legacy-SQL downgrade applies: the
-        method takes the legacy unguarded UPDATE path. The write
-        lands and no mismatch is logged because the guard SQL
-        never runs. Documented spec deviation: OBSERVE no longer
-        stamps ``operation_id`` for the six fenced methods that
-        share the ``replace_facts_for_segment``-style downgrade.
-        Per fencing plan §9.1 + the lead's directive on OFF acting
-        as a kill switch rather than a soft-drop of writes.
+        """OBSERVE validates and logs the mismatch while allowing the write.
+
+        OFF remains the silent rollback mode; shared fact mutations retain
+        diagnostics and an audit entry when OBSERVE admits a stale caller.
         """
         store = SQLiteStore(
             tmp_path / "pwm-obs.db",
@@ -569,16 +565,18 @@ class TestPerWriteFenceModeMatrix:
                 operation_id="op-mismatch",
                 owner_worker_id="w-1", lifecycle_epoch=1,
             )
-        # Legacy path ran: write landed with the new field values.
+        # OBSERVE permits the revision while retaining mismatch diagnostics.
         assert self._fact_fields(store) == ("v2", "o2", "w2")
-        # No mismatch log because the guard SQL was bypassed by the
-        # OFF=legacy-SQL downgrade.
+        # The same failed operation identity appears in the log and audit.
         msgs = [
             r.message for r in caplog.records
             if "COMPACTION_FENCE_OBSERVED_MISMATCH" in r.message
             and "update_fact_fields" in r.message
         ]
-        assert not msgs
+        assert len(msgs) == 1 and "operation_id=op-mismatch" in msgs[0]
+        audit, = store.get_fact_decisions(conv)
+        assert audit["operation_id"] == "op-mismatch" and audit["accepted"] == 1
+        store.close()
 
     def test_observe_legacy_path_does_not_leak_open_transaction(
         self, tmp_path, conv,

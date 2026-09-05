@@ -8,10 +8,9 @@ class TestSupersessionMigration:
     def test_migration_creates_links_from_superseded_by(self, tmp_path):
         db_path = str(tmp_path / "test.db")
         store = SQLiteStore(db_path=db_path)
-        old_fact = Fact(id="old-1", subject="user", verb="lives-in", object="NYC")
+        old_fact = Fact(id="old-1", subject="user", verb="lives-in", object="NYC", superseded_by="new-1")
         new_fact = Fact(id="new-1", subject="user", verb="lives-in", object="Chicago")
         store.store_facts([old_fact, new_fact])
-        store.set_fact_superseded("old-1", "new-1")
 
         store.migrate_supersession_to_links()
 
@@ -25,10 +24,9 @@ class TestSupersessionMigration:
     def test_migration_is_idempotent(self, tmp_path):
         db_path = str(tmp_path / "test.db")
         store = SQLiteStore(db_path=db_path)
-        old = Fact(id="old", subject="user", verb="has", object="dog")
+        old = Fact(id="old", subject="user", verb="has", object="dog", superseded_by="new")
         new = Fact(id="new", subject="user", verb="has", object="cat")
         store.store_facts([old, new])
-        store.set_fact_superseded("old", "new")
 
         store.migrate_supersession_to_links()
         store.migrate_supersession_to_links()

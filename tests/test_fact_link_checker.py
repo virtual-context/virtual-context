@@ -2,10 +2,20 @@
 
 from unittest.mock import MagicMock
 
+import pytest
+
 import json
 
 from virtual_context.ingest.supersession import FactLinkChecker
 from virtual_context.types import Fact, FactLink, SupersessionConfig
+from virtual_context.core.fact_lifecycle import fact_version
+
+_FACTS = {}
+
+
+@pytest.fixture(autouse=True)
+def _reset_fact_inventory():
+    _FACTS.clear()
 
 
 def _make_checker(llm_response="[]", graph_links=True, config=None):
@@ -14,6 +24,10 @@ def _make_checker(llm_response="[]", graph_links=True, config=None):
     llm.last_usage = {}
     store = MagicMock()
     store.query_facts.return_value = []
+    store.set_fact_superseded.return_value = True
+    store.store_fact_links.side_effect = lambda links, **kwargs: len(links)
+    store.get_fact_admission_scope.return_value = None
+    store.get_fact_admission_snapshot.side_effect = lambda fact_id: {"fact_version": fact_version(_FACTS[fact_id]), "audience": None, "source_versions": ()}
     cfg = config or SupersessionConfig(enabled=True, batch_size=20)
     checker = FactLinkChecker(
         llm_provider=llm, model="test", store=store, config=cfg,
@@ -23,7 +37,10 @@ def _make_checker(llm_response="[]", graph_links=True, config=None):
 
 
 def _make_fact(id="f1", subject="user", verb="led", object="Alpha", tags=None, **kw):
-    return Fact(id=id, subject=subject, verb=verb, object=object, tags=tags or [], **kw)
+    kw.setdefault("conversation_id", "conversation")
+    fact = Fact(id=id, subject=subject, verb=verb, object=object, tags=tags or [], **kw)
+    _FACTS[id] = fact
+    return fact
 
 
 class TestFactLinkCheckerSupersessionMode:
@@ -44,6 +61,7 @@ class TestFactLinkCheckerSupersessionMode:
         store.set_fact_superseded.assert_called_once_with(
             "old", "new",
             operation_id=None, owner_worker_id=None, lifecycle_epoch=None,
+            expected_old_version=fact_version(old), expected_new_version=fact_version(new), expected_source_versions=(),
         )
 
     def test_disabled_config(self):

@@ -65,6 +65,12 @@ class CompositeStore:
             ("fact_links", fact_links), ("state", state),
             ("search", search),
         ):
+            if getattr(delegate, "supports_engine_lifecycle", None) is False:
+                raise ValueError(
+                    f"{type(delegate).__name__} cannot be used as the {label} "
+                    "delegate: engine storage requires conversation scoping "
+                    "and durable lifecycle fencing; use SQLite or Postgres"
+                )
             delegate_mode = getattr(delegate, "_compaction_fence_mode", None)
             # The mismatch guard fires ONLY when the delegate exposes
             # a real ``CompactionFenceMode`` value. ``getattr`` against
@@ -85,6 +91,27 @@ class CompositeStore:
         self._fact_links = fact_links
         self._state = state
         self._search = search
+
+    @property
+    def capabilities(self):
+        from .store_capabilities import StoreCapabilities, capabilities_of
+        segments = capabilities_of(self._segments)
+        facts = capabilities_of(self._facts)
+        search = capabilities_of(self._search)
+        return StoreCapabilities(
+            conversation_scope=all(capabilities_of(store).conversation_scope for store in
+                                   (self._segments, self._facts, self._state, self._search)),
+            canonical_sources=segments.canonical_sources,
+            lifecycle_fencing=all(capabilities_of(store).lifecycle_fencing for store in
+                                  (self._segments, self._facts, self._state, self._search)),
+            atomic_fact_mutation=facts.atomic_fact_mutation,
+            audience_proofs=segments.audience_proofs and facts.audience_proofs,
+            actor_cards=segments.actor_cards and facts.actor_cards,
+            fact_links=capabilities_of(self._fact_links).fact_links,
+            streaming_embeddings=search.streaming_embeddings,
+            durable_exchanges=capabilities_of(self._state).durable_exchanges,
+            native_vectors=search.native_vectors,
+        )
 
     # ------------------------------------------------------------------
     # SegmentStore
@@ -439,10 +466,12 @@ class CompositeStore:
         conversation_id: str,
         *,
         protected_recent_turns: int = 0,
+        limit: int | None = None,
     ) -> list[CanonicalTurnRow]:
         return self._segments.get_uncompacted_canonical_turns(
             conversation_id,
             protected_recent_turns=protected_recent_turns,
+            limit=limit,
         )
 
     def reconstruct_history_for_conv(
@@ -774,12 +803,20 @@ class CompositeStore:
         operation_id: str | None = None,
         owner_worker_id: str | None = None,
         lifecycle_epoch: int | None = None,
-    ) -> None:
+        tenant_id: str | None = None,
+        expected_old_version: str | None = None,
+        expected_new_version: str | None = None,
+        expected_source_versions: tuple[tuple[str, str], ...] | None = None,
+    ) -> bool:
         return self._facts.set_fact_superseded(
             old_fact_id, new_fact_id,
             operation_id=operation_id,
             owner_worker_id=owner_worker_id,
             lifecycle_epoch=lifecycle_epoch,
+            tenant_id=tenant_id,
+            expected_old_version=expected_old_version,
+            expected_new_version=expected_new_version,
+            expected_source_versions=expected_source_versions,
         )
 
     def update_fact_fields(
@@ -793,12 +830,14 @@ class CompositeStore:
         operation_id: str | None = None,
         owner_worker_id: str | None = None,
         lifecycle_epoch: int | None = None,
+        tenant_id: str | None = None,
     ) -> bool:
         return self._facts.update_fact_fields(
             fact_id, verb, object, status, what,
             operation_id=operation_id,
             owner_worker_id=owner_worker_id,
             lifecycle_epoch=lifecycle_epoch,
+            tenant_id=tenant_id,
         )
 
     def get_fact_count_by_tags(self, *, conversation_id: str | None = None) -> dict[str, int]:
@@ -953,6 +992,7 @@ class CompositeStore:
         owner_worker_id: str | None = None,
         lifecycle_epoch: int | None = None,
         conversation_id: str | None = None,
+        embedding_model: str = "",
     ) -> None:
         return self._search.store_chunk_embeddings(
             segment_ref, chunks,
@@ -960,10 +1000,38 @@ class CompositeStore:
             owner_worker_id=owner_worker_id,
             lifecycle_epoch=lifecycle_epoch,
             conversation_id=conversation_id,
+            embedding_model=embedding_model,
         )
 
-    def get_all_chunk_embeddings(self) -> list[ChunkEmbedding]:
-        return self._search.get_all_chunk_embeddings()
+    def get_all_chunk_embeddings(self, conversation_id: str | None = None) -> list[ChunkEmbedding]:
+        return self._search.get_all_chunk_embeddings(conversation_id=conversation_id)
+
+    def vector_search_ready(self, model: str) -> bool:
+        ready = getattr(self._search, "vector_search_ready", None)
+        return bool(ready(model)) if callable(ready) else False
+
+    def search_segment_chunks_by_embedding(self, query_embedding, *, conversation_id=None,
+                                          limit=200, after=None, min_similarity=0.25) -> list[dict]:
+        return self._search.search_segment_chunks_by_embedding(
+            query_embedding, conversation_id=conversation_id, limit=limit,
+            after=after, min_similarity=min_similarity,
+        )
+
+    def search_canonical_turn_chunks_by_embedding(self, query_embedding, *, conversation_id=None,
+                                                 limit=200, after=None, min_similarity=0.25) -> list[dict]:
+        return self._search.search_canonical_turn_chunks_by_embedding(
+            query_embedding, conversation_id=conversation_id, limit=limit,
+            after=after, min_similarity=min_similarity,
+        )
+
+    def search_speaker_turn_chunks_by_embedding(self, query_embedding, *, speaker_context,
+                                               conversation_id=None, limit=200, after=None,
+                                               min_similarity=0.25) -> list[dict]:
+        return self._search.search_speaker_turn_chunks_by_embedding(
+            query_embedding, speaker_context=speaker_context,
+            conversation_id=conversation_id, limit=limit, after=after,
+            min_similarity=min_similarity,
+        )
 
     def has_chunks_for_segment(self, segment_ref: str) -> bool:
         return self._search.has_chunks_for_segment(segment_ref)
@@ -975,6 +1043,8 @@ class CompositeStore:
         side: str,
         chunks: list[CanonicalTurnChunkEmbedding],
         canonical_turn_id: str | None = None,
+        *,
+        embedding_model: str = "",
     ) -> None:
         return self._search.store_canonical_turn_chunk_embeddings(
             conversation_id,
@@ -982,6 +1052,7 @@ class CompositeStore:
             side,
             chunks,
             canonical_turn_id=canonical_turn_id,
+            embedding_model=embedding_model,
         )
 
     def get_all_canonical_turn_chunk_embeddings(
@@ -2526,3 +2597,45 @@ class CompositeStore:
             if sid not in closed and hasattr(sub, "close"):
                 sub.close()
                 closed.add(sid)
+
+    def get_segment_chunk_embedding_page(self, *, conversation_id=None, limit=200, after=None):
+        return self._search.get_segment_chunk_embedding_page(conversation_id=conversation_id, limit=limit, after=after)
+
+    def get_canonical_turn_chunk_embedding_page(self, *, conversation_id=None, speaker_context=None, limit=200, after=None):
+        return self._search.get_canonical_turn_chunk_embedding_page(conversation_id=conversation_id, speaker_context=speaker_context, limit=limit, after=after)
+
+    def get_canonical_turn_rows_by_group(self, conversation_id, turn_group_numbers, *, internal_validation=False):
+        return self._segments.get_canonical_turn_rows_by_group(conversation_id, turn_group_numbers, internal_validation=internal_validation)
+
+    def get_canonical_turn_rows_by_source_message_ids(self, conversation_id, source_message_ids, *, internal_validation=False):
+        return self._segments.get_canonical_turn_rows_by_source_message_ids(conversation_id, source_message_ids, internal_validation=internal_validation)
+
+    def get_compaction_watermark(self, conversation_id):
+        return self._segments.get_compaction_watermark(conversation_id)
+
+    def put_pending_exchange(self, conversation_id, exchange_id, payload_json, *, expires_at, max_entries=4, max_bytes=2097152):
+        return self._state.put_pending_exchange(conversation_id, exchange_id, payload_json, expires_at=expires_at, max_entries=max_entries, max_bytes=max_bytes)
+
+    def list_pending_exchanges(self, conversation_id, *, now):
+        return self._state.list_pending_exchanges(conversation_id, now=now)
+
+    def claim_pending_exchange(self, conversation_id, exchange_id, claim_id, *, now, lease_seconds=120):
+        return self._state.claim_pending_exchange(conversation_id, exchange_id, claim_id, now=now, lease_seconds=lease_seconds)
+
+    def renew_pending_exchange(self, conversation_id, exchange_id, claim_id, *, now, lease_seconds=120):
+        return self._state.renew_pending_exchange(conversation_id, exchange_id, claim_id, now=now, lease_seconds=lease_seconds)
+
+    def finish_pending_exchange(self, conversation_id, exchange_id, claim_id, *, consume):
+        return self._state.finish_pending_exchange(conversation_id, exchange_id, claim_id, consume=consume)
+
+    def get_fact_admission_scope(self, fact_id, *, tenant_id=None):
+        return self._facts.get_fact_admission_scope(fact_id, tenant_id=tenant_id)
+
+    def get_fact_decisions(self, conversation_id, *, limit=100, before=None):
+        return self._facts.get_fact_decisions(conversation_id, limit=limit, before=before)
+
+    def get_fact_admission_snapshot(self, fact_id, *, tenant_id=None):
+        return self._facts.get_fact_admission_snapshot(fact_id, tenant_id=tenant_id)
+
+    def get_pending_exchange(self, conversation_id, exchange_id, *, now):
+        return self._state.get_pending_exchange(conversation_id, exchange_id, now=now)

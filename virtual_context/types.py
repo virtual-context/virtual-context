@@ -9,6 +9,11 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Literal, Protocol, TypedDict, Union, runtime_checkable
 
+# Re-exported for existing callers; canonical definitions in patterns.py
+from .patterns import DEFAULT_TEMPORAL_PATTERNS  # noqa: F401
+
+from .core.rendered_memory import RenderedMemory
+
 # ---------------------------------------------------------------------------
 # Default models
 # ---------------------------------------------------------------------------
@@ -1213,8 +1218,6 @@ class TagResult:
     query_embedding: list[float] | None = None
 
 
-# Re-exported for existing callers; canonical definitions in patterns.py
-from .patterns import DEFAULT_TEMPORAL_PATTERNS  # noqa: F401
 
 
 @dataclass
@@ -2691,6 +2694,8 @@ class PagingConfig:
 class AssembledContext:
     core_context: str = ""
     tag_sections: dict[str, str] = field(default_factory=dict)
+    # Immutable request-local rendered memory records; never durable proof.
+    rendered_memories: tuple[RenderedMemory, ...] = field(default_factory=tuple, repr=False)
     facts_text: str = ""  # Formatted facts block
     conversation_history: list[Message] = field(default_factory=list)
     total_tokens: int = 0
@@ -2879,6 +2884,8 @@ class RetrieverConfig:
     anchorless_lookback: int = 6           # how many recent turns for working set
     inbound_tagger_type: str = "embedding"  # "embedding" (default) or "llm"
     embedding_model: str = "all-MiniLM-L6-v2"
+    # Opt-in PostgreSQL exact distance ranking; requires explicit vector migration.
+    vector_search_enabled: bool = False
     embedding_threshold: float = 0.3
     prefetch_facts: bool = True            # filter facts by query tags instead of fetching all
     # Dense fact retrieval: rank the eligible fact pool by cosine similarity
@@ -3115,6 +3122,7 @@ class PreparedPayload:
     inbound_bytes: int
     outbound_bytes: int
     metadata: dict = field(default_factory=dict)  # catch-all for anything else
+    request_history_json: str = field(default="[]", repr=False)
     is_vcattach: bool = False
     vcattach_target_id: str = ""
     vcattach_label: str = ""

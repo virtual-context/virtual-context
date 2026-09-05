@@ -21,9 +21,11 @@ class FalkorDBFactStore:
     Facts are ``(:Fact)`` nodes, links are ``[:FACT_LINK]`` edges,
     tags are ``(:Tag)`` nodes connected via ``[:HAS_TAG]``.
 
-    This backend does NOT implement SegmentStore, StateStore, or SearchStore —
-    those fall back to SQLite or Postgres via CompositeStore.
+    This is a direct graph utility. It cannot share the SQL canonical store's
+    lifecycle and compaction transactions, so engine composition is refused.
     """
+
+    supports_engine_lifecycle = False
 
     def __init__(
         self, host: str = "localhost", port: int = 6379,

@@ -3,7 +3,7 @@
 from virtual_context.storage.sqlite import SQLiteStore
 from virtual_context.storage.noop_fact_link_store import NoopFactLinkStore
 from virtual_context.core.composite_store import CompositeStore
-from virtual_context.types import Fact, FactLink, LinkedFact
+from virtual_context.types import Fact, FactLink
 
 
 class TestFullPipeline:
@@ -48,10 +48,9 @@ class TestFullPipeline:
         """Migrate superseded_by data, then query with link following."""
         sqlite = SQLiteStore(db_path=str(tmp_path / "test.db"))
 
-        old = Fact(id="old", subject="user", verb="lives-in", object="NYC")
+        old = Fact(id="old", subject="user", verb="lives-in", object="NYC", superseded_by="new")
         new = Fact(id="new", subject="user", verb="lives-in", object="Chicago")
         sqlite.store_facts([old, new])
-        sqlite.set_fact_superseded("old", "new")
 
         sqlite.migrate_supersession_to_links()
 

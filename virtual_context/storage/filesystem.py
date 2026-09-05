@@ -5,17 +5,76 @@ from __future__ import annotations
 from collections.abc import Collection
 
 import json
+import heapq
 import os
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from stat import S_ISREG
 
 import yaml
 
 from ..core.store import ContextStore
+from ..core.store_capabilities import StoreCapabilities
 from ..core.exceptions import ConversationLifecycleConflict
-from ..types import ChunkEmbedding, ConversationStats, DepthLevel, EngineStateSnapshot, QuoteResult, SegmentMetadata, StoredSegment, StoredSummary, TagStats, TagSummary, TurnTagEntry, WorkingSetEntry, strict_segment_identity_metadata, strict_structured_summary, structured_summary_to_dict
+from ..types import CanonicalTurnRow, ChunkEmbedding, ConversationStats, DepthLevel, EngineStateSnapshot, QuoteResult, SegmentMetadata, StoredSegment, StoredSummary, TagStats, TagSummary, TurnTagEntry, WorkingSetEntry, strict_segment_identity_metadata, strict_structured_summary, structured_summary_to_dict
 from .helpers import dt_to_str as _dt_to_str, str_to_dt as _str_to_dt, extract_excerpt as _extract_excerpt
+
+
+def _iter_embedding_json_array(path: Path):
+    """Decode one legacy array item at a time with a bounded parser buffer."""
+    decoder = json.JSONDecoder()
+    max_item_bytes = 4 * 1024 * 1024
+    with path.open("r", encoding="utf-8") as stream:
+        buffer = ""
+        eof = False
+
+        def fill():
+            nonlocal buffer, eof
+            chunk = stream.read(65536)
+            eof = not chunk
+            buffer += chunk
+            if len(buffer.encode("utf-8")) > max_item_bytes:
+                raise ValueError("Filesystem embedding item exceeds 4 MiB; reindex smaller chunks")
+
+        def available():
+            nonlocal buffer
+            buffer = buffer.lstrip()
+            while not buffer and not eof:
+                fill()
+                buffer = buffer.lstrip()
+            return bool(buffer)
+
+        if not available() or buffer[0] != "[":
+            raise ValueError("Invalid filesystem embedding array")
+        buffer = buffer[1:]
+        first = True
+        while available():
+            if buffer[0] == "]":
+                buffer = buffer[1:]
+                if available():
+                    raise ValueError("Trailing data in filesystem embedding array")
+                return
+            if not first:
+                if buffer[0] != ",":
+                    raise ValueError("Invalid filesystem embedding separator")
+                buffer = buffer[1:]
+                if not available() or buffer[0] == "]":
+                    raise ValueError("Invalid filesystem embedding item")
+            while True:
+                try:
+                    item, end = decoder.raw_decode(buffer)
+                    break
+                except json.JSONDecodeError:
+                    if eof:
+                        raise ValueError("Incomplete filesystem embedding array") from None
+                    fill()
+            if not isinstance(item, dict):
+                raise ValueError("Filesystem embedding items must be objects")
+            buffer = buffer[end:]
+            yield item
+            first = False
+        raise ValueError("Unterminated filesystem embedding array")
 
 
 def _segment_to_index_entry(seg: StoredSegment) -> dict:
@@ -32,6 +91,7 @@ def _segment_to_index_entry(seg: StoredSegment) -> dict:
         "compression_ratio": seg.compression_ratio,
         "compaction_model": seg.compaction_model,
         "entities": seg.metadata.entities,
+        "session_date": seg.metadata.session_date,
     }
 
 
@@ -219,6 +279,8 @@ def _segment_to_summary(seg: StoredSegment) -> StoredSummary:
 class FilesystemStore(ContextStore):
     """Store segments as markdown files organized by primary_tag directory."""
 
+    capabilities = StoreCapabilities(conversation_scope=True, streaming_embeddings=True)
+
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root)
         self._index_path = self.root / "_index.json"
@@ -322,8 +384,17 @@ class FilesystemStore(ContextStore):
     ) -> str:
         path = self._segment_path(segment.primary_tag, segment.ref)
         path.write_text(_segment_to_markdown(segment))
+        source_stat = path.stat()
         with self._lock:
             self._index[segment.ref] = _segment_to_index_entry(segment)
+            self._index[segment.ref]["_embedding_metadata"] = {
+                "source_stat": [source_stat.st_mtime_ns, source_stat.st_ctime_ns,
+                                source_stat.st_size, source_stat.st_ino],
+                "conversation_id": segment.conversation_id,
+                "primary_tag": segment.primary_tag,
+                "tags": list(segment.tags),
+                "session_date": segment.metadata.session_date,
+            }
             self._save_index()
         return segment.ref
 
@@ -759,6 +830,7 @@ class FilesystemStore(ContextStore):
         owner_worker_id: str | None = None,
         lifecycle_epoch: int | None = None,
         conversation_id: str | None = None,
+        embedding_model: str = "",
     ) -> None:
         embed_dir = self.root / "_embeddings"
         embed_dir.mkdir(parents=True, exist_ok=True)
@@ -775,7 +847,110 @@ class FilesystemStore(ContextStore):
         ]
         path.write_text(json.dumps(data, indent=2))
 
-    def get_all_chunk_embeddings(self) -> list[ChunkEmbedding]:
+    def _segment_embedding_metadata(self, ref, conversation_id):
+        """Reuse small metadata only while the actual source file is unchanged."""
+        with self._lock:
+            entry = dict(self._index.get(ref, {}))
+        if not entry or (conversation_id is not None and entry.get("conversation_id", "") != conversation_id):
+            return None
+        path = self._segment_path(entry["primary_tag"], ref)
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            return None
+        if not S_ISREG(stat.st_mode):
+            return None
+        fingerprint = [stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size, stat.st_ino]
+        metadata = entry.get("_embedding_metadata")
+        if metadata is None or metadata.get("source_stat") != fingerprint:
+            # Old indexes and externally edited Markdown are read once per
+            # file version, not once per vector. Never trust an orphan index.
+            segment = self.get_segment(ref, conversation_id=conversation_id)
+            if segment is None:
+                return None
+            try:
+                current = path.stat()
+            except FileNotFoundError:
+                return None
+            if [current.st_mtime_ns, current.st_ctime_ns, current.st_size, current.st_ino] != fingerprint:
+                return None
+            metadata = {
+                "source_stat": fingerprint,
+                "conversation_id": segment.conversation_id,
+                "primary_tag": segment.primary_tag,
+                "tags": list(segment.tags),
+                "session_date": segment.metadata.session_date,
+            }
+            with self._lock:
+                if self._index.get(ref) == entry:
+                    self._index[ref]["_embedding_metadata"] = metadata
+        if conversation_id is not None and metadata["conversation_id"] != conversation_id:
+            return None
+        return {key: value for key, value in metadata.items() if key != "source_stat"}
+
+    def get_segment_chunk_embedding_page(
+        self, *, conversation_id=None, limit=200, after=None,
+    ) -> list[dict]:
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("Page limit must be between 1 and 1000")
+        if after is not None and (len(after) != 2 or not isinstance(after[0], str)
+                                  or type(after[1]) is not int):
+            raise ValueError("Invalid segment embedding cursor")
+        after = tuple(after) if after is not None else None
+        embed_dir = self.root / "_embeddings"
+        if not embed_dir.is_dir():
+            return []
+        results: list[dict] = []
+        previous_ref = None
+        while len(results) < limit:
+            # The metadata index is already resident. Select only a bounded
+            # group of references without copying all file paths or vectors.
+            with self._lock:
+                refs = heapq.nsmallest(limit, (
+                    ref for ref, metadata in self._index.items()
+                    if (conversation_id is None or metadata.get("conversation_id", "") == conversation_id)
+                    and (after is None or ref >= after[0])
+                    and (previous_ref is None or ref > previous_ref)
+                ))
+            if not refs:
+                break
+            for ref in refs:
+                previous_ref = ref
+                metadata = self._segment_embedding_metadata(ref, conversation_id)
+                if metadata is None:
+                    continue
+                safe_ref = ref.replace("/", "_").replace("\\", "_").replace("..", "_")
+                path = embed_dir / f"{safe_ref}.json"
+                if not path.is_file():
+                    continue
+                selected: dict[tuple, dict] = {}
+                remaining = limit - len(results)
+                for item in _iter_embedding_json_array(path):
+                    if item.get("segment_ref") != ref or type(item.get("chunk_index")) is not int:
+                        continue
+                    cursor = (ref, item["chunk_index"])
+                    if after is not None and cursor <= after:
+                        continue
+                    # Legacy files need not be sorted by chunk index. Keep
+                    # only the next page's smallest keys while streaming.
+                    if len(selected) >= remaining and cursor not in selected:
+                        greatest = max(selected)
+                        if cursor >= greatest:
+                            continue
+                        del selected[greatest]
+                    selected[cursor] = {**item, **metadata, "cursor": cursor}
+                results.extend(selected[key] for key in sorted(selected))
+                if len(results) == limit:
+                    return results
+        return results
+
+    def get_canonical_turn_chunk_embedding_page(
+        self, *, conversation_id=None, speaker_context=None, limit=200, after=None,
+    ) -> list[dict]:
+        # This backend has no canonical turn-chunk persistence seam.
+        return []
+
+    def get_all_chunk_embeddings(self, conversation_id: str | None = None) -> list[ChunkEmbedding]:
         embed_dir = self.root / "_embeddings"
         if not embed_dir.is_dir():
             return []
@@ -786,6 +961,10 @@ class FilesystemStore(ContextStore):
             except (json.JSONDecodeError, OSError):
                 continue
             for item in data:
+                if conversation_id is not None:
+                    entry = self._index.get(item["segment_ref"])
+                    if entry is None or entry.get("conversation_id", "") != conversation_id:
+                        continue
                 results.append(ChunkEmbedding(
                     segment_ref=item["segment_ref"],
                     chunk_index=item["chunk_index"],

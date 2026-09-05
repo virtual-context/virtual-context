@@ -7,6 +7,7 @@ import logging
 import re
 import time
 
+from ..core.fact_lifecycle import decide_supersession, fact_version, parse_fact_date
 from ..core.store import ContextStore
 from ..core.telemetry import TelemetryLedger
 from ..types import Fact, FactLink, LLMProvider, RelationType, SupersessionConfig
@@ -65,22 +66,8 @@ def refresh_fact_embedding(
 
 
 def _parse_date_for_comparison(date_str: str):
-    """Parse a date string into a comparable date object. Returns None on failure."""
-    from datetime import date, datetime
-    if not date_str or date_str == "(unknown)":
-        return None
-    # Try YYYY-MM-DD
-    for fmt in ("%Y-%m-%d", "%Y/%m/%d"):
-        try:
-            return datetime.strptime(date_str[:10], fmt).date()
-        except ValueError:
-            pass
-    # Try "2023/04/20 (Thu) 04:17" format
-    try:
-        return datetime.strptime(date_str.split("(")[0].strip(), "%Y/%m/%d").date()
-    except ValueError:
-        pass
-    return None
+    """Compatibility name for the shared lifecycle date parser."""
+    return parse_fact_date(date_str)
 
 
 def _extract_object_keyword(object_str: str) -> str | None:
@@ -99,59 +86,6 @@ def _extract_object_keyword(object_str: str) -> str | None:
     return max(pool, key=len)
 
 
-_MERGE_SYSTEM = (
-    "You are a memory consolidation assistant. Respond only with JSON."
-)
-
-_MERGE_PROMPT = """\
-A fact has been superseded by a newer fact. Produce a single merged fact \
-that captures the current state and what changed.
-
-State what IS true now as durable knowledge. Do not echo the original \
-conversational phrasing — restate the facts in neutral, declarative language.
-
-SUPERSEDED (old) fact:
-  {old_formatted}
-
-CURRENT (new) fact:
-  {new_formatted}
-
-Produce a merged fact with updated fields:
-- "verb": a declarative verb describing the current state (e.g. "has", "holds", "improved")
-- "object": the current value with specifics preserved
-- "status": the appropriate temporal status
-- "what": one or two sentences of durable knowledge — current state and what changed
-
-Reply with JSON: {{"verb": "...", "object": "...", "status": "...", "what": "..."}}\
-"""
-
-
-_PROMOTE_SYSTEM = "You are a memory rewrite assistant. Respond only with JSON."
-
-_PROMOTE_PROMPT = """\
-A planned event's date has passed. Rewrite this fact as a completed event.
-
-Original fact:
-  Subject: {subject}
-  Verb: {verb}
-  Object: {object}
-  Who: {who}
-  What: {what}
-  Planned date: {when_date}
-
-The date {when_date} is now in the past (current date: {ref_date}). \
-Rewrite the fact as something that happened, not something that was planned. \
-Preserve who was involved (the "Who" field) in the rewritten text.
-
-Produce updated fields:
-- "verb": a past-tense action verb (e.g. "played", "attended", "went to")
-- "object": the object with planning language removed
-- "what": one sentence stating what happened, in past tense, including who was involved
-
-Reply with JSON: {{"verb": "...", "object": "...", "what": "..."}}\
-"""
-
-
 def promote_planned_facts(
     store: ContextStore,
     reference_date: str = "",
@@ -165,140 +99,111 @@ def promote_planned_facts(
     lifecycle_epoch: int | None = None,
     conversation_id: str | None = None,
 ) -> int:
-    """Promote 'planned' facts whose when_date has passed to 'completed'.
+    """Compatibility no-op: elapsed plans are not evidence of completion.
 
-    When a fact has status='planned' and a concrete when_date that is before
-    the reference_date (or today if not provided), its status is updated to
-    'completed' and verb/what are rewritten via LLM to reflect past tense.
-
-    Falls back to a simple status flip if no LLM provider is available.
-
-    When called from a compaction phase, the caller forwards the guard
-    kwargs so ``update_fact_fields`` writes through the active
-    operation-id fence (fencing plan §5.6 caller-side propagation).
-    The caller also forwards ``conversation_id`` so the planned-facts
-    query is scoped to the active op's conversation. Without that
-    scope a due planned fact from another conversation would trigger
-    ``CompactionLeaseLost`` on its guarded rewrite and abort an
-    unrelated compaction. Legacy non-compaction callers (CLI, tests,
-    ingest pipelines) omit the kwargs and continue through the
-    documented all-None branch with a global planned-facts scan.
-
-    Returns the number of facts promoted.
+    Kept for callers of older releases. A plan retains its original status,
+    text, and embedding until new canonical evidence establishes an outcome.
+    The past ``when_date`` already identifies an elapsed plan to readers.
+    No model calls or storage mutations are performed.
     """
-    from datetime import date, datetime
+    return 0
 
-    ref = None
-    if reference_date:
-        ref = _parse_date_for_comparison(reference_date)
-    if ref is None:
-        ref = date.today()
 
-    # When the caller supplies operation context, also constrain the
-    # planned-facts scan to the active op's conversation so we never
-    # touch facts in other conversations under a fenced write.
-    _query_kwargs: dict[str, object] = {
-        "status": "planned",
-        "limit": 10000,
+def _fact_scope(store, fact):
+    resolver = getattr(store, "get_fact_admission_scope", None)
+    if not callable(resolver):
+        return None
+    scope = resolver(fact.id)
+    return scope if isinstance(scope, tuple) and len(scope) == 2 and all(isinstance(value, str) for value in scope) else None
+
+
+def _proposal_snapshot(store, fact, *, cache=None):
+    key = (fact.id, fact_version(fact))
+    if cache is not None and key in cache:
+        return cache[key]
+    resolver = getattr(store, "get_fact_admission_snapshot", None)
+    if not callable(resolver):
+        return None
+    snapshot = resolver(fact.id)
+    if not isinstance(snapshot, dict) or snapshot.get("fact_version") != key[1]:
+        snapshot = None
+    if cache is not None:
+        cache[key] = snapshot
+    return snapshot
+
+
+def _proposal_versions(new_snapshot, old_snapshot):
+    return {
+        "expected_old_version": old_snapshot["fact_version"],
+        "expected_new_version": new_snapshot["fact_version"],
+        "expected_source_versions": tuple(sorted(set(
+            tuple(pair) for pair in (*old_snapshot.get("source_versions", ()), *new_snapshot.get("source_versions", ()))
+        ))),
     }
-    if conversation_id is not None:
-        _query_kwargs["conversation_id"] = conversation_id
-    planned = store.query_facts(**_query_kwargs)
-    promoted = 0
-    for fact in planned:
-        fact_date = _parse_date_for_comparison(fact.when_date or "")
-        if fact_date and fact_date < ref:
-            verb = fact.verb
-            obj = fact.object
-            what = fact.what or ""
-
-            # LLM rewrite for clean past-tense text
-            if llm_provider:
-                prompt = _PROMOTE_PROMPT.format(
-                    subject=fact.subject, verb=fact.verb,
-                    object=fact.object, who=fact.who or "",
-                    what=fact.what or "",
-                    when_date=fact.when_date or str(fact_date),
-                    ref_date=ref.isoformat(),
-                )
-                try:
-                    response, _ = llm_provider.complete(
-                        system=_PROMOTE_SYSTEM, user=prompt, max_tokens=200,
-                    )
-                    cleaned = re.sub(r"<think>.*?</think>", "", response.strip(), flags=re.DOTALL).strip()
-                    if cleaned.startswith("```"):
-                        cleaned = cleaned.split("\n", 1)[1] if "\n" in cleaned else cleaned[3:]
-                    if cleaned.endswith("```"):
-                        cleaned = cleaned[:-3]
-                    cleaned = cleaned.strip()
-                    if cleaned.startswith("json"):
-                        cleaned = cleaned[4:].strip()
-                    data = json.loads(cleaned)
-                    verb = data.get("verb", verb)
-                    obj = data.get("object", obj)
-                    what = data.get("what", what)
-                except Exception as e:
-                    logger.warning("Planned fact rewrite failed, using status-only: %s", e)
-
-            _updated = store.update_fact_fields(
-                fact.id, verb=verb, object=obj, status="completed", what=what,
-                operation_id=operation_id,
-                owner_worker_id=owner_worker_id,
-                lifecycle_epoch=lifecycle_epoch,
-            )
-            # Reflect the rewrite on the in-memory fact so the re-embed uses
-            # the promoted text, then refresh the dense vector under the same
-            # guard. The backend already invalidated the stale vector.
-            fact.verb = verb
-            fact.object = obj
-            fact.status = "completed"
-            fact.what = what
-            if _updated:
-                refresh_fact_embedding(
-                    store, embed_fn, embedding_model, fact,
-                    operation_id=operation_id,
-                    owner_worker_id=owner_worker_id,
-                    lifecycle_epoch=lifecycle_epoch,
-                )
-            promoted += 1
-            logger.info(
-                "Promoted planned→completed: %s %s → %s %s [when: %s]",
-                fact.subject, fact.verb, verb, obj[:40], fact.when_date,
-            )
-    if promoted:
-        logger.info("Promoted %d planned facts to completed (ref date: %s)", promoted, ref.isoformat())
-    return promoted
 
 
-def dedup_facts(store: ContextStore) -> int:
-    """Remove exact-duplicate facts from the store.
+def _admitted_snapshots(store, new, candidates, *, snapshot_cache=None):
+    """Bind each fact once before model I/O; SQL revalidates these proofs by CAS.
 
-    Groups non-superseded facts by (subject, verb, object, what) and marks
-    duplicates as superseded by the first occurrence.  Only considers facts
-    with non-empty 'what' to avoid collapsing distinct facts that happen to
-    share subject+verb but differ in meaning.
-
-    Storage-agnostic — works with any ContextStore implementation.
-
-    Returns the number of duplicates removed.
+    The cache lives only for one incoming fact's candidate selection. Embedding
+    and comparison share that immutable proposal, never a cross-request proof.
     """
-    all_facts = store.query_facts(limit=50000)
+    cache = {} if snapshot_cache is None else snapshot_cache
+    new_snapshot = _proposal_snapshot(store, new, cache=cache)
+    if new_snapshot is None:
+        return None, [], {}
+    accepted, old_snapshots = [], {}
+    for old in candidates:
+        if old.id == new.id:
+            continue
+        snapshot = _proposal_snapshot(store, old, cache=cache)
+        if snapshot is None:
+            continue
+        if decide_supersession(new, old, new_audience=new_snapshot.get("audience"), old_audience=snapshot.get("audience")).accepted:
+            accepted.append(old)
+            old_snapshots[old.id] = snapshot
+    return new_snapshot, accepted, old_snapshots
+
+
+def _admit_supersession_ids(
+    new_fact: Fact, candidates: list[Fact], proposed_ids: list[str], *, snapshots,
+) -> list[str]:
+    """Restrict model IDs to the pre-admitted immutable proposal."""
+    candidates_by_id = {fact.id: fact for fact in candidates}
+    return [old_id for old_id in dict.fromkeys(proposed_ids)
+            if old_id in candidates_by_id and decide_supersession(
+                new_fact, candidates_by_id[old_id],
+                new_audience=snapshots[new_fact.id].get("audience"),
+                old_audience=snapshots[old_id].get("audience"),
+            ).accepted]
+
+
+def dedup_facts(store: ContextStore, *, conversation_id: str | None = None) -> int:
+    """Consolidate exact duplicates only inside one admitted source scope."""
+    kwargs = {"limit": 50000}
+    if conversation_id is not None:
+        kwargs["conversation_id"] = conversation_id
+    all_facts = store.query_facts(**kwargs)
     groups: dict[tuple, list[Fact]] = {}
-    for f in all_facts:
-        if f.superseded_by or not f.what:
+    for fact in all_facts:
+        if fact.superseded_by or not fact.what or not fact.conversation_id:
             continue
-        key = (f.subject.lower(), f.verb.lower(), f.object.lower(), f.what.lower())
-        groups.setdefault(key, []).append(f)
-
+        key = (fact.conversation_id, fact.author_actor_id, fact.author_source_role,
+               _fact_scope(store, fact), fact.subject.casefold(), fact.verb.casefold(),
+               fact.object.casefold(), fact.what.casefold())
+        groups.setdefault(key, []).append(fact)
     deduped = 0
-    for key, facts in groups.items():
-        if len(facts) <= 1:
+    for facts in groups.values():
+        if len(facts) < 2:
             continue
+        # Chronology still applies to duplicate source claims. Retain the latest
+        # dated occurrence and record which historical occurrence it replaces.
+        facts.sort(key=lambda fact: (str(parse_fact_date(fact.when_date or fact.session_date) or ""), str(fact.mentioned_at), fact.id), reverse=True)
         keeper = facts[0]
-        for dupe in facts[1:]:
-            store.set_fact_superseded(dupe.id, keeper.id)
-            deduped += 1
-
+        for duplicate in facts[1:]:
+            new_snapshot, candidates, snapshots = _admitted_snapshots(store, keeper, [duplicate])
+            if candidates and store.set_fact_superseded(duplicate.id, keeper.id, **_proposal_versions(new_snapshot, snapshots[duplicate.id])) is True:
+                deduped += 1
     if deduped:
         logger.info("Deduped %d exact-duplicate facts", deduped)
     return deduped
@@ -324,7 +229,7 @@ class FactSupersessionChecker:
         self._telemetry = telemetry_ledger
         self._embed_fn = embed_fn
         self._embedding_model = embedding_model
-        self._all_facts_cache: list[Fact] | None = None
+        self._all_facts_cache: dict[str, list[Fact]] = {}
 
     def check_and_supersede(
         self,
@@ -344,19 +249,15 @@ class FactSupersessionChecker:
         sets to the active op's conversation) so a candidate from a
         different conversation never reaches the fenced supersession
         write, avoiding a spurious ``CompactionLeaseLost`` from the
-        both-endpoint validation. Legacy callers omit the kwargs and
-        continue with the global candidate scan.
+        both-endpoint validation. Conversation, author, audience and chronology
+        constrain every caller before any model sees the candidates.
 
         Returns count of superseded facts.
         """
         if not self.config.enabled or not new_facts:
             return 0
 
-        # When the caller is fenced (operation_id supplied), constrain
-        # candidate queries to each fact's conversation_id. The pipeline
-        # writes the active op's conversation_id onto every fact before
-        # calling this method, so per-fact scoping is the right granularity.
-        _is_fenced = operation_id is not None
+        # All reads are conversation-scoped; write fences are independent.
 
         import sys as _sys
         import time as _time
@@ -371,7 +272,7 @@ class FactSupersessionChecker:
             if fact.id in superseded_this_run:
                 logger.info("  Supersession %d/%d: skipped (already superseded this run)", idx, total)
                 continue
-            if not fact.subject:
+            if not fact.subject or not fact.conversation_id:
                 logger.info("  Supersession %d/%d: skipped (no subject)", idx, total)
                 continue
             # Query existing non-superseded facts with same subject.
@@ -383,7 +284,7 @@ class FactSupersessionChecker:
                 "tags": fact.tags if fact.tags else None,
                 "limit": self.config.batch_size,
             }
-            if _is_fenced and fact.conversation_id:
+            if fact.conversation_id:
                 _query_kwargs["conversation_id"] = fact.conversation_id
             candidates = self.store.query_facts(**_query_kwargs)
             # Object-similarity candidates -- catches cross-session duplicates
@@ -397,7 +298,7 @@ class FactSupersessionChecker:
                     "object_contains": keyword,
                     "limit": self.config.batch_size,
                 }
-                if _is_fenced and fact.conversation_id:
+                if fact.conversation_id:
                     _obj_query_kwargs["conversation_id"] = fact.conversation_id
                 obj_candidates = self.store.query_facts(**_obj_query_kwargs)
                 # Filter to case-sensitive whole-word matches to avoid
@@ -410,15 +311,18 @@ class FactSupersessionChecker:
                         seen_ids.add(c.id)
             # Embedding-based candidates — finds semantically similar facts
             # regardless of tag overlap or ingestion order.
+            snapshot_cache = {}
             seen_ids = {c.id for c in candidates}
             embed_candidates = self._embedding_candidates(
                 fact, seen_ids,
                 restrict_conversation_id=(
-                    fact.conversation_id if _is_fenced and fact.conversation_id else None
+                    fact.conversation_id
                 ),
+                snapshot_cache=snapshot_cache,
             )
             candidates.extend(embed_candidates)
-            candidates = [c for c in candidates if c.id != fact.id and c.id not in superseded_this_run]
+            candidates = [c for c in candidates if c.id not in superseded_this_run]
+            new_snapshot, candidates, snapshots = _admitted_snapshots(self.store, fact, candidates, snapshot_cache=snapshot_cache)
             if not candidates:
                 _skipped += 1
                 if idx % 100 == 0 or idx == total:
@@ -436,30 +340,18 @@ class FactSupersessionChecker:
             _llm_calls += 1
             superseded_ids = self._check_batch(fact, candidates)
             if superseded_ids:
-                # Hard date guard: never supersede a candidate with a newer
-                # session date than the new fact.  The LLM prompt asks for
-                # this but doesn't always comply.
-                cand_by_id = {c.id: c for c in candidates}
-                new_date = _parse_date_for_comparison(fact.when_date or fact.session_date or "")
-                safe_ids = []
-                for old_id in superseded_ids:
-                    old_fact = cand_by_id.get(old_id)
-                    if old_fact:
-                        old_date = _parse_date_for_comparison(old_fact.when_date or old_fact.session_date or "")
-                        if new_date and old_date and old_date > new_date:
-                            logger.info("  Supersession date guard: refusing to supersede newer fact %s (%s > %s)",
-                                        old_id[:8], old_date, new_date)
-                            continue
-                    safe_ids.append(old_id)
+                safe_ids = _admit_supersession_ids(fact, candidates, superseded_ids, snapshots={**snapshots, fact.id: new_snapshot})
                 for old_id in safe_ids:
-                    self.store.set_fact_superseded(
+                    accepted = self.store.set_fact_superseded(
                         old_id, fact.id,
                         operation_id=operation_id,
                         owner_worker_id=owner_worker_id,
                         lifecycle_epoch=lifecycle_epoch,
+                        **_proposal_versions(new_snapshot, snapshots[old_id]),
                     )
-                    superseded_this_run.add(old_id)
-                    superseded_count += 1
+                    if accepted is True:
+                        superseded_this_run.add(old_id)
+                        superseded_count += 1
                 logger.info("  Supersession %d/%d: %d superseded (total %d) — %s",
                             idx, total, len(superseded_ids), superseded_count, fact.subject[:40])
             else:
@@ -480,16 +372,17 @@ class FactSupersessionChecker:
         _sys.stderr.flush()
         return superseded_count
 
-    def _get_all_facts(self) -> list[Fact]:
-        """Cache all non-superseded facts for embedding search."""
-        if self._all_facts_cache is None:
-            self._all_facts_cache = self.store.query_facts(limit=10000)
-        return self._all_facts_cache
+    def _get_all_facts(self, conversation_id: str) -> list[Fact]:
+        """Cache only this owned conversation's bounded candidate pool."""
+        if conversation_id not in self._all_facts_cache:
+            self._all_facts_cache[conversation_id] = self.store.query_facts(limit=10000, conversation_id=conversation_id)
+        return self._all_facts_cache[conversation_id]
 
     def _embedding_candidates(
         self, fact: Fact, already_seen: set[str], top_k: int = 10, threshold: float = 0.5,
         *,
         restrict_conversation_id: str | None = None,
+        snapshot_cache=None,
     ) -> list[Fact]:
         """Find semantically similar facts via embedding on the 'what' field.
 
@@ -505,7 +398,7 @@ class FactSupersessionChecker:
         if not query_text.strip():
             return []
 
-        all_facts = self._get_all_facts()
+        all_facts = self._get_all_facts(fact.conversation_id)
         # Filter to same subject, not already seen
         pool = [
             f for f in all_facts
@@ -517,6 +410,7 @@ class FactSupersessionChecker:
                 or f.conversation_id == restrict_conversation_id
             )
         ]
+        _, pool, _ = _admitted_snapshots(self.store, fact, pool, snapshot_cache=snapshot_cache)
         if not pool:
             return []
 
@@ -599,53 +493,13 @@ class FactSupersessionChecker:
         return "\n".join(lines)
 
     def _merge_facts(self, winning_fact: Fact, old_fact: Fact) -> None:
-        """Merge old fact's knowledge into the winning fact via LLM.
+        """Compatibility no-op: accepted source-derived claims stay unchanged.
 
-        Updates verb, object, status, and what on the winning fact to capture
-        the temporal transition as durable knowledge.
+        Supersession records the old/new relationship and source versions.
+        Model-written consolidation prose is not new evidence and cannot
+        rewrite the surviving fact's fields or temporal status.
         """
-        prompt = _MERGE_PROMPT.format(
-            old_formatted=old_fact.format_for_prompt(),
-            new_formatted=winning_fact.format_for_prompt(),
-        )
-        try:
-            response, _ = self.llm.complete(
-                system=_MERGE_SYSTEM,
-                user=prompt,
-                max_tokens=256,
-            )
-        except Exception as e:
-            logger.warning("Supersession merge LLM call failed: %s", e)
-            return
-
-        if not response:
-            return
-        merged = self._parse_merge_response(response)
-        if not merged:
-            return
-
-        verb = merged.get("verb", winning_fact.verb)
-        obj = merged.get("object", winning_fact.object)
-        status = merged.get("status", winning_fact.status)
-        what = merged.get("what", winning_fact.what)
-
-        _updated = self.store.update_fact_fields(winning_fact.id, verb, obj, status, what)
-        # Update the in-memory object so subsequent merges see current state
-        winning_fact.verb = verb
-        winning_fact.object = obj
-        winning_fact.status = status
-        winning_fact.what = what
-        # Legacy non-compaction caller: refresh the dense vector best-effort
-        # with no guard kwargs (the backend already invalidated the stale
-        # row inside the update transaction).
-        if _updated:
-            refresh_fact_embedding(
-                self.store, self._embed_fn, self._embedding_model, winning_fact,
-            )
-        logger.info(
-            "Merged superseded fact into %s: verb=%r, object=%r",
-            winning_fact.id[:8], verb, obj,
-        )
+        return None
 
     def _parse_merge_response(self, response: str) -> dict | None:
         text = response.strip()
@@ -714,7 +568,7 @@ class FactSupersessionChecker:
             except (json.JSONDecodeError, ValueError):
                 return []
 
-        return [candidates[i].id for i in indices if isinstance(i, int) and 0 <= i < len(candidates)]
+        return [candidates[i].id for i in indices if type(i) is int and 0 <= i < len(candidates)]
 
 
 # Valid relation types for link detection
@@ -772,12 +626,11 @@ class FactLinkChecker:
     ) -> tuple[int, int]:
         """Detect supersession and (optionally) inter-fact links.
 
-        Runs a deterministic planned->completed promotion pass first,
-        then LLM-based supersession/linking.
+        A model proposes relationships; deterministic chronology admits
+        supersession. Elapsed plans remain plans until new evidence arrives.
 
         When called from a compaction phase, the caller forwards the
-        guard kwargs so ``promote_planned_facts``,
-        ``check_and_supersede``, ``set_fact_superseded``, and
+        guard kwargs so ``check_and_supersede``, ``set_fact_superseded``, and
         ``store_fact_links`` all write through the active
         operation-id fence (fencing plan §5.6 caller-side propagation).
         ``conversation_id`` is required alongside the guard triple for
@@ -789,19 +642,6 @@ class FactLinkChecker:
         if not self.config.enabled or not new_facts:
             return 0, 0
         from ..types import CompactionLeaseLost
-
-        # Pre-pass: promote planned facts whose date has passed (LLM rewrite).
-        # conversation_id scopes the planned-facts scan so a due fact
-        # from another conversation cannot trigger a guarded rewrite
-        # rejection during this conversation's compaction.
-        promote_planned_facts(
-            self.store, llm_provider=self.llm, model=self.model,
-            embed_fn=self._embed_fn, embedding_model=self._embedding_model,
-            operation_id=operation_id,
-            owner_worker_id=owner_worker_id,
-            lifecycle_epoch=lifecycle_epoch,
-            conversation_id=conversation_id,
-        )
 
         if not self.graph_links:
             superseded = self._supersession.check_and_supersede(
@@ -816,23 +656,21 @@ class FactLinkChecker:
         total_links = 0
         total_superseded = 0
 
-        _is_fenced = operation_id is not None
         for fact in new_facts:
-            if not fact.subject:
+            if not fact.subject or not fact.conversation_id:
                 continue
 
-            # When fenced, scope candidates to the active op's
-            # conversation so a candidate from another conversation
-            # cannot trigger a guarded supersession/link write rejection.
+            # Constrain every candidate read before model comparison.
             _query_kwargs: dict[str, object] = {
                 "subject": fact.subject,
                 "tags": fact.tags if fact.tags else None,
                 "limit": self.config.batch_size,
             }
-            if _is_fenced and conversation_id is not None:
-                _query_kwargs["conversation_id"] = conversation_id
+            if conversation_id is not None and conversation_id != fact.conversation_id:
+                continue
+            _query_kwargs["conversation_id"] = fact.conversation_id
             candidates = self.store.query_facts(**_query_kwargs)
-            candidates = [c for c in candidates if c.id != fact.id]
+            new_snapshot, candidates, snapshots = _admitted_snapshots(self.store, fact, candidates)
             if not candidates:
                 continue
 
@@ -844,26 +682,42 @@ class FactLinkChecker:
                 logger.warning("FactLinkChecker LLM call failed: %s", e)
                 continue
 
-            # Handle supersession
-            for old_id in superseded_ids:
-                self.store.set_fact_superseded(
-                    old_id, fact.id,
-                    operation_id=operation_id,
-                    owner_worker_id=owner_worker_id,
-                    lifecycle_epoch=lifecycle_epoch,
+            snapshots[fact.id] = new_snapshot
+            safe_ids = _admit_supersession_ids(fact, candidates, superseded_ids, snapshots=snapshots)
+            known_facts = {candidate.id: candidate for candidate in [fact, *candidates]}
+            pairs = {(old_id, fact.id) for old_id in safe_ids}
+            for link in links:
+                if link.relation_type == "supersedes":
+                    new = known_facts.get(link.source_fact_id)
+                    old = known_facts.get(link.target_fact_id)
+                    if new and old and decide_supersession(
+                        new, old, new_audience=snapshots[new.id].get("audience"),
+                        old_audience=snapshots[old.id].get("audience"),
+                    ).accepted:
+                        pairs.add((old.id, new.id))
+            accepted_pairs = set()
+            for old_id, new_id in sorted(pairs):
+                accepted = self.store.set_fact_superseded(
+                    old_id, new_id, operation_id=operation_id,
+                    owner_worker_id=owner_worker_id, lifecycle_epoch=lifecycle_epoch,
+                    **_proposal_versions(snapshots[new_id], snapshots[old_id]),
                 )
-                total_superseded += 1
+                if accepted is True:
+                    accepted_pairs.add((old_id, new_id))
+                    total_superseded += 1
+            links = [link for link in links if link.relation_type != "supersedes"
+                     or (link.target_fact_id, link.source_fact_id) in accepted_pairs]
 
             # Store links
             if links:
-                self.store.store_fact_links(
+                stored_count = self.store.store_fact_links(
                     links,
                     operation_id=operation_id,
                     owner_worker_id=owner_worker_id,
                     lifecycle_epoch=lifecycle_epoch,
-                    conversation_id=conversation_id,
+                    conversation_id=conversation_id or fact.conversation_id,
                 )
-                total_links += len(links)
+                total_links += stored_count if type(stored_count) is int else 0
 
         return total_links, total_superseded
 
@@ -956,7 +810,7 @@ class FactLinkChecker:
         superseded_ids = []
         if isinstance(superseded_raw, list):
             for idx in superseded_raw:
-                if isinstance(idx, int) and 0 <= idx < len(candidates):
+                if type(idx) is int and 0 <= idx < len(candidates):
                     superseded_ids.append(candidates[idx].id)
 
         # Parse links

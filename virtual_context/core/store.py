@@ -12,10 +12,10 @@ from ..types import (
     CANONICAL_TAGGING_IDENTITY_KEY,
     CanonicalTurnChunkEmbedding,
     CanonicalTurnRow,
+    CanonicalTurnReconcileRow,
     ChunkEmbedding,
     CompactionLeaseClaim,
     ConversationStats,
-    DepthLevel,
     EngineStateSnapshot,
     Fact,
     FactSignal,
@@ -28,7 +28,6 @@ from ..types import (
     StoredSummary,
     TagStats,
     TagSummary,
-    WorkingSetEntry,
 )
 from .progress_snapshot import ProgressSnapshot
 
@@ -151,6 +150,11 @@ def canonical_rows_to_history(
 
 class ContextStore(ABC):
     """Pluggable storage backend for compacted conversation segments."""
+
+    @property
+    def capabilities(self):
+        from .store_capabilities import StoreCapabilities
+        return StoreCapabilities()
 
     @abstractmethod
     def store_segment(
@@ -389,11 +393,28 @@ class ContextStore(ABC):
         owner_worker_id: str | None = None,
         lifecycle_epoch: int | None = None,
         conversation_id: str | None = None,
+        embedding_model: str = "",
     ) -> None:
         """Idempotent: replaces any existing chunks for this segment."""
 
-    def get_all_chunk_embeddings(self) -> list[ChunkEmbedding]:
+    def get_all_chunk_embeddings(self, conversation_id: str | None = None) -> list[ChunkEmbedding]:
         return []
+
+    def vector_search_ready(self, model: str) -> bool:
+        return False
+
+    def search_segment_chunks_by_embedding(self, query_embedding, *, conversation_id=None,
+                                          limit=200, after=None, min_similarity=0.25) -> list[dict]:
+        raise NotImplementedError("Native semantic vector search requires PostgreSQL")
+
+    def search_canonical_turn_chunks_by_embedding(self, query_embedding, *, conversation_id=None,
+                                                 limit=200, after=None, min_similarity=0.25) -> list[dict]:
+        raise NotImplementedError("Native semantic vector search requires PostgreSQL")
+
+    def search_speaker_turn_chunks_by_embedding(self, query_embedding, *, speaker_context,
+                                               conversation_id=None, limit=200, after=None,
+                                               min_similarity=0.25) -> list[dict]:
+        raise NotImplementedError("Native semantic vector search requires PostgreSQL")
 
     def has_chunks_for_segment(self, segment_ref: str) -> bool:
         """Return True iff at least one chunk embedding row exists
@@ -417,6 +438,8 @@ class ContextStore(ABC):
         side: str,
         chunks: list[CanonicalTurnChunkEmbedding],
         canonical_turn_id: str | None = None,
+        *,
+        embedding_model: str = "",
     ) -> None:
         """Idempotent: replaces any existing embedded chunks for this turn side."""
 
@@ -576,13 +599,16 @@ class ContextStore(ABC):
         conversation_id: str,
         *,
         protected_recent_turns: int = 0,
+        limit: int | None = None,
     ) -> list[CanonicalTurnRow]:
+        if limit is not None and (type(limit) is not int or limit < 1):
+            raise ValueError("Backlog limit must be a positive integer")
         rows = [row for row in self.get_all_canonical_turns(conversation_id) if not row.compacted_at]
         if protected_recent_turns > 0 and len(rows) > protected_recent_turns:
-            return rows[:-protected_recent_turns]
+            return rows[:-protected_recent_turns][:limit]
         if protected_recent_turns > 0:
             return []
-        return rows
+        return rows[:limit]
 
     def reconstruct_history_for_conv(
         self, conversation_id: str,
@@ -1927,8 +1953,12 @@ class ContextStore(ABC):
         operation_id: str | None = None,
         owner_worker_id: str | None = None,
         lifecycle_epoch: int | None = None,
-    ) -> None:
-        pass
+        tenant_id: str | None = None,
+        expected_old_version: str | None = None,
+        expected_new_version: str | None = None,
+        expected_source_versions: tuple[tuple[str, str], ...] | None = None,
+    ) -> bool:
+        return False
 
     def update_fact_fields(
         self,
@@ -1941,6 +1971,7 @@ class ContextStore(ABC):
         operation_id: str | None = None,
         owner_worker_id: str | None = None,
         lifecycle_epoch: int | None = None,
+        tenant_id: str | None = None,
     ) -> bool:
         return False
 
@@ -2218,3 +2249,45 @@ class ContextStore(ABC):
         owner because those ids separate disclosure policy from storage.
         """
         return ""
+
+    def get_segment_chunk_embedding_page(self, *, conversation_id=None, limit=200, after=None):
+        raise NotImplementedError("get_segment_chunk_embedding_page is not supported by this store")
+
+    def get_canonical_turn_chunk_embedding_page(self, *, conversation_id=None, speaker_context=None, limit=200, after=None):
+        raise NotImplementedError("get_canonical_turn_chunk_embedding_page is not supported by this store")
+
+    def get_canonical_turn_rows_by_group(self, conversation_id, turn_group_numbers, *, internal_validation=False):
+        raise NotImplementedError("get_canonical_turn_rows_by_group is not supported by this store")
+
+    def get_canonical_turn_rows_by_source_message_ids(self, conversation_id, source_message_ids, *, internal_validation=False):
+        raise NotImplementedError("get_canonical_turn_rows_by_source_message_ids is not supported by this store")
+
+    def get_compaction_watermark(self, conversation_id):
+        raise NotImplementedError("get_compaction_watermark is not supported by this store")
+
+    def put_pending_exchange(self, conversation_id, exchange_id, payload_json, *, expires_at, max_entries=4, max_bytes=2097152):
+        raise NotImplementedError("put_pending_exchange is not supported by this store")
+
+    def list_pending_exchanges(self, conversation_id, *, now):
+        raise NotImplementedError("list_pending_exchanges is not supported by this store")
+
+    def claim_pending_exchange(self, conversation_id, exchange_id, claim_id, *, now, lease_seconds=120):
+        raise NotImplementedError("claim_pending_exchange is not supported by this store")
+
+    def renew_pending_exchange(self, conversation_id, exchange_id, claim_id, *, now, lease_seconds=120):
+        raise NotImplementedError("renew_pending_exchange is not supported by this store")
+
+    def finish_pending_exchange(self, conversation_id, exchange_id, claim_id, *, consume):
+        raise NotImplementedError("finish_pending_exchange is not supported by this store")
+
+    def get_fact_admission_scope(self, fact_id, *, tenant_id=None):
+        return None
+
+    def get_fact_decisions(self, conversation_id, *, limit=100, before=None):
+        raise NotImplementedError("Fact decision history requires relational storage")
+
+    def get_fact_admission_snapshot(self, fact_id, *, tenant_id=None):
+        return None
+
+    def get_pending_exchange(self, conversation_id, exchange_id, *, now):
+        raise NotImplementedError("Durable exchanges require relational storage")

@@ -12,6 +12,14 @@ from virtual_context.ingest.supersession import (
     _extract_object_keyword,
 )
 from virtual_context.types import Fact, SupersessionConfig
+from virtual_context.core.fact_lifecycle import fact_version
+
+_FACTS = {}
+
+@pytest.fixture(autouse=True)
+def _reset_fact_inventory():
+    _FACTS.clear()
+
 
 
 # ── helpers ──────────────────────────────────────────────────────────────
@@ -30,6 +38,9 @@ def _make_checker(
 
     store = MagicMock()
     store.query_facts.return_value = []
+    store.set_fact_superseded.return_value = True
+    store.get_fact_admission_scope.return_value = None
+    store.get_fact_admission_snapshot.side_effect = lambda fact_id: {"fact_version": fact_version(_FACTS[fact_id]), "audience": None, "source_versions": ()}
 
     cfg = config or SupersessionConfig(enabled=True, batch_size=20)
     checker = FactSupersessionChecker(
@@ -51,8 +62,9 @@ def _make_fact(
     when_date: str = "",
     what: str = "",
 ) -> Fact:
-    return Fact(
+    fact = Fact(
         id=id,
+        conversation_id="conversation",
         subject=subject,
         verb=verb,
         object=object,
@@ -61,6 +73,8 @@ def _make_fact(
         when_date=when_date,
         what=what,
     )
+    _FACTS[id] = fact
+    return fact
 
 
 # ── _extract_object_keyword tests ───────────────────────────────────────
@@ -287,6 +301,7 @@ class TestCheckAndSupersede:
         store.set_fact_superseded.assert_called_once_with(
             "old-001", "new-001",
             operation_id=None, owner_worker_id=None, lifecycle_epoch=None,
+            expected_old_version=fact_version(old_fact), expected_new_version=fact_version(new_fact), expected_source_versions=(),
         )
 
     def test_no_contradiction(self):
@@ -316,7 +331,8 @@ class TestCheckAndSupersede:
         # decide which old fact to return as a candidate.
         _fact_idx = [0]  # mutable counter
 
-        def query_side_effect(subject=None, tags=None, limit=20, object_contains=None):
+        def query_side_effect(subject=None, tags=None, limit=20, object_contains=None, conversation_id=None):
+            assert conversation_id == "conversation"
             if subject == "user" and object_contains is None and tags is None:
                 # Unfiltered call (e.g., embedding candidates cache) — return all
                 return [old1, old2]

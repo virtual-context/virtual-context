@@ -305,3 +305,38 @@ serving-complete until those actions and the final verification run succeed.
 - `retrieve` / `transform`: `-m` / `--message` is the inbound message to retrieve for; `--active-tags` supplies a comma-separated working set to simulate; `transform` also takes `--budget` to override the token budget.
 - `recall`: `--limit` caps returned segments (default 5).
 - `init`: `--force` overwrites an existing config file.
+
+### Check and repair SQLite search indexes
+
+`virtual-context -c config.yaml admin repair-search-indexes` compares FTS indexes
+against their stored content without rebuilding them. Add `--apply` to rebuild
+only corrupt indexes. Use `--sqlite-path PATH` to select an existing database
+and repeat `--index NAME` to restrict the check. Output reports `ok`,
+`needs_rebuild`, or `rebuilt` for each checked index. This repairs search indexes;
+it cannot recover fact relationships removed by older replacement writes.
+
+### Prepare PostgreSQL canonical group reads
+
+`virtual-context -c config.yaml admin migrate-read-indexes` reports whether the
+canonical group index is ready. Add `--apply` to build it concurrently through
+an idle connection. PostgreSQL worker startup does not build this large index;
+schedule the command as an explicit upgrade step. A conflicting migration or
+lock wait fails visibly and can be retried. SQLite creates its local index at
+startup.
+
+### Prepare native PostgreSQL semantic ranking
+
+`virtual-context -c config.yaml admin migrate-semantic-vectors` checks the
+optional pgvector cache schema and reports readiness. Add `--apply` to install
+and backfill it, with `--batch-size N` controlling each batch. PostgreSQL must
+have the pgvector extension package available. The configured embedding model
+must be `all-MiniLM-L6-v2`; verify that existing chunk embeddings were generated
+with that model before backfilling. Raw embedding JSON remains authoritative.
+
+Upgrade all writers, then rerun the backfill and check the per-model residue
+report before enabling native reads. A mixed-version writer can make the cache
+incomplete for every conversation. After real-database parity and resource checks, set
+`retrieval.vector_search_enabled: true` to use exact DB-side ranking. The flag
+is off by default; migration does not activate it. Enabled reads require a ready
+cache and raise if it becomes incomplete rather than falling back to an
+archive-sized Python scan. Set the flag to false to restore the existing path.

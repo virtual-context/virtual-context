@@ -255,11 +255,11 @@ class TestSetFactSuperseded:
         from virtual_context.storage.sqlite import SQLiteStore
         from virtual_context.types import Fact
         store = SQLiteStore(str(tmp_path / "test.db"))
-        old = Fact(subject="user", verb="has PB", object="27:12", status="completed")
-        new = Fact(subject="user", verb="has PB", object="25:50", status="completed")
+        old = Fact(conversation_id="conversation", subject="fixture-rig", verb="records", object="100 ms", status="completed")
+        new = Fact(conversation_id="conversation", subject="fixture-rig", verb="records", object="80 ms", status="completed")
         store.store_facts([old, new])
         store.set_fact_superseded(old.id, new.id)
-        results = store.query_facts(subject="user")
+        results = store.query_facts(subject="fixture-rig")
         assert len(results) == 1
         assert results[0].id == new.id
 
@@ -267,8 +267,8 @@ class TestSetFactSuperseded:
         from virtual_context.storage.sqlite import SQLiteStore
         from virtual_context.types import Fact
         store = SQLiteStore(str(tmp_path / "test.db"))
-        old = Fact(subject="user", verb="has PB", object="27:12")
-        new = Fact(subject="user", verb="has PB", object="25:50")
+        old = Fact(conversation_id="conversation", subject="fixture-rig", verb="records", object="100 ms")
+        new = Fact(conversation_id="conversation", subject="fixture-rig", verb="records", object="80 ms")
         store.store_facts([old, new])
         store.set_fact_superseded(old.id, new.id)
         conn = store._get_conn()
@@ -468,15 +468,15 @@ class TestFactEnrichmentIntegration:
         from virtual_context.storage.sqlite import SQLiteStore
         from virtual_context.types import Fact
         store = SQLiteStore(str(tmp_path / "test.db"))
-        old = Fact(subject="user", verb="has PB", object="27:12",
-                   fact_type="personal", what="User has a PB of 27:12.")
-        new = Fact(subject="user", verb="has PB", object="25:50",
-                   fact_type="personal", what="User has a PB of 25:50.")
+        old = Fact(conversation_id="conversation", subject="fixture-rig", verb="records", object="100 ms",
+                   fact_type="personal", what="Fixture rig records a cycle time of 100 ms.")
+        new = Fact(conversation_id="conversation", subject="fixture-rig", verb="records", object="80 ms",
+                   fact_type="personal", what="Fixture rig records a cycle time of 80 ms.")
         store.store_facts([old, new])
         store.set_fact_superseded(old.id, new.id)
-        results = store.query_facts(subject="user")
+        results = store.query_facts(subject="fixture-rig")
         assert len(results) == 1
-        assert "25:50" in results[0].object
+        assert "80 ms" in results[0].object
 
     def test_fact_type_filter_excludes_experience(self, tmp_path):
         """Experience facts should be filterable separately."""
@@ -498,8 +498,6 @@ class TestSupersessionTagFiltering:
 
     def test_tag_filtered_candidates(self, tmp_path):
         """check_and_supersede passes fact.tags to query_facts."""
-        import tempfile
-        from pathlib import Path
         from tests.conftest import MockLLMProvider
         from virtual_context.storage.sqlite import SQLiteStore
         from virtual_context.types import Fact, SupersessionConfig
@@ -507,11 +505,11 @@ class TestSupersessionTagFiltering:
 
         store = SQLiteStore(str(tmp_path / "test.db"))
         # Store facts with different tags
-        running_fact = Fact(
+        running_fact = Fact(conversation_id="conversation",
             subject="user", verb="set", object="5K PB of 27:12",
             tags=["running", "5k-run", "personal-best"],
         )
-        cooking_fact = Fact(
+        cooking_fact = Fact(conversation_id="conversation",
             subject="user", verb="prefers", object="Italian cuisine",
             tags=["cooking", "food-preference"],
         )
@@ -523,7 +521,7 @@ class TestSupersessionTagFiltering:
             llm_provider=llm, model="test",
             store=store, config=SupersessionConfig(enabled=True),
         )
-        new_fact = Fact(
+        new_fact = Fact(conversation_id="conversation",
             subject="user", verb="set", object="5K PB of 25:50",
             tags=["running", "5k-run", "personal-best"],
         )
@@ -538,15 +536,13 @@ class TestSupersessionTagFiltering:
 
     def test_no_tags_falls_back_to_subject_only(self, tmp_path):
         """Facts without tags still get subject-based candidates."""
-        import tempfile
-        from pathlib import Path
         from tests.conftest import MockLLMProvider
         from virtual_context.storage.sqlite import SQLiteStore
         from virtual_context.types import Fact, SupersessionConfig
         from virtual_context.ingest.supersession import FactSupersessionChecker
 
         store = SQLiteStore(str(tmp_path / "test.db"))
-        old = Fact(subject="user", verb="likes", object="coffee", tags=[])
+        old = Fact(conversation_id="conversation", subject="user", verb="likes", object="coffee", tags=[])
         store.store_facts([old])
 
         llm = MockLLMProvider(response="[]")
@@ -554,7 +550,7 @@ class TestSupersessionTagFiltering:
             llm_provider=llm, model="test",
             store=store, config=SupersessionConfig(enabled=True),
         )
-        new = Fact(subject="user", verb="prefers", object="tea", tags=[])
+        new = Fact(conversation_id="conversation", subject="user", verb="prefers", object="tea", tags=[])
         store.store_facts([new])
         checker.check_and_supersede([new])
 
@@ -756,8 +752,8 @@ class TestSupersessionNoMerge:
         from virtual_context.ingest.supersession import FactSupersessionChecker
 
         store = SQLiteStore(str(tmp_path / "test.db"))
-        old = Fact(subject="user", verb="has", object="27:12", tags=["run"])
-        new = Fact(subject="user", verb="has", object="25:50", tags=["run"])
+        old = Fact(conversation_id="conversation", subject="fixture-rig", verb="has", object="100 ms", tags=["fixture-benchmark"])
+        new = Fact(conversation_id="conversation", subject="fixture-rig", verb="has", object="80 ms", tags=["fixture-benchmark"])
         store.store_facts([old, new])
 
         llm = _SequentialMockLLM(['[0]'])
@@ -770,12 +766,12 @@ class TestSupersessionNoMerge:
         assert count == 1
         # Only 1 LLM call (detection), no merge call
         assert len(llm.calls) == 1
-        results = store.query_facts(subject="user")
+        results = store.query_facts(subject="fixture-rig")
         assert len(results) == 1
         # Winner keeps its original fields — no LLM rewrite
         assert results[0].id == new.id
         assert results[0].verb == "has"
-        assert results[0].object == "25:50"
+        assert results[0].object == "80 ms"
 
 
 class TestUpdateFactFields:
@@ -987,7 +983,7 @@ class TestSupersessionObjectSimilarity:
         store = SQLiteStore(str(tmp_path / "test.db"))
 
         # Old fact: different tags (session 1, tags=['backpack'])
-        old = Fact(
+        old = Fact(conversation_id="conversation",
             subject="user", verb="returned",
             object="from solo camping trip to Yosemite National Park",
             status="completed", tags=["backpack"],
@@ -996,7 +992,7 @@ class TestSupersessionObjectSimilarity:
         store.store_facts([old])
 
         # New fact: different tags (session 2, tags=['bear-safety'])
-        new_fact = Fact(
+        new_fact = Fact(conversation_id="conversation",
             subject="user", verb="started",
             object="solo camping trip to Yosemite National Park",
             status="completed", tags=["bear-safety"],

@@ -428,8 +428,7 @@ def test_sqlite_update_fact_fields_invalidates_then_refreshes_all_callers(sqlite
     assert r_drop is True
     assert "drop" not in sqlite_store.load_fact_embeddings(conv, MODEL_A)
 
-    # (b) promote_planned_facts caller refresh: LLM rewrites verb/what,
-    #     the old vector is invalidated then refreshed to the new text.
+    # (b) Expired plans preserve both their original evidence and its vector.
     planned = Fact(
         id="planned", subject="user", verb="will_attend", object="conference",
         what="the AI summit", status="planned", when_date="2020-01-01",
@@ -446,12 +445,12 @@ def test_sqlite_update_fact_fields_invalidates_then_refreshes_all_callers(sqlite
     )
     got = sqlite_store.query_facts(conversation_id=conv, subject="user")
     promoted = next(f for f in got if f.id == "planned")
-    assert promoted.status == "completed"
+    assert promoted.status == "planned"
+    assert promoted.verb == "will_attend"
     loaded = sqlite_store.load_fact_embeddings(conv, MODEL_A)
-    assert loaded["planned"][1] == _embed([promoted.embed_text()])[0]
-    assert loaded["planned"][1] != [9.0, 9.0, 9.0]
+    assert loaded["planned"][1] == [9.0, 9.0, 9.0]
 
-    # (c) supersession _merge_facts caller refresh.
+    # (c) Model consolidation cannot rewrite the winner or its valid vector.
     win = _seg_fact("winner", conv, "seg-w", verb="owns", obj="car", what="a sedan")
     old = _seg_fact("loser", conv, "seg-w", verb="owned", obj="car", what="a coupe")
     sqlite_store.store_facts([win, old])
@@ -464,8 +463,9 @@ def test_sqlite_update_fact_fields_invalidates_then_refreshes_all_callers(sqlite
     )
     checker._merge_facts(win, old)
     loaded_w = sqlite_store.load_fact_embeddings(conv, MODEL_A)["winner"][1]
-    assert loaded_w == _embed([win.embed_text()])[0]
-    assert loaded_w != [1.0, 1.0, 1.0]
+    assert loaded_w == [1.0, 1.0, 1.0]
+    saved_w = next(f for f in sqlite_store.query_facts(conversation_id=conv) if f.id == "winner")
+    assert (saved_w.verb, saved_w.object, saved_w.what) == ("owns", "car", "a sedan")
 
 
 def test_sqlite_update_fact_fields_refresh_failure_leaves_no_stale_vector(
@@ -486,12 +486,11 @@ def test_sqlite_update_fact_fields_refresh_failure_leaves_no_stale_vector(
         raise RuntimeError("embedding provider down")
 
     monkeypatch.setattr(sqlite_store, "store_fact_embeddings", _boom)
-    llm = _RewriteLLM({"verb": "moved", "object": "city", "what": "to Boston"})
-    # Refresh failure is swallowed; invalidation already ran in-txn.
-    promote_planned_facts(
-        sqlite_store, llm_provider=llm, model="llm-x",
-        embed_fn=_embed, embedding_model=MODEL_A,
-    )
+    # An explicit evidence-backed mutation invalidates before best-effort refresh.
+    assert sqlite_store.update_fact_fields("pf", "moved", "city", "completed", "to Boston")
+    planned.verb = "moved"
+    planned.status = "completed"
+    refresh_fact_embedding(sqlite_store, _embed, MODEL_A, planned)
     # No stale current-model row survives.
     conn = sqlite_store._get_conn()
     assert conn.execute(
@@ -643,8 +642,8 @@ def test_postgres_update_fact_fields_invalidates_then_refreshes_all_callers(pg_s
     promoted = next(f for f in pg_store.query_facts(conversation_id=conv, subject="user")
                     if f.id == "pgplanned")
     loaded = pg_store.load_fact_embeddings(conv, MODEL_A)
-    assert loaded["pgplanned"][1] == _embed([promoted.embed_text()])[0]
-    assert loaded["pgplanned"][1] != [9.0, 9.0, 9.0]
+    assert promoted.status == "planned"
+    assert loaded["pgplanned"][1] == [9.0, 9.0, 9.0]
     pg_store.delete_conversation(conv)
 
 

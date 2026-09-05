@@ -18,6 +18,12 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..core.compaction_fence import CompactionFenceMode
+    from ..types import BacklogCandidate, CompactionLeaseClaim
+
 from ..core.canonical_turns import STRIP_WHITESPACE
 from ..core.discord_snowflake import (
     datetime_to_snowflake_ceil,
@@ -62,7 +68,6 @@ from ..types import (
     StoredSummary,
     TagStats,
     TagSummary,
-    TemporalStatus,
     TurnTagEntry,
     WorkingSetEntry,
     channel_excerpt_prefix,
@@ -88,6 +93,8 @@ from ..types import (
     speaker_handle_for_rank,
 )
 from .helpers import dt_to_str as _dt_to_str, str_to_dt as _str_to_dt, extract_excerpt as _extract_excerpt
+from .postgres_vectors import PostgresVectorSearchMixin
+from .relational import RelationalStoreMixin
 
 logger = logging.getLogger(__name__)
 
@@ -1229,9 +1236,9 @@ def _merge_canonical_turn_rows(rows: list[CanonicalTurnRow]) -> dict[int, Canoni
             for tag in row.tags:
                 if tag not in merged_row.tags:
                     merged_row.tags.append(tag)
-            for signal in row.fact_signals:
-                if signal not in merged_row.fact_signals:
-                    merged_row.fact_signals.append(signal)
+            for fact_signal in row.fact_signals:
+                if fact_signal not in merged_row.fact_signals:
+                    merged_row.fact_signals.append(fact_signal)
             for code_ref in row.code_refs:
                 if code_ref not in merged_row.code_refs:
                     merged_row.code_refs.append(code_ref)
@@ -1243,8 +1250,17 @@ def _merge_canonical_turn_rows(rows: list[CanonicalTurnRow]) -> dict[int, Canoni
     return merged
 
 
-class PostgresStore(ContextStore):
+class PostgresStore(PostgresVectorSearchMixin, RelationalStoreMixin, ContextStore):
     """PostgreSQL storage backend with tsvector FTS and full protocol support."""
+
+    _relational_dialect = "postgres"
+
+    @property
+    def capabilities(self):
+        from dataclasses import replace
+        from ..core.store_capabilities import RELATIONAL_CAPABILITIES
+        return replace(RELATIONAL_CAPABILITIES, native_vectors=True)
+
 
     # Per-async-task post-commit scope for the alias write seam. When the
     # merge body opens an outer transaction it activates a scope so
@@ -1295,6 +1311,13 @@ class PostgresStore(ContextStore):
         )
         self.search_config = None  # set by engine after construction
         self._ensure_schema()
+
+    def migrate_bounded_read_indexes(self, *, dry_run: bool = True) -> dict:
+        """Explicit concurrent index migration; worker startup never builds it."""
+        from .postgres_maintenance import migrate_bounded_read_indexes
+
+        with self.pool.connection() as conn:
+            return migrate_bounded_read_indexes(conn, dry_run=dry_run)
 
     def _enforce_or_observe_mismatch(
         self, *, operation_id: str | None, write_site: str,
@@ -1472,6 +1495,7 @@ class PostgresStore(ContextStore):
             )
             try:
                 self._ensure_schema_locked()
+                self._ensure_request_state_schema()
             finally:
                 try:
                     lock_conn.execute(
@@ -2902,7 +2926,7 @@ class PostgresStore(ContextStore):
         what makes deletion and audience policy possible at all.
         """
         with self.pool.connection() as conn:
-            conn.execute(f"""
+            conn.execute("""
                 CREATE TABLE IF NOT EXISTS actor_profiles (
                     tenant_id TEXT NOT NULL,
                     actor_id TEXT NOT NULL,
@@ -4520,21 +4544,25 @@ class PostgresStore(ContextStore):
                 values = {f: str(entry.get(f, "") or "").strip() for f in self._OUTBOUND_FIELDS}
                 raw_observed = entry.get("observed_at")
             except AttributeError:
-                _decline("malformed_identity"); continue
+                _decline("malformed_identity")
+                continue
             if any(not v for v in values.values()) or any(
                 len(v) > 256 for v in values.values()
             ):
-                _decline("malformed_identity"); continue
+                _decline("malformed_identity")
+                continue
             if any(v != str(entry.get(f, "")) for f, v in values.items()):
                 # A value a trim would change is not already canonical, and a
                 # key built from it would not match one built by the reader.
-                _decline("malformed_identity"); continue
+                _decline("malformed_identity")
+                continue
             observed_at = self._coerce_observed_at(raw_observed)
             if observed_at is None:
                 # A time that cannot be read is not a time. Treating it as
                 # fresh would make the record immortal and let it outlive the
                 # conversation the fence exists to protect.
-                _decline("malformed_identity"); continue
+                _decline("malformed_identity")
+                continue
             if observed_at < cutoff:
                 logger.info(
                     "AGENT_OUTBOUND_FENCED conv=%s message_id=%s observed_at=%s "
@@ -4542,7 +4570,8 @@ class PostgresStore(ContextStore):
                     conversation_id, values["message_id"], observed_at.isoformat(),
                     epoch, epoch_started_at.isoformat(),
                 )
-                _decline("fence_rejection"); continue
+                _decline("fence_rejection")
+                continue
 
             # The scope names WHICH agent authored this, and one gateway
             # serves several. The sender is authoritative because only it
@@ -4563,7 +4592,8 @@ class PostgresStore(ContextStore):
             if not scope and channel_ns:
                 scope = str(channel_ns[0] or "")
             if not scope:
-                _decline("unresolvable_tenant_scope"); continue
+                _decline("unresolvable_tenant_scope")
+                continue
             if channel_ns and (
                 str(channel_ns[0] or "") != scope
                 or str(channel_ns[1] or "") != values["platform"].lower()
@@ -4581,7 +4611,8 @@ class PostgresStore(ContextStore):
                     values["account_id"], channel_ns[0], channel_ns[1],
                     channel_ns[2],
                 )
-                _decline("namespace_mismatch"); continue
+                _decline("namespace_mismatch")
+                continue
 
             rows.append((
                 str(tenant_id or ""), scope,
@@ -6088,7 +6119,8 @@ class PostgresStore(ContextStore):
             # action 'tag_conflict': special tag-summary conflict resolution
             TABLES_SIMPLE = (
                 "segments", "canonical_turn_anchors", "canonical_turn_chunks",
-                "ingest_batches", "facts", "fact_embeddings",
+                "ingest_batches", "facts",
+                "fact_decisions", "fact_embeddings",
                 "segment_tool_outputs",
             )
             # Tables whose natural key can legitimately collide across
@@ -6583,13 +6615,21 @@ class PostgresStore(ContextStore):
 
                 # Step 5: per-table moves.
                 for tbl in TABLES_SIMPLE:
-                    cur = conn.execute(
-                        f"UPDATE {tbl} "
-                        f"   SET conversation_id = %s, "
-                        f"       origin_conversation_id = COALESCE(NULLIF(origin_conversation_id, ''), %s) "
-                        f" WHERE conversation_id = %s",
-                        (target_conversation_id, source_conversation_id, source_conversation_id),
-                    )
+                    if tbl == "fact_decisions":
+                        # Audit payload and original owner stay immutable. Older
+                        # records may honestly have an unknown (empty) origin.
+                        cur = conn.execute(
+                            "UPDATE fact_decisions SET conversation_id=%s WHERE conversation_id=%s",
+                            (target_conversation_id, source_conversation_id),
+                        )
+                    else:
+                        cur = conn.execute(
+                            f"UPDATE {tbl} "
+                            f"   SET conversation_id = %s, "
+                            f"       origin_conversation_id = COALESCE(NULLIF(origin_conversation_id, ''), %s) "
+                            f" WHERE conversation_id = %s",
+                            (target_conversation_id, source_conversation_id, source_conversation_id),
+                        )
                     rows_moved[tbl] = cur.rowcount
 
                 # Natural-key conflict tables: drop source rows whose key
@@ -7984,6 +8024,15 @@ class PostgresStore(ContextStore):
                             f"{expected_generation}, current={current_generation}, "
                             f"deleted={current_deleted}"
                         )
+                if expected_generation is None:
+                    # Direct deletes also leave a durable tombstone. Old requests
+                    # cannot recreate hidden continuation state after the rows vanish.
+                    conn.execute("""INSERT INTO conversation_lifecycle
+                        (conversation_id,generation,deleted,updated_at) VALUES (%s,1,%s,%s)
+                        ON CONFLICT (conversation_id) DO UPDATE SET
+                            generation=conversation_lifecycle.generation+1,
+                            deleted=excluded.deleted,updated_at=excluded.updated_at""",
+                        (conversation_id,True,datetime.now(timezone.utc).isoformat()))
                 tenant_row = conn.execute(
                     """SELECT tenant_id FROM conversations
                         WHERE conversation_id = %s""",
@@ -8019,6 +8068,8 @@ class PostgresStore(ContextStore):
                 deleted = self._delete_conversation_rows(conn, "segments", conversation_id)
                 for table in (
                     "engine_state",
+                    "pending_tool_exchanges",
+                    "fact_decisions",
                     "fact_embeddings",
                     "facts",
                     "canonical_turns",
@@ -8656,6 +8707,7 @@ class PostgresStore(ContextStore):
         owner_worker_id: str | None = None,
         lifecycle_epoch: int | None = None,
         conversation_id: str | None = None,
+        embedding_model: str = "",
     ) -> None:
         """Store chunk embeddings for a segment.
 
@@ -8686,6 +8738,7 @@ class PostgresStore(ContextStore):
             guard_all = False
         with self.pool.connection() as conn:
             with conn.transaction():
+                self._set_semantic_vector_write_model(conn, embedding_model)
                 if guard_all:
                     # Verify segment_ref belongs to the supplied
                     # conversation_id AND the active op matches before
@@ -8729,10 +8782,16 @@ class PostgresStore(ContextStore):
                             (segment_ref, chunk.chunk_index, chunk.text, json.dumps(chunk.embedding)),
                         )
 
-    def get_all_chunk_embeddings(self) -> list[ChunkEmbedding]:
+    def get_all_chunk_embeddings(self, conversation_id: str | None = None) -> list[ChunkEmbedding]:
         with self.pool.connection() as conn:
+            sql = "SELECT chunk.segment_ref, chunk.chunk_index, chunk.text, chunk.embedding_json FROM segment_chunks chunk"
+            params = []
+            if conversation_id is not None:
+                sql += " JOIN segments s ON s.ref=chunk.segment_ref WHERE s.conversation_id=%s"
+                params.append(conversation_id)
+            sql += " ORDER BY chunk.segment_ref, chunk.chunk_index"
             rows = conn.execute(
-                "SELECT segment_ref, chunk_index, text, embedding_json FROM segment_chunks ORDER BY segment_ref, chunk_index"
+                sql, params,
             ).fetchall()
             return [
                 ChunkEmbedding(
@@ -8764,12 +8823,15 @@ class PostgresStore(ContextStore):
         side: str,
         chunks: list[CanonicalTurnChunkEmbedding],
         canonical_turn_id: str | None = None,
+        *,
+        embedding_model: str = "",
     ) -> None:
         with self.pool.connection() as conn:
             canonical_turn_id = canonical_turn_id or self._lookup_canonical_turn_id_for_ordinal(conversation_id, turn_number)
             if canonical_turn_id is None:
                 return
             with conn.transaction():
+                self._set_semantic_vector_write_model(conn, embedding_model)
                 conn.execute(
                     "DELETE FROM canonical_turn_chunks WHERE conversation_id = %s AND canonical_turn_id = %s AND side = %s",
                     (conversation_id, canonical_turn_id, side),
@@ -12045,14 +12107,10 @@ class PostgresStore(ContextStore):
         conversation_id: str,
         turn_numbers: list[int],
     ) -> dict[int, CanonicalTurnRow]:
-        if not turn_numbers:
-            return {}
-        merged_rows = _merge_canonical_turn_rows(self._load_canonical_turn_rows(conversation_id))
-        return {
-            turn_number: merged_rows[turn_number]
-            for turn_number in turn_numbers
-            if turn_number in merged_rows
-        }
+        from .compaction_reads import load_logical_groups
+        return load_logical_groups(
+            self, conversation_id, turn_numbers, merge_rows=_merge_canonical_turn_rows,
+        )
 
     def get_canonical_turn_rows_by_id(
         self,
@@ -12149,7 +12207,7 @@ class PostgresStore(ContextStore):
         """
         with self.pool.connection() as conn:
             rows = conn.execute(
-                f"""SELECT canonical_turn_id, conversation_id, turn_number,
+                """SELECT canonical_turn_id, conversation_id, turn_number,
                           turn_group_number, sort_key, turn_hash,
                           session_date, sender,
                           origin_channel_id, origin_channel_label, sender_actor_id,
@@ -12223,22 +12281,13 @@ class PostgresStore(ContextStore):
         conversation_id: str,
         *,
         protected_recent_turns: int = 0,
+        limit: int | None = None,
     ) -> list[CanonicalTurnRow]:
-        merged_rows = list(_merge_canonical_turn_rows(self._load_canonical_turn_rows(conversation_id)).values())
-        # Only a verified user/assistant logical pair is compactable.  A
-        # terminal singleton remains queryable canonical evidence but cannot
-        # synthesize an empty half or advance the pair watermark.
-        uncompacted = [
-            row for row in merged_rows
-            if not row.compacted_at
-            and (row.user_content or "").strip()
-            and (row.assistant_content or "").strip()
-        ]
-        if protected_recent_turns > 0 and len(uncompacted) > protected_recent_turns:
-            uncompacted = uncompacted[:-protected_recent_turns]
-        elif protected_recent_turns > 0:
-            uncompacted = []
-        return uncompacted
+        from .compaction_reads import load_uncompacted_groups
+        return load_uncompacted_groups(
+            self, conversation_id, merge_rows=_merge_canonical_turn_rows,
+            protected_recent_turns=protected_recent_turns, limit=limit,
+        )
 
     def get_recent_canonical_turns(
         self,
@@ -13502,7 +13551,7 @@ class PostgresStore(ContextStore):
                 conditions.append("f.subject = %s")
                 params.append(subject)
             if verbs is not None:
-                like_clauses = [f"f.verb ILIKE %s" for _ in verbs]
+                like_clauses = ["f.verb ILIKE %s" for _ in verbs]
                 conditions.append("(" + " OR ".join(like_clauses) + ")")
                 params.extend(f"%{_escape_like(v)}%" for v in verbs)
             elif verb is not None:
@@ -15388,65 +15437,19 @@ class PostgresStore(ContextStore):
         operation_id: str | None = None,
         owner_worker_id: str | None = None,
         lifecycle_epoch: int | None = None,
-    ) -> None:
-        """Mark `old_fact_id` superseded by `new_fact_id`.
-
-        When all guard kwargs are supplied, the UPDATE only fires if a
-        ``compaction_operation`` row at ``status='running'`` exists for
-        the supplied ``(operation_id, owner_worker_id, lifecycle_epoch)``
-        AND both endpoint facts belong to the same conversation as the
-        active op. This blocks cross-conversation supersession pointers
-        per fencing plan §4.2 P1-7 / §4.3 P1-8 fold.
-        """
-        _validate_compaction_guard_kwargs(
-            operation_id, owner_worker_id, lifecycle_epoch,
+        tenant_id: str | None = None,
+        expected_old_version: str | None = None,
+        expected_new_version: str | None = None,
+        expected_source_versions: tuple[tuple[str, str], ...] | None = None,
+    ) -> bool:
+        return self._set_fact_superseded(
+            old_fact_id, new_fact_id, operation_id=operation_id,
+            owner_worker_id=owner_worker_id, lifecycle_epoch=lifecycle_epoch,
+            tenant_id=tenant_id,
+            expected_old_version=expected_old_version,
+            expected_new_version=expected_new_version,
+            expected_source_versions=expected_source_versions,
         )
-        guard_all = (
-            operation_id is not None
-            and owner_worker_id is not None
-            and lifecycle_epoch is not None
-        )
-        # OFF/OBSERVE tier downgrades the guard so
-        # ``set_fact_superseded`` takes the legacy unguarded UPDATE
-        # path. Per fencing plan §9.1 OFF kill switch.
-        if guard_all and not self._compaction_fence_mode.enforces:
-            guard_all = False
-        with self.pool.connection() as conn:
-            if guard_all:
-                cur = conn.execute(
-                    """UPDATE facts
-                          SET superseded_by = %s
-                        WHERE id = %s
-                          AND EXISTS (
-                              SELECT 1
-                                FROM facts f_old, facts f_new,
-                                     compaction_operation co
-                               WHERE f_old.id = %s
-                                 AND f_new.id = %s
-                                 AND f_old.conversation_id = f_new.conversation_id
-                                 AND co.conversation_id = f_old.conversation_id
-                                 AND co.operation_id = %s
-                                 AND co.owner_worker_id = %s
-                                 AND co.lifecycle_epoch = %s
-                                 AND co.status = 'running'
-                          )""",
-                    (
-                        new_fact_id, old_fact_id,
-                        old_fact_id, new_fact_id,
-                        operation_id, owner_worker_id, lifecycle_epoch,
-                    ),
-                )
-                if (cur.rowcount or 0) == 0:
-                    self._enforce_or_observe_mismatch(
-                        operation_id=operation_id,
-                        write_site="set_fact_superseded",
-                    )
-                    return
-            else:
-                conn.execute(
-                    "UPDATE facts SET superseded_by = %s WHERE id = %s",
-                    (new_fact_id, old_fact_id),
-                )
 
     def update_fact_fields(
         self,
@@ -15459,79 +15462,13 @@ class PostgresStore(ContextStore):
         operation_id: str | None = None,
         owner_worker_id: str | None = None,
         lifecycle_epoch: int | None = None,
+        tenant_id: str | None = None,
     ) -> bool:
-        """Update mutable fact fields. Fenced when guard kwargs are
-        supplied: the UPDATE only fires if the target fact belongs to
-        the same conversation as the active op.
-
-        When the mutation changes an embed-text field (``verb``,
-        ``object``, or ``what``; a ``status``-only change is not embed
-        text) the fact's ``fact_embeddings`` row is deleted in the same
-        transaction so a stale vector can never survive the rewrite. A
-        guard-fail raises and the surrounding transaction rolls back,
-        keeping the old fact and old vector together. Returns ``True``
-        iff a row was actually updated.
-        """
-        _validate_compaction_guard_kwargs(
-            operation_id, owner_worker_id, lifecycle_epoch,
+        return self._update_fact_fields(
+            fact_id, verb, object, status, what, operation_id=operation_id,
+            owner_worker_id=owner_worker_id, lifecycle_epoch=lifecycle_epoch,
+            tenant_id=tenant_id,
         )
-        guard_all = (
-            operation_id is not None
-            and owner_worker_id is not None
-            and lifecycle_epoch is not None
-        )
-        # OFF/OBSERVE tier downgrades the guard so
-        # ``update_fact_fields`` takes the legacy unguarded UPDATE
-        # path. Per fencing plan §9.1 OFF kill switch.
-        if guard_all and not self._compaction_fence_mode.enforces:
-            guard_all = False
-        with self.pool.connection() as conn:
-            _old = conn.execute(
-                "SELECT verb, object, what FROM facts WHERE id = %s", (fact_id,),
-            ).fetchone()
-            _embed_changed = _old is not None and (
-                _old["verb"], _old["object"], _old["what"]
-            ) != (verb, object, what)
-            if guard_all:
-                cur = conn.execute(
-                    """UPDATE facts
-                          SET verb = %s, object = %s, status = %s, what = %s
-                        WHERE id = %s
-                          AND EXISTS (
-                              SELECT 1
-                                FROM facts f, compaction_operation co
-                               WHERE f.id = %s
-                                 AND co.conversation_id = f.conversation_id
-                                 AND co.operation_id = %s
-                                 AND co.owner_worker_id = %s
-                                 AND co.lifecycle_epoch = %s
-                                 AND co.status = 'running'
-                          )""",
-                    (
-                        verb, object, status, what, fact_id,
-                        fact_id, operation_id, owner_worker_id, lifecycle_epoch,
-                    ),
-                )
-                if (cur.rowcount or 0) == 0:
-                    # guard_all is only True at ACTIVE tier, so this
-                    # raises CompactionLeaseLost and the transaction rolls
-                    # back, keeping the old fact and old vector together.
-                    self._enforce_or_observe_mismatch(
-                        operation_id=operation_id,
-                        write_site="update_fact_fields",
-                    )
-                    return False
-            else:
-                cur = conn.execute(
-                    "UPDATE facts SET verb = %s, object = %s, status = %s, what = %s WHERE id = %s",
-                    (verb, object, status, what, fact_id),
-                )
-            _updated = (cur.rowcount or 0) > 0
-            if _updated and _embed_changed:
-                conn.execute(
-                    "DELETE FROM fact_embeddings WHERE fact_id = %s", (fact_id,),
-                )
-            return _updated
 
     def get_fact_count_by_tags(self, *, conversation_id: str | None = None) -> dict[str, int]:
         with self.pool.connection() as conn:
