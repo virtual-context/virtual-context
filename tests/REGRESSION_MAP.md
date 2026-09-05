@@ -616,6 +616,7 @@ Use `pytest -m regression` to run all regression tests.
 | `test_prepare_user_message_strip.py` | BUG-060 |
 | `test_history_widening_guard.py` | BUG-061 |
 | `test_actor_card_admission_quality.py` | BUG-063 |
+| `test_actor_card_style_evidence.py` | BUG-069 |
 | `test_card_availability_and_adjudication.py` | BUG-064, BUG-065 |
 | `test_render_escape_host_attribution.py` | BUG-066, BUG-067 |
 | `test_tag_summary_materialization.py` | BUG-041 |
@@ -802,3 +803,17 @@ Use `pytest -m regression` to run all regression tests.
   - `test_actor_card_assembly.py::test_actor_card_orientation_precedes_entries`
   - `test_actor_card_assembly.py::test_actor_card_render_golden`
   - `test_actor_card_assembly.py::test_card_scalars_cannot_escape_the_wrapper`
+
+### BUG-069 — a single phrase becomes high-confidence recurring actor style
+
+- **Symptom**: a card turns one playful utterance into a high-confidence claim of recurring language, and normalizes the actor's exact term. Regression fixtures use synthetic actors and quotations only.
+- **Cause**: the semantic contract did not explicitly prohibit turning one phrase into a habitual-frequency claim or normalizing its terms. Confidence counted citation rows, allowing a fact and its own source message, or several facts from one message, to masquerade as repeated evidence.
+- **Fix**: policy 17 adds the exact-term and distinct-message rules to both prompts. Preference/style confidence is capped at 0.7 for fewer than two proven distinct messages, including carryovers. Native-message identities deduplicate physical rows; version-two requester facts must resolve to one exact, already-loaded actor message within their segment's explicit source mapping. Unknown, ambiguous, legacy, or quoted-subject fact identities do not prove multiplicity. Only bounded existing source metadata is retained; identity fields enter the evidence fingerprint. Other kinds keep the existing 0.8 single-source cap.
+- **Tests**:
+  - `test_actor_card_style_evidence.py::test_single_quoted_phrase_cannot_inflate_existing_style_even_if_admission_allows` — synthetic regression exercises the same failure even with permissive independent admission; downgrade preserves the older exact-term entry.
+  - `test_actor_card_style_evidence.py::test_style_confidence_counts_distinct_proven_messages` — both affected kinds; single fact/message, duplicate evidence, unknown provenance, segment-neighbor exclusions, and genuine repetition.
+  - `test_actor_card_style_evidence.py::test_carryover_style_is_recalibrated_without_rewriting` — immutable carryovers receive the same evidence cap.
+  - `test_actor_card_style_evidence.py::test_other_card_kinds_keep_existing_single_source_cap` — goal/history behavior is unchanged.
+  - `test_actor_card_style_evidence.py::test_both_prompt_surfaces_forbid_single_utterance_habits_and_preserve_exact_terms` — actual curator/admission prompts carry the rule and retain below-cap confidence.
+  - `test_actor_card_style_evidence.py::test_source_identity_change_invalidates_confidence_input_hash` — fact/native message ID corrections and swapped fact-to-segment references force recalibration even without relying on the dirty hint.
+  - `test_actor_card_style_evidence.py::test_carryover_is_calibrated_before_confidence_sensitive_admission` — the judge receives the calibrated proposal, preserving a valid entry that its obsolete confidence would otherwise cause it to reject.

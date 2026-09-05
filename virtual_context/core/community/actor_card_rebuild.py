@@ -16,6 +16,7 @@ from .evidence_manifest import evidence_digest
 from .actor_card_policy import (
     _ACTOR_CARD_CITATION_LIMIT,
     _ACTOR_CARD_SINGLE_SOURCE_CONFIDENCE_CAP,
+    _ACTOR_CARD_SINGLE_MESSAGE_STYLE_CONFIDENCE_CAP,
     _ActorCardAdmissionError,
     _ActorCardCoverageError,
     _format_rejection_counts,
@@ -26,6 +27,81 @@ if TYPE_CHECKING:
 
 # Keep the existing operator log channel stable across the extraction.
 logger = logging.getLogger("virtual_context.core.compaction_pipeline")
+
+
+def _actor_card_message_keys(fact_sources, turn_sources, segment_source_ids):
+    """Resolve citation identities using evidence already loaded for this build.
+
+    Facts never inherit every message in their segment. Only a version-two
+    requester fact with one exact native source match contributes an identity;
+    legacy, quoted-subject and unavailable provenance cannot prove repetition.
+    """
+    keys = {}
+    native_turns = {}
+    for source in turn_sources:
+        turn = source.turn
+        owner = source.owner_conversation_id
+        audience = source.audience_conversation_id
+        native_id = turn.source_message_id or ""
+        key = (
+            ("message", owner, audience, native_id)
+            if native_id else ("canonical", owner, audience, turn.canonical_turn_id)
+        )
+        keys[(owner, audience, "turn", turn.canonical_turn_id)] = key
+        if native_id:
+            native_turns.setdefault((owner, native_id), []).append(source)
+    for source in fact_sources:
+        fact = source.fact
+        if (
+            fact.author_attribution_version != 2
+            or fact.author_source_role != "requester"
+            or not fact.author_source_message_id
+        ):
+            continue
+        owner = source.owner_conversation_id
+        audience = source.audience_conversation_id
+        matches = native_turns.get((owner, fact.author_source_message_id), [])
+        if len(matches) != 1:
+            continue
+        turn_source = matches[0]
+        turn = turn_source.turn
+        if (
+            turn_source.audience_conversation_id != audience
+            or turn.sender_actor_id != fact.author_actor_id
+            or turn.canonical_turn_id not in segment_source_ids.get(
+                (owner, fact.segment_ref), (),
+            )
+        ):
+            continue
+        keys[(owner, audience, "fact", fact.id)] = keys[
+            (owner, audience, "turn", turn.canonical_turn_id)
+        ]
+    return keys
+
+
+def _actor_card_confidence(kind, confidence, citations, message_keys):
+    from ...types import CARD_KIND_COMMUNICATION_PREF, CARD_KIND_INTERACTION_STYLE
+
+    if kind in (CARD_KIND_COMMUNICATION_PREF, CARD_KIND_INTERACTION_STYLE):
+        proved_messages = {message_keys[key] for key in citations if key in message_keys}
+        if len(proved_messages) < 2:
+            return min(confidence, _ACTOR_CARD_SINGLE_MESSAGE_STYLE_CONFIDENCE_CAP)
+    elif len(citations) == 1:
+        return min(confidence, _ACTOR_CARD_SINGLE_SOURCE_CONFIDENCE_CAP)
+    return confidence
+
+
+def _calibrate_actor_card_entries(entries, message_keys):
+    for entry, entry_sources in entries:
+        citations = [
+            (source.owner_conversation_id, source.audience_conversation_id,
+             "fact" if source.fact_id else "turn",
+             source.fact_id or source.canonical_turn_id)
+            for source in entry_sources
+        ]
+        entry.confidence = _actor_card_confidence(
+            entry.kind, float(entry.confidence or 0.0), citations, message_keys,
+        )
 
 
 class ActorCardRebuildService:
@@ -109,7 +185,7 @@ class ActorCardRebuildService:
 
         tenant_id = self._config.tenant_id
 
-        def _read_inputs() -> tuple[list, list, list, str]:
+        def _read_inputs() -> tuple[list, list, list, str, dict]:
             configured_curation_model = (
                 getattr(
                     self._config.assembler,
@@ -238,6 +314,10 @@ class ActorCardRebuildService:
             fact_payload = (
                 {
                     "id": source.fact.id,
+                    "owner": source.owner_conversation_id,
+                    "audience": source.audience_conversation_id,
+                    "segment_ref": source.fact.segment_ref,
+                    "author_actor_id": source.fact.author_actor_id,
                     "subject": source.fact.subject,
                     "verb": source.fact.verb,
                     "object": source.fact.object,
@@ -249,6 +329,7 @@ class ActorCardRebuildService:
                     "session_date": source.fact.session_date,
                     "author_version": (source.fact.author_attribution_version),
                     "author_role": source.fact.author_source_role,
+                    "author_source_message_id": source.fact.author_source_message_id,
                 }
                 for source in facts
             )
@@ -259,6 +340,7 @@ class ActorCardRebuildService:
                     "audience": source.audience_conversation_id,
                     "channel": source.audience_channel_id,
                     "content": source.turn.user_content,
+                    "source_message_id": source.turn.source_message_id,
                     "created_at": (source.turn.created_at or source.turn.first_seen_at or ""),
                     "owner_epoch": source.owner_lifecycle_epoch,
                     "audience_epoch": source.audience_lifecycle_epoch,
@@ -303,6 +385,25 @@ class ActorCardRebuildService:
                 )
                 or type(getattr(self._compactor, "llm", None)).__name__
             )
+            segment_source_ids = {}
+            visible_ids_by_owner = {}
+            for source in turns:
+                visible_ids_by_owner.setdefault(source.owner_conversation_id, set()).add(
+                    source.turn.canonical_turn_id,
+                )
+
+            def source_records():
+                # Retain only source-id metadata from the existing streamed
+                # manifest. Confidence calibration performs no extra DB reads.
+                for record in self._evidence_records(facts, turns):
+                    if record.get("kind") == "fact_segment":
+                        segment_source_ids[(record["owner"], record["ref"])] = (
+                            visible_ids_by_owner.get(record["owner"], set()).intersection(
+                                record["source_ids"],
+                            )
+                        )
+                    yield record
+
             digest = evidence_digest(
                 {
                     "policy": self._policy_version,
@@ -322,16 +423,17 @@ class ActorCardRebuildService:
                     "facts": fact_payload,
                     "turns": turn_payload,
                     "carryovers": carryover_payload,
-                    "source_evidence": self._evidence_records(facts, turns),
+                    "source_evidence": source_records(),
                 },
             )
-            return facts, turns, carryovers, digest
+            return facts, turns, carryovers, digest, segment_source_ids
 
         (
             fact_sources,
             turn_sources,
             carryover_entries,
             input_hash,
+            _segment_source_ids,
         ) = _read_inputs()
         profile = self._store.get_actor_profile(tenant_id, actor_id)
         if profile is None:
@@ -405,7 +507,10 @@ class ActorCardRebuildService:
             turn_sources,
             carryover_entries,
             input_hash,
+            segment_source_ids,
         ) = _read_inputs()
+
+        message_keys = _actor_card_message_keys(fact_sources, turn_sources, segment_source_ids)
 
         fact_source_by_audience_id = {
             (source.audience_conversation_id, source.fact.id): source for source in fact_sources
@@ -625,15 +730,16 @@ class ActorCardRebuildService:
                 rejected["missing_citations"] += 1
                 continue
 
-            # Single-message evidence cannot be maximal regardless of what
-            # the curator asserted: cap it in code so the stored number
-            # stays honest even when the model ignores the calibration
-            # instruction.
-            if len(fact_ids) + len(turn_ids) == 1:
-                confidence = min(
-                    confidence,
-                    _ACTOR_CARD_SINGLE_SOURCE_CONFIDENCE_CAP,
-                )
+            citations = [
+                (fact_source_by_audience_id[(audience_id, fid)].owner_conversation_id,
+                 audience_id, "fact", fid)
+                for fid in fact_ids
+            ] + [
+                (turn_source_by_audience_id[(audience_id, tid)].owner_conversation_id,
+                 audience_id, "turn", tid)
+                for tid in turn_ids
+            ]
+            confidence = _actor_card_confidence(kind, confidence, citations, message_keys)
 
             scope = (
                 CARD_SCOPE_CROSS_CONTEXT
@@ -768,6 +874,10 @@ class ActorCardRebuildService:
             normalized.append((entry, entry_sources))
             normalized_by_audience.setdefault(audience_id, []).append((entry, entry_sources))
 
+        # Admission sees the same calibrated proposal for fresh and carried
+        # entries. A stale stored confidence must not cause an otherwise valid
+        # carryover to fail the current semantic confidence contract.
+        _calibrate_actor_card_entries(normalized, message_keys)
         basic_accepted_count = len(normalized)
         independently_substantive = False
         coverage_gap = False
@@ -965,20 +1075,11 @@ class ActorCardRebuildService:
         # wedging the card behind a gate the hardened admission rules can
         # never satisfy for banter- or request-heavy actors.
 
-        # The single-source confidence cap is an EVIDENCE invariant, not a
-        # curation-vintage one: a stored number must never exceed what one
-        # cited message supports, whichever path produced the entry. Fresh
-        # entries were capped at normalization; carried-over cross-context
-        # entries arrive with their originally stored confidence, so this
-        # final pass clamps every admitted entry with exactly one source.
+        # Carryovers must meet the same current evidence calibration as fresh
+        # candidates; citation rows are not independent message observations.
         # Confidence is not part of the entry's immutable body or identity
         # digest, so the clamp changes no id and rewrites no body.
-        for entry, entry_sources in normalized:
-            if len(entry_sources) == 1:
-                entry.confidence = min(
-                    float(entry.confidence or 0.0),
-                    _ACTOR_CARD_SINGLE_SOURCE_CONFIDENCE_CAP,
-                )
+        _calibrate_actor_card_entries(normalized, message_keys)
 
         expected_epochs: dict[str, int] = {}
         for source in [*fact_sources, *turn_sources]:

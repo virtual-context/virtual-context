@@ -8,7 +8,7 @@ from ...types import LLMProviderError
 logger = logging.getLogger("virtual_context.core.compaction_pipeline")
 
 _ACTOR_CARD_CITATION_LIMIT = 16
-_ACTOR_CARD_POLICY_VERSION = 16
+_ACTOR_CARD_POLICY_VERSION = 17
 _ACTOR_CARD_SEMANTIC_CONTRACT = (
     "Semantic contract for every candidate: communication_pref means only "
     "how this actor wants the agent to communicate, respond, format answers, "
@@ -37,6 +37,23 @@ _ACTOR_CARD_SEMANTIC_CONTRACT = (
     "disagree. Every cited id must itself materially support the body; do not "
     "add invocation, acknowledgement, or merely adjacent messages as extra "
     "citations. "
+    "For communication_pref and interaction_style, a quoted phrase or single utterance "
+    "never establishes frequency or habit. Do not claim 'frequently', 'often', "
+    "'always', 'usually', recurring language, or a habitual manner without multiple "
+    "distinct cited actor-authored messages that materially support that "
+    "pattern. A fact and its source message are one observation, as are "
+    "multiple facts derived from the same message. Uncited neighboring "
+    "messages, an older card entry, and a long source segment do not supply "
+    "additional observations. When repetition is not established, quote it as "
+    "an example instead, provided the entry otherwise passes admission. "
+    "Preserve the actor's exact meaningful terms "
+    "when rewriting or quoting style examples: keep 'pal-o' as 'pal-o'; "
+    "do not normalize 'pal-o' to 'pal'. A word inside one longer quoted "
+    "phrase does not establish standalone use of that word. Reject an "
+    "immutable candidate with insufficient_evidence when it makes these "
+    "unsupported generalizations. A communication_pref or interaction_style "
+    "supported by a single fact or a single distinct message must have "
+    "confidence no higher than 0.7. "
 )
 
 
@@ -88,6 +105,7 @@ _ACTOR_CARD_CONFIDENCE_SCALE = (
 # A claim resting on exactly one cited source is capped in code regardless
 # of what the curator asserted: single-message evidence cannot be maximal.
 _ACTOR_CARD_SINGLE_SOURCE_CONFIDENCE_CAP = 0.8
+_ACTOR_CARD_SINGLE_MESSAGE_STYLE_CONFIDENCE_CAP = 0.7
 
 
 def _format_rejection_counts(rejected) -> str:
