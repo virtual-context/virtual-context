@@ -14,8 +14,7 @@ exception handling:
   guard triple + conversation_id to ``store_fact_links`` and
   ``set_fact_superseded`` and downstream ``promote_planned_facts`` ->
   ``update_fact_fields``.
-* T3.17e: ``promote_planned_facts`` forwards the guard triple to
-  ``update_fact_fields``.
+* Legacy planned-fact promotion never mutates evidence, even with guard kwargs.
 
 * T3.18a: ``CompactionLeaseLost`` raised inside
   ``_propagate_tool_output_links`` propagates past its broad ``except
@@ -35,7 +34,7 @@ are covered by tests/test_compaction_per_write_fence.py).
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import pytest
@@ -47,11 +46,9 @@ from virtual_context.ingest.supersession import (
     promote_planned_facts,
 )
 from virtual_context.types import (
-    ChunkEmbedding,
     CompactionResult,
     CompactionLeaseLost,
     Fact,
-    FactLink,
     SegmentMetadata,
     StoredSegment,
     StoredSummary,
@@ -84,6 +81,7 @@ class _SpyStore:
         self._raise_on: set[str] = set()
         self._planned_facts: list[Fact] = []
         self._candidate_facts: list[Fact] = []
+        self._persisted_facts: dict[str, Fact] = {}
 
     def raise_lease_lost_on(self, method: str) -> None:
         self._raise_on.add(method)
@@ -93,6 +91,17 @@ class _SpyStore:
 
     def seed_candidate(self, fact: Fact) -> None:
         self._candidate_facts.append(fact)
+        self.seed_proposals([fact])
+
+    def seed_proposals(self, facts: list[Fact]) -> None:
+        self._persisted_facts.update({fact.id: fact for fact in facts})
+
+    def get_fact_admission_snapshot(self, fact_id: str) -> dict | None:
+        from virtual_context.core.fact_lifecycle import fact_version
+        fact = self._persisted_facts.get(fact_id)
+        if fact is None:
+            return None
+        return {"fact_version": fact_version(fact), "audience": None, "source_versions": ()}
 
     def _record(self, method: str, args: tuple, kwargs: dict) -> None:
         self.calls.append(_Call(method=method, args=args, kwargs=kwargs))
@@ -114,8 +123,9 @@ class _SpyStore:
         self._record("store_fact_links", args, kwargs)
         return 0
 
-    def set_fact_superseded(self, *args: Any, **kwargs: Any) -> None:
+    def set_fact_superseded(self, *args: Any, **kwargs: Any) -> bool:
         self._record("set_fact_superseded", args, kwargs)
+        return True
 
     def update_fact_fields(self, *args: Any, **kwargs: Any) -> None:
         self._record("update_fact_fields", args, kwargs)
@@ -322,8 +332,10 @@ class TestT317c_CheckAndSupersede:
         new_fact = Fact(id="new-1", subject="alice", verb="likes",
                         object="coffee", what="coffee preference",
                         conversation_id="conv-A")
+        incoming_facts = [new_fact]
+        store.seed_proposals(incoming_facts)
         checker.check_and_supersede(
-            [new_fact],
+            incoming_facts,
             operation_id="op-1", owner_worker_id="w-1", lifecycle_epoch=2,
         )
         sfs = store.calls_of("set_fact_superseded")
@@ -340,10 +352,9 @@ class TestT317c_CheckAndSupersede:
                                   what="paris visit",
                                   conversation_id="conv-Y"))
         checker = _make_supersession_checker(store)
-        checker.check_and_supersede([Fact(
-            id="new-leg", subject="bob", verb="visits", object="london",
-            what="london visit", conversation_id="conv-Y",
-        )])
+        incoming_facts = [Fact(id='new-leg', subject='bob', verb='visits', object='london', what='london visit', conversation_id='conv-Y')]
+        store.seed_proposals(incoming_facts)
+        checker.check_and_supersede(incoming_facts)
         sfs = store.calls_of("set_fact_superseded")
         assert sfs
         kw = sfs[0].kwargs
@@ -354,8 +365,7 @@ class TestT317c_CheckAndSupersede:
 
 # ---------------------------------------------------------------------------
 # T3.17d: FactLinkChecker.check_and_link forwards guard kwargs to all
-# downstream writes (set_fact_superseded, store_fact_links,
-# promote_planned_facts -> update_fact_fields).
+# downstream writes (set_fact_superseded and store_fact_links).
 # ---------------------------------------------------------------------------
 
 
@@ -371,9 +381,7 @@ class _LLMForGraphLinks:
 
 
 class _LLMNeverPromotes:
-    """LLMProvider that never returns anything; ``promote_planned_facts``
-    falls back to status flip which still hits ``update_fact_fields``.
-    """
+    """LLMProvider that proposes no changes."""
 
     def complete(self, *, system: str, user: str, max_tokens: int = 0):
         return "", 0
@@ -391,12 +399,8 @@ def _make_link_checker(store, graph: bool = True):
 
 
 class TestT317d_CheckAndLink:
-    def test_promote_planned_pass_forwards_guard_kwargs(self):
-        """check_and_link runs promote_planned_facts as a pre-pass; the
-        guard kwargs must reach update_fact_fields when promote rewrites
-        a planned fact."""
+    def test_check_and_link_does_not_promote_plans_by_date(self):
         store = _SpyStore()
-        # Seed a planned fact whose when_date has already passed.
         past_fact = Fact(
             id="planned-1", subject="carol", verb="will visit",
             object="rome", what="rome trip", status="planned",
@@ -404,20 +408,15 @@ class TestT317d_CheckAndLink:
         )
         store.seed_planned_fact(past_fact)
         checker = _make_link_checker(store, graph=False)
-        # Graph mode False: promote runs, then check_and_supersede; the
-        # candidate list is empty so no set_fact_superseded fires.
+        incoming_facts = [Fact(id='trigger', subject='z', verb='v', object='o', what='w', conversation_id='conv-A')]
+        store.seed_proposals(incoming_facts)
         checker.check_and_link(
-            [Fact(id="trigger", subject="z", verb="v", object="o",
-                  what="w", conversation_id="conv-A")],
+            incoming_facts,
             operation_id="op-2", owner_worker_id="w-2", lifecycle_epoch=3,
             conversation_id="conv-A",
         )
-        uff = store.calls_of("update_fact_fields")
-        assert uff, "update_fact_fields was not called from promote_planned_facts"
-        kw = uff[0].kwargs
-        assert kw["operation_id"] == "op-2"
-        assert kw["owner_worker_id"] == "w-2"
-        assert kw["lifecycle_epoch"] == 3
+        assert store.calls_of("update_fact_fields") == []
+        assert past_fact.status == "planned"
 
     def test_graph_mode_store_fact_links_carries_conversation_id(self):
         """In graph mode, the FactLinkChecker writes a FactLink and that
@@ -448,8 +447,10 @@ class TestT317d_CheckAndLink:
             id="new-link", subject="dave", verb="visits", object="paris",
             what="trip", conversation_id="conv-A",
         )
+        incoming_facts = [new_fact]
+        store.seed_proposals(incoming_facts)
         checker.check_and_link(
-            [new_fact],
+            incoming_facts,
             operation_id="op-3", owner_worker_id="w-3", lifecycle_epoch=4,
             conversation_id="conv-A",
         )
@@ -463,44 +464,24 @@ class TestT317d_CheckAndLink:
 
 
 # ---------------------------------------------------------------------------
-# T3.17e: promote_planned_facts forwards guard triple
+# Planned-fact compatibility entry point preserves evidence
 # ---------------------------------------------------------------------------
 
 
 class TestT317e_PromotePlannedFacts:
-    def test_forwards_guard_triple_to_update_fact_fields(self):
+    @pytest.mark.parametrize("guard", [
+        {}, {"operation_id": "old-op", "owner_worker_id": "old-worker", "lifecycle_epoch": 1},
+    ])
+    def test_legacy_promotion_never_writes(self, guard):
         store = _SpyStore()
         store.seed_planned_fact(Fact(
-            id="planned-2", subject="erin", verb="will run", object="5k",
-            what="5k plan", status="planned",
-            when_date="2020-01-01", conversation_id="conv-Z",
+            id="planned", subject="erin", verb="will run", object="5k",
+            what="5k plan", status="planned", when_date="2020-01-01",
+            conversation_id="conv-Z",
         ))
-        promoted = promote_planned_facts(
-            store,
-            operation_id="op-9", owner_worker_id="w-9", lifecycle_epoch=7,
-        )
-        assert promoted == 1
-        uff = store.calls_of("update_fact_fields")
-        assert uff
-        kw = uff[0].kwargs
-        assert kw["operation_id"] == "op-9"
-        assert kw["owner_worker_id"] == "w-9"
-        assert kw["lifecycle_epoch"] == 7
-
-    def test_legacy_call_passes_none_kwargs(self):
-        store = _SpyStore()
-        store.seed_planned_fact(Fact(
-            id="planned-leg", subject="x", verb="will", object="y",
-            what="z", status="planned",
-            when_date="2020-01-01", conversation_id="conv-Q",
-        ))
-        promote_planned_facts(store)
-        uff = store.calls_of("update_fact_fields")
-        assert uff
-        kw = uff[0].kwargs
-        assert kw["operation_id"] is None
-        assert kw["owner_worker_id"] is None
-        assert kw["lifecycle_epoch"] is None
+        assert promote_planned_facts(store, **guard) == 0
+        assert store.calls_of("update_fact_fields") == []
+        assert store.calls_of("query_facts") == []
 
 
 # ---------------------------------------------------------------------------
@@ -546,10 +527,10 @@ class TestT318b_FactLinkCheckerLeaseLostPropagates:
         store.raise_lease_lost_on("set_fact_superseded")
         checker = _make_supersession_checker(store)
         with pytest.raises(CompactionLeaseLost):
+            incoming_facts = [Fact(id='new-x', subject='frank', verb='owns', object='bike', what='bike', conversation_id='conv-A')]
+            store.seed_proposals(incoming_facts)
             checker.check_and_supersede(
-                [Fact(id="new-x", subject="frank", verb="owns",
-                      object="bike", what="bike",
-                      conversation_id="conv-A")],
+                incoming_facts,
                 operation_id="op-1", owner_worker_id="w-1",
                 lifecycle_epoch=1,
             )
@@ -582,10 +563,10 @@ class TestT318b_FactLinkCheckerLeaseLostPropagates:
             model="stub", store=store, config=cfg, graph_links=True,
         )
         with pytest.raises(CompactionLeaseLost):
+            incoming_facts = [Fact(id='new-y', subject='grace', verb='visits', object='paris', what='trip', conversation_id='conv-A')]
+            store.seed_proposals(incoming_facts)
             checker.check_and_link(
-                [Fact(id="new-y", subject="grace", verb="visits",
-                      object="paris", what="trip",
-                      conversation_id="conv-A")],
+                incoming_facts,
                 operation_id="op-1", owner_worker_id="w-1",
                 lifecycle_epoch=1, conversation_id="conv-A",
             )
@@ -608,10 +589,10 @@ class TestT318b_FactLinkCheckerLeaseLostPropagates:
 
         checker._check_links = _raise_lease_lost
         with pytest.raises(CompactionLeaseLost):
+            incoming_facts = [Fact(id='new-inner', subject='helen', verb='uses', object='go', what='tooling', conversation_id='conv-A')]
+            store.seed_proposals(incoming_facts)
             checker.check_and_link(
-                [Fact(id="new-inner", subject="helen", verb="uses",
-                      object="go", what="tooling",
-                      conversation_id="conv-A")],
+                incoming_facts,
                 operation_id="op-1", owner_worker_id="w-1",
                 lifecycle_epoch=1, conversation_id="conv-A",
             )
@@ -747,8 +728,10 @@ class TestT317f_FencedQueriesScopedToConversation:
         new = Fact(id="new-z", subject="hank", verb="lives-in",
                    object="Chicago", what="address",
                    conversation_id="conv-A")
+        incoming_facts = [new]
+        store.seed_proposals(incoming_facts)
         checker.check_and_supersede(
-            [new],
+            incoming_facts,
             operation_id="op-1", owner_worker_id="w-1", lifecycle_epoch=1,
         )
         # Every query_facts call must carry conversation_id=conv-A.
@@ -760,51 +743,30 @@ class TestT317f_FencedQueriesScopedToConversation:
                 "op's conversation"
             )
 
-    def test_check_and_supersede_legacy_does_not_pass_conversation_id(self):
+    def test_check_and_supersede_legacy_still_scopes_conversation_id(self):
         store = _SpyStore()
         store.seed_candidate(Fact(
             id="cand-leg", subject="iris", verb="likes", object="tea",
             what="pref", conversation_id="conv-X",
         ))
         checker = _make_supersession_checker(store)
-        checker.check_and_supersede([Fact(
-            id="new-leg", subject="iris", verb="likes", object="coffee",
-            what="pref", conversation_id="conv-X",
-        )])
+        incoming_facts = [Fact(id='new-leg', subject='iris', verb='likes', object='coffee', what='pref', conversation_id='conv-X')]
+        store.seed_proposals(incoming_facts)
+        checker.check_and_supersede(incoming_facts)
         qf = store.calls_of("query_facts")
         assert qf
         for call in qf:
-            # Legacy path: conversation_id must NOT be passed so behavior
-            # matches pre-P3 global scan.
-            assert "conversation_id" not in call.kwargs
+            # Ownership scope is required independently of the fence mode.
+            assert call.kwargs["conversation_id"] == "conv-X"
 
-    def test_promote_planned_facts_passes_conversation_id_when_fenced(self):
+    def test_legacy_promotion_does_not_scan_other_conversations(self):
         store = _SpyStore()
-        store.seed_planned_fact(Fact(
-            id="planned-scoped", subject="jay", verb="will",
-            object="walk", what="task", status="planned",
-            when_date="2020-01-01", conversation_id="conv-A",
-        ))
-        promote_planned_facts(
-            store,
-            operation_id="op-1", owner_worker_id="w-1",
+        assert promote_planned_facts(
+            store, operation_id="op-1", owner_worker_id="w-1",
             lifecycle_epoch=1, conversation_id="conv-A",
-        )
-        qf = store.calls_of("query_facts")
-        assert qf
-        assert qf[0].kwargs.get("conversation_id") == "conv-A"
+        ) == 0
+        assert store.calls_of("query_facts") == []
 
-    def test_promote_planned_facts_legacy_does_not_pass_conversation_id(self):
-        store = _SpyStore()
-        store.seed_planned_fact(Fact(
-            id="planned-leg", subject="k", verb="will", object="x",
-            what="y", status="planned",
-            when_date="2020-01-01", conversation_id="conv-Q",
-        ))
-        promote_planned_facts(store)
-        qf = store.calls_of("query_facts")
-        assert qf
-        assert "conversation_id" not in qf[0].kwargs
 
 
 # ---------------------------------------------------------------------------

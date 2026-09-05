@@ -29,13 +29,17 @@ def test_turn_group_zero_does_not_collapse_into_unset_provenance():
             conversation_id="c", canonical_turn_id="unset", turn_group_number=-1,
         ),
     ]
-    pipeline._store = SimpleNamespace(get_all_canonical_turns=lambda _cid: rows)
+    pipeline._store = SimpleNamespace(
+        get_canonical_turn_rows_by_group=lambda _cid, groups, **_kwargs: [
+            row for row in rows if row.turn_group_number in groups
+        ],
+    )
     pipeline._config = SimpleNamespace(conversation_id="c")
 
-    grouped = pipeline._physical_rows_by_group()
+    grouped = pipeline._physical_rows_by_group([0, -1])
 
     assert [row.canonical_turn_id for row in grouped[0]] == ["zero"]
-    assert [row.canonical_turn_id for row in grouped[-1]] == ["unset"]
+    assert -1 not in grouped
 
 
 def test_resolved_target_outside_segment_suppresses_copied_subject_lane():

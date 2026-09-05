@@ -50,7 +50,12 @@ class _PhysicalRowStore(_RowStore):
         self._physical_rows = physical_rows
 
     def get_all_canonical_turns(self, conversation_id):
-        return list(self._physical_rows)
+        raise AssertionError("compaction enumerated the full physical archive")
+
+    def get_canonical_turn_rows_by_group(self, conversation_id, groups, *, internal_validation=False):
+        assert internal_validation is True
+        return [row for row in self._physical_rows
+                if row.conversation_id == conversation_id and row.turn_group_number in groups]
 
 
 def _pipeline(rows):

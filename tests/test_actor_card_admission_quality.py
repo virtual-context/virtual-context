@@ -67,10 +67,10 @@ def test_confidence_scale_is_defined_for_the_curator():
 @pytest.mark.regression("BUG-063")
 def test_both_prompt_surfaces_reference_the_judgment_rules():
     curation_src = inspect.getsource(
-        cp.CompactionPipeline._curate_actor_card_partition
+        cp.ActorCardCurationService.curate_partition
     )
     admission_src = inspect.getsource(
-        cp.CompactionPipeline._admit_actor_card_entries
+        cp.ActorCardAdmissionService.admit_entries
     )
     assert "_ACTOR_CARD_JUDGMENT_RULES" in curation_src
     assert "_ACTOR_CARD_JUDGMENT_RULES" in admission_src
