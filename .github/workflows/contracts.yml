@@ -13,11 +13,14 @@ jobs:
   minimal-install:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    strategy:
+      matrix:
+        python-version: ['3.11', '3.12']
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: ${{ matrix.python-version }}
       - name: Install locked base dependencies
         run: |
           python -m pip install uv==0.9.30
@@ -45,13 +48,16 @@ jobs:
   contracts:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      matrix:
+        python-version: ['3.11', '3.12']
     env:
       TIKTOKEN_CACHE_DIR: ${{ runner.temp }}/tiktoken
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: ${{ matrix.python-version }}
       - name: Install locked contract dependencies
         run: |
           python -m pip install uv==0.9.30

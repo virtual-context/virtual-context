@@ -12,6 +12,8 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 TESTS = [
     "tests/test_admin_setup_contracts.py",
+    "tests/test_actor_card_assembly.py",
+    "tests/test_actor_card_style_evidence.py",
     "tests/test_benchmark_cache_manifest.py",
     "tests/test_context_budget_contract.py",
     "tests/test_fact_lifecycle_contracts.py",
