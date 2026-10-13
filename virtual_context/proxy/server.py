@@ -1111,9 +1111,8 @@ async def prepare_payload(
     # Resolve upstream context window limit for this model
     from .helpers import (  # noqa: F811 — resolve patched helpers at request time
         offer_vc_tools,
-    tool_names,
+        tool_names,
         _inject_context,
-        _inject_vc_tools,
     )
     from ..model_limits import resolve_upstream_limit
 
