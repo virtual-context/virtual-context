@@ -109,8 +109,11 @@ class TestChannelSchemaPg:
         }
 
     def test_migration_adds_the_columns_to_a_legacy_table(self, store):
-        """Drop the columns, then re-run the migration path the way startup
-        does, and confirm the rows and the view come back intact.
+        """Restore a legacy table through the complete startup migration.
+
+        Modern triggers depend on these columns and did not exist on the
+        legacy table. CASCADE removes them along with the columns; bootstrap
+        must restore both the columns and their safety triggers.
         """
         conv = _conv()
         store.upsert_conversation(tenant_id="t", conversation_id=conv)
@@ -118,17 +121,31 @@ class TestChannelSchemaPg:
              user_content="legacy", origin_channel_id="7",
              origin_channel_label="#a")
 
-        with store.pool.connection() as conn:
-            conn.execute("DROP VIEW IF EXISTS canonical_turns_ordinal")
-            conn.execute(
-                "ALTER TABLE canonical_turns DROP COLUMN origin_channel_id"
-            )
-            conn.execute(
-                "ALTER TABLE canonical_turns DROP COLUMN origin_channel_label"
-            )
+        try:
+            with store.pool.connection() as conn:
+                conn.execute("DROP VIEW IF EXISTS canonical_turns_ordinal")
+                conn.execute(
+                    "ALTER TABLE canonical_turns DROP COLUMN origin_channel_id CASCADE"
+                )
+                conn.execute(
+                    "ALTER TABLE canonical_turns DROP COLUMN origin_channel_label CASCADE"
+                )
+        finally:
+            # Run bootstrap explicitly: a second store in this process now
+            # uses the prepared-schema cache. Also repair after setup errors
+            # so later tests do not inherit a partially removed schema.
+            store._ensure_schema()
 
-        store._ensure_canonical_turn_schema()
-        store._ensure_canonical_turn_views()
+        with store.pool.connection() as conn:
+            triggers = conn.execute(
+                """SELECT tgname FROM pg_trigger
+                   WHERE tgrelid = 'canonical_turns'::regclass
+                     AND NOT tgisinternal"""
+            ).fetchall()
+        assert {
+            "trg_guard_receipted_assistant_channel_update",
+            "trg_invalidate_actor_card_turn_source",
+        } <= {row["tgname"] for row in triggers}
 
         rows = store.get_all_canonical_turns(conv)
         assert len(rows) == 1

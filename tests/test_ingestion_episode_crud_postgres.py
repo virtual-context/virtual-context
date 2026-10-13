@@ -56,9 +56,9 @@ def _seed_canonical(s, *, conv_id: str, count: int, tagged: int) -> None:
                 normalized_user_text, normalized_assistant_text,
                 user_content, assistant_content,
                 sort_key, source_batch_id, first_seen_at, last_seen_at,
-                covered_ingestible_entries, tagged_at,
+                covered_ingestible_entries, tagged_at, turn_group_number,
                 created_at, updated_at
-            ) VALUES (%s, %s, %s, 1, 'u','a','u_raw','a_raw', %s, %s, %s, %s, 1, %s, %s, %s)
+            ) VALUES (%s, %s, %s, 1, 'u','a','u_raw','a_raw', %s, %s, %s, %s, 1, %s, %s, %s, %s)
             """,
             (
                 uuid.uuid4(),
@@ -69,6 +69,7 @@ def _seed_canonical(s, *, conv_id: str, count: int, tagged: int) -> None:
                 now,
                 now,
                 now if i < tagged else None,
+                i,
                 now,
                 now,
             ),

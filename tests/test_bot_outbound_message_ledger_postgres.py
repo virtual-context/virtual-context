@@ -460,15 +460,16 @@ def _ns_conv(store, scope="vast", platform="discord", account="vast", channel=No
     with pg_test_conn().cursor() as cur:
         cur.execute(
             """INSERT INTO canonical_turns (
-                   canonical_turn_id, conversation_id, turn_hash, hash_version,
+                   canonical_turn_id, conversation_id, audience_conversation_id,
+                   turn_hash, hash_version,
                    normalized_user_text, normalized_assistant_text,
                    user_content, assistant_content, sort_key, source_batch_id,
                    first_seen_at, last_seen_at, covered_ingestible_entries,
                    tagged_at, created_at, updated_at
-               ) VALUES (gen_random_uuid(), %s, %s, 1, 'u','a','u','a', 1000.0,
+               ) VALUES (gen_random_uuid(), %s, %s, %s, 1, 'u','a','u','a', 1000.0,
                          gen_random_uuid(), %s, %s, 1, NULL, %s, %s)
                RETURNING canonical_turn_id""",
-            (conv, f"h-{uuid.uuid4().hex[:8]}", now, now, now, now),
+            (conv, conv, f"h-{uuid.uuid4().hex[:8]}", now, now, now, now),
         )
         turn_id = cur.fetchone()["canonical_turn_id"]
         cur.execute(

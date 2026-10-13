@@ -69,6 +69,7 @@ def _make_postgres_proxy_state(dsn: str, conversation_id: str):
 
     config = VirtualContextConfig(
         conversation_id=conversation_id,
+        tenant_id="e2e-test",
         storage=StorageConfig(
             backend="postgres",
             postgres_dsn=dsn,

@@ -97,12 +97,12 @@ def test_backfill_fills_never_resurrected_rows_and_leaves_the_rest_unknown():
     nothing recorded, and inventing one would be exactly the guess this column
     exists to avoid.
 
-    The rows are seeded and then a NEW store is constructed, so the assertion
-    runs against the migration in the schema bootstrap. Running a copy of the
-    backfill statement from inside the test would assert on a second
+    The rows are seeded and then the real schema bootstrap is run explicitly:
+    constructing another store in this process uses the prepared-schema cache.
+    Running a copy of the backfill statement inside the test would assert on a second
     implementation and pass while the real one was wrong.
     """
-    _store()  # ensure the column exists before seeding it
+    store = _store()  # ensure the column exists before seeding it
     virgin, resurrected = _conv(), _conv()
     now = datetime.now(timezone.utc)
     with pg_test_conn().cursor() as cur:
@@ -115,7 +115,7 @@ def test_backfill_fills_never_resurrected_rows_and_leaves_the_rest_unknown():
                 (conv, epoch, now, now),
             )
 
-    store = _store()  # runs _ensure_schema, and with it the real backfill
+    store._ensure_schema()  # exercise the real startup backfill after seeding
 
     assert store.get_lifecycle_epoch_started_at(virgin) is not None, (
         "the backfill left a never-resurrected row without an epoch start"
@@ -149,7 +149,7 @@ def test_backfill_does_not_restamp_an_already_recorded_start():
         )
     recorded = store.get_lifecycle_epoch_started_at(conv)
 
-    _store()  # bootstrap again; the backfill must skip this populated row
+    store._ensure_schema()  # bootstrap again; skip this populated row
 
     assert store.get_lifecycle_epoch_started_at(conv) == recorded
 
