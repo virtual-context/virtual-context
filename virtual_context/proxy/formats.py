@@ -3346,20 +3346,63 @@ class OpenAIResponsesFormat(PayloadFormat):
     _HOST_SCAFFOLD_PREFIXES = (
         "<recommended_plugins>", "<external_openclaw_current_sender>", "<environment_context>",
     )
+    _PROJECT_INSTRUCTIONS_RE = re.compile(
+        r"# AGENTS\.md instructions(?: for [^\r\n]+)?\r?\n"
+        r"\s*<INSTRUCTIONS>[\s\S]*</INSTRUCTIONS>"
+    )
+
+    @classmethod
+    def _is_host_context_text(cls, text: str) -> bool:
+        text = text.strip()
+        return text.startswith(cls._HOST_SCAFFOLD_PREFIXES) or (
+            text.startswith(cls._HOST_CONTEXT_BEGIN) and text.endswith(cls._HOST_CONTEXT_END)
+        )
+
+    def _is_project_instructions_item(self, item: dict) -> bool:
+        """Recognize Codex's complete project-document envelope, not quoted prose.
+
+        Codex transports project instructions as a user message, optionally
+        followed by environment context in another text block. Preserve its
+        original role/content; recognition does not promote its authority.
+        Requiring the complete envelope avoids hiding ordinary requests that
+        merely mention AGENTS.md or append a question to an example envelope.
+        """
+        content = item.get("content", "")
+        if isinstance(content, str):
+            texts = [content]
+        elif isinstance(content, list) and content and all(
+            isinstance(block, dict)
+            and block.get("type") in ("input_text", "text")
+            and isinstance(block.get("text"), str)
+            for block in content
+        ):
+            texts = [block["text"] for block in content]
+        else:
+            return False
+        return bool(self._PROJECT_INSTRUCTIONS_RE.fullmatch(texts[0].strip())) and all(
+            self._is_host_context_text(text) for text in texts[1:]
+        )
 
     def _is_host_context_item(self, item: dict) -> bool:
-        """A user-role item the host appends after the prompt with its own runtime state.
+        """Host-supplied project instructions or runtime state in a user-role item.
 
         It travels upstream untouched but is not the user's message: it never
         counts as the current message, never pairs with a reply as a user turn,
         and stays inside the prompt's turn group.
         """
-        if not isinstance(item, dict) or item.get("role") != "user":
+        if (not isinstance(item, dict) or item.get("role") != "user"
+                or self._is_bare_item(item)):
             return False
-        text = self._extract_text_from_content(item.get("content", "")).strip()
-        if text.startswith(self._HOST_SCAFFOLD_PREFIXES):
+        if self._is_project_instructions_item(item):
             return True
-        return text.startswith(self._HOST_CONTEXT_BEGIN) and text.endswith(self._HOST_CONTEXT_END)
+        text = self._extract_text_from_content(item.get("content", "")).strip()
+        return self._is_host_context_text(text)
+
+    def _is_conversational_message(self, msg: dict) -> bool:
+        # Merging a project document into the next user message would erase
+        # its boundary and make that request disappear from ingest/replay.
+        return (not self._is_bare_item(msg) and not self._is_host_context_item(msg)
+                and super()._is_conversational_message(msg))
 
     # -- Message extraction --
 
