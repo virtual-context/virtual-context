@@ -340,15 +340,24 @@ def _chain_has_tool_activity(messages: list[dict], indices: tuple[int, ...] | ra
     return False
 
 
-def _is_leading_instruction_item(msg: dict, fmt: PayloadFormat | None) -> bool:
+def _is_protected_instruction_item(msg: dict, fmt: PayloadFormat | None) -> bool:
+    """Instructions retain their original carrier through history transforms."""
     if not isinstance(msg, dict):
         return False
     if msg.get("role") in ("system", "developer"):
         return True
-    if msg.get("type", "message") != "message":
-        return not str(msg.get("type", "")).endswith(("_call", "_output"))
     is_host_context = getattr(fmt, "_is_host_context_item", None)
     return bool(callable(is_host_context) and is_host_context(msg))
+
+
+def _is_leading_instruction_item(msg: dict, fmt: PayloadFormat | None) -> bool:
+    if _is_protected_instruction_item(msg, fmt):
+        return True
+    if not isinstance(msg, dict):
+        return False
+    if msg.get("type", "message") != "message":
+        return not str(msg.get("type", "")).endswith(("_call", "_output"))
+    return False
 
 
 def filter_body_messages(
@@ -418,11 +427,22 @@ def filter_body_messages(
     if not chat_msgs:
         return body, 0
 
-    # Split trailing user message (current turn) from history pairs
+    # Pair conversation through interleaved instruction carriers, retaining a
+    # map to their original positions. Otherwise q0, HOST, a0 loses a logical
+    # turn and shifts every later tag lookup. Keep the raw list unchanged so
+    # trailing host context also stays after the current user message.
+    conversation_indices = [
+        i for i, msg in enumerate(chat_msgs)
+        if not _is_protected_instruction_item(msg, fmt)
+    ]
+    conversation_msgs = [chat_msgs[i] for i in conversation_indices]
+
+    # Exclude the trailing conversational user from history, even when host
+    # context follows it in the raw payload. It remains an unpaired kept item.
     current_user = None
-    if chat_msgs and chat_msgs[-1].get("role") == "user":
-        current_user = chat_msgs[-1]
-        chat_msgs = chat_msgs[:-1]
+    if conversation_msgs and conversation_msgs[-1].get("role") == "user":
+        current_user = conversation_msgs.pop()
+        conversation_indices.pop()
 
     # Group into atomic turn chains, tracking which message indices are paired.
     # A chain is: user + assistant + zero or more tool rounds.
@@ -435,23 +455,23 @@ def filter_body_messages(
     pairs: list[tuple[int, ...]] = []  # tuple of ALL msg indices in the chain
     paired_indices: set[int] = set()
     i = 0
-    while i + 1 < len(chat_msgs):
-        if (chat_msgs[i].get("role") == "user"
-                and chat_msgs[i + 1].get("role") == _asst_role):
+    while i + 1 < len(conversation_msgs):
+        if (conversation_msgs[i].get("role") == "user"
+                and conversation_msgs[i + 1].get("role") == _asst_role):
             chain_indices: list[int] = [i, i + 1]
             j = i + 2
             # Extend chain through tool rounds (same logic as trim_to_upstream_limit)
-            while j < len(chat_msgs) - 1:
-                next_msg = chat_msgs[j]
+            while j < len(conversation_msgs) - 1:
+                next_msg = conversation_msgs[j]
                 next_role = next_msg.get("role", "")
                 # OpenAI tool response (role="tool")
                 if next_role == "tool":
                     tool_batch = [j]
                     k = j + 1
-                    while k < len(chat_msgs) and chat_msgs[k].get("role") == "tool":
+                    while k < len(conversation_msgs) and conversation_msgs[k].get("role") == "tool":
                         tool_batch.append(k)
                         k += 1
-                    if k < len(chat_msgs) and chat_msgs[k].get("role") == _asst_role:
+                    if k < len(conversation_msgs) and conversation_msgs[k].get("role") == _asst_role:
                         chain_indices.extend(tool_batch)
                         chain_indices.append(k)
                         j = k + 1
@@ -459,7 +479,7 @@ def filter_body_messages(
                     else:
                         break  # tool messages without following assistant — stop
                 # OpenAI Responses bare function_call/function_call_output round
-                responses_round = _consume_responses_tool_round(chat_msgs, j, _asst_role)
+                responses_round = _consume_responses_tool_round(conversation_msgs, j, _asst_role)
                 if responses_round:
                     round_indices, next_index = responses_round
                     chain_indices.extend(round_indices)
@@ -471,9 +491,9 @@ def filter_body_messages(
                 if _is_tool_result_only_user(next_msg):
                     break
                 break  # real user message, not part of tool chain
-            pairs.append(tuple(chain_indices))
-            for ci in chain_indices:
-                paired_indices.add(ci)
+            raw_chain_indices = tuple(conversation_indices[ci] for ci in chain_indices)
+            pairs.append(raw_chain_indices)
+            paired_indices.update(raw_chain_indices)
             i = chain_indices[-1] + 1
         else:
             i += 1
@@ -606,6 +626,8 @@ def filter_body_messages(
     # the first user message.
     first_kept_indices = sorted(keep_msg)
     for idx in first_kept_indices:
+        if _is_protected_instruction_item(chat_msgs[idx], fmt):
+            continue
         if chat_msgs[idx].get("role") == "user":
             break  # first kept message is already user — no fix needed
         # Force-keep this message and all messages before it
@@ -655,9 +677,6 @@ def filter_body_messages(
         if msg_idx in keep_msg:
             kept.append(chat_msgs[msg_idx])
 
-    if current_user:
-        kept.append(current_user)
-
     # Strip thinking blocks when messages were dropped.  Thinking blocks
     # carry cryptographic signatures that chain across turns; dropping a
     # message mid-chain breaks the chain and the Anthropic API returns 500.
@@ -703,8 +722,6 @@ def filter_body_messages(
     _prefix_len = len(prefix)
     _chat_kept_i = 0
     for kept_i in range(_prefix_len, len(kept)):
-        if current_user and kept_i == len(kept) - 1:
-            break  # last entry is current_user, not from chat_msgs
         while _chat_kept_i < len(chat_msgs) and _chat_kept_i not in keep_msg:
             _chat_kept_i += 1
         if _chat_kept_i < len(chat_msgs) and _chat_kept_i in _critical_indices:
@@ -731,12 +748,14 @@ def filter_body_messages(
         if kept_i < _prefix_len:
             continue
         role = msg.get("role")
-        if role is None:
+        if role is None or _is_protected_instruction_item(msg, fmt):
             alternating.append(msg)
             _alt_critical.append(kept_i in _critical_kept)
             _alt_paired.append(kept_i in _paired_kept)
             continue
-        if len(alternating) > _prefix_len and role == alternating[-1].get("role"):
+        if (len(alternating) > _prefix_len
+                and not _is_protected_instruction_item(alternating[-1], fmt)
+                and role == alternating[-1].get("role")):
             if kept_i in _critical_kept:
                 # This message has a tool_use/tool_result partner that's also
                 # kept — dropping it would create an orphan.  Instead, drop
@@ -802,7 +821,10 @@ def filter_body_messages(
 
     # Compute drops from final kept list (not incremental tracking, which
     # undercounts when alternation enforcement removes additional messages).
-    kept_user_count = sum(1 for m in kept if m.get("role") == "user")
+    kept_user_count = sum(
+        1 for m in kept
+        if m.get("role") == "user" and not _is_protected_instruction_item(m, fmt)
+    )
     if current_user:
         kept_user_count -= 1  # exclude current turn from pair count
     dropped = max(0, total_pairs - kept_user_count)
@@ -935,7 +957,9 @@ def stub_compacted_messages(
     chains: list[tuple[int, ...]] = []
     i = 0
     while i + 1 < len(messages):
-        if messages[i].get("role") == "user" and messages[i + 1].get("role") == assistant_role:
+        if (messages[i].get("role") == "user"
+                and not _is_protected_instruction_item(messages[i], fmt)
+                and messages[i + 1].get("role") == assistant_role):
             chain_indices: list[int] = [i, i + 1]
             j = i + 2
             while j < len(messages) - 1:
@@ -1194,105 +1218,68 @@ def trim_to_upstream_limit(
     # Use format abstraction for atomic turn grouping
     all_groups = fmt.group_into_turns(body)
 
-    # Separate system-prefix groups (always kept, not counted against budget)
-    # from real turn groups.  A "system prefix" group is one at the start of
-    # the array whose items all have role="system".
-    system_groups: list = []
-    turn_groups: list = []
-    for g in all_groups:
-        if not turn_groups:
-            # Still scanning for system-only prefix groups
-            all_system = all(
-                original_messages[idx].get("role") == "system"
-                for idx in g.indices
-            )
-            if all_system:
-                system_groups.append(g)
-                continue
-        turn_groups.append(g)
+    # Instructions may share a turn group with old conversation. Protect the
+    # original items individually, rather than protecting only all-system
+    # prefix groups or retaining unrelated history along with instructions.
+    fixed_indices = {
+        idx for idx, msg in enumerate(original_messages)
+        if _is_protected_instruction_item(msg, fmt)
+    }
+    for idx, msg in enumerate(original_messages):
+        if not _is_leading_instruction_item(msg, fmt):
+            break
+        fixed_indices.add(idx)
 
-    # Collect trailing items: indices not covered by any turn group.
-    # group_into_turns covers all items, so this is normally empty, but
-    # handle the edge case defensively.
-    grouped_indices: set[int] = set()
-    for g in all_groups:
-        grouped_indices.update(g.indices)
-    trailing = tuple(
-        idx for idx in range(len(original_messages))
-        if idx not in grouped_indices
-    )
-
-    if len(turn_groups) <= 2 and not trailing:
+    grouped_indices = {idx for group in all_groups for idx in group.indices}
+    fixed_indices.update(set(range(len(original_messages))) - grouped_indices)
+    turn_groups = [
+        tuple(idx for idx in group.indices if idx not in fixed_indices)
+        for group in all_groups
+    ]
+    turn_groups = [indices for indices in turn_groups if indices]
+    if len(turn_groups) <= 2:
         return body, 0
 
-    fixed = fmt._estimate_system_tokens(body) + fmt.estimate_tools_tokens(body)
+    # Count the actual fixed payload, including instruction carriers, tools,
+    # and provider-level fields. Protected text still consumes context; if it
+    # cannot fit, admit_provider_payload rejects instead of deleting it.
+    fixed_body = dict(body)
+    fixed_body[msg_key] = [
+        msg for idx, msg in enumerate(original_messages) if idx in fixed_indices
+    ]
+    fixed = fmt.estimate_payload_tokens(fixed_body)
     available = input_limit - fixed
+    protected_count = min(2, len(turn_groups))
+    keep_groups = list(turn_groups[-protected_count:])
+    budget_used = sum(
+        fmt.estimate_message_tokens(original_messages[idx])
+        for indices in keep_groups for idx in indices
+    )
 
     logger.info(
-        "TRIM_BUDGET: total=%d fixed(system+tools)=%d "
+        "TRIM_BUDGET: total=%d fixed(instructions+tools)=%d "
         "input_limit=%d available_for_msgs=%d turns=%d",
         total, fixed, input_limit, available, len(turn_groups),
     )
 
-    # Protect the last 2 turn groups (or all if fewer than 2)
-    protected_count = min(2, len(turn_groups))
-
-    if available <= 0:
-        # System+tools alone exceed the limit — keep only protected turns
-        keep_indices: set[int] = set()
-        for g in system_groups:
-            keep_indices.update(g.indices)
-        for g in turn_groups[-protected_count:]:
-            keep_indices.update(g.indices)
-        for idx in trailing:
-            keep_indices.add(idx)
-        new_messages = [m for idx, m in enumerate(original_messages) if idx in keep_indices]
-        trimmed_body = dict(body)
-        trimmed_body[msg_key] = new_messages
-        return trimmed_body, len(turn_groups) - protected_count
-
-    # Build from newest to oldest.  Start with protected turn groups +
-    # trailing items, then add older groups until the budget is full.
-    keep_groups = list(turn_groups[-protected_count:])
-    budget_used = 0
-
-    # Always count trailing items
-    for idx in trailing:
-        budget_used += fmt.estimate_message_tokens(original_messages[idx])
-    # Count system-prefix groups (always kept)
-    for g in system_groups:
-        for idx in g.indices:
-            budget_used += fmt.estimate_message_tokens(original_messages[idx])
-    # Count protected turn groups
-    for g in keep_groups:
-        for idx in g.indices:
-            budget_used += fmt.estimate_message_tokens(original_messages[idx])
-
-    # Walk backwards from the oldest unprotected turn group
     added = 0
-    trimmable = turn_groups[:-protected_count] if protected_count else turn_groups
-    for g_idx in range(len(trimmable) - 1, -1, -1):
-        g = trimmable[g_idx]
-        g_tokens = 0
-        for idx in g.indices:
-            g_tokens += fmt.estimate_message_tokens(original_messages[idx])
-        if budget_used + g_tokens <= available:
-            keep_groups.insert(0, g)
-            budget_used += g_tokens
+    trimmable = turn_groups[:-protected_count]
+    for indices in reversed(trimmable):
+        group_tokens = sum(
+            fmt.estimate_message_tokens(original_messages[idx]) for idx in indices
+        )
+        if budget_used + group_tokens <= available:
+            keep_groups.insert(0, indices)
+            budget_used += group_tokens
             added += 1
-        # else: skip — too big, but keep trying older smaller ones
 
     total_removed = len(trimmable) - added
     if total_removed == 0:
         return body, 0
 
-    keep_indices: set[int] = set()
-    for g in system_groups:
-        keep_indices.update(g.indices)
-    for g in keep_groups:
-        keep_indices.update(g.indices)
-    for idx in trailing:
-        keep_indices.add(idx)
+    keep_indices = set(fixed_indices)
+    for indices in keep_groups:
+        keep_indices.update(indices)
 
     new_messages = [m for idx, m in enumerate(original_messages) if idx in keep_indices]
     trimmed_body = dict(body)
@@ -1928,10 +1915,18 @@ def _build_pre_filter_chain_from_index(
 def _index_pre_filter_chains(
     pre_filter_messages: list[dict],
     _asst_role: str,
+    fmt: PayloadFormat | None = None,
 ) -> dict[str, list[list[int]]]:
     """Pre-index candidate chains by leading user text for reuse during collapse."""
+    # Instructions can be interleaved with a tool turn. They are neither its
+    # user text nor part of its restorable conversation snapshot.
+    source_indices = [
+        i for i, msg in enumerate(pre_filter_messages)
+        if not _is_protected_instruction_item(msg, fmt)
+    ]
+    conversation_messages = [pre_filter_messages[i] for i in source_indices]
     index: dict[str, list[list[int]]] = {}
-    for i, msg in enumerate(pre_filter_messages):
+    for i, msg in enumerate(conversation_messages):
         if msg.get("role") != "user":
             continue
         if _is_tool_result_only_user(msg):
@@ -1939,10 +1934,10 @@ def _index_pre_filter_chains(
         text = _extract_text_for_stub_hash(msg)
         if not text:
             continue
-        chain = _build_pre_filter_chain_from_index(pre_filter_messages, i, _asst_role)
+        chain = _build_pre_filter_chain_from_index(conversation_messages, i, _asst_role)
         if chain is None:
             continue
-        index.setdefault(text, []).append(chain)
+        index.setdefault(text, []).append([source_indices[j] for j in chain])
     return index
 
 
@@ -2084,6 +2079,8 @@ def collapse_turn_chains(
         asst_text = ""
         for gi in turn.indices:
             msg = messages[gi]
+            if _is_protected_instruction_item(msg, fmt):
+                continue
             if msg.get("role") in ("user", "human") and not _is_tool_result_only_user(msg):
                 user_text = _extract_text_for_stub_hash(msg)
             elif msg.get("role") == _asst_role and not asst_text:
@@ -2203,7 +2200,7 @@ def collapse_turn_chains(
         else:
             if pre_filter_chain_index is None:
                 _prefilter_index_stage = time.monotonic()
-                pre_filter_chain_index = _index_pre_filter_chains(pre_filter_messages, _asst_role)
+                pre_filter_chain_index = _index_pre_filter_chains(pre_filter_messages, _asst_role, fmt)
                 _note("index_pre_filter_chains", _prefilter_index_stage)
 
             # b. Find corresponding messages in pre_filter_body
@@ -2235,7 +2232,8 @@ def collapse_turn_chains(
             # for those chains. The restore boundary applies the same rule to
             # legacy snapshots already at rest.
             pf_msgs = sanitize_chain_snapshot_messages(
-                [pre_filter_messages[pi] for pi in pf_chain]
+                [pre_filter_messages[pi] for pi in pf_chain
+                 if not _is_protected_instruction_item(pre_filter_messages[pi], fmt)]
             )
             if not pf_msgs:
                 logger.warning(
@@ -2519,8 +2517,10 @@ def collapse_turn_chains(
     for tidx in _all_collapsed_tidxs:
         turn = history_turns[tidx]
         for gi in turn.indices:
-            collapsed_indices.add(gi)
             msg = messages[gi]
+            if _is_protected_instruction_item(msg, fmt):
+                continue
+            collapsed_indices.add(gi)
             if not isinstance(msg, dict):
                 continue
             content = msg.get("content", [])
@@ -2547,7 +2547,10 @@ def collapse_turn_chains(
     insertions: list[tuple[int, dict, dict]] = []
     for tidx, (ref, stub_user, stub_asst) in collapse_map.items():
         turn = history_turns[tidx]
-        insertions.append((turn.indices[0], stub_user, stub_asst))
+        first_conversation_index = next(
+            gi for gi in turn.indices if gi in collapsed_indices
+        )
+        insertions.append((first_conversation_index, stub_user, stub_asst))
     insertions.sort(key=lambda x: x[0])
 
     # Strip orphaned tool_result / function_call_output blocks from
@@ -2599,7 +2602,7 @@ def collapse_turn_chains(
         messages = fmt.get_messages(body)
         insert_at = 0
         for i, m in enumerate(messages):
-            if m.get("role") in ("system", "developer"):
+            if _is_leading_instruction_item(m, fmt):
                 insert_at = i + 1
             else:
                 break
@@ -2758,6 +2761,8 @@ def scan_reducible_items(
 
     # -- Tool outputs (via format method) -------------------------------
     for tool_out in fmt.iter_tool_outputs(body):
+        if _is_protected_instruction_item(messages[tool_out.msg_index], fmt):
+            continue
         content_str = tool_out.content
         tc_bytes = len(content_str)
         if tc_bytes < 100:
@@ -2789,6 +2794,8 @@ def scan_reducible_items(
     for media_info in fmt.iter_media_blocks(body):
         # Estimate data size from the source/URL — check all known shapes.
         msg = messages[media_info.msg_index]
+        if _is_protected_instruction_item(msg, fmt):
+            continue
         # Gemini stores blocks in "parts"; others use "content".
         content = msg.get("parts") or msg.get("content", [])
         data_size = 0
@@ -2843,6 +2850,8 @@ def scan_reducible_items(
 
     # -- Conversational text (via format method) ------------------------
     for mi in range(len(messages)):
+        if _is_protected_instruction_item(messages[mi], fmt):
+            continue
         text = fmt.extract_text_from_item(body, mi)
         if not text or len(text) <= 100:
             continue
