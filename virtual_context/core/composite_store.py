@@ -240,6 +240,9 @@ class CompositeStore:
     def get_all_tag_summaries(self, *, conversation_id: str | None = None) -> list[TagSummary]:
         return self._segments.get_all_tag_summaries(conversation_id=conversation_id)
 
+    def get_segment_tags_without_summaries(self, conversation_id: str) -> list[str]:
+        return self._segments.get_segment_tags_without_summaries(conversation_id)
+
     def search_tag_summaries_fts(self, query: str, limit: int = 20, conversation_id: str | None = None) -> list[tuple[str, float]]:
         return self._segments.search_tag_summaries_fts(query, limit=limit, conversation_id=conversation_id)
 

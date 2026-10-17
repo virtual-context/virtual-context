@@ -8439,6 +8439,22 @@ class PostgresStore(PostgresVectorSearchMixin, RelationalStoreMixin, ContextStor
                 updated_at=_str_to_dt(row["updated_at"]),
             )
 
+    def get_segment_tags_without_summaries(self, conversation_id: str) -> list[str]:
+        with self.pool.connection() as conn:
+            rows = conn.execute(
+                """SELECT DISTINCT st.tag
+                     FROM segment_tags st
+                     JOIN segments s ON s.ref = st.segment_ref
+                    WHERE s.conversation_id = %s
+                      AND st.tag <> '' AND left(st.tag, 1) <> '_'
+                      AND NOT EXISTS (SELECT 1 FROM tag_summaries ts
+                                       WHERE ts.conversation_id = s.conversation_id
+                                         AND ts.tag = st.tag)
+                    ORDER BY st.tag""",
+                (conversation_id,),
+            ).fetchall()
+        return [row["tag"] for row in rows]
+
     def get_all_tag_summaries(self, *, conversation_id: str | None = None) -> list[TagSummary]:
         with self.pool.connection() as conn:
             if conversation_id is not None:

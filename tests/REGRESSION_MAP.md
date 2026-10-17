@@ -5,6 +5,14 @@ Use `pytest -m regression` to run all regression tests.
 
 ## By Bug ID
 
+### BUG-126 — Tag summaries lost to an interrupted compaction were never rebuilt
+
+- **Symptom**: a conversation's segment tags stayed without `tag_summaries` rows indefinitely (20 on one production conversation, some carried by 77 segments); the divergence check kept failing.
+- **Root cause**: a compaction stores its segments before building their tag summaries; when the process restarted between the two, the new segments' tags never got a summary, because later compactions only roll up tags carried by the segments they compact themselves.
+- **Fix**: every compaction also rolls up the conversation's segment tags that have no summary (`get_segment_tags_without_summaries`, one query on SQLite and PostgreSQL), taking those tags' turns from stored canonical rows since neither the compacted rows nor a freshly restored turn index hold them.
+- **Tests**:
+  - `test_tag_rollup_recovery.py` — store lookup, rebuild on the next compaction, turn anchors with an empty turn index, no double-counted turns
+
 ### BUG-125 — Facts were gathered and curated after the summaries
 
 - **Symptom**: prepare ran topic selection, summary rerank and fact curation one after another, three judgment-model round trips in sequence.
@@ -1388,6 +1396,7 @@ Use `pytest -m regression` to run all regression tests.
 | `test_actor_card_resource_preferences.py` | BUG-071 |
 | `test_card_availability_and_adjudication.py` | BUG-064, BUG-065 |
 | `test_render_escape_host_attribution.py` | BUG-066, BUG-067 |
+| `test_tag_rollup_recovery.py` | BUG-126 |
 | `test_tag_summary_materialization.py` | BUG-041 |
 | `test_embedding_context_guard.py` | BUG-042 |
 | `test_embedding_reserved_seats.py` | BUG-043 |

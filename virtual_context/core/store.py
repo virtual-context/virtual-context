@@ -296,6 +296,15 @@ class ContextStore(ABC):
         source segments belong to that conversation.
         """
 
+    def get_segment_tags_without_summaries(self, conversation_id: str) -> list[str]:
+        """Sorted tags carried by the conversation's segments that have no tag
+        summary. Tags starting with ``_`` (``_general``) never get one."""
+        have = {ts.tag for ts in self.get_all_tag_summaries(conversation_id=conversation_id)}
+        return sorted({
+            stat.tag for stat in self.get_all_tags(conversation_id=conversation_id)
+            if stat.tag and not stat.tag.startswith("_") and stat.tag not in have
+        })
+
     @abstractmethod
     def search_full_text(
         self,

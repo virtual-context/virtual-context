@@ -8327,6 +8327,21 @@ CREATE TABLE IF NOT EXISTS request_captures (
             updated_at=_str_to_dt(row["updated_at"]),
         )
 
+    def get_segment_tags_without_summaries(self, conversation_id: str) -> list[str]:
+        rows = self._get_conn().execute(
+            """SELECT DISTINCT st.tag
+                 FROM segment_tags st
+                 JOIN segments s ON s.ref = st.segment_ref
+                WHERE s.conversation_id = ?
+                  AND st.tag <> '' AND substr(st.tag, 1, 1) <> '_'
+                  AND NOT EXISTS (SELECT 1 FROM tag_summaries ts
+                                   WHERE ts.conversation_id = s.conversation_id
+                                     AND ts.tag = st.tag)
+                ORDER BY st.tag""",
+            (conversation_id,),
+        ).fetchall()
+        return [row[0] for row in rows]
+
     def get_all_tag_summaries(self, *, conversation_id: str | None = None) -> list[TagSummary]:
         conn = self._get_conn()
         if conversation_id is not None:

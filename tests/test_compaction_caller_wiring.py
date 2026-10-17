@@ -666,6 +666,9 @@ def _bound_build_tag_summaries(store):
     pipe._compaction_guard_kwargs = (
         CompactionPipeline._compaction_guard_kwargs.__get__(pipe)
     )
+    pipe._segment_tags_missing_summaries = (
+        CompactionPipeline._segment_tags_missing_summaries.__get__(pipe)
+    )
     return CompactionPipeline._build_tag_summaries.__get__(pipe)
 
 

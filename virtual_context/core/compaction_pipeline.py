@@ -1003,6 +1003,25 @@ class CompactionPipeline:
 
         return report
 
+    def _segment_tags_missing_summaries(self, skip: set[str]) -> list[str]:
+        """The conversation's segment tags that have no tag summary, minus *skip*."""
+        conv = self._config.conversation_id
+        try:
+            missing = self._store.get_segment_tags_without_summaries(conv)
+        except Exception as exc:  # noqa: BLE001 - the rollup itself must still run
+            logger.warning(
+                "TAG_ROLLUP_RECOVER lookup failed for conv=%s (%s)",
+                conv[:12], type(exc).__name__,
+            )
+            return []
+        missing = [tag for tag in missing if tag not in skip]
+        if missing:
+            logger.info(
+                "TAG_ROLLUP_RECOVER conv=%s tags=%d %s",
+                conv[:12], len(missing), missing[:10],
+            )
+        return missing
+
     def _build_tag_summaries(
         self,
         *,
@@ -1078,6 +1097,12 @@ class CompactionPipeline:
             if r.primary_tag and r.primary_tag not in cover_set:
                 cover_tags.append(r.primary_tag)
                 cover_set.add(r.primary_tag)
+        # A compaction stores its segments before this rollup; one that died
+        # in between (a restart) left their tags without summaries, and only
+        # this step ever builds them, so every compaction picks those up too.
+        recovered = self._segment_tags_missing_summaries(cover_set)
+        cover_tags.extend(recovered)
+        cover_set.update(recovered)
         if not cover_tags:
             return 0, []
 
@@ -1207,6 +1232,25 @@ class CompactionPipeline:
                 ),
                 default=0,
             )
+
+        # Recovered tags belong to turns compacted earlier, which neither
+        # compact_rows nor a freshly restored index holds: read stored rows.
+        if recovered:
+            wanted = set(recovered)
+            for tag in wanted:  # stored rows are complete; the index may hold a few live turns
+                tag_to_turns.pop(tag, None)
+                tag_to_canonical_turn_ids.pop(tag, None)
+            for row in self._store.get_all_canonical_turns(self._config.conversation_id):
+                row_tags = set(getattr(row, "tags", None) or [])
+                if getattr(row, "primary_tag", ""):
+                    row_tags.add(row.primary_tag)
+                _raw_turn = getattr(row, "turn_number", -1)
+                row_turn = int(_raw_turn if _raw_turn is not None else -1)
+                row_cid = getattr(row, "canonical_turn_id", "") or ""
+                for tag in row_tags & wanted:
+                    tag_to_turns.setdefault(tag, []).append(row_turn)
+                    if row_cid:
+                        tag_to_canonical_turn_ids.setdefault(tag, []).append(row_cid)
 
         # Load existing tag summaries for the compactor's staleness check.
         existing_tag_summaries: dict = {}
