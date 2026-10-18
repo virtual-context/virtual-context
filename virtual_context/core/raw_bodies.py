@@ -25,7 +25,7 @@ from typing import Callable
 
 from ..proxy._envelope import (
     _HOST_CTX_JSON_BLOCK_RE,
-    _HOST_REQUEST_LINE_RE,
+    _host_request_bounds,
     _is_host_carried_prompt,
 )
 
@@ -123,9 +123,8 @@ def _omit_host_context(text: str) -> str:
     """Replace a host prompt's replayed context section with a marker."""
     if "⟦openclaw:ctx⟧" not in text or not _is_host_carried_prompt(text):
         return text
-    labels = list(_HOST_REQUEST_LINE_RE.finditer(text))
-    request_start = labels[-1].start()
-    head = text[:request_start]
+    context_end, keep_start, _request = _host_request_bounds(text)
+    head = text[:context_end]
     position = 0
     while True:
         match = _HOST_CTX_JSON_BLOCK_RE.match(head, position)
@@ -142,4 +141,4 @@ def _omit_host_context(text: str) -> str:
         f"{HOST_CONTEXT_OMITTED_LABEL}: ⟦openclaw:ctx⟧\n"
         f"sha256={digest} chars={len(omitted)}\n\n"
     )
-    return head[:position] + marker + text[request_start:]
+    return head[:position] + marker + text[keep_start:]

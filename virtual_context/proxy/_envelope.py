@@ -38,6 +38,12 @@ _HOST_CTX_JSON_BLOCK_RE = re.compile(
 _HOST_CTX_LABEL_LINE_RE = re.compile(r"(?m)^[ \t]*[A-Z][^\n:⟦]{0,80}:[ \t]*⟦openclaw:ctx⟧[ \t]*$")
 _HOST_ASSEMBLED_LINE_RE = re.compile(r"(?m)^[ \t]*OpenClaw assembled context for this turn:[ \t]*$")
 _HOST_REQUEST_LINE_RE = re.compile(r"(?m)^[ \t]*Current user request:[ \t]*\n?")
+# A group host's selected room history, one message per line. A reused thread
+# puts the request after it, past a blank line, without a request label.
+_HOST_SELECTED_HEADER_RE = re.compile(
+    r"(?m)^[ \t]*Conversation context \(chronological, selected for current message\):[ \t]*⟦openclaw:ctx⟧[ \t]*$"
+)
+_BLANK_LINES_RE = re.compile(r"\n[ \t]*\n\s*")
 # MemOS preamble: starts with "# Role", ends with this delimiter line (zero-width spaces)
 _MEMOS_QUERY_DELIM = "user\u200b原\u200b始\u200bquery\u200b：\u200b\u200b\u200b\u200b"
 
@@ -286,7 +292,7 @@ def _extract_envelope_metadata(text: str) -> tuple[str, dict]:
         text, had_replay = _HOST_REPLAY_RE.subn("", text)
         text = text.lstrip()
         had_replay = bool(had_replay)
-    if _HOST_REQUEST_LABEL in text and _is_host_carried_prompt(text, had_replay):
+    if (_HOST_REQUEST_LABEL in text or "⟦openclaw:ctx⟧" in text) and _is_host_carried_prompt(text, had_replay):
         # The requester's words need none of the recognizers below: the host
         # wrote the envelope, not a channel adapter.
         return _split_host_request(text, metadata), metadata
@@ -418,10 +424,29 @@ def extract_timestamp_from_metadata(metadata: dict | None) -> "datetime | None":
     return None
 
 
+def _host_request_bounds(text: str) -> tuple[int, int, int] | None:
+    """``(context_end, keep_start, request_start)`` of a host prompt's request.
+
+    The request follows the last request label, or, without one, the blank
+    line ending a selected room-history section. ``keep_start`` is where the
+    text kept after omitted context begins: the label, or the request itself.
+    """
+    labels = list(_HOST_REQUEST_LINE_RE.finditer(text))
+    if labels:
+        return labels[-1].start(), labels[-1].start(), labels[-1].end()
+    header = _HOST_SELECTED_HEADER_RE.search(text)
+    if header is None:
+        return None
+    blank = _BLANK_LINES_RE.search(text, header.end())
+    if blank is None or not text[blank.end():].strip():
+        return None
+    return blank.start(), blank.end(), blank.end()
+
+
 def _is_host_carried_prompt(text: str, had_replay: bool = False) -> bool:
     """Only a host-built prompt splits on the request label; prose keeps it."""
     if not _HOST_REQUEST_LINE_RE.search(text):
-        return False
+        return _host_request_bounds(text) is not None
     return bool(
         had_replay
         or _HOST_ASSEMBLED_LINE_RE.search(text)
@@ -440,9 +465,8 @@ def _split_host_request(text: str, metadata: dict) -> str:
     files are dropped. Nested labels come from the host wrapping its own
     assembled context in the request slot, so the last label wins.
     """
-    labels = list(_HOST_REQUEST_LINE_RE.finditer(text))
-    last = labels[-1]
-    head, request = text[:last.start()], text[last.end():]
+    context_end, _keep, request_start = _host_request_bounds(text)
+    head, request = text[:context_end], text[request_start:]
     # Only blocks at the leading edge are the adapter's; anything after the
     # first other section (replayed chat, workspace files) is quoted text.
     position = 0
