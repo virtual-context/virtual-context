@@ -5,6 +5,22 @@ Use `pytest -m regression` to run all regression tests.
 
 ## By Bug ID
 
+### BUG-136 — Last exchange plus a new message was appended a second time
+
+- **Symptom**: a stored question and its reply appeared twice in canonical storage, with the same turn hash and platform message id.
+- **Root cause**: the payload held only the last answered exchange and the new message. Its overlap with storage (two rows) was below the smallest anchor window, and the short-overlap search only ran for payloads of fewer than three rows, so alignment fell through to `no_overlap_append`.
+- **Fix**: when no anchor matches, `_find_alignment` accepts an overlap shorter than the smallest window where the payload begins exactly where storage ends.
+- **Tests**:
+  - `test_ingest_short_tail_overlap.py`
+
+### BUG-135 — Unlabeled host request stored the whole host prompt as the user message
+
+- **Symptom**: one canonical row's user text was a 573,000-character host prompt (metadata, the selected room history, then the request), and its raw body kept the replayed history.
+- **Root cause**: a reused host thread puts the request after the selected room-history section and a blank line without a "Current user request:" label; request extraction and raw-body context omission both keyed on that label.
+- **Fix**: `_host_request_bounds` finds the request after the last label or, without one, after the blank line ending a selected room-history section; envelope extraction and `_omit_host_context` both use it.
+- **Tests**:
+  - `test_host_unlabeled_request.py`
+
 ### BUG-134 — History filter dropped the newest user messages, the current request among them
 
 - **Symptom**: in a group chat the model answered "Thanks" a second time; the two newest user messages, including the request being sent, were missing from the outbound payload.
@@ -1472,6 +1488,8 @@ Use `pytest -m regression` to run all regression tests.
 | `test_raw_body_storage_postgres.py` | BUG-131 |
 | `test_replay_media.py` | BUG-132 |
 | `test_proxy_message_filter.py` | PROXY-022, PROXY-004, BUG-134 |
+| `test_host_unlabeled_request.py` | BUG-135 |
+| `test_ingest_short_tail_overlap.py` | BUG-136 |
 | `test_tag_summary_materialization.py` | BUG-041 |
 | `test_embedding_context_guard.py` | BUG-042 |
 | `test_embedding_reserved_seats.py` | BUG-043 |

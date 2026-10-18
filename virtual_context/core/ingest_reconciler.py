@@ -2751,6 +2751,21 @@ class IngestReconciler:
                             best = candidate
             if best is not None:
                 return best
+        # An overlap shorter than the smallest anchor window is still found
+        # when the payload begins where storage ends, the usual shape of a
+        # host that carries only its last exchange plus the new message.
+        if allow_short_overlap:
+            shortest = min(_ALIGNMENT_WINDOW_SIZES)
+            for overlap_len in range(min(shortest - 1, len(existing_hashes), len(incoming_hashes)), 0, -1):
+                if existing_hashes[-overlap_len:] == incoming_hashes[:overlap_len]:
+                    existing_start = len(existing_hashes) - overlap_len
+                    return _Alignment(
+                        existing_start=existing_start,
+                        incoming_start=0,
+                        overlap_len=overlap_len,
+                        window_size=overlap_len,
+                        merge_mode=_alignment_mode(existing_start, 0, overlap_len),
+                    )
         return None
 
     def _write_turn(
