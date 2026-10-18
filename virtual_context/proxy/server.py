@@ -1998,6 +1998,11 @@ async def prepare_payload(
     if _replay_messages:
         from .host_replay import without_host_replayed_groups
         _replay_messages = without_host_replayed_groups(_replay_messages, body, fmt)
+    if _replay_messages and state is not None:
+        from .replay_media import attach_replay_images
+        _replay_messages = attach_replay_images(
+            _replay_messages, state.engine._store, body, state.engine.config.conversation_id,
+        )
     # Native requester continuity is injected only into this outbound copy.
     # ``body`` and ``_pre_filter_body`` remain the client-owned shapes used by
     # canonical ingestion, so replayed rows cannot be re-admitted.

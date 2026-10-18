@@ -711,6 +711,12 @@ def catalog_tool_names(body: dict) -> list[str]:
     return names
 
 
+def _replay_images(message) -> tuple:
+    metadata = getattr(message, "metadata", None)
+    images = metadata.get("replay_images") if isinstance(metadata, dict) else None
+    return tuple(images or ())
+
+
 class PayloadFormat(ABC):
     """Strategy interface for provider-specific request/response handling."""
 
@@ -937,9 +943,17 @@ class PayloadFormat(ABC):
     def inject_context(self, body: dict, prepend_text: str) -> dict:
         ...
 
-    def _serialize_replayed_message(self, role: str, content: str) -> dict:
-        """Build one provider-native text message for ephemeral replay."""
-        return {"role": role, "content": content}
+    def _serialize_replayed_message(self, role: str, content: str, images=()) -> dict:
+        """Build one provider-native message for ephemeral replay.
+
+        ``images`` are ``(media_type, base64 data)`` pairs sent after the text.
+        """
+        if not images:
+            return {"role": role, "content": content}
+        return {"role": role, "content": [{"type": "text", "text": content}] + [
+            {"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{data}"}}
+            for media_type, data in images
+        ]}
 
     @staticmethod
     def _normalized_conversation_role(item: dict) -> str:
@@ -1084,8 +1098,10 @@ class PayloadFormat(ABC):
             if self._contains_ordered_fingerprints(existing, normalized):
                 continue
             serialized.extend(
-                self._serialize_replayed_message(role, content)
-                for role, content in normalized
+                self._serialize_replayed_message(
+                    role, content, _replay_images(message) if role == "user" else (),
+                )
+                for (role, content), message in zip(normalized, accepted)
             )
             delivered.extend(accepted)
             existing.extend(normalized)
@@ -1699,6 +1715,14 @@ class PayloadFormat(ABC):
 
 class AnthropicFormat(PayloadFormat):
     """Anthropic Messages API format."""
+
+    def _serialize_replayed_message(self, role: str, content: str, images=()) -> dict:
+        if not images:
+            return {"role": role, "content": content}
+        return {"role": role, "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": data}}
+            for media_type, data in images
+        ] + [{"type": "text", "text": content}]}
 
     _SYSTEM_SCALE = 1.032
     _TOOLS_SCALE = 1.08
@@ -2780,10 +2804,13 @@ class GeminiFormat(PayloadFormat):
     def name(self) -> str:
         return "gemini"
 
-    def _serialize_replayed_message(self, role: str, content: str) -> dict:
+    def _serialize_replayed_message(self, role: str, content: str, images=()) -> dict:
         return {
             "role": "model" if role == "assistant" else "user",
-            "parts": [{"text": content}],
+            "parts": [{"text": content}] + [
+                {"inline_data": {"mime_type": media_type, "data": data}}
+                for media_type, data in images
+            ],
         }
 
     # -- helpers --
@@ -3257,7 +3284,7 @@ class OpenAIResponsesFormat(PayloadFormat):
     def name(self) -> str:
         return "openai_responses"
 
-    def _serialize_replayed_message(self, role: str, content: str) -> dict:
+    def _serialize_replayed_message(self, role: str, content: str, images=()) -> dict:
         return {
             "type": "message",
             "role": role,
@@ -3266,6 +3293,9 @@ class OpenAIResponsesFormat(PayloadFormat):
                     "type": "output_text" if role == "assistant" else "input_text",
                     "text": content,
                 }
+            ] + [
+                {"type": "input_image", "image_url": f"data:{media_type};base64,{data}"}
+                for media_type, data in images
             ],
         }
 

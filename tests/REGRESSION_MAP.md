@@ -5,6 +5,14 @@ Use `pytest -m regression` to run all regression tests.
 
 ## By Bug ID
 
+### BUG-132 — Protected-window turns replayed from storage lost their images
+
+- **Symptom**: when the protected window filled recent turns from storage, an image the user sent in one of those turns never reached the model; the turn arrived as text only.
+- **Root cause**: `_merge_protected_window` rebuilds stored rows as text messages and the replay serializers emitted text only, so the images named in the row's raw body were dropped.
+- **Fix**: `proxy.replay_media.attach_replay_images` reads each replayed user turn's stored images (inline or by blob reference), skips any image the outbound payload already carries, and the replay serializers emit them as native image parts for Anthropic, OpenAI chat, OpenAI Responses and Gemini.
+- **Tests**:
+  - `test_replay_media.py` — each format serializes replayed images, stored images attach except those already sent, a lookup failure leaves replay text-only
+
 ### BUG-131 — Raw bodies stored every resent image and the host's replayed context
 
 - **Symptom**: one guild conversation's canonical rows held 727 MB of raw bodies, of which 25 MB were distinct images and under 2 MB was user text; each read of those rows moved megabytes per row into the process, and freed memory stayed resident.
@@ -1445,6 +1453,7 @@ Use `pytest -m regression` to run all regression tests.
 | `test_request_reads_without_bodies_postgres.py` | BUG-130 |
 | `test_raw_body_storage.py` | BUG-131 |
 | `test_raw_body_storage_postgres.py` | BUG-131 |
+| `test_replay_media.py` | BUG-132 |
 | `test_tag_summary_materialization.py` | BUG-041 |
 | `test_embedding_context_guard.py` | BUG-042 |
 | `test_embedding_reserved_seats.py` | BUG-043 |
