@@ -768,6 +768,16 @@ def filter_body_messages(
                     alternating.append(msg)  # both critical — keep both
                     _alt_critical.append(True)
                     _alt_paired.append(kept_i in _paired_kept)
+            elif (not _alt_critical[-1]
+                    and fmt._is_conversational_message(alternating[-1])
+                    and fmt._is_conversational_message(msg)):
+                # Two plain messages of one role in a row: combine them so
+                # neither is lost. Unanswered user messages before the current
+                # request are what the model is meant to answer.
+                combined = copy.deepcopy(alternating[-1])
+                fmt._merge_message_content(combined, copy.deepcopy(msg))
+                alternating[-1] = combined
+                _alt_paired[-1] = _alt_paired[-1] or kept_i in _paired_kept
             elif kept_i in _paired_kept and not _alt_paired[-1] and not _alt_critical[-1]:
                 # The previous message was never answered and belongs to no
                 # kept turn; this one opens a kept turn whose reply follows.

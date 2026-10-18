@@ -5,6 +5,15 @@ Use `pytest -m regression` to run all regression tests.
 
 ## By Bug ID
 
+### BUG-134 — History filter dropped the newest user messages, the current request among them
+
+- **Symptom**: in a group chat the model answered "Thanks" a second time; the two newest user messages, including the request being sent, were missing from the outbound payload.
+- **Root cause**: `filter_body_messages` enforces role alternation after dropping pairs. For a run of same-role messages it kept the first and skipped the rest, so unanswered user messages ahead of the current one, and the current one itself, were discarded; an unanswered message before a kept question was also replaced rather than kept.
+- **Fix**: adjacent plain messages of one role are merged into one message, so alternation holds and no text is lost; tool-bearing messages keep the existing handling.
+- **Tests**:
+  - `test_proxy_message_filter.py` — `test_unanswered_user_messages_before_the_current_one_are_merged_not_dropped`
+  - `test_filter_keeps_paired_over_unanswered.py` — protected question still directly precedes its reply
+
 ### BUG-133 — Unlabeled request after a group's selected history was replayed as history
 
 - **Symptom**: in a group chat the model answered an earlier message ("Thanks" → "Anytime") instead of the newest one; the newest request never reached the model as the current message.
@@ -1381,7 +1390,7 @@ Use `pytest -m regression` to run all regression tests.
 | `test_protected_zone_media_size.py` | BUG-102 |
 | `test_drop_compacted_in_tool_loop.py` | BUG-103 |
 | `test_protected_window_host_speaker_dedup.py` | BUG-104 |
-| `test_filter_keeps_paired_over_unanswered.py` | BUG-105 |
+| `test_filter_keeps_paired_over_unanswered.py` | BUG-105, BUG-134 |
 | `test_chain_restore_format.py` | BUG-106 |
 | `test_fact_topic_pointer.py` | BUG-108 |
 | `test_chat_completions_paging_tools.py` | BUG-109 |
@@ -1462,6 +1471,7 @@ Use `pytest -m regression` to run all regression tests.
 | `test_raw_body_storage.py` | BUG-131 |
 | `test_raw_body_storage_postgres.py` | BUG-131 |
 | `test_replay_media.py` | BUG-132 |
+| `test_proxy_message_filter.py` | PROXY-022, PROXY-004, BUG-134 |
 | `test_tag_summary_materialization.py` | BUG-041 |
 | `test_embedding_context_guard.py` | BUG-042 |
 | `test_embedding_reserved_seats.py` | BUG-043 |

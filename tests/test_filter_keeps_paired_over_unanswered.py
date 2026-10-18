@@ -21,7 +21,8 @@ def _msg(role, text):
 
 
 def _texts(body):
-    return [(i["role"], i["content"][0]["text"]) for i in body["input"] if i.get("role") in ("user", "assistant")]
+    return [(i["role"], "\n".join(part["text"] for part in i["content"]))
+            for i in body["input"] if i.get("role") in ("user", "assistant")]
 
 
 @pytest.mark.regression("BUG-105")
@@ -37,5 +38,6 @@ def test_an_unanswered_message_does_not_displace_a_protected_question():
         fmt=get_format("openai_responses"),
     )
     kept = _texts(out)
-    assert ("user", "q1") in kept and ("user", "q2") in kept
-    assert kept.index(("user", "q1")) + 1 == kept.index(("assistant", "a1"))
+    asks = [n for n, (role, text) in enumerate(kept) if role == "user" and text.endswith("q1")]
+    assert asks and kept[asks[0] + 1] == ("assistant", "a1")
+    assert ("user", "q2") in kept

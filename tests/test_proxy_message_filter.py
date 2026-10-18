@@ -1039,3 +1039,46 @@ class TestComputeEffectiveBudget:
         )
         assert budget == 19_000 + 7_500 + 10_000  # 36,500
         assert promoted is True
+
+
+def _responses_user(text):
+    return {"type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]}
+
+
+def _responses_assistant(text):
+    return {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]}
+
+
+def _responses_text(item):
+    return "".join(part.get("text", "") for part in item.get("content", []))
+
+
+@pytest.mark.regression("BUG-134")
+def test_unanswered_user_messages_before_the_current_one_are_merged_not_dropped():
+    # A group request whose latest messages were never answered: after older
+    # pairs are dropped, the newest user messages, the current request among
+    # them, must still reach the model.
+    from virtual_context.proxy.formats import get_format
+
+    body = {"model": "m", "input": [
+        _responses_user("Q0"), _responses_assistant("A0"),
+        _responses_user("Q1"), _responses_assistant("A1"),
+        _responses_user("[Image] screenshot"),
+        _responses_user("Find the charger"), _responses_assistant("Found one."),
+        _responses_user("Thanks"),
+        _responses_user("Why cant you verify the price"),
+        _responses_user("Finish the check"),
+    ]}
+    idx = TurnTagIndex()
+    for i, tags in enumerate([["cooking"], ["music"], ["charger"]]):
+        idx.append(TurnTagEntry(turn_number=i, message_hash=f"h{i}", tags=tags, primary_tag=tags[0]))
+    filtered, dropped = _filter_body_messages(
+        body, idx, ["unrelated"], recent_turns=1, fmt=get_format("openai_responses"),
+    )
+    items = filtered["input"]
+    texts = [_responses_text(i) for i in items]
+    assert dropped == 2
+    assert [i["role"] for i in items] == ["user", "assistant", "user"]
+    assert "[Image] screenshot" in texts[0] and "Find the charger" in texts[0]
+    assert all(t in texts[-1] for t in ("Thanks", "Why cant you verify the price", "Finish the check"))
+    assert texts[-1].rstrip().endswith("Finish the check")
