@@ -12612,7 +12612,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
         )
 
     @contextmanager
-    def _raw_blob_connection(self):
+    def _raw_blob_connection(self, transaction: bool = True):
         yield self._get_conn()
 
     def _raw_blob_commit(self, conn) -> None:

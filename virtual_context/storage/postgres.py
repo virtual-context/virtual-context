@@ -13529,8 +13529,11 @@ class PostgresStore(PostgresVectorSearchMixin, RelationalStoreMixin, ContextStor
         )
 
     @contextmanager
-    def _raw_blob_connection(self):
+    def _raw_blob_connection(self, transaction: bool = True):
         with self.pool.connection() as conn:
+            if not transaction:
+                yield conn
+                return
             with conn.transaction():
                 yield conn
 

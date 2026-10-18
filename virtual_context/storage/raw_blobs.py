@@ -187,12 +187,16 @@ def compact_stored_raw_bodies(
 ) -> dict[str, int]:
     """Rewrite one conversation's stored raw bodies into their compacted form.
 
-    Reads and rewrites ``batch_size`` rows per transaction, so memory is
-    bounded by the largest few bodies rather than the conversation.
+    Each row is read and its blobs stored before any transaction touches
+    ``canonical_turns``; the row is then rewritten in a transaction of its
+    own that applies only if its bodies are still the ones read. Lock time
+    on the table stays at one small update per row, so schema setup and live
+    writes never wait behind the transfer of large bodies. ``batch_size``
+    bounds how many row ids are read per query.
     """
     p = _placeholder(dialect)
     counts = {"rows_scanned": 0, "rows_compacted": 0, "bytes_before": 0, "bytes_after": 0, "blobs": 0}
-    with store._raw_blob_connection() as conn:
+    with store._raw_blob_connection(transaction=False) as conn:
         ids = [
             str(row["canonical_turn_id"])
             for row in conn.execute(
@@ -206,38 +210,56 @@ def compact_stored_raw_bodies(
         ]
     seen_blobs: set[str] = set()
     for start in range(0, len(ids), batch_size):
-        batch = ids[start:start + batch_size]
-        with store._raw_blob_connection() as conn:
-            for canonical_turn_id in batch:
+        for canonical_turn_id in ids[start:start + batch_size]:
+            with store._raw_blob_connection(transaction=False) as conn:
                 row = conn.execute(
                     f"""SELECT user_raw_content, assistant_raw_content FROM canonical_turns
                          WHERE canonical_turn_id = {p}""",
                     (canonical_turn_id,),
                 ).fetchone()
-                if row is None:
-                    continue
-                counts["rows_scanned"] += 1
-                old_user, old_assistant = row["user_raw_content"], row["assistant_raw_content"]
-                user, assistant = compact_raw_body(old_user), compact_raw_body(old_assistant)
-                before = len(old_user or "") + len(old_assistant or "")
-                after = len(user.text or "") + len(assistant.text or "")
-                counts["bytes_before"] += before
-                counts["bytes_after"] += after
-                if (user.text, assistant.text) == (old_user, old_assistant):
-                    continue
-                counts["rows_compacted"] += 1
-                blobs = {**user.blobs, **assistant.blobs}
-                seen_blobs.update(blobs)
-                if dry_run:
-                    continue
+            if row is None:
+                continue
+            counts["rows_scanned"] += 1
+            old_user, old_assistant = row["user_raw_content"], row["assistant_raw_content"]
+            del row
+            user, assistant = compact_raw_body(old_user), compact_raw_body(old_assistant)
+            counts["bytes_before"] += len(old_user or "") + len(old_assistant or "")
+            counts["bytes_after"] += len(user.text or "") + len(assistant.text or "")
+            if (user.text, assistant.text) == (old_user, old_assistant):
+                continue
+            counts["rows_compacted"] += 1
+            blobs = {**user.blobs, **assistant.blobs}
+            seen_blobs.update(blobs)
+            if dry_run:
+                continue
+            with store._raw_blob_connection(transaction=False) as conn:
                 store_blobs(conn, dialect, blobs)
+                store._raw_blob_commit(conn)
+            unchanged, unchanged_params = _unchanged_bodies_sql(dialect, old_user, old_assistant)
+            with store._raw_blob_connection() as conn:
                 grant(conn, dialect, canonical_turn_id)
                 conn.execute(
                     f"""UPDATE canonical_turns SET user_raw_content = {p}, assistant_raw_content = {p}
-                         WHERE canonical_turn_id = {p}""",
-                    (user.text, assistant.text, canonical_turn_id),
+                         WHERE canonical_turn_id = {p} AND {unchanged}""",
+                    (user.text, assistant.text, canonical_turn_id, *unchanged_params),
                 )
                 clear_grant(conn, dialect, canonical_turn_id)
-            store._raw_blob_commit(conn)
+                store._raw_blob_commit(conn)
     counts["blobs"] = len(seen_blobs)
     return counts
+
+
+def _unchanged_bodies_sql(dialect: str, user: str | None, assistant: str | None) -> tuple[str, tuple]:
+    """Predicate: a row's raw bodies are still *user* and *assistant*."""
+    import hashlib
+
+    if dialect == "postgres":
+        digest = lambda value: hashlib.md5((value or "").encode()).hexdigest()  # noqa: E731
+        return (
+            "md5(COALESCE(user_raw_content, '')) = %s AND md5(COALESCE(assistant_raw_content, '')) = %s",
+            (digest(user), digest(assistant)),
+        )
+    return (
+        "COALESCE(user_raw_content, '') = ? AND COALESCE(assistant_raw_content, '') = ?",
+        (user or "", assistant or ""),
+    )
