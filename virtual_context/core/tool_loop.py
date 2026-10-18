@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import httpx
 
+from .memory_watch import measured
 from ..types import (
     SpeakerRetrievalContext,
     ToolCallRecord,
@@ -1240,6 +1241,10 @@ def _render_recall_all_payload(
     return cloned
 
 
+@measured(
+    lambda engine, name, *a, **k: f"tool:{name}",
+    lambda engine, *a, **k: engine.config.conversation_id,
+)
 def execute_vc_tool(
     engine: VirtualContextEngine,
     name: str,

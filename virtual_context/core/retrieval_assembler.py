@@ -13,6 +13,7 @@ import time
 from typing import TYPE_CHECKING
 
 from .engine_utils import get_recent_context
+from .memory_watch import measured
 from . import hint_builder
 from .hint_builder import build_autonomous_hint, build_supervised_hint, build_default_hint
 from .protected_window import _slice_payload_prefix_preserving_db_recent
@@ -247,6 +248,7 @@ class RetrievalAssembler:
             provider.save_retrieval_memo(conversation_id, memo_key, {"kept": indices})
         return curated
 
+    @measured("inbound", lambda self, *a, **k: self.config.conversation_id)
     def on_message_inbound(
         self,
         message: str,
@@ -1028,6 +1030,10 @@ class RetrievalAssembler:
             json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
         ).hexdigest()
 
+    @measured(
+        lambda self, *a, **k: "context_hint_rebuild" if k.get("force_rebuild") else "context_hint",
+        lambda self, *a, **k: self.config.conversation_id,
+    )
     def _build_context_hint(
         self,
         paging_mode: str | None = None,

@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from ..core.conversation_store import StaleConversationWriteError
+from ..core.memory_watch import measured
 from ..core.exceptions import CanonicalSourceConflict
 from ..core.lifecycle_epoch import LifecycleEpochMismatch
 from ..core.segmenter import pair_messages_into_turns
@@ -2568,6 +2569,7 @@ class ProxyState:
                 self.engine.config.conversation_id[:12],
             )
 
+    @measured("tag", lambda self, *a, **k: self.engine.config.conversation_id)
     def _run_tag_turn(
         self,
         history: list[Message],
@@ -2877,6 +2879,7 @@ class ProxyState:
         logger.warning("RECORD_EDIT op=%s left pending: compaction lease unavailable", operation_id[:8])
         return False
 
+    @measured("compact", lambda self, *a, **k: self.engine.config.conversation_id)
     def _run_compact(
         self,
         history: list[Message],

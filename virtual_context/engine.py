@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from .proxy.session_state import SessionState
 
 from .config import load_config
+from .core.memory_watch import measured
 from .core.assembler import ContextAssembler
 from .core.compactor import DomainCompactor
 from .core.ingest_reconciler import (
@@ -161,6 +162,7 @@ class VirtualContextEngine:
     exact_source_admission_version = 2
     source_event_time_version = 1
 
+    @measured("engine_init", lambda self, *a, **k: getattr(k.get("config"), "conversation_id", "") or "")
     def __init__(
         self,
         config_path: str | Path | None = None,
