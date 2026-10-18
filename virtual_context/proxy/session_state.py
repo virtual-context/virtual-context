@@ -470,6 +470,13 @@ class SessionStateProvider:
         return cls._VECTOR_MARKER + header + b"\n" + flat
 
     @classmethod
+    def _encode_vector_matrix(cls, tags: list[str], matrix, **extra) -> bytes:
+        """The ``_encode_vector_map`` format, written straight from one float32 matrix."""
+        dims = [int(matrix.shape[1])] * len(tags) if len(tags) else []
+        header = json.dumps({"tags": tags, "dims": dims, **extra}, default=str).encode("utf-8")
+        return cls._VECTOR_MARKER + header + b"\n" + matrix.tobytes()
+
+    @classmethod
     def _decode_vector_map(cls, raw: object) -> dict[str, list[float]] | None:
         """Decode a whole-snapshot value; returns None when it is not a map."""
         if isinstance(raw, (bytes, bytearray)) and raw[:4] == cls._VECTOR_MARKER:
@@ -1369,28 +1376,44 @@ class SessionStateProvider:
         *,
         ttl_seconds: int | None = None,
     ) -> None:
-        """Save normalized tag-summary embeddings for retrieval scoring."""
+        """Save normalized tag-summary embeddings for retrieval scoring.
+
+        Vectors are normalized as one float32 matrix, so a conversation with
+        thousands of tags never holds a Python float object per value.
+        """
         try:
             import numpy as np
 
-            normalized = {
-                str(tag): self._normalize_embedding(list(values))
-                for tag, values in embeddings_by_tag.items()
-                if values is not None and len(values)
-            }
-            self._redis.set(
-                self._tag_summary_embedding_snapshot_key(conversation_id),
-                self._encode_vector_map(normalized),
-                ex=ttl_seconds or self._TAG_SUMMARY_EMBEDDING_SNAPSHOT_TTL_SECONDS,
-            )
-            version = int(self._redis.incr(self._tag_summary_embedding_version_key(conversation_id)))
-            tags = list(normalized)
-            if len({len(normalized[t]) for t in tags}) <= 1:
-                matrix = np.asarray([normalized[t] for t in tags], dtype=np.float32).reshape(len(tags), -1)
+            tags: list[str] = []
+            rows: list = []
+            for tag, values in embeddings_by_tag.items():
+                if values is None or len(values) == 0:
+                    continue
+                tags.append(str(tag))
+                rows.append(np.asarray(values, dtype=np.float32))
+            if len({row.shape[0] for row in rows}) <= 1:
+                matrix = np.vstack(rows) if rows else np.zeros((0, 0), dtype=np.float32)
+                if rows:
+                    norms = np.linalg.norm(matrix, axis=1)
+                    matrix /= np.where(norms > 0.0, norms, 1.0)[:, None]
                 matrix.setflags(write=False)
-                entry = self._snapshot_entry(version, tags, matrix)
+                del rows
+                blob = self._encode_vector_matrix(tags, matrix)
             else:
                 # Vectors of different lengths cannot share one matrix.
+                normalized = {t: self._normalize_embedding(r.tolist()) for t, r in zip(tags, rows)}
+                matrix = None
+                blob = self._encode_vector_map(normalized)
+            self._redis.set(
+                self._tag_summary_embedding_snapshot_key(conversation_id),
+                blob,
+                ex=ttl_seconds or self._TAG_SUMMARY_EMBEDDING_SNAPSHOT_TTL_SECONDS,
+            )
+            del blob
+            version = int(self._redis.incr(self._tag_summary_embedding_version_key(conversation_id)))
+            if matrix is not None:
+                entry = self._snapshot_entry(version, tags, matrix)
+            else:
                 entry = (version, {t: self._vector32(normalized[t]) for t in tags}, ([], None))
             self._tag_summary_embedding_snapshot_runtime_cache[conversation_id] = entry
         except Exception:
@@ -1407,8 +1430,11 @@ class SessionStateProvider:
         """Rebuild the shared tag-summary embedding snapshot from the store."""
         if self._store is None or not hasattr(self._store, "load_tag_summary_embeddings"):
             return None
-        embeddings = self._store.load_tag_summary_embeddings(conversation_id=conversation_id)
+        from ..core.store import tag_summary_embedding_vectors
+
+        embeddings = tag_summary_embedding_vectors(self._store, conversation_id)
         self.save_tag_summary_embedding_snapshot(conversation_id, embeddings)
+        del embeddings
         entry = self._tag_summary_embedding_snapshot_runtime_cache.get(conversation_id)
         return dict(entry[1]) if entry is not None else {}
 

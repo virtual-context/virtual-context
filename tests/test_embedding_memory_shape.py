@@ -15,6 +15,7 @@ from virtual_context.core.embedding_tag_generator import EmbeddingTagGenerator
 from virtual_context.core.retrieval_scoring import compute_embedding_candidates
 from virtual_context.proxy import session_state
 from virtual_context.proxy.session_state import SessionStateProvider
+from virtual_context.storage.sqlite import SQLiteStore
 from virtual_context.types import TagGeneratorConfig
 
 CONV = "conv-1"
@@ -158,3 +159,55 @@ def test_inbound_tagger_shares_the_cached_vectors_and_its_matrix():
     matrix = tagger._similarity_matrix[2]
     tagger.generate_tags("camera feed", ["hcg-dosing", "camera"])
     assert tagger._similarity_matrix[2] is matrix
+
+
+# Tag-summary embeddings were read from storage as Python float lists, once for
+# the compaction merge check and again for the shared snapshot (BUG-128).
+
+def _sqlite_with_embeddings(tmp_path):
+    store = SQLiteStore(str(tmp_path / "e.db"))
+    store.store_tag_summary_embedding("a", "c", [3.0, 4.0])
+    store.store_tag_summary_embedding("b", "c", [0.0, 2.0])
+    store.store_tag_summary_embedding("x", "other", [1.0, 0.0])
+    return store
+
+
+@pytest.mark.regression("BUG-128")
+def test_embedding_vectors_are_float32_and_match_the_lists(tmp_path):
+    store = _sqlite_with_embeddings(tmp_path)
+    vectors = store.load_tag_summary_embedding_vectors(conversation_id="c")
+    lists = store.load_tag_summary_embeddings(conversation_id="c")
+    assert set(vectors) == set(lists) == {"a", "b"}
+    for tag, values in lists.items():
+        assert vectors[tag].dtype == np.float32
+        assert np.allclose(vectors[tag], values)
+    from virtual_context.core.store import tag_summary_embedding_vectors
+    assert set(tag_summary_embedding_vectors(store, None)) == {"a", "b", "x"}
+
+
+@pytest.mark.regression("BUG-128")
+def test_snapshot_refresh_never_builds_float_lists(tmp_path, monkeypatch):
+    store = _sqlite_with_embeddings(tmp_path)
+
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("the refresh must not load embeddings as lists")
+
+    monkeypatch.setattr(SQLiteStore, "load_tag_summary_embeddings", refuse)
+    provider = SessionStateProvider(redis_client=fakeredis.FakeRedis(decode_responses=False), store=store)
+    snapshot = provider.refresh_tag_summary_embedding_snapshot("c")
+    assert np.allclose(snapshot["a"], [0.6, 0.8]) and np.allclose(snapshot["b"], [0.0, 1.0])
+    reader = SessionStateProvider(redis_client=provider._redis, store=None)
+    tags, matrix = reader.load_tag_summary_embedding_matrix("c")
+    assert sorted(tags) == ["a", "b"] and matrix.dtype == np.float32
+    assert np.allclose(matrix[tags.index("a")], [0.6, 0.8])
+
+
+@pytest.mark.regression("BUG-128")
+def test_snapshot_from_lists_keeps_its_values(tmp_path):
+    provider = SessionStateProvider(redis_client=fakeredis.FakeRedis(decode_responses=False), store=None)
+    provider.save_tag_summary_embedding_snapshot("c", {"a": [3.0, 4.0], "zero": [0.0, 0.0], "empty": []})
+    snapshot = provider.load_tag_summary_embedding_snapshot("c")
+    assert set(snapshot) == {"a", "zero"}
+    assert np.allclose(snapshot["a"], [0.6, 0.8]) and np.allclose(snapshot["zero"], [0.0, 0.0])
+    tags, _matrix = provider.load_tag_summary_embedding_matrix("c")
+    assert tags == ["a"]

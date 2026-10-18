@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 from .tag_scoring import compute_tag_overlap_score
 from .math_utils import cosine_similarity
+from .store import tag_summary_embedding_vectors
 
 try:
     import numpy as np
@@ -156,7 +157,7 @@ def compute_embedding_candidates(
 
     stored = stored_embeddings
     if stored is None:
-        stored = store.load_tag_summary_embeddings(conversation_id=conversation_id)
+        stored = tag_summary_embedding_vectors(store, conversation_id)
     if not stored:
         return {}
 

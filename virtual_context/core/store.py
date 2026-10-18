@@ -148,12 +148,44 @@ def canonical_rows_to_history(
     return history
 
 
+def float32_vectors(embeddings) -> dict[str, object]:
+    """``{tag: values}`` as read-only float32 arrays, dropping empty ones.
+
+    Without numpy the values stay as they are.
+    """
+    try:
+        import numpy as np
+    except ImportError:
+        return {tag: values for tag, values in (embeddings or {}).items() if values}
+
+    out: dict[str, object] = {}
+    for tag, values in (embeddings or {}).items():
+        if values is None or len(values) == 0:
+            continue
+        vector = np.asarray(values, dtype=np.float32)
+        vector.setflags(write=False)
+        out[tag] = vector
+    return out
+
+
 def canonical_turn_tags(store, conversation_id: str) -> list[tuple[str, int, str, list[str]]]:
     """``(canonical_turn_id, turn_number, primary_tag, tags)`` per canonical turn, in order."""
     loader = getattr(store, "get_canonical_turn_tags", None)
     if callable(loader):
         return loader(conversation_id)
     return ContextStore.get_canonical_turn_tags(store, conversation_id)
+
+
+def tag_summary_embedding_vectors(store, conversation_id: str | None) -> dict[str, object]:
+    """A conversation's tag summary embeddings as float32 arrays, from any store.
+
+    Without a conversation id every conversation's embeddings are loaded, as
+    ``load_tag_summary_embeddings`` does.
+    """
+    loader = getattr(store, "load_tag_summary_embedding_vectors", None)
+    if conversation_id and callable(loader):
+        return loader(conversation_id=conversation_id)
+    return float32_vectors(store.load_tag_summary_embeddings(conversation_id=conversation_id))
 
 
 class ContextStore(ABC):
@@ -1938,6 +1970,16 @@ class ContextStore(ABC):
     ) -> dict[str, list[float]]:
         """Load all tag summary embeddings. Returns {tag: embedding_vector}."""
         return {}
+
+    def load_tag_summary_embedding_vectors(
+        self, *, conversation_id: str,
+    ) -> dict[str, object]:
+        """One conversation's tag summary embeddings as read-only float32 arrays.
+
+        Holds a few bytes per value instead of a Python float object each, which
+        matters for conversations with thousands of tag summaries.
+        """
+        return float32_vectors(self.load_tag_summary_embeddings(conversation_id=conversation_id))
 
     # ------------------------------------------------------------------
     # Cross-cutting queries (used by consolidator, tool loop, etc.)

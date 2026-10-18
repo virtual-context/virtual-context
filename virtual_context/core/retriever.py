@@ -11,7 +11,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable
 
-from .store import ContextStore
+from .store import ContextStore, tag_summary_embedding_vectors
 from .tag_generator import TagGenerator, detect_temporal_heuristic
 from .turn_tag_index import TurnTagIndex
 from ..patterns import DEFAULT_TEMPORAL_PATTERNS
@@ -127,9 +127,7 @@ class ContextRetriever:
             )
             if cached is not None:
                 return cached
-        stored = self.store.load_tag_summary_embeddings(
-            conversation_id=self._conversation_id,
-        )
+        stored = tag_summary_embedding_vectors(self.store, self._conversation_id)
         if self._session_state_provider is not None and self._conversation_id:
             self._session_state_provider.save_tag_summary_embedding_snapshot(
                 self._conversation_id,
@@ -395,8 +393,8 @@ class ContextRetriever:
         ):
             loaded = provider.load_tag_summary_embedding_matrix(self._conversation_id)
         if loaded is None:
-            stored = self.store.load_tag_summary_embeddings(conversation_id=self._conversation_id) or {}
-            tags = [tag for tag, values in stored.items() if values]
+            stored = tag_summary_embedding_vectors(self.store, self._conversation_id)
+            tags = list(stored)
             if not tags:
                 return None
             rows = np.asarray([stored[tag] for tag in tags], dtype=np.float32)

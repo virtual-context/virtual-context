@@ -34,7 +34,7 @@ from ..core.discord_snowflake import (
     datetime_to_snowflake_ceil,
     datetime_to_snowflake_floor,
 )
-from ..core.store import ContextStore
+from ..core.store import ContextStore, float32_vectors
 from .audience_proof import effective_attested_audience, verify_source_replay_audience
 from .assistant_channel_enrichment import (
     ensure_assistant_channel_enrichment_schema,
@@ -13624,6 +13624,36 @@ class PostgresStore(PostgresVectorSearchMixin, RelationalStoreMixin, ContextStor
                 except (json.JSONDecodeError, TypeError):
                     pass
             return result
+
+    def load_tag_summary_embedding_vectors(
+        self, *, conversation_id: str,
+    ) -> dict[str, object]:
+        # A server-side cursor streams the JSON text in batches, so neither the
+        # whole result set nor a Python list per vector is ever held at once.
+        try:
+            import numpy as np
+        except ImportError:
+            return float32_vectors(self.load_tag_summary_embeddings(conversation_id=conversation_id))
+
+        result: dict[str, object] = {}
+        with self.pool.connection() as conn:
+            with conn.transaction():
+                with conn.cursor(name="tag_summary_embedding_vectors") as cur:
+                    cur.itersize = 512
+                    cur.execute(
+                        "SELECT tag, embedding_json FROM tag_summary_embeddings WHERE conversation_id = %s",
+                        (conversation_id,),
+                    )
+                    for row in cur:
+                        try:
+                            vector = np.asarray(json.loads(row["embedding_json"]), dtype=np.float32)
+                        except (json.JSONDecodeError, TypeError, ValueError):
+                            continue
+                        if vector.ndim != 1 or not vector.size:
+                            continue
+                        vector.setflags(write=False)
+                        result[row["tag"]] = vector
+        return result
 
     def store_fact_embeddings(
         self,

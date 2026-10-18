@@ -252,6 +252,11 @@ class CompositeStore:
     def load_tag_summary_embeddings(self, conversation_id: str | None = None) -> dict[str, list[float]]:
         return self._segments.load_tag_summary_embeddings(conversation_id=conversation_id)
 
+    def load_tag_summary_embedding_vectors(self, *, conversation_id: str) -> dict[str, object]:
+        from .store import tag_summary_embedding_vectors
+
+        return tag_summary_embedding_vectors(self._segments, conversation_id)
+
     def get_segments_by_tags(
         self, tags: list[str], min_overlap: int = 1, limit: int = 20,
         conversation_id: str | None = None,

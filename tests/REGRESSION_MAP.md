@@ -5,6 +5,14 @@ Use `pytest -m regression` to run all regression tests.
 
 ## By Bug ID
 
+### BUG-128 — Tag-summary embeddings were held as Python float lists
+
+- **Symptom**: each compaction of a conversation with about 8,000 tag summaries allocated well over 100 MB of short-lived embedding data per pass (measured: 96 MB live, 162 MB peak per load, against 13 MB for the same values as float32).
+- **Root cause**: `load_tag_summary_embeddings` parsed every stored JSON vector into a list of Python floats; the compaction merge check loaded the whole conversation's set, and the snapshot refresh loaded it again and copied each vector while normalizing.
+- **Fix**: `load_tag_summary_embedding_vectors` streams rows (a server-side cursor on PostgreSQL) into read-only float32 arrays; the merge check, the snapshot refresh and the retrieval fallbacks use it, and the snapshot is normalized and encoded as one matrix.
+- **Tests**:
+  - `test_embedding_memory_shape.py` — float32 vectors match the list loader, the snapshot refresh never builds lists, list input keeps its values
+
 ### BUG-127 — Hot paths loaded every canonical turn with its raw bodies
 
 - **Symptom**: on a long conversation each tagged turn spent 5–12 s persisting, and every turn that compacted grew the serving process by about 1.5 GB that it did not return; memory pressure restarted the service repeatedly.
@@ -1356,7 +1364,7 @@ Use `pytest -m regression` to run all regression tests.
 | `test_orphaned_compaction_operation.py` | BUG-080 |
 | `test_orphaned_compaction_operation_postgres.py` | BUG-080 |
 | `test_embedding_memory_shape.py` | PROXY-038 |
-| `test_embedding_memory_shape.py` | PROXY-038 |
+| `test_embedding_memory_shape.py` | PROXY-038, BUG-128 |
 | `test_tag_summary_embedding_snapshot_freshness.py` | PROXY-037 |
 | `test_completion_audience_stamp.py` | PROXY-036 |
 | `test_out_of_band_route_audience.py` | PROXY-034 |

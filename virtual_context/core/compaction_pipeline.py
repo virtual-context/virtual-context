@@ -13,7 +13,7 @@ from collections.abc import Callable, Collection
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from .store import ContextStore, canonical_turn_tags
+from .store import ContextStore, canonical_turn_tags, tag_summary_embedding_vectors
 from .structured_summary import validate_tag_rollup_inputs
 from .turn_tag_index import TurnTagIndex
 
@@ -1569,8 +1569,8 @@ class CompactionPipeline:
         now = datetime.now(timezone.utc)
 
         # P1: pre-load embeddings and embed_fn once (not per-segment)
-        stored_embeddings = self._store.load_tag_summary_embeddings(
-            conversation_id=self._config.conversation_id,
+        stored_embeddings = tag_summary_embedding_vectors(
+            self._store, self._config.conversation_id,
         )
         embed_fn = self._semantic.get_embed_fn() if self._semantic else None
 
