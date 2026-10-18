@@ -497,6 +497,19 @@ class CompositeStore:
             internal_validation=internal_validation,
         )
 
+    def get_raw_blobs(self, hashes) -> dict[str, tuple[str, str]]:
+        return self._segments.get_raw_blobs(hashes)
+
+    def delete_unreferenced_raw_blobs(self) -> int:
+        return self._segments.delete_unreferenced_raw_blobs()
+
+    def compact_stored_raw_bodies(
+        self, conversation_id: str, *, batch_size: int = 5, dry_run: bool = False,
+    ) -> dict[str, int]:
+        return self._segments.compact_stored_raw_bodies(
+            conversation_id, batch_size=batch_size, dry_run=dry_run,
+        )
+
     def get_canonical_turn_audiences(
         self,
         keys: list[tuple[str, str]],

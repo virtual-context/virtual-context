@@ -44,6 +44,15 @@ from .actor_card_transition_guards import postgres_actor_card_turn_source_functi
 from .channel_enrichment_guards import (
     ensure_receipted_channel_guard,
 )
+from .raw_blobs import (
+    clear_grant as _clear_raw_compaction_grant,
+    compact_stored_raw_bodies as _compact_stored_raw_bodies,
+    delete_unreferenced_blobs as _delete_unreferenced_raw_blobs,
+    ensure_raw_blob_schema,
+    load_blobs as _load_raw_blobs,
+    prepare_raw_write as _prepare_raw_write,
+    raw_body_guard_sql as _raw_body_guard_sql,
+)
 from .audience_reassignment import (
     assert_audience_reassignment_schema,
     ensure_audience_reassignment_schema,
@@ -2519,6 +2528,7 @@ class PostgresStore(PostgresVectorSearchMixin, RelationalStoreMixin, ContextStor
             )
             with conn.transaction():
                 ensure_audience_reassignment_schema(conn, "postgres")
+                ensure_raw_blob_schema(conn, "postgres")
                 ensure_assistant_channel_enrichment_schema(conn, "postgres")
             conn.execute(
                 """CREATE OR REPLACE FUNCTION
@@ -2536,8 +2546,7 @@ class PostgresStore(PostgresVectorSearchMixin, RelationalStoreMixin, ContextStor
                                OLD.normalized_assistant_text IS DISTINCT FROM NEW.normalized_assistant_text OR
                                OLD.user_content IS DISTINCT FROM NEW.user_content OR
                                OLD.assistant_content IS DISTINCT FROM NEW.assistant_content OR
-                               OLD.user_raw_content IS DISTINCT FROM NEW.user_raw_content OR
-                               OLD.assistant_raw_content IS DISTINCT FROM NEW.assistant_raw_content OR
+                               {raw_guard} OR
                                OLD.sender IS DISTINCT FROM NEW.sender OR
                                OLD.origin_channel_id IS DISTINCT FROM NEW.origin_channel_id OR
                                OLD.origin_channel_label IS DISTINCT FROM NEW.origin_channel_label OR
@@ -2579,8 +2588,7 @@ class PostgresStore(PostgresVectorSearchMixin, RelationalStoreMixin, ContextStor
                                OLD.normalized_assistant_text IS DISTINCT FROM NEW.normalized_assistant_text OR
                                OLD.user_content IS DISTINCT FROM NEW.user_content OR
                                OLD.assistant_content IS DISTINCT FROM NEW.assistant_content OR
-                               OLD.user_raw_content IS DISTINCT FROM NEW.user_raw_content OR
-                               OLD.assistant_raw_content IS DISTINCT FROM NEW.assistant_raw_content OR
+                               {raw_guard} OR
                                (EXISTS (
                                    SELECT 1 FROM canonical_audience_reassignments ar
                                    WHERE ar.canonical_turn_id = OLD.canonical_turn_id
@@ -2614,7 +2622,7 @@ class PostgresStore(PostgresVectorSearchMixin, RelationalStoreMixin, ContextStor
                        END IF;
                        RETURN NEW;
                    END;
-                   $$ LANGUAGE plpgsql"""
+                   $$ LANGUAGE plpgsql""".replace("{raw_guard}", _raw_body_guard_sql(dialect="postgres"))
             )
             # One transaction, not two statements. DROP TRIGGER takes an
             # ACCESS EXCLUSIVE lock and the pool is autocommit, so as
@@ -8304,6 +8312,7 @@ class PostgresStore(PostgresVectorSearchMixin, RelationalStoreMixin, ContextStor
                 if media_dir and os.path.isdir(media_dir):
                     shutil.rmtree(media_dir, ignore_errors=True)
 
+            self._collect_raw_blobs()
             return deleted
 
     def save_tag_summary(
@@ -10323,6 +10332,9 @@ class PostgresStore(PostgresVectorSearchMixin, RelationalStoreMixin, ContextStor
                 audience_conversation_id=audience_conversation_id or "",
                 origin_channel_id=origin_channel_id or "",
             )
+            user_raw_content, assistant_raw_content, raw_compaction_grant = _prepare_raw_write(
+                conn, "postgres", str(canonical_turn_id), user_raw_content, assistant_raw_content,
+            )
             conn.execute(
                 """INSERT INTO canonical_turns
                 (canonical_turn_id, conversation_id, turn_group_number, sort_key, turn_hash, hash_version,
@@ -10409,6 +10421,8 @@ class PostgresStore(PostgresVectorSearchMixin, RelationalStoreMixin, ContextStor
                     updated,
                 ),
             )
+            if raw_compaction_grant:
+                _clear_raw_compaction_grant(conn, "postgres", str(canonical_turn_id))
             if source_claim:
                 self._attest_canonical_user_source_on_connection(
                     conn,
@@ -13487,7 +13501,41 @@ class PostgresStore(PostgresVectorSearchMixin, RelationalStoreMixin, ContextStor
                     "DELETE FROM canonical_turns WHERE conversation_id = %s AND canonical_turn_id = %s",
                     (conversation_id, canonical_turn_id),
                 )
-            return int(cur.rowcount or 0)
+            deleted = int(cur.rowcount or 0)
+        self._collect_raw_blobs()
+        return deleted
+
+    def _collect_raw_blobs(self) -> None:
+        # A failed sweep leaves unreferenced blobs for the next one; it never
+        # fails the delete that triggered it.
+        try:
+            self.delete_unreferenced_raw_blobs()
+        except Exception:
+            logger.warning("Raw blob cleanup failed", exc_info=True)
+
+    def get_raw_blobs(self, hashes) -> dict[str, tuple[str, str]]:
+        with self.pool.connection() as conn:
+            return _load_raw_blobs(conn, "postgres", hashes)
+
+    def delete_unreferenced_raw_blobs(self) -> int:
+        with self.pool.connection() as conn:
+            return _delete_unreferenced_raw_blobs(conn, "postgres")
+
+    def compact_stored_raw_bodies(
+        self, conversation_id: str, *, batch_size: int = 5, dry_run: bool = False,
+    ) -> dict[str, int]:
+        return _compact_stored_raw_bodies(
+            self, "postgres", conversation_id, batch_size=batch_size, dry_run=dry_run,
+        )
+
+    @contextmanager
+    def _raw_blob_connection(self):
+        with self.pool.connection() as conn:
+            with conn.transaction():
+                yield conn
+
+    def _raw_blob_commit(self, conn) -> None:
+        """Commit happens when ``_raw_blob_connection`` exits."""
 
     def delete_canonical_turns_by_batch_id(
         self,

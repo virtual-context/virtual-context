@@ -51,6 +51,15 @@ from .actor_card_transition_guards import sqlite_actor_card_turn_source_update_s
 from .channel_enrichment_guards import (
     ensure_receipted_channel_guard,
 )
+from .raw_blobs import (
+    clear_grant as _clear_raw_compaction_grant,
+    compact_stored_raw_bodies as _compact_stored_raw_bodies,
+    delete_unreferenced_blobs as _delete_unreferenced_raw_blobs,
+    ensure_raw_blob_schema,
+    load_blobs as _load_raw_blobs,
+    prepare_raw_write as _prepare_raw_write,
+    raw_body_guard_sql as _raw_body_guard_sql,
+)
 from .audience_reassignment import (
     assert_audience_reassignment_schema,
     ensure_audience_reassignment_schema,
@@ -2762,6 +2771,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
         create memberships.
         """
         ensure_audience_reassignment_schema(conn, "sqlite")
+        ensure_raw_blob_schema(conn, "sqlite")
         ensure_assistant_channel_enrichment_schema(conn, "sqlite")
         for trigger_name in (
             "trg_guard_attested_canonical_turn_update",
@@ -2957,8 +2967,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
                     OLD.normalized_assistant_text IS NOT NEW.normalized_assistant_text OR
                     OLD.user_content IS NOT NEW.user_content OR
                     OLD.assistant_content IS NOT NEW.assistant_content OR
-                    OLD.user_raw_content IS NOT NEW.user_raw_content OR
-                    OLD.assistant_raw_content IS NOT NEW.assistant_raw_content OR
+                    {raw_guard} OR
                     OLD.sender IS NOT NEW.sender OR
                     OLD.origin_channel_id IS NOT NEW.origin_channel_id OR
                     OLD.origin_channel_label IS NOT NEW.origin_channel_label OR
@@ -2999,8 +3008,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
                     OLD.normalized_assistant_text IS NOT NEW.normalized_assistant_text OR
                     OLD.user_content IS NOT NEW.user_content OR
                     OLD.assistant_content IS NOT NEW.assistant_content OR
-                    OLD.user_raw_content IS NOT NEW.user_raw_content OR
-                    OLD.assistant_raw_content IS NOT NEW.assistant_raw_content OR
+                    {raw_guard} OR
                     (EXISTS (
                         SELECT 1 FROM canonical_audience_reassignments ar
                         WHERE ar.canonical_turn_id = OLD.canonical_turn_id
@@ -3084,7 +3092,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
             BEGIN
                 SELECT RAISE(ABORT, 'canonical source membership is immutable');
             END;
-            """
+            """.replace("{raw_guard}", _raw_body_guard_sql(dialect="sqlite"))
         )
 
         ensure_receipted_channel_guard(conn, "sqlite")
@@ -8123,6 +8131,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
             conn.execute("ROLLBACK")
             raise
 
+        self._collect_raw_blobs()
         return deleted
 
     def cleanup(
@@ -9465,6 +9474,9 @@ CREATE TABLE IF NOT EXISTS request_captures (
             audience_conversation_id=audience_conversation_id or "",
             origin_channel_id=origin_channel_id or "",
         )
+        user_raw_content, assistant_raw_content, raw_compaction_grant = _prepare_raw_write(
+            conn, "sqlite", str(canonical_turn_id), user_raw_content, assistant_raw_content,
+        )
         conn.execute(
             """INSERT INTO canonical_turns
             (canonical_turn_id, conversation_id, turn_group_number, sort_key, turn_hash, hash_version,
@@ -9550,6 +9562,8 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 updated,
             ),
         )
+        if raw_compaction_grant:
+            _clear_raw_compaction_grant(conn, "sqlite", str(canonical_turn_id))
         if source_claim:
             self.attest_canonical_user_source(
                 CanonicalTurnRow(
@@ -12569,7 +12583,40 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 (conversation_id, canonical_turn_id),
             )
         conn.commit()
-        return int(cur.rowcount or 0)
+        deleted = int(cur.rowcount or 0)
+        self._collect_raw_blobs()
+        return deleted
+
+    def _collect_raw_blobs(self) -> None:
+        # A failed sweep leaves unreferenced blobs for the next one; it never
+        # fails the delete that triggered it.
+        try:
+            self.delete_unreferenced_raw_blobs()
+        except Exception:
+            logger.warning("Raw blob cleanup failed", exc_info=True)
+
+    def get_raw_blobs(self, hashes) -> dict[str, tuple[str, str]]:
+        return _load_raw_blobs(self._get_conn(), "sqlite", hashes)
+
+    def delete_unreferenced_raw_blobs(self) -> int:
+        conn = self._get_conn()
+        deleted = _delete_unreferenced_raw_blobs(conn, "sqlite")
+        self._commit_if_unlocked(conn)
+        return deleted
+
+    def compact_stored_raw_bodies(
+        self, conversation_id: str, *, batch_size: int = 5, dry_run: bool = False,
+    ) -> dict[str, int]:
+        return _compact_stored_raw_bodies(
+            self, "sqlite", conversation_id, batch_size=batch_size, dry_run=dry_run,
+        )
+
+    @contextmanager
+    def _raw_blob_connection(self):
+        yield self._get_conn()
+
+    def _raw_blob_commit(self, conn) -> None:
+        self._commit_if_unlocked(conn)
 
     def delete_canonical_turns_by_batch_id(
         self,

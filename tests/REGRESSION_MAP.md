@@ -5,6 +5,15 @@ Use `pytest -m regression` to run all regression tests.
 
 ## By Bug ID
 
+### BUG-131 — Raw bodies stored every resent image and the host's replayed context
+
+- **Symptom**: one guild conversation's canonical rows held 727 MB of raw bodies, of which 25 MB were distinct images and under 2 MB was user text; each read of those rows moved megabytes per row into the process, and freed memory stayed resident.
+- **Root cause**: the host resends recent images and its own rendering of the channel history with every request, and `save_canonical_turn` stored each turn's raw body as received: 4,051 image parts for 161 distinct images, plus about 1 MB of replayed context per turn that normalization discards.
+- **Fix**: `core.raw_bodies.compact_raw_body` moves inline data into `canonical_raw_blobs` (one row per SHA-256, referenced as `vc-blob:sha256:<hex>`) and replaces a host prompt's replayed context section with a labeled hash marker, keeping the adapter's metadata blocks and the request; writes compact on save, `compact_stored_raw_bodies` rewrites existing rows in small batches, attested rows accept only their own compaction through `canonical_raw_compaction_grants`, and deletes sweep unreferenced blobs.
+- **Tests**:
+  - `test_raw_body_storage.py` — normalization, sender and channel survive compaction, images round-trip, rows share blobs, attested rows accept only their own compaction, backfill and blob cleanup
+  - `test_raw_body_storage_postgres.py` — the same storage, backfill and cleanup on PostgreSQL
+
 ### BUG-130 — Per-request reads loaded canonical raw bodies
 
 - **Symptom**: every request on a long conversation read megabytes of raw request bodies it never used: the summary audience check read up to hundreds of full source rows, the recent-turn readers read up to 200 rows (110 MB of raw bodies on one conversation), the context hint loaded every tag summary (146 MB peak for 8,035 topics), and a restore without session state read every row's bodies (818 MB peak).
@@ -1434,6 +1443,8 @@ Use `pytest -m regression` to run all regression tests.
 | `test_canonical_read_projection.py` | BUG-127, BUG-129 |
 | `test_request_reads_without_bodies.py` | BUG-130 |
 | `test_request_reads_without_bodies_postgres.py` | BUG-130 |
+| `test_raw_body_storage.py` | BUG-131 |
+| `test_raw_body_storage_postgres.py` | BUG-131 |
 | `test_tag_summary_materialization.py` | BUG-041 |
 | `test_embedding_context_guard.py` | BUG-042 |
 | `test_embedding_reserved_seats.py` | BUG-043 |

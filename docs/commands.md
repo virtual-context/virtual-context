@@ -227,6 +227,7 @@ Each imported conversation keeps its own conversation ID from the export, so sep
 | `backfill-fact-embeddings` | Write embeddings for facts that predate embedding storage |
 | `backfill-senders` | Recover sender labels on canonical turns |
 | `backfill-channels` | Recover channel provenance on canonical turns |
+| `compact-raw-bodies` | Store each inline image once and drop replayed host context from stored raw bodies (`--batch-size`, default 5 rows per transaction) |
 | `backfill-actors` | Recover durable actor IDs from retained raw user text |
 | `backfill-reply-roles` | Recover reply roles and audience provenance |
 | `backfill-fact-authors` | Re-distill facts with canonical actor provenance |
@@ -247,7 +248,7 @@ Run `virtual-context admin <subcommand> --help` for the flags each command takes
 
 **Two safety models exist; know which one your command uses.**
 
-- Commands that **write by default** and take `--dry-run` to report instead: `backfill-senders`, `backfill-channels`, `backfill-actors`, `backfill-reply-roles`, `backfill-fact-authors`, `rebuild-actor-cards`, `retag-canonical-turns`, `backfill-session-state-markers`.
+- Commands that **write by default** and take `--dry-run` to report instead: `backfill-senders`, `backfill-channels`, `compact-raw-bodies`, `backfill-actors`, `backfill-reply-roles`, `backfill-fact-authors`, `rebuild-actor-cards`, `retag-canonical-turns`, `backfill-session-state-markers`.
 - Commands that **dry-run by default** and take `--apply` to write: `reattribute-audience`, `rebuild-derived-data`, `resummarize-segments`, `migrate-structured-summaries`, `resequence-canonical-turns`, `normalize-canonical-actor-ids`, `reindex-canonical-turn-embeddings`.
 - `backfill-tag-summaries` and `backfill-fact-embeddings` take `--force-rebuild` to regenerate rows that already exist.
 

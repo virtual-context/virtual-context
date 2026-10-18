@@ -628,6 +628,24 @@ class ContextStore(ABC):
         """
         return {}
 
+    def get_raw_blobs(self, hashes) -> dict[str, tuple[str, str]]:
+        """Stored inline data by hash: ``{hash: (media_type, data)}``.
+
+        Compacted raw bodies reference images and files by hash; see
+        ``core.raw_bodies``. Backends without a blob store return nothing.
+        """
+        return {}
+
+    def delete_unreferenced_raw_blobs(self) -> int:
+        """Delete stored blobs no canonical row references any more."""
+        return 0
+
+    def compact_stored_raw_bodies(
+        self, conversation_id: str, *, batch_size: int = 5, dry_run: bool = False,
+    ) -> dict[str, int]:
+        """Rewrite a conversation's stored raw bodies into their compacted form."""
+        raise NotImplementedError("this store cannot compact raw bodies")
+
     def get_canonical_turn_audiences(
         self,
         keys: list[tuple[str, str]],

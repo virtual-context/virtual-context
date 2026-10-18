@@ -1817,6 +1817,79 @@ def cmd_admin_backfill_senders(args):
             pass
 
 
+def cmd_admin_compact_raw_bodies(args):
+    """Rewrite stored raw bodies into their compacted form.
+
+    Inline images and files move to the shared blob store and a host prompt's
+    replayed context section is replaced by a hash marker; see
+    ``core.raw_bodies``. Rows are rewritten a few at a time, so memory stays
+    bounded by the largest bodies in one batch.
+
+        virtual-context admin compact-raw-bodies <conv-id>
+        virtual-context admin compact-raw-bodies --tenant-id <tid> --all-convs-for-tenant
+
+    ``--dry-run`` reports the sizes without writing. Unreferenced blobs are
+    removed after a writing run.
+    """
+    from virtual_context.engine import VirtualContextEngine
+
+    conversation_id = getattr(args, "conversation_id", None) or ""
+    tenant_id = getattr(args, "tenant_id", "") or ""
+    all_convs = bool(getattr(args, "all_convs_for_tenant", False))
+    dry_run = bool(getattr(args, "dry_run", False))
+    if not conversation_id and not all_convs:
+        print(json.dumps({
+            "status": "error",
+            "stage": "args",
+            "error": "either <conversation_id> or --all-convs-for-tenant must be supplied",
+        }))
+        sys.exit(2)
+    try:
+        config = load_config(args.config)
+    except Exception as exc:  # noqa: BLE001
+        print(json.dumps({"status": "error", "stage": "load_config", "error": repr(exc)}))
+        sys.exit(1)
+    if conversation_id:
+        config.conversation_id = conversation_id
+    if tenant_id:
+        config.tenant_id = tenant_id
+    _apply_storage_overrides(config, args)
+    try:
+        engine = VirtualContextEngine(config=config)
+    except Exception as exc:  # noqa: BLE001
+        print(json.dumps({"status": "error", "stage": "engine_construct", "error": repr(exc)}))
+        sys.exit(1)
+    try:
+        if all_convs:
+            targets = engine._store.list_canonical_conversation_ids(
+                tenant_id=tenant_id or None, limit=getattr(args, "limit", None),
+            )
+        else:
+            targets = [engine.config.conversation_id]
+        results = []
+        for target in targets:
+            counts = engine._store.compact_stored_raw_bodies(
+                target, batch_size=args.batch_size, dry_run=dry_run,
+            )
+            results.append({"conversation_id": target, **counts})
+        blobs_deleted = 0 if dry_run else engine._store.delete_unreferenced_raw_blobs()
+        print(json.dumps({
+            "status": "ok",
+            "dry_run": dry_run,
+            "conversations": len(targets),
+            "rows_compacted": sum(r["rows_compacted"] for r in results),
+            "bytes_before": sum(r["bytes_before"] for r in results),
+            "bytes_after": sum(r["bytes_after"] for r in results),
+            "blobs_deleted": blobs_deleted,
+            "results": results,
+        }))
+    finally:
+        try:
+            engine.close()
+        except Exception:
+            pass
+
+
 def cmd_admin_backfill_channels(args):
     """Recover the canonical_turns channel columns for pre-existing rows.
 
@@ -3275,6 +3348,35 @@ def main():
     )
 
     # ------------------------------------------------------------------
+    # admin compact-raw-bodies
+    # ------------------------------------------------------------------
+    compact_raw_parser = admin_sub.add_parser(
+        "compact-raw-bodies",
+        help="Move stored inline images to the blob store and drop replayed host context",
+    )
+    compact_raw_parser.add_argument(
+        "conversation_id", nargs="?", default=None,
+        help="Conversation id to compact (omit with --all-convs-for-tenant)",
+    )
+    compact_raw_parser.add_argument("--tenant-id", default="", help="Tenant id (default: empty)")
+    compact_raw_parser.add_argument(
+        "--all-convs-for-tenant", action="store_true",
+        help="Every conversation owning canonical rows, scoped to --tenant-id when supplied",
+    )
+    compact_raw_parser.add_argument("--dry-run", action="store_true", help="Report sizes without writing")
+    compact_raw_parser.add_argument("--limit", type=int, default=None, help="Conversations enumerated in batch mode")
+    compact_raw_parser.add_argument("--batch-size", type=int, default=5, help="Rows rewritten per transaction")
+    compact_raw_parser.add_argument(
+        "--storage-backend", choices=("sqlite", "postgres", "filesystem"),
+        help="Override the engine's storage backend.",
+    )
+    compact_raw_parser.add_argument(
+        "--postgres-dsn",
+        help="Postgres connection string; falls back to DATABASE_URL when neither this nor -c is given.",
+    )
+    compact_raw_parser.add_argument("--sqlite-path", help="SQLite database path.")
+
+    # ------------------------------------------------------------------
     # admin backfill-channels
     # ------------------------------------------------------------------
     backfill_channel_parser = admin_sub.add_parser(
@@ -3770,6 +3872,8 @@ def main():
             cmd_admin_backfill_fact_embeddings(args)
         elif args.admin_command == "backfill-senders":
             cmd_admin_backfill_senders(args)
+        elif args.admin_command == "compact-raw-bodies":
+            cmd_admin_compact_raw_bodies(args)
         elif args.admin_command == "backfill-channels":
             cmd_admin_backfill_channels(args)
         elif args.admin_command == "backfill-actors":
