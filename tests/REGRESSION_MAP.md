@@ -5,6 +5,14 @@ Use `pytest -m regression` to run all regression tests.
 
 ## By Bug ID
 
+### BUG-133 — Unlabeled request after a group's selected history was replayed as history
+
+- **Symptom**: in a group chat the model answered an earlier message ("Thanks" → "Anytime") instead of the newest one; the newest request never reached the model as the current message.
+- **Root cause**: a reused host thread appends the turn as the selected room-history section, a blank line, and the request with no "Current user request:" label. `_take_selected_history` ran the section to the end of the text, so the request was folded into the last history line as a continuation and the current message was left with metadata only.
+- **Fix**: a blank line ends the selected-history section, so text after it stays in the current message.
+- **Tests**:
+  - `test_host_replay_expansion.py` — `test_unlabeled_request_after_selected_history_stays_the_current_message`
+
 ### BUG-132 — Protected-window turns replayed from storage lost their images
 
 - **Symptom**: when the protected window filled recent turns from storage, an image the user sent in one of those turns never reached the model; the turn arrived as text only.
@@ -1412,7 +1420,7 @@ Use `pytest -m regression` to run all regression tests.
 | `test_context_cache_prefix.py` | PROXY-027 |
 | `test_responses_context_placement.py` | PROXY-027 |
 | `test_chat_context_placement.py` | PROXY-027 |
-| `test_host_replay_expansion.py` | PROXY-026, BUG-118, BUG-119 |
+| `test_host_replay_expansion.py` | PROXY-026, BUG-118, BUG-119, BUG-133 |
 | `test_unreplied_turns_compaction.py` | BUG-079 |
 | `test_postgres_store.py` | BUG-078 |
 | `test_tui.py` | BUG-002 |

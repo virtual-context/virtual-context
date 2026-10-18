@@ -243,3 +243,21 @@ def test_selected_group_history_without_a_replay_block_is_expanded():
     out, n = expand_host_replay({"model": "m", "input": [_user(prompt)]})
     assert n == 4
     assert _text(out["input"][-1]) == "Current user request:\nWhich mix should I use?"
+
+
+@pytest.mark.regression("BUG-133")
+def test_unlabeled_request_after_selected_history_stays_the_current_message():
+    # A reused host thread appends the turn as the section followed by a blank
+    # line and the request, with no "Current user request:" label.
+    prompt = (
+        "Conversation info: ⟦openclaw:ctx⟧\n```json\n{\"chat_id\":\"telegram:-1\"}\n```\n\n"
+        + SELECTED
+        + '#session:a5 2026-10-18 19:07:33 UTC {"id":"8049932331","name":"Y","channel":"telegram"}: Why cant you verify it\n'
+        "\nFinish the check"
+    )
+    out, n = expand_host_replay({"model": "m", "input": [_user(prompt)]})
+    texts = [_text(i) for i in out["input"]]
+    assert n == 5
+    assert texts[-2] == "Y: Why cant you verify it"
+    assert texts[-1].endswith("Finish the check")
+    assert "#session:" not in texts[-1]

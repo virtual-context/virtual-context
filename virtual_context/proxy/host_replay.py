@@ -42,6 +42,7 @@ _USER_ROLES = {"user", "compactionSummary", "system"}
 _SELECTED_HEADER_RE = re.compile(
     r"(?m)^[ \t]*Conversation context \(chronological, selected for current message\):[ \t]*⟦openclaw:ctx⟧[ \t]*\n"
 )
+_BLANK_LINE_RE = re.compile(r"(?m)^[ \t]*$")
 _SELECTED_LINE_RE = re.compile(r"^#(session:\S+|\d+) \d{4}-\d\d-\d\d \d\d:\d\d:\d\d UTC (.*)$")
 _HOST_SPEAKERS = {"OpenClaw"}
 
@@ -134,6 +135,11 @@ def _take_selected_history(text: str) -> tuple[str, list[tuple[str, str]]]:
     block = text.find("<conversation_context>", start)
     if block >= 0:
         ends.append(block)
+    # The section is one line per message; a blank line ends it. A reused
+    # thread appends the request after that blank line without a label.
+    blank = _BLANK_LINE_RE.search(text, start)
+    if blank:
+        ends.append(blank.start())
     end = min(ends)
     entries = parse_selected_history(text[start:end])
     if not entries:
