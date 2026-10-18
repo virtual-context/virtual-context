@@ -184,7 +184,7 @@ class TestWarmAtCommit:
             assert hint and hint != stale
             assert provider.hints[(conv, key)] == hint
             assert not provider.load_calls, "forced prewarm must bypass shared reads"
-            assert engine._retrieval._store.get_all_tag_summaries.called
+            assert engine._retrieval._store.get_tag_summary_topics.called
         finally:
             engine.close()
 
@@ -262,7 +262,7 @@ class TestWarmAtCommit:
                     instrumentation=instrumentation,
                 )
                 assert hint == engine._retrieval._context_hint_cache_value
-                assert not engine2._retrieval._store.get_all_tag_summaries.called, (
+                assert not engine2._retrieval._store.get_tag_summary_topics.called, (
                     "fresh worker rebuilt the hint instead of hitting the "
                     "cross-worker layer warmed at commit"
                 )

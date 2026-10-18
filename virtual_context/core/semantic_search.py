@@ -6,6 +6,7 @@ and cosine-similarity search.
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 from collections.abc import Iterator
@@ -140,10 +141,47 @@ def _user_embedding_text(user_text: str, user_raw_content: str | None) -> str:
     canonical = user_text or ""
     if canonical.strip():
         return canonical
-    raw = user_raw_content or ""
+    raw = _raw_text_parts(user_raw_content or "")
     if any(marker in raw for marker in _HOST_SCAFFOLD_MARKERS):
         return canonical
     return raw
+
+
+def _raw_text_parts(raw: str) -> str:
+    """The text of a stored raw body, never its inline image or file data.
+
+    A body with text parts embeds as that text. An attachment-only body embeds
+    as its parts with any inline data left out.
+    """
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return raw
+    if isinstance(parsed, str):
+        return parsed
+    if not isinstance(parsed, list):
+        return raw
+    texts = [
+        part["text"] for part in parsed
+        if isinstance(part, dict)
+        and part.get("type") in ("text", "input_text")
+        and isinstance(part.get("text"), str)
+    ]
+    if texts:
+        return "\n".join(texts)
+    stripped = _without_inline_data(parsed)
+    return raw if stripped == parsed else json.dumps(stripped, separators=(",", ":"))
+
+
+def _without_inline_data(value):
+    if isinstance(value, dict):
+        return {
+            key: _without_inline_data(item) for key, item in value.items()
+            if not (key in ("data", "file_data") or (isinstance(item, str) and item.startswith("data:")))
+        }
+    if isinstance(value, list):
+        return [_without_inline_data(item) for item in value]
+    return value
 
 
 class SemanticSearchManager:

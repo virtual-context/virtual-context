@@ -140,6 +140,15 @@ def _install_exact_rows(store: MagicMock, rows: list[SimpleNamespace]) -> None:
             key: by_key[key] for key in keys if key in by_key
         }
     )
+    store.get_canonical_turn_audiences.side_effect = (
+        lambda keys: {
+            key: (getattr(row, "audience_conversation_id", ""),
+                  getattr(row, "audience_attribution_version", 0))
+            for key, row in store.get_canonical_turn_rows_by_id(
+                keys, speaker_context=None,
+            ).items()
+        }
+    )
 
 
 def _assert_summary_search_failed_closed(result: dict, *, mode: str) -> None:

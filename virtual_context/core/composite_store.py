@@ -26,6 +26,7 @@ from ..types import (
     StoredSummary,
     TagStats,
     TagSummary,
+    TagTopic,
 )
 
 if TYPE_CHECKING:
@@ -239,6 +240,9 @@ class CompositeStore:
 
     def get_all_tag_summaries(self, *, conversation_id: str | None = None) -> list[TagSummary]:
         return self._segments.get_all_tag_summaries(conversation_id=conversation_id)
+
+    def get_tag_summary_topics(self, conversation_id: str) -> list[TagTopic]:
+        return self._segments.get_tag_summary_topics(conversation_id)
 
     def get_segment_tags_without_summaries(self, conversation_id: str) -> list[str]:
         return self._segments.get_segment_tags_without_summaries(conversation_id)
@@ -493,11 +497,23 @@ class CompositeStore:
             internal_validation=internal_validation,
         )
 
+    def get_canonical_turn_audiences(
+        self,
+        keys: list[tuple[str, str]],
+    ) -> dict[tuple[str, str], tuple[str, int]]:
+        return self._segments.get_canonical_turn_audiences(keys)
+
     def get_all_canonical_turns(
         self,
         conversation_id: str,
     ) -> list[CanonicalTurnRow]:
         return self._segments.get_all_canonical_turns(conversation_id)
+
+    def get_all_canonical_turn_texts(
+        self,
+        conversation_id: str,
+    ) -> list[CanonicalTurnRow]:
+        return self._segments.get_all_canonical_turn_texts(conversation_id)
 
     def get_canonical_turn_rows_in_groups(
         self, conversation_id: str, *, min_turn_group: int, max_turn_group: int | None = None,

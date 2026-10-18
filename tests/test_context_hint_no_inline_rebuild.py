@@ -56,7 +56,7 @@ def test_a_request_after_the_prewarm_hits_the_prewarmed_hint(tmp_path):
         engine._retrieval._context_hint_cache_key = ""    # another worker: nothing in process
         engine._retrieval._store = MagicMock(wraps=engine._retrieval._store)
         assert engine._retrieval._build_context_hint(_mode(engine)) == prewarmed
-        assert not engine._retrieval._store.get_all_tag_summaries.called
+        assert not engine._retrieval._store.get_tag_summary_topics.called
     finally:
         engine.close()
 
@@ -73,7 +73,7 @@ def test_a_request_before_the_prewarm_uses_the_earlier_hint_instead_of_rebuildin
         info: dict = {}
         assert engine._retrieval._build_context_hint(_mode(engine), instrumentation=info) == earlier
         assert info.get("cache_layer") == "latest_fallback"
-        assert not engine._retrieval._store.get_all_tag_summaries.called
+        assert not engine._retrieval._store.get_tag_summary_topics.called
     finally:
         engine.close()
 
@@ -89,7 +89,7 @@ def test_an_earlier_generation_is_never_served(tmp_path):
         info: dict = {}
         engine._retrieval._build_context_hint(_mode(engine), instrumentation=info)
         assert info.get("cache_layer") == "both_miss"
-        assert engine._retrieval._store.get_all_tag_summaries.called
+        assert engine._retrieval._store.get_tag_summary_topics.called
     finally:
         engine.close()
 

@@ -476,7 +476,9 @@ def build_default_hint(
 
     lines: list[str] = []
     for ts in tag_summaries:
-        turn_count = len(ts.source_turn_numbers)
+        turn_count = getattr(ts, "turn_count", None)
+        if turn_count is None:
+            turn_count = len(ts.source_turn_numbers)
         lines.append(f"- {ts.tag} ({turn_count} turns)")
 
     hint = _assemble(lines, visible_all_names)

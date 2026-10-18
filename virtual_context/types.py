@@ -2595,6 +2595,13 @@ class TagSummary:
 
 
 @dataclass
+class TagTopic:
+    """A stored topic's name and how many turns its summary covers."""
+    tag: str
+    turn_count: int = 0
+
+
+@dataclass
 class TagStats:
     tag: str = ""
     usage_count: int = 0

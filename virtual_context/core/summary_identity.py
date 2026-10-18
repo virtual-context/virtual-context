@@ -279,19 +279,30 @@ def _source_ids(item: object) -> list[str]:
     return [value.strip() for value in raw if isinstance(value, str) and value.strip()]
 
 
-def _load_rows(store: object | None, keys: list[tuple[str, str]]) -> dict | None:
-    """Exact source rows, unscoped; ``None`` when the lookup failed."""
-    getter = getattr(store, "get_canonical_turn_rows_by_id", None)
-    if not keys or not callable(getter):
+def _load_audiences(store: object | None, keys: list[tuple[str, str]]) -> dict | None:
+    """Stored audience of each exact source key; ``None`` when the lookup failed."""
+    if not keys:
         return {}
+    getter = getattr(store, "get_canonical_turn_audiences", None)
+    rows_getter = getattr(store, "get_canonical_turn_rows_by_id", None)
     try:
-        try:
-            rows = getter(keys, speaker_context=None, internal_validation=True)
-        except TypeError:
-            rows = getter(keys, speaker_context=None)
+        if callable(getter):
+            audiences = getter(keys)
+        elif callable(rows_getter):
+            try:
+                rows = rows_getter(keys, speaker_context=None, internal_validation=True)
+            except TypeError:
+                rows = rows_getter(keys, speaker_context=None)
+            audiences = {
+                key: (getattr(row, "audience_conversation_id", ""),
+                      getattr(row, "audience_attribution_version", 0))
+                for key, row in rows.items()
+            }
+        else:
+            return {}
     except Exception:
         return None
-    return rows if hasattr(rows, "get") else None
+    return audiences if hasattr(audiences, "get") else None
 
 
 def summaries_admitted_for_audience(
@@ -314,20 +325,19 @@ def summaries_admitted_for_audience(
         (conversation_id, source_id)
         for ids in ids_by_item for source_id in ids
     ))
-    rows = _load_rows(store, keys)
+    audiences = _load_audiences(store, keys)
     admitted: list[bool] = []
     for ids in ids_by_item:
-        if rows is None:
+        if audiences is None:
             # The audience could not be checked, so nothing sourced is shown.
             admitted.append(not ids)
             continue
         foreign = False
         for source_id in ids:
-            row = rows.get((conversation_id, source_id))
-            if row is None:
+            stored = audiences.get((conversation_id, source_id))
+            if not isinstance(stored, tuple) or len(stored) != 2:
                 continue
-            row_audience = getattr(row, "audience_conversation_id", "")
-            version = getattr(row, "audience_attribution_version", 0)
+            row_audience, version = stored
             if not isinstance(row_audience, str) or not isinstance(version, int):
                 continue
             if row_audience.strip() and version > 0 and row_audience.strip() != audience:

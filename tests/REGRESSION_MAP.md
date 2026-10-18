@@ -5,6 +5,15 @@ Use `pytest -m regression` to run all regression tests.
 
 ## By Bug ID
 
+### BUG-130 — Per-request reads loaded canonical raw bodies
+
+- **Symptom**: every request on a long conversation read megabytes of raw request bodies it never used: the summary audience check read up to hundreds of full source rows, the recent-turn readers read up to 200 rows (110 MB of raw bodies on one conversation), the context hint loaded every tag summary (146 MB peak for 8,035 topics), and a restore without session state read every row's bodies (818 MB peak).
+- **Root cause**: those paths used full-row reads (`get_canonical_turn_rows_by_id`, `get_recent_canonical_turns`, `get_all_tag_summaries`, `get_all_canonical_turns`) while reading only audience fields, text, topic names, or the pending turns' bodies; an attachment-only turn also embedded its raw body, inline image data included.
+- **Fix**: `get_canonical_turn_audiences` for the audience check, recent-turn reads without raw columns, `get_tag_summary_topics` for the hint, and a restore from `get_all_canonical_turn_texts` that reads raw bodies for the uncompacted turns only; embedding text never includes inline data.
+- **Tests**:
+  - `test_request_reads_without_bodies.py` — each read, its equivalence with the full read, and the embedding text
+  - `test_request_reads_without_bodies_postgres.py` — PostgreSQL returns turn ids as UUIDs; the projections still match
+
 ### BUG-129 — Ingestion resume, compaction takeover and batch ingest read the whole conversation
 
 - **Symptom**: every ingestion takeover of a long conversation loaded all of its canonical rows with their raw bodies (728 MB on one conversation, taken over 18 times in one day), so the work a resume or takeover cost grew with the conversation's age instead of with what was pending.
@@ -1423,6 +1432,8 @@ Use `pytest -m regression` to run all regression tests.
 | `test_render_escape_host_attribution.py` | BUG-066, BUG-067 |
 | `test_tag_rollup_recovery.py` | BUG-126 |
 | `test_canonical_read_projection.py` | BUG-127, BUG-129 |
+| `test_request_reads_without_bodies.py` | BUG-130 |
+| `test_request_reads_without_bodies_postgres.py` | BUG-130 |
 | `test_tag_summary_materialization.py` | BUG-041 |
 | `test_embedding_context_guard.py` | BUG-042 |
 | `test_embedding_reserved_seats.py` | BUG-043 |

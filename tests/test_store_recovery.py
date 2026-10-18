@@ -527,6 +527,15 @@ def _fill_store(rows):
             key: by_key[key] for key in keys if key in by_key
         }
     )
+    store.get_canonical_turn_audiences.side_effect = (
+        lambda keys: {
+            key: (getattr(row, "audience_conversation_id", ""),
+                  getattr(row, "audience_attribution_version", 0))
+            for key, row in store.get_canonical_turn_rows_by_id(
+                keys, speaker_context=None,
+            ).items()
+        }
+    )
     store.get_recent_canonical_turns.return_value = materialized
     store.get_tool_outputs_for_turn.return_value = []
     return store

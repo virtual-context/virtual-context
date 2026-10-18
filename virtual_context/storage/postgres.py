@@ -88,6 +88,7 @@ from ..types import (
     StoredSummary,
     TagStats,
     TagSummary,
+    TagTopic,
     TurnTagEntry,
     WorkingSetEntry,
     channel_excerpt_prefix,
@@ -1280,6 +1281,10 @@ _SCHEMA_LOCK = threading.Lock()
 
 
 _CANONICAL_TURN_ROW_COLUMNS = """canonical_turn_id, conversation_id, turn_number, turn_group_number, sort_key, turn_hash, hash_version, normalized_user_text, normalized_assistant_text, user_content, assistant_content, user_raw_content, assistant_raw_content, primary_tag, tags_json, session_date, sender, origin_channel_id, origin_channel_label, sender_actor_id, source_message_id, reply_target_message_id, reply_subject_actor_id, reply_subject_label, reply_target_body, reply_attribution_version, audience_conversation_id, audience_attribution_version, origin_conversation_id, fact_signals_json, code_refs_json, tagged_at, compacted_at, first_seen_at, last_seen_at, source_batch_id, created_at, updated_at, covered_ingestible_entries"""
+_CANONICAL_TURN_TEXT_COLUMNS = _CANONICAL_TURN_ROW_COLUMNS.replace(
+    "user_raw_content, assistant_raw_content",
+    "NULL AS user_raw_content, NULL AS assistant_raw_content",
+)
 
 class PostgresStore(PostgresVectorSearchMixin, RelationalStoreMixin, ContextStore):
     """PostgreSQL storage backend with tsvector FTS and full protocol support."""
@@ -3741,10 +3746,12 @@ class PostgresStore(PostgresVectorSearchMixin, RelationalStoreMixin, ContextStor
             ).fetchone()
             return int(row["turn_number"]) if row else -1
 
-    def _load_canonical_turn_rows_raw(self, conversation_id: str) -> list[CanonicalTurnRow]:
+    def _load_canonical_turn_rows_raw(
+        self, conversation_id: str, columns: str = _CANONICAL_TURN_ROW_COLUMNS,
+    ) -> list[CanonicalTurnRow]:
         with self.pool.connection() as conn:
             rows = conn.execute(
-                f"""SELECT {_CANONICAL_TURN_ROW_COLUMNS}
+                f"""SELECT {columns}
                    FROM canonical_turns_ordinal
                    WHERE conversation_id = %s
                    ORDER BY sort_key, canonical_turn_id""",
@@ -3752,17 +3759,19 @@ class PostgresStore(PostgresVectorSearchMixin, RelationalStoreMixin, ContextStor
             ).fetchall()
             return [_row_to_canonical_turn(row) for row in rows]
 
-    def _load_canonical_turn_rows(self, conversation_id: str) -> list[CanonicalTurnRow]:
+    def _load_canonical_turn_rows(
+        self, conversation_id: str, columns: str = _CANONICAL_TURN_ROW_COLUMNS,
+    ) -> list[CanonicalTurnRow]:
         # Lazy backfill: conversations ingested before turn_group_number was
         # introduced sit at -1 on every row and rely on the content-heuristic
         # fallback in _merge_canonical_turn_rows forever. Detect the all-legacy
         # case at read time and trigger a one-shot recompute so subsequent
         # reads use explicit groups (faster, deterministic under edits).
-        rows = self._load_canonical_turn_rows_raw(conversation_id)
+        rows = self._load_canonical_turn_rows_raw(conversation_id, columns)
         if rows and all(r.turn_group_number < 0 for r in rows):
             try:
                 self.recompute_canonical_turn_groups(conversation_id)
-                rows = self._load_canonical_turn_rows_raw(conversation_id)
+                rows = self._load_canonical_turn_rows_raw(conversation_id, columns)
             except Exception:
                 logger.warning(
                     "Lazy turn_group_number backfill failed for %s; falling back to content heuristics",
@@ -8448,6 +8457,16 @@ class PostgresStore(PostgresVectorSearchMixin, RelationalStoreMixin, ContextStor
             ).fetchall()
         return [row["tag"] for row in rows]
 
+    def get_tag_summary_topics(self, conversation_id: str) -> list[TagTopic]:
+        with self.pool.connection() as conn:
+            rows = conn.execute(
+                """SELECT tag, json_array_length(source_turn_numbers::json) AS turn_count
+                     FROM tag_summaries WHERE conversation_id = %s
+                    ORDER BY updated_at DESC""",
+                (conversation_id,),
+            ).fetchall()
+        return [TagTopic(tag=row["tag"], turn_count=int(row["turn_count"] or 0)) for row in rows]
+
     def get_all_tag_summaries(self, *, conversation_id: str | None = None) -> list[TagSummary]:
         with self.pool.connection() as conn:
             if conversation_id is not None:
@@ -12488,11 +12507,45 @@ class PostgresStore(PostgresVectorSearchMixin, RelationalStoreMixin, ContextStor
                     )] = parsed
         return out
 
+    def get_canonical_turn_audiences(
+        self,
+        keys: list[tuple[str, str]],
+    ) -> dict[tuple[str, str], tuple[str, int]]:
+        by_conversation: dict[str, list[str]] = {}
+        for conversation_id, canonical_turn_id in keys:
+            if conversation_id and canonical_turn_id:
+                by_conversation.setdefault(conversation_id, []).append(canonical_turn_id)
+        out: dict[tuple[str, str], tuple[str, int]] = {}
+        if not by_conversation:
+            return out
+        with self.pool.connection() as conn:
+            for conversation_id, turn_ids in by_conversation.items():
+                rows = conn.execute(
+                    """SELECT canonical_turn_id, audience_conversation_id,
+                              audience_attribution_version
+                         FROM canonical_turns
+                        WHERE conversation_id = %s
+                          AND canonical_turn_id = ANY(%s)""",
+                    (conversation_id, list(dict.fromkeys(turn_ids))),
+                ).fetchall()
+                for row in rows:
+                    out[(conversation_id, str(row["canonical_turn_id"]))] = (
+                        row["audience_conversation_id"] or "",
+                        int(row["audience_attribution_version"] or 0),
+                    )
+        return out
+
     def get_all_canonical_turns(
         self,
         conversation_id: str,
     ) -> list[CanonicalTurnRow]:
         return self._load_canonical_turn_rows(conversation_id)
+
+    def get_all_canonical_turn_texts(
+        self,
+        conversation_id: str,
+    ) -> list[CanonicalTurnRow]:
+        return self._load_canonical_turn_rows(conversation_id, _CANONICAL_TURN_TEXT_COLUMNS)
 
     def get_canonical_turn_rows_in_groups(
         self,
@@ -12704,7 +12757,8 @@ class PostgresStore(PostgresVectorSearchMixin, RelationalStoreMixin, ContextStor
         never let a row-level LIMIT strand one half at the window boundary.
         Legacy rows without a group number count as singleton groups. No
         ``tagged_at`` filter is applied — fresh peer-channel rows whose tagger
-        has not caught up must still surface in the protected window.
+        has not caught up must still surface in the protected window. Raw
+        bodies are not loaded; every reader of recent turns uses their text.
         """
         if limit <= 0:
             return []
@@ -12718,7 +12772,7 @@ class PostgresStore(PostgresVectorSearchMixin, RelationalStoreMixin, ContextStor
                           sort_key, turn_hash, hash_version,
                           normalized_user_text, normalized_assistant_text,
                           user_content, assistant_content,
-                          user_raw_content, assistant_raw_content,
+                          NULL AS user_raw_content, NULL AS assistant_raw_content,
                           primary_tag, tags_json, session_date, sender,
                           origin_channel_id, origin_channel_label, sender_actor_id,
                           source_message_id, reply_target_message_id, reply_subject_actor_id,

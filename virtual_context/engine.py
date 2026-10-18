@@ -1419,8 +1419,10 @@ class VirtualContextEngine:
         return user_content, assistant_content, user_raw_content, assistant_raw_content
 
     def _restore_from_canonical_rows(self, conversation_id: str) -> bool:
+        # The turn index needs every turn's text and tags; raw bodies are
+        # read afterwards for the live and pending turns only.
         try:
-            rows = list(self._store.get_all_canonical_turns(conversation_id))
+            rows = list(self._store.get_all_canonical_turn_texts(conversation_id))
         except Exception:
             logger.warning(
                 "Failed to load canonical turns for conversation %s",
@@ -1529,6 +1531,7 @@ class VirtualContextEngine:
             )
             for turn_number, pair_rows in pending_pairs
         ]
+        self._fill_restored_raw_bodies(conversation_id)
         logger.info(
             "Canonical restore loaded %d turns (%d indexed, %d compacted, %d live, %d pending) for conversation %s",
             len(paired_rows),
@@ -1539,6 +1542,38 @@ class VirtualContextEngine:
             conversation_id[:12],
         )
         return True
+
+    def _fill_restored_raw_bodies(self, conversation_id: str) -> None:
+        """Give restored pending turns their raw bodies.
+
+        Pending turns sit past the compaction watermark, so their raw bodies
+        come from the uncompacted rows; a turn whose rows cannot be read keeps
+        its text without them.
+        """
+        getter = getattr(self._store, "get_uncompacted_canonical_turns", None)
+        if not callable(getter):
+            return
+        try:
+            rows = list(getter(conversation_id))
+        except Exception:
+            logger.warning("Failed to load live canonical turns for %s", conversation_id[:12], exc_info=True)
+            return
+        groups = [getattr(row, "turn_group_number", None) for row in rows]
+        if any(group is None or int(group) < 0 for group in groups):
+            # Positional turn numbers of a partial row set would not match.
+            return
+        payloads = {
+            turn_number: self._pair_payload_from_rows(pair_rows)
+            for turn_number, pair_rows in self._group_canonical_rows_into_pairs(rows)
+        }
+
+        self._restored_pending_turns = [
+            (entry[0], *payload)
+            if (payload := payloads.get(entry[0])) is not None
+            and tuple(payload[:2]) == tuple(entry[1:3])
+            else entry
+            for entry in self._restored_pending_turns
+        ]
 
     def restore_live_turns_from_canonical_rows(self, conversation_id: str) -> bool:
         """Restore only the live and pending turns from uncompacted canonical rows.

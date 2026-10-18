@@ -1157,9 +1157,8 @@ class RetrievalAssembler:
                 instrumentation["load_context_hint_cache_ms"] = _cache_load_ms
 
         _t_fetch = time.monotonic()
-        tag_summaries = self._store.get_all_tag_summaries(
-            conversation_id=self.config.conversation_id,
-        )
+        # The hint names topics; summary text and sources stay in storage.
+        tag_summaries = self._store.get_tag_summary_topics(self.config.conversation_id)
         if instrumentation is not None:
             instrumentation["get_all_tag_summaries_ms"] = round(
                 (time.monotonic() - _t_fetch) * 1000, 1

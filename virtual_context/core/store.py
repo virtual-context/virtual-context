@@ -28,6 +28,7 @@ from ..types import (
     StoredSummary,
     TagStats,
     TagSummary,
+    TagTopic,
 )
 from .progress_snapshot import ProgressSnapshot
 
@@ -356,6 +357,17 @@ class ContextStore(ABC):
     @abstractmethod
     def get_tag_summary(self, tag: str, conversation_id: str = "") -> TagSummary | None: ...
 
+    def get_tag_summary_topics(self, conversation_id: str) -> list[TagTopic]:
+        """Each stored topic's name and covered turn count, newest first.
+
+        Same topics and order as ``get_all_tag_summaries``; backends override
+        this with a query that leaves the summary text and sources in storage.
+        """
+        return [
+            TagTopic(tag=ts.tag, turn_count=len(ts.source_turn_numbers))
+            for ts in self.get_all_tag_summaries(conversation_id=conversation_id)
+        ]
+
     @abstractmethod
     def get_all_tag_summaries(self, *, conversation_id: str | None = None) -> list[TagSummary]:
         """Retrieve all tag summaries, ordered by tag name.
@@ -432,7 +444,7 @@ class ContextStore(ABC):
         the caller sees the most recent rows first. Split user/assistant rows
         are atomic at the window boundary. Filtering by ``tagged_at`` is
         intentionally NOT applied — fresh peer-channel rows must surface
-        before the tagger catches up.
+        before the tagger catches up. Rows carry no raw bodies.
 
         Backends that do not host canonical_turns (filesystem,
         secondary graph stores) return ``[]`` defensively.
@@ -616,6 +628,22 @@ class ContextStore(ABC):
         """
         return {}
 
+    def get_canonical_turn_audiences(
+        self,
+        keys: list[tuple[str, str]],
+    ) -> dict[tuple[str, str], tuple[str, int]]:
+        """Stored audience of each exact ``(conversation_id, canonical_turn_id)``.
+
+        Maps each found key to ``(audience_conversation_id,
+        audience_attribution_version)``; missing keys are omitted. Backends
+        override this with a query that reads only those two columns.
+        """
+        rows = self.get_canonical_turn_rows_by_id(keys, internal_validation=True)
+        return {
+            key: (row.audience_conversation_id, row.audience_attribution_version)
+            for key, row in rows.items()
+        }
+
     def delete_canonical_turn_chunk_embeddings(
         self,
         conversation_id: str,
@@ -705,6 +733,16 @@ class ContextStore(ABC):
         conversation_id: str,
     ) -> list[CanonicalTurnRow]:
         return []
+
+    def get_all_canonical_turn_texts(
+        self,
+        conversation_id: str,
+    ) -> list[CanonicalTurnRow]:
+        """Every canonical row with its text but without its raw bodies."""
+        rows = self.get_all_canonical_turns(conversation_id)
+        for row in rows:
+            row.user_raw_content = row.assistant_raw_content = None
+        return rows
 
     def count_canonical_turns(self, conversation_id: str) -> int:
         """Number of canonical_turn rows under the LITERAL conversation id.
