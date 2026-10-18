@@ -1278,6 +1278,9 @@ _SCHEMA_READY: set[str] = set()
 _SCHEMA_LOCK = threading.Lock()
 
 
+
+_CANONICAL_TURN_ROW_COLUMNS = """canonical_turn_id, conversation_id, turn_number, turn_group_number, sort_key, turn_hash, hash_version, normalized_user_text, normalized_assistant_text, user_content, assistant_content, user_raw_content, assistant_raw_content, primary_tag, tags_json, session_date, sender, origin_channel_id, origin_channel_label, sender_actor_id, source_message_id, reply_target_message_id, reply_subject_actor_id, reply_subject_label, reply_target_body, reply_attribution_version, audience_conversation_id, audience_attribution_version, origin_conversation_id, fact_signals_json, code_refs_json, tagged_at, compacted_at, first_seen_at, last_seen_at, source_batch_id, created_at, updated_at, covered_ingestible_entries"""
+
 class PostgresStore(PostgresVectorSearchMixin, RelationalStoreMixin, ContextStore):
     """PostgreSQL storage backend with tsvector FTS and full protocol support."""
 
@@ -3741,17 +3744,7 @@ class PostgresStore(PostgresVectorSearchMixin, RelationalStoreMixin, ContextStor
     def _load_canonical_turn_rows_raw(self, conversation_id: str) -> list[CanonicalTurnRow]:
         with self.pool.connection() as conn:
             rows = conn.execute(
-                """SELECT canonical_turn_id, conversation_id, turn_number, turn_group_number, sort_key, turn_hash, hash_version,
-                          normalized_user_text, normalized_assistant_text, user_content, assistant_content,
-                          user_raw_content, assistant_raw_content, primary_tag, tags_json, session_date,
-                          sender, origin_channel_id, origin_channel_label, sender_actor_id,
-                          source_message_id, reply_target_message_id, reply_subject_actor_id,
-                          reply_subject_label, reply_target_body, reply_attribution_version,
-                          audience_conversation_id, audience_attribution_version,
-                          origin_conversation_id,
-                          fact_signals_json, code_refs_json, tagged_at, compacted_at, first_seen_at,
-                          last_seen_at, source_batch_id, created_at, updated_at,
-                          covered_ingestible_entries
+                f"""SELECT {_CANONICAL_TURN_ROW_COLUMNS}
                    FROM canonical_turns_ordinal
                    WHERE conversation_id = %s
                    ORDER BY sort_key, canonical_turn_id""",
@@ -12500,6 +12493,74 @@ class PostgresStore(PostgresVectorSearchMixin, RelationalStoreMixin, ContextStor
         conversation_id: str,
     ) -> list[CanonicalTurnRow]:
         return self._load_canonical_turn_rows(conversation_id)
+
+    def get_canonical_turn_rows_in_groups(
+        self,
+        conversation_id: str,
+        *,
+        min_turn_group: int,
+        max_turn_group: int | None = None,
+    ) -> list[CanonicalTurnRow]:
+        """Full canonical rows of the turn groups in ``[min_turn_group, max_turn_group]``.
+
+        Same rows and order as ``get_all_canonical_turns`` restricted to those
+        groups, so a caller that needs only recent turns reads only them. A
+        conversation still on legacy (ungrouped) rows is read whole and filtered.
+        """
+        with self.pool.connection() as conn:
+            legacy = conn.execute(
+                "SELECT 1 FROM canonical_turns WHERE conversation_id = %s AND turn_group_number < 0 LIMIT 1",
+                (conversation_id,),
+            ).fetchone()
+            if legacy is None:
+                upper = "" if max_turn_group is None else " AND turn_group_number <= %s"
+                params = [conversation_id, int(min_turn_group)]
+                if max_turn_group is not None:
+                    params.append(int(max_turn_group))
+                rows = conn.execute(
+                    f"""SELECT {_CANONICAL_TURN_ROW_COLUMNS}
+                       FROM canonical_turns_ordinal
+                       WHERE conversation_id = %s AND turn_group_number >= %s{upper}
+                       ORDER BY sort_key, canonical_turn_id""",
+                    params,
+                ).fetchall()
+                return [_row_to_canonical_turn(row) for row in rows]
+        return [
+            row for row in self._load_canonical_turn_rows(conversation_id)
+            if int(row.turn_group_number) >= int(min_turn_group)
+            and (max_turn_group is None or int(row.turn_group_number) <= int(max_turn_group))
+        ]
+
+    def first_untagged_complete_group(self, conversation_id: str) -> int | None:
+        """Lowest turn group with both halves present and a row not yet tagged."""
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                """SELECT MIN(turn_group_number) AS first_group FROM (
+                       SELECT turn_group_number
+                       FROM canonical_turns
+                       WHERE conversation_id = %s AND turn_group_number >= 0
+                       GROUP BY turn_group_number
+                       HAVING SUM(CASE WHEN tagged_at IS NULL OR tagged_at = '' THEN 1 ELSE 0 END) > 0
+                          AND SUM(CASE WHEN btrim(coalesce(user_content, ''), %s) <> '' THEN 1 ELSE 0 END) > 0
+                          AND SUM(CASE WHEN btrim(coalesce(assistant_content, ''), %s) <> '' THEN 1 ELSE 0 END) > 0
+                   ) pending""",
+                (conversation_id, STRIP_WHITESPACE, STRIP_WHITESPACE),
+            ).fetchone()
+        value = row["first_group"] if row is not None else None
+        return int(value) if value is not None else None
+
+    def latest_session_date_before(self, conversation_id: str, turn_number: int) -> str:
+        """Session date of the newest turn before ``turn_number`` that has one."""
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                """SELECT session_date FROM canonical_turns_ordinal
+                   WHERE conversation_id = %s AND turn_number < %s
+                     AND btrim(coalesce(session_date, ''), %s) <> ''
+                   ORDER BY sort_key DESC, canonical_turn_id DESC
+                   LIMIT 1""",
+                (conversation_id, int(turn_number), STRIP_WHITESPACE),
+            ).fetchone()
+        return (row["session_date"] or "").strip() if row is not None else ""
 
     def get_canonical_turn_tags(
         self, conversation_id: str,

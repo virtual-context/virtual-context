@@ -499,6 +499,19 @@ class CompositeStore:
     ) -> list[CanonicalTurnRow]:
         return self._segments.get_all_canonical_turns(conversation_id)
 
+    def get_canonical_turn_rows_in_groups(
+        self, conversation_id: str, *, min_turn_group: int, max_turn_group: int | None = None,
+    ) -> list[CanonicalTurnRow]:
+        return self._segments.get_canonical_turn_rows_in_groups(
+            conversation_id, min_turn_group=min_turn_group, max_turn_group=max_turn_group,
+        )
+
+    def first_untagged_complete_group(self, conversation_id: str) -> int | None:
+        return self._segments.first_untagged_complete_group(conversation_id)
+
+    def latest_session_date_before(self, conversation_id: str, turn_number: int) -> str:
+        return self._segments.latest_session_date_before(conversation_id, turn_number)
+
     def get_canonical_turn_tags(self, conversation_id: str) -> list[tuple[str, int, str, list[str]]]:
         from .store import canonical_turn_tags
 

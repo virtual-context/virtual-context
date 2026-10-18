@@ -176,6 +176,34 @@ def canonical_turn_tags(store, conversation_id: str) -> list[tuple[str, int, str
     return ContextStore.get_canonical_turn_tags(store, conversation_id)
 
 
+def canonical_rows_in_groups(
+    store, conversation_id: str, *, min_turn_group: int, max_turn_group: int | None = None,
+) -> list:
+    """Full canonical rows of a turn-group range, from any store."""
+    loader = getattr(store, "get_canonical_turn_rows_in_groups", None)
+    if callable(loader):
+        return loader(conversation_id, min_turn_group=min_turn_group, max_turn_group=max_turn_group)
+    return ContextStore.get_canonical_turn_rows_in_groups(
+        store, conversation_id, min_turn_group=min_turn_group, max_turn_group=max_turn_group,
+    )
+
+
+def first_untagged_complete_group(store, conversation_id: str) -> int | None:
+    """Lowest turn group with both halves present and a row not yet tagged, from any store."""
+    finder = getattr(store, "first_untagged_complete_group", None)
+    if callable(finder):
+        return finder(conversation_id)
+    return ContextStore.first_untagged_complete_group(store, conversation_id)
+
+
+def latest_session_date_before(store, conversation_id: str, turn_number: int) -> str:
+    """Session date of the newest turn before ``turn_number`` that has one, from any store."""
+    finder = getattr(store, "latest_session_date_before", None)
+    if callable(finder):
+        return finder(conversation_id, turn_number)
+    return ContextStore.latest_session_date_before(store, conversation_id, turn_number)
+
+
 def tag_summary_embedding_vectors(store, conversation_id: str | None) -> dict[str, object]:
     """A conversation's tag summary embeddings as float32 arrays, from any store.
 
@@ -1346,6 +1374,42 @@ class ContextStore(ABC):
         anchors: list[tuple[int, str, str]],
     ) -> int:
         return 0
+
+    def get_canonical_turn_rows_in_groups(
+        self,
+        conversation_id: str,
+        *,
+        min_turn_group: int,
+        max_turn_group: int | None = None,
+    ) -> list[CanonicalTurnRow]:
+        """Full canonical rows of the turn groups in ``[min_turn_group, max_turn_group]``,
+        in ``get_all_canonical_turns`` order."""
+        return [
+            row for row in self.get_all_canonical_turns(conversation_id)
+            if int(row.turn_group_number) >= int(min_turn_group)
+            and (max_turn_group is None or int(row.turn_group_number) <= int(max_turn_group))
+        ]
+
+    def first_untagged_complete_group(self, conversation_id: str) -> int | None:
+        """Lowest turn group with both halves present and a row not yet tagged."""
+        halves: dict[int, list[bool]] = {}
+        for row in self.get_all_canonical_turns(conversation_id):
+            group = int(row.turn_group_number)
+            if group < 0:
+                continue
+            state = halves.setdefault(group, [False, False, False])
+            state[0] = state[0] or bool((row.user_content or "").strip())
+            state[1] = state[1] or bool((row.assistant_content or "").strip())
+            state[2] = state[2] or not row.tagged_at
+        pending = [group for group, (user, assistant, untagged) in halves.items() if user and assistant and untagged]
+        return min(pending) if pending else None
+
+    def latest_session_date_before(self, conversation_id: str, turn_number: int) -> str:
+        """Session date of the newest turn before ``turn_number`` that has one."""
+        for row in reversed(self.get_all_canonical_turns(conversation_id)):
+            if row.turn_number < turn_number and (row.session_date or "").strip():
+                return row.session_date.strip()
+        return ""
 
     def get_canonical_turn_tags(
         self, conversation_id: str,

@@ -1432,11 +1432,18 @@ class TestSessionStateMachine:
 
         # The durable walk derives the resume window from canonical rows:
         # group 0 is tagged, groups 1-2 are complete and untagged.
-        state.engine._store.get_all_canonical_turns.return_value = [
+        durable_rows = [
             _durable_row(0, "Q0", "A0", tagged_at="2026-01-01T00:00:00Z"),
             _durable_row(1, "Q1", "A1"),
             _durable_row(2, "Q2", "A2"),
         ]
+        store = state.engine._store
+        store.first_untagged_complete_group.return_value = 1
+        store.get_canonical_turn_rows_in_groups.side_effect = (
+            lambda _conv, *, min_turn_group, max_turn_group=None: [
+                row for row in durable_rows if row.turn_group_number >= min_turn_group
+            ]
+        )
 
         def ingest_gap(pairs, progress_callback=None, turn_offset=0, **kwargs):
             for i in range(0, len(pairs), 2):
@@ -1456,6 +1463,7 @@ class TestSessionStateMachine:
         state.engine.ingest_history.side_effect = ingest_gap
 
         assert state.resume_pending_ingestion_if_needed() is True
+        assert store.get_canonical_turn_rows_in_groups.call_args.kwargs["min_turn_group"] == 1
         time.sleep(0.5)
 
         assert state.session_state == SessionState.ACTIVE

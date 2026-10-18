@@ -20,7 +20,7 @@ from .engine_utils import extract_turn_pairs, get_recent_context
 from .canonical_turns import HASH_VERSION, compute_turn_hash_from_raw, utcnow_iso
 from .ingest_reconciler import IngestReconciler
 from .segmenter import pair_messages_into_turns
-from .store import ContextStore
+from .store import ContextStore, canonical_rows_in_groups, latest_session_date_before
 from .turn_tag_index import TurnTagIndex
 from ..types import CANONICAL_TAGGING_IDENTITY_KEY, Message
 
@@ -1935,8 +1935,14 @@ class TaggingPipeline:
                 raise RuntimeError(
                     "strict canonical tagging lifecycle epoch changed"
                 )
+            # Strict resolution matches each pair to the rows of its own turn
+            # group, so only this batch's groups are read.
             all_rows = sorted(
-                self._store.get_all_canonical_turns(self.config.conversation_id),
+                canonical_rows_in_groups(
+                    self._store, self.config.conversation_id,
+                    min_turn_group=turn_offset,
+                    max_turn_group=turn_offset + len(history_turns) - 1,
+                ),
                 key=lambda row: (row.sort_key, row.canonical_turn_id),
             )
             strict_rows_by_id = {
@@ -1956,13 +1962,11 @@ class TaggingPipeline:
         running_session_date = ""
         if turn_offset > 0:
             try:
-                prior_rows = self._store.get_all_canonical_turns(self.config.conversation_id)
+                running_session_date = latest_session_date_before(
+                    self._store, self.config.conversation_id, turn_offset,
+                )
             except Exception:
-                prior_rows = []
-            for row in reversed(prior_rows):
-                if row.turn_number < turn_offset and (row.session_date or "").strip():
-                    running_session_date = row.session_date.strip()
-                    break
+                running_session_date = ""
 
         for batch_turn, pair in enumerate(history_turns):
             user_msg, asst_msg = self._split_pair_messages(pair.messages)

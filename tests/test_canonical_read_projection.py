@@ -99,3 +99,58 @@ def test_canonical_turn_tags_match_the_full_rows(tmp_path):
         assert canonical_turn_tags(engine._store, "c") == full
     finally:
         engine.close()
+
+
+# Restarts, takeovers and ingestion also read only the turns they act on
+# (BUG-129): a multi-year conversation must not cost its whole history to
+# resume ingestion, take over a compaction, or ingest a batch.
+
+@pytest.mark.regression("BUG-129")
+def test_group_range_and_markers_match_the_full_read(tmp_path):
+    from virtual_context.core.store import ContextStore
+    engine, _compactor, _report = _compacted(tmp_path)
+    try:
+        store = engine._store
+        full = store.get_all_canonical_turns("c")
+        groups = sorted({int(row.turn_group_number) for row in full})
+        assert len(groups) >= 4
+        lo, hi = groups[1], groups[-2]
+        ranged = store.get_canonical_turn_rows_in_groups("c", min_turn_group=lo, max_turn_group=hi)
+        assert [r.canonical_turn_id for r in ranged] == [
+            r.canonical_turn_id for r in full if lo <= int(r.turn_group_number) <= hi
+        ]
+        assert ranged[0].user_raw_content == next(
+            r for r in full if r.canonical_turn_id == ranged[0].canonical_turn_id
+        ).user_raw_content
+        assert store.first_untagged_complete_group("c") == ContextStore.first_untagged_complete_group(store, "c")
+        for turn in (0, groups[2], groups[-1] + 1):
+            assert store.latest_session_date_before("c", turn) == ContextStore.latest_session_date_before(store, "c", turn)
+    finally:
+        engine.close()
+
+
+@pytest.mark.regression("BUG-129")
+def test_strict_history_ingest_reads_only_its_batch(tmp_path, monkeypatch):
+    engine, _compactor, _report = _compacted(tmp_path)
+    try:
+        callers = _record_full_reads(monkeypatch)
+        _compact_more(engine, ["saxifrage water in winter again"])
+        assert not _read_from(callers, "ingest_history")
+    finally:
+        engine.close()
+
+
+@pytest.mark.regression("BUG-129")
+def test_takeover_history_holds_only_uncompacted_turns(tmp_path, monkeypatch):
+    engine, _compactor, _report = _compacted(tmp_path)
+    try:
+        uncompacted = engine._store.get_uncompacted_canonical_turns("c")
+        callers = _record_full_reads(monkeypatch)
+        history, uncompacted_only = ProxyState._uncompacted_history(
+            types.SimpleNamespace(engine=engine), "c",
+        )
+        assert uncompacted_only
+        assert len(history) == 2 * len(uncompacted)
+        assert not callers
+    finally:
+        engine.close()

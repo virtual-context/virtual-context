@@ -1071,11 +1071,17 @@ def test_resume_pending_ingestion_spawns_heartbeat_sidecar() -> None:
             sort_key=float(turn) * 1000.0,
         )
 
-    state.engine._store.get_all_canonical_turns.return_value = [
+    durable_rows = [
         _durable_row(0, "Q0", "A0", tagged_at="2026-01-01T00:00:00Z"),
         _durable_row(1, "Q1", "A1"),
         _durable_row(2, "Q2", "A2"),
     ]
+    state.engine._store.first_untagged_complete_group.return_value = 1
+    state.engine._store.get_canonical_turn_rows_in_groups.side_effect = (
+        lambda _conv, *, min_turn_group, max_turn_group=None: [
+            row for row in durable_rows if row.turn_group_number >= min_turn_group
+        ]
+    )
 
     # Stub the heavy worker loop so the test ends quickly; the test only
     # asserts that the sidecar was spawned alongside the ingestion thread.

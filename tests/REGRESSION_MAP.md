@@ -5,6 +5,15 @@ Use `pytest -m regression` to run all regression tests.
 
 ## By Bug ID
 
+### BUG-129 — Ingestion resume, compaction takeover and batch ingest read the whole conversation
+
+- **Symptom**: every ingestion takeover of a long conversation loaded all of its canonical rows with their raw bodies (728 MB on one conversation, taken over 18 times in one day), so the work a resume or takeover cost grew with the conversation's age instead of with what was pending.
+- **Root cause**: ingestion resume, compaction takeover, post-ingest compaction and strict history ingest each read every canonical row (or rebuilt the whole history) and then used only the pending tail, a single batch, or one session date.
+- **Fix**: resume reads only the turn groups from its baseline or the first untagged complete group (`first_untagged_complete_group`, `get_canonical_turn_rows_in_groups`); takeover and post-ingest size their request from uncompacted turns only; strict ingest reads its batch's groups and seeds the session date with `latest_session_date_before`. Legacy ungrouped conversations still read whole and filter.
+- **Tests**:
+  - `test_canonical_read_projection.py` — group range and markers match the full read, strict ingest and takeover history make no full read
+  - `test_proxy_session.py::TestSessionStateMachine::test_resume_pending_ingestion_from_store_gap`, `test_legacy_ingestion_lease_ownership.py::test_resume_pending_ingestion_spawns_heartbeat_sidecar` — resume through the bounded reads
+
 ### BUG-128 — Tag-summary embeddings were held as Python float lists
 
 - **Symptom**: each compaction of a conversation with about 8,000 tag summaries allocated well over 100 MB of short-lived embedding data per pass (measured: 96 MB live, 162 MB peak per load, against 13 MB for the same values as float32).
@@ -1413,7 +1422,7 @@ Use `pytest -m regression` to run all regression tests.
 | `test_card_availability_and_adjudication.py` | BUG-064, BUG-065 |
 | `test_render_escape_host_attribution.py` | BUG-066, BUG-067 |
 | `test_tag_rollup_recovery.py` | BUG-126 |
-| `test_canonical_read_projection.py` | BUG-127 |
+| `test_canonical_read_projection.py` | BUG-127, BUG-129 |
 | `test_tag_summary_materialization.py` | BUG-041 |
 | `test_embedding_context_guard.py` | BUG-042 |
 | `test_embedding_reserved_seats.py` | BUG-043 |

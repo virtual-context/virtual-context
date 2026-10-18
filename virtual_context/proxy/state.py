@@ -1580,9 +1580,9 @@ class ProxyState:
             # that define this compaction input. A long-lived worker may carry
             # a stale request-history checkpoint after another worker commits.
             self._advance_compaction_watermark()
-            compact_history = self.engine._store.reconstruct_history_for_conv(
-                conversation_id,
-            )
+            # Compaction reads its own input rows from the store; the history
+            # here only sizes the request, so it holds the uncompacted turns.
+            compact_history, _ = self._uncompacted_history(conversation_id)
             from ..types import CompactionSignal
             signal = CompactionSignal(
                 priority="takeover", current_tokens=0, budget_tokens=0,
@@ -1829,8 +1829,15 @@ class ProxyState:
         total = self._completed_turn_count()
         physical_rows_available = True
         try:
+            # Resume starts at the indexed baseline or an earlier untagged
+            # group, so older rows are never read.
+            from ..core.store import canonical_rows_in_groups, first_untagged_complete_group
+            lower = baseline
+            first_untagged = first_untagged_complete_group(self.engine._store, conversation_id)
+            if first_untagged is not None:
+                lower = min(lower, first_untagged)
             physical_rows = sorted(
-                self.engine._store.get_all_canonical_turns(conversation_id),
+                canonical_rows_in_groups(self.engine._store, conversation_id, min_turn_group=lower),
                 key=lambda row: (row.sort_key, row.canonical_turn_id),
             )
         except (AttributeError, NotImplementedError):
@@ -3379,12 +3386,12 @@ class ProxyState:
             # authority. ``compacted_prefix_messages`` can lag a peer worker's
             # durable canonical commit until this request refreshes it.
             self._advance_compaction_watermark()
-            compact_history = self.engine._store.reconstruct_history_for_conv(
+            compact_history, uncompacted_only = self._uncompacted_history(
                 self.engine.config.conversation_id,
             )
             protected = self.engine.config.monitor.protected_recent_turns * 2
             watermark = self.engine._engine_state.compacted_prefix_messages
-            compactable = len(compact_history) - watermark - protected
+            compactable = len(compact_history) - protected - (0 if uncompacted_only else watermark)
             if compactable <= 0:
                 logger.info("POST-INGEST: no compactable messages (history=%d, watermark=%d, protected=%d)",
                             len(compact_history), watermark, protected)
@@ -3778,6 +3785,19 @@ class ProxyState:
         finally:
             if acquired_compaction_lock:
                 self._compaction_lock.release()
+
+    def _uncompacted_history(self, conversation_id: str) -> tuple[list[Message], bool]:
+        """Messages of the turns past the compaction watermark, oldest first.
+
+        The second value is False when the store cannot read uncompacted turns
+        alone and the whole conversation was reconstructed instead.
+        """
+        store = self.engine._store
+        getter = getattr(store, "get_uncompacted_canonical_turns", None)
+        if callable(getter):
+            from ..core.store import canonical_rows_to_history
+            return canonical_rows_to_history(list(getter(conversation_id))), True
+        return store.reconstruct_history_for_conv(conversation_id), False
 
     def _advance_compaction_watermark(self) -> None:
         """Refresh the derived compaction watermark from durable canonical turns.
