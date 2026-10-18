@@ -246,6 +246,7 @@ class SegmentStore(Protocol):
         self,
         conversation_id: str,
     ) -> list[CanonicalTurnRow]: ...
+    def get_canonical_turn_tags(self, conversation_id: str) -> list[tuple[str, int, str, list[str]]]: ...
     def has_complete_untagged_canonical_group(
         self,
         *,

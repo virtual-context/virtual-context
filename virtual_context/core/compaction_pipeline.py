@@ -13,7 +13,7 @@ from collections.abc import Callable, Collection
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from .store import ContextStore
+from .store import ContextStore, canonical_turn_tags
 from .structured_summary import validate_tag_rollup_inputs
 from .turn_tag_index import TurnTagIndex
 
@@ -1240,13 +1240,12 @@ class CompactionPipeline:
             for tag in wanted:  # stored rows are complete; the index may hold a few live turns
                 tag_to_turns.pop(tag, None)
                 tag_to_canonical_turn_ids.pop(tag, None)
-            for row in self._store.get_all_canonical_turns(self._config.conversation_id):
-                row_tags = set(getattr(row, "tags", None) or [])
-                if getattr(row, "primary_tag", ""):
-                    row_tags.add(row.primary_tag)
-                _raw_turn = getattr(row, "turn_number", -1)
-                row_turn = int(_raw_turn if _raw_turn is not None else -1)
-                row_cid = getattr(row, "canonical_turn_id", "") or ""
+            for row_cid, row_turn, primary_tag, tags in canonical_turn_tags(
+                self._store, self._config.conversation_id,
+            ):
+                row_tags = set(tags)
+                if primary_tag:
+                    row_tags.add(primary_tag)
                 for tag in row_tags & wanted:
                     tag_to_turns.setdefault(tag, []).append(row_turn)
                     if row_cid:

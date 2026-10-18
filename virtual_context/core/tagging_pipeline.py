@@ -437,7 +437,14 @@ class TaggingPipeline:
                 1,
             )
         )
-        rows = list(self._store.get_all_canonical_turns(self.config.conversation_id))
+        # The search compares hashes and reads group numbers and ids, never
+        # text, so it uses the content-free projection where the store has one.
+        project = getattr(self._store, "get_canonical_turn_reconcile_rows", None)
+        projected = project(self.config.conversation_id) if callable(project) else None
+        rows = list(
+            projected if projected is not None
+            else self._store.get_all_canonical_turns(self.config.conversation_id)
+        )
         matched_pair: tuple[object, object] | None = None
         search_order: list[int] = []
         approx_idx = max(0, entry.turn_number * 2)

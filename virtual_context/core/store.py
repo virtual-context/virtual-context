@@ -148,6 +148,14 @@ def canonical_rows_to_history(
     return history
 
 
+def canonical_turn_tags(store, conversation_id: str) -> list[tuple[str, int, str, list[str]]]:
+    """``(canonical_turn_id, turn_number, primary_tag, tags)`` per canonical turn, in order."""
+    loader = getattr(store, "get_canonical_turn_tags", None)
+    if callable(loader):
+        return loader(conversation_id)
+    return ContextStore.get_canonical_turn_tags(store, conversation_id)
+
+
 class ContextStore(ABC):
     """Pluggable storage backend for compacted conversation segments."""
 
@@ -1306,6 +1314,25 @@ class ContextStore(ABC):
         anchors: list[tuple[int, str, str]],
     ) -> int:
         return 0
+
+    def get_canonical_turn_tags(
+        self, conversation_id: str,
+    ) -> list[tuple[str, int, str, list[str]]]:
+        """``(canonical_turn_id, turn_number, primary_tag, tags)`` per canonical turn.
+
+        Same rows and order as ``get_all_canonical_turns``, without their text,
+        which for a long conversation is most of what that read moves.
+        """
+        out = []
+        for row in self.get_all_canonical_turns(conversation_id):
+            raw_turn = getattr(row, "turn_number", -1)
+            out.append((
+                getattr(row, "canonical_turn_id", "") or "",
+                int(raw_turn if raw_turn is not None else -1),
+                getattr(row, "primary_tag", "") or "",
+                list(getattr(row, "tags", None) or []),
+            ))
+        return out
 
     def get_canonical_turn_reconcile_rows(
         self,

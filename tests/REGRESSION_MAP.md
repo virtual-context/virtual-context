@@ -5,6 +5,14 @@ Use `pytest -m regression` to run all regression tests.
 
 ## By Bug ID
 
+### BUG-127 — Hot paths loaded every canonical turn with its raw bodies
+
+- **Symptom**: on a long conversation each tagged turn spent 5–12 s persisting, and every turn that compacted grew the serving process by about 1.5 GB that it did not return; memory pressure restarted the service repeatedly.
+- **Root cause**: `get_all_canonical_turns` returns full rows, including raw request and response bodies (728 MB for one conversation); the per-turn hash search, the proxy watermark refresh and the recovered-tag rollup each called it while reading only hashes, ids, group numbers, tags or the prefix count.
+- **Fix**: the hash search uses the content-free reconcile projection, the watermark refresh reads `get_compaction_watermark`, and the rollup reads the new `get_canonical_turn_tags` projection (id, turn number, primary tag, tags).
+- **Tests**:
+  - `test_canonical_read_projection.py` — no full-row read from any of the three paths, results unchanged, projection matches the full rows
+
 ### BUG-126 — Tag summaries lost to an interrupted compaction were never rebuilt
 
 - **Symptom**: a conversation's segment tags stayed without `tag_summaries` rows indefinitely (20 on one production conversation, some carried by 77 segments); the divergence check kept failing.
@@ -1397,6 +1405,7 @@ Use `pytest -m regression` to run all regression tests.
 | `test_card_availability_and_adjudication.py` | BUG-064, BUG-065 |
 | `test_render_escape_host_attribution.py` | BUG-066, BUG-067 |
 | `test_tag_rollup_recovery.py` | BUG-126 |
+| `test_canonical_read_projection.py` | BUG-127 |
 | `test_tag_summary_materialization.py` | BUG-041 |
 | `test_embedding_context_guard.py` | BUG-042 |
 | `test_embedding_reserved_seats.py` | BUG-043 |

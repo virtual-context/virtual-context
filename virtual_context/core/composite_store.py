@@ -494,6 +494,11 @@ class CompositeStore:
     ) -> list[CanonicalTurnRow]:
         return self._segments.get_all_canonical_turns(conversation_id)
 
+    def get_canonical_turn_tags(self, conversation_id: str) -> list[tuple[str, int, str, list[str]]]:
+        from .store import canonical_turn_tags
+
+        return canonical_turn_tags(self._segments, conversation_id)
+
     def count_canonical_turns(self, conversation_id: str) -> int:
         return self._segments.count_canonical_turns(conversation_id)
 

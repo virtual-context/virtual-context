@@ -24,6 +24,7 @@ from ..core.conversation_store import StaleConversationWriteError
 from ..core.exceptions import CanonicalSourceConflict
 from ..core.lifecycle_epoch import LifecycleEpochMismatch
 from ..core.segmenter import pair_messages_into_turns
+from ..core.store_capabilities import capabilities_of
 from ..engine import VirtualContextEngine
 from ..core.turn_tag_index import TurnTagIndex
 from ..types import CompactionLeaseLost, EngineState, Message, SplitResult, TurnTagEntry
@@ -3786,22 +3787,27 @@ class ProxyState:
         prefix rather than whatever happens to be in memory right now.
         """
         try:
-            rows = list(
-                self.engine._store.get_all_canonical_turns(
-                    self.engine.config.conversation_id,
+            store = self.engine._store
+            conversation_id = self.engine.config.conversation_id
+            if capabilities_of(store).canonical_sources:
+                # Read from scalar metadata; loading every row's bodies to
+                # count a prefix costs the size of the whole conversation.
+                new_wm, _ = store.get_compaction_watermark(conversation_id)
+                paired_rows = None
+            else:
+                paired_rows = self.engine._group_canonical_rows_into_pairs(
+                    list(store.get_all_canonical_turns(conversation_id)),
                 )
-            )
-            paired_rows = self.engine._group_canonical_rows_into_pairs(rows)
-            new_wm, _ = self.engine._canonical_prefix_watermark(paired_rows)
+                new_wm, _ = self.engine._canonical_prefix_watermark(paired_rows)
             old_wm = int(self.engine._engine_state.compacted_prefix_messages)
             if new_wm != old_wm:
                 self.engine._engine_state.compacted_prefix_messages = new_wm
                 logger.info(
                     "Compaction watermark refreshed from canonical rows: %d -> %d "
-                    "(paired_turns=%d)",
+                    "(paired_turns=%s)",
                     old_wm,
                     new_wm,
-                    len(paired_rows),
+                    len(paired_rows) if paired_rows is not None else "-",
                 )
             self.engine._engine_state.flushed_prefix_messages = min(
                 int(self.engine._engine_state.flushed_prefix_messages or 0),

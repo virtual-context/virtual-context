@@ -12501,6 +12501,27 @@ class PostgresStore(PostgresVectorSearchMixin, RelationalStoreMixin, ContextStor
     ) -> list[CanonicalTurnRow]:
         return self._load_canonical_turn_rows(conversation_id)
 
+    def get_canonical_turn_tags(
+        self, conversation_id: str,
+    ) -> list[tuple[str, int, str, list[str]]]:
+        with self.pool.connection() as conn:
+            rows = conn.execute(
+                """SELECT canonical_turn_id, turn_number, primary_tag, tags_json
+                   FROM canonical_turns_ordinal
+                   WHERE conversation_id = %s
+                   ORDER BY sort_key, canonical_turn_id""",
+                (conversation_id,),
+            ).fetchall()
+        return [
+            (
+                str(row["canonical_turn_id"] or ""),
+                int(row["turn_number"] if row["turn_number"] is not None else -1),
+                row["primary_tag"] or "",
+                list(json.loads(row["tags_json"] or "[]") or []),
+            )
+            for row in rows
+        ]
+
     def _get_canonical_turn_reconcile_rows_raw(
         self,
         conversation_id: str,
