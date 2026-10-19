@@ -261,3 +261,28 @@ def test_unlabeled_request_after_selected_history_stays_the_current_message():
     assert texts[-2] == "Y: Why cant you verify it"
     assert texts[-1].endswith("Finish the check")
     assert "#session:" not in texts[-1]
+
+
+@pytest.mark.regression("BUG-137")
+def test_retry_messages_with_selected_history_do_not_hide_the_replay_block():
+    # A retried turn appends a resume message that carries its own selected
+    # room history; the bootstrap message still holds the replay block.
+    retry = (
+        "Conversation info: ⟦openclaw:ctx⟧\n```json\n{\"chat_id\":\"telegram:-1\"}\n```\n\n"
+        + SELECTED
+        + "\nContinue the current task from the existing transcript."
+    )
+    body = {"model": "m", "input": [
+        {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "system"}]},
+        _user(GROUP_PROMPT),
+        _user(retry),
+        _user(retry),
+    ]}
+    out, n = expand_host_replay(body)
+    texts = [_text(i) for i in out["input"]]
+    assert n == 5 + 4
+    assert all("<conversation_context>" not in t for t in texts)
+    assert all("#session:" not in t and "chronological, selected" not in t for t in texts)
+    assert sum(t == "Unattributed user: show the plant" for t in texts) == 1
+    assert texts[-1].endswith("Continue the current task from the existing transcript.")
+    assert any(t.endswith("Current user request:\nWhich mix should I use?") for t in texts)

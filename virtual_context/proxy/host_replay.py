@@ -178,15 +178,41 @@ def _carries_history(text: str) -> bool:
     return "<conversation_context>" in text or bool(_SELECTED_HEADER_RE.search(text))
 
 
+def _newest_user_with(items: list, carries) -> int | None:
+    for index in range(len(items) - 1, -1, -1):
+        item = items[index]
+        if isinstance(item, dict) and item.get("type", "message") == "message" and item.get("role") == "user":
+            if carries(_item_text(item)):
+                return index
+    return None
+
+
+def _history_part(item: dict, carries) -> tuple[list, int | None]:
+    content = item.get("content")
+    parts = content if isinstance(content, list) else [{"type": "input_text", "text": content}]
+    at = next((i for i, part in enumerate(parts)
+               if isinstance(part, dict) and carries(str(part.get("text", "")))), None)
+    return parts, at
+
+
+def _has_block(text: str) -> bool:
+    return "<conversation_context>" in text
+
+
+def _has_selected(text: str) -> bool:
+    return bool(_SELECTED_HEADER_RE.search(text))
+
+
 def expand_host_replay(body: dict) -> tuple[dict, int]:
     """Split the newest host history in the payload into turns before its message.
 
     The history is normally in the current message. A host that projects
     history once into a thread's first message and then appends later turns
-    leaves it in an older user message; the newest message carrying history is
-    expanded either way, and older ones are left as they are. Within it, a
-    selected room-history section becomes turns first and the replay block's
-    turns follow.
+    leaves it in an older user message. The newest replay block becomes turns
+    before the message holding it, and the newest selected room-history
+    section becomes turns before its message (ahead of the block's turns when
+    both are in one message). Older replay blocks are left as they are; older
+    selected sections are removed, since the newest one supersedes them.
 
     Returns ``(body, inserted_item_count)``. The input body is never mutated;
     when there is nothing to expand the same object is returned with 0.
@@ -194,43 +220,59 @@ def expand_host_replay(body: dict) -> tuple[dict, int]:
     items = body.get("input") if isinstance(body, dict) else None
     if not isinstance(items, list):
         return body, 0
-    target = None
-    for index in range(len(items) - 1, -1, -1):
-        item = items[index]
-        if isinstance(item, dict) and item.get("type", "message") == "message" and item.get("role") == "user":
-            if _carries_history(_item_text(item)):
-                target = index
-                break
-    if target is None:
+    block_at = _newest_user_with(items, _has_block)
+    selected_at = _newest_user_with(items, _has_selected)
+    if block_at is None and selected_at is None:
         return body, 0
+    texts: dict[int, tuple[list, int, str]] = {}
+    inserted: dict[int, list[tuple[str, str]]] = {}
     # Only the text part holding the history is rewritten; every other part of
-    # the current message (images, files, audio, further text) is kept as-is.
-    content = items[target].get("content")
-    parts = content if isinstance(content, list) else [{"type": "input_text", "text": content}]
-    at = next((i for i, part in enumerate(parts)
-               if isinstance(part, dict) and _carries_history(str(part.get("text", "")))), None)
-    if at is None:
+    # the message (images, files, audio, further text) is kept as-is.
+    for index, item in enumerate(items):
+        if index > (selected_at if selected_at is not None else -1) and index != block_at:
+            continue
+        if not (isinstance(item, dict) and item.get("type", "message") == "message" and item.get("role") == "user"):
+            continue
+        parts, at = _history_part(item, _carries_history)
+        if at is None:
+            continue
+        text, entries = _take_selected_history(parts[at]["text"])
+        if index != selected_at:
+            entries = []
+        replayed = []
+        if index == block_at:
+            match = _BLOCK_RE.search(text)
+            replayed = parse_replay_block(match.group(1)) if match else []
+            if match and replayed:
+                before = _PREAMBLE_RE.sub("", text[:match.start()]).rstrip()
+                after = text[match.end():].lstrip()
+                text = (before + "\n\n" + after) if before else after
+        if text == parts[at]["text"] and not entries and not replayed:
+            continue
+        texts[index] = (parts, at, text.strip())
+        inserted[index] = entries + replayed
+    if not inserted:
         return body, 0
-    text, entries = _take_selected_history(parts[at]["text"])
-    match = _BLOCK_RE.search(text)
-    replayed = parse_replay_block(match.group(1)) if match else []
-    if match and replayed:
-        before = _PREAMBLE_RE.sub("", text[:match.start()]).rstrip()
-        after = text[match.end():].lstrip()
-        text = (before + "\n\n" + after).strip() if before else after.strip()
-    else:
-        text = text.strip()
-    entries = entries + replayed
-    if not entries:
+    out_items: list = []
+    count = 0
+    for index, item in enumerate(items):
+        if index in texts:
+            parts, at, text = texts[index]
+            expanded = [_message(role, entry) for role, entry in inserted[index]]
+            out_items.extend(expanded)
+            count += len(expanded)
+            current = copy.deepcopy(item)
+            new_parts = copy.deepcopy(parts)
+            new_parts[at] = {**new_parts[at], "text": text}
+            current["content"] = new_parts
+            out_items.append(current)
+        else:
+            out_items.append(item)
+    if not count:
         return body, 0
-    current = copy.deepcopy(items[target])
-    new_parts = copy.deepcopy(parts)
-    new_parts[at] = {**new_parts[at], "text": text}
-    current["content"] = new_parts
-    expanded = [_message(role, entry) for role, entry in entries]
     out = dict(body)
-    out["input"] = list(items[:target]) + expanded + [current] + list(items[target + 1:])
-    return out, len(expanded)
+    out["input"] = out_items
+    return out, count
 
 
 def without_host_replayed_groups(replay_messages: list, body: dict, fmt) -> list:

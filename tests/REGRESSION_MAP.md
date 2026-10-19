@@ -5,6 +5,14 @@ Use `pytest -m regression` to run all regression tests.
 
 ## By Bug ID
 
+### BUG-137 — Retried turn sent the host's replayed history unexpanded
+
+- **Symptom**: after a failed attempt, each retry of a fresh host thread reached upstream at 365k–607k tokens, though the first attempt was trimmed to 76k.
+- **Root cause**: a retry appends a resume message carrying its own selected room-history section. Expansion only rewrote the newest message carrying any history, so the bootstrap message's replay block (over a million characters, mostly old tool output) stayed whole in a user message that no history filter can trim, and each earlier resume message kept its own copy of the room history.
+- **Fix**: the newest replay block and the newest selected section are each expanded before their own message; older selected sections are removed.
+- **Tests**:
+  - `test_host_replay_expansion.py` — `test_retry_messages_with_selected_history_do_not_hide_the_replay_block`
+
 ### BUG-136 — Last exchange plus a new message was appended a second time
 
 - **Symptom**: a stored question and its reply appeared twice in canonical storage, with the same turn hash and platform message id.
@@ -1445,7 +1453,7 @@ Use `pytest -m regression` to run all regression tests.
 | `test_context_cache_prefix.py` | PROXY-027 |
 | `test_responses_context_placement.py` | PROXY-027 |
 | `test_chat_context_placement.py` | PROXY-027 |
-| `test_host_replay_expansion.py` | PROXY-026, BUG-118, BUG-119, BUG-133 |
+| `test_host_replay_expansion.py` | PROXY-026, BUG-118, BUG-119, BUG-133, BUG-137 |
 | `test_unreplied_turns_compaction.py` | BUG-079 |
 | `test_postgres_store.py` | BUG-078 |
 | `test_tui.py` | BUG-002 |
