@@ -1579,13 +1579,24 @@ async def prepare_payload(
             wait_ms += _note_prep("wait_for_prior_tag", t0)
             # Backpressure: if last tag_turn hit the hard threshold,
             # wait for pending compaction to finish before proceeding.
-            # Soft threshold → async (no wait), hard → block until caught up.
-            if state._last_compact_priority == "hard":
+            # Soft threshold → async (no wait), hard → block until caught up,
+            # unless the protected window alone already reaches the hard
+            # threshold: then the compaction cannot change this payload and
+            # the request goes ahead instead of paying for it.
+            _compact_wait = state._compact_wait_decision
+            if _compact_wait.should_wait():
                 t_compact = time.monotonic()
                 await state.wait_for_compact_async(
                     timeout=_prior_work_timeout,
                 )
                 wait_ms += _note_prep("wait_for_prior_compact", t_compact)
+            elif _compact_wait.priority == "hard":
+                logger.info(
+                    "COMPACT_WAIT_SKIPPED conv=%s floor=%dt hard=%dt: pending compaction "
+                    "cannot bring this request under the hard threshold",
+                    state.engine.config.conversation_id[:12],
+                    _compact_wait.floor_tokens, _compact_wait.hard_tokens,
+                )
 
             if not state.is_conversation_deleted():
                 live_history = (

@@ -30,6 +30,7 @@ from ..engine import VirtualContextEngine
 from ..core.turn_tag_index import TurnTagIndex
 from ..types import CompactionLeaseLost, EngineState, Message, SplitResult, TurnTagEntry
 
+from .compaction_backpressure import CompactionWaitDecision, decide_compaction_wait
 from .helpers import (
     _strip_envelope,
     _extract_ingestible_messages,
@@ -196,6 +197,7 @@ class ProxyState:
         self._pending_compact: Future | None = None
         self._pending_split: Future | None = None
         self._last_compact_priority: str = ""  # "soft" or "hard" from last tag_turn
+        self._compact_wait_decision = CompactionWaitDecision()  # whether the next request waits on it
         self._ingested_conversations: set[str] = set()
         self._ingested_first_hash: dict[str, str] = {}  # conversation_id → hash of first message
         self._ingested_turn_count: dict[str, int] = {}   # conversation_id → turn count at ingestion
@@ -2362,6 +2364,43 @@ class ProxyState:
         protected_count = protected_recent_turns * 2
         return max(0, len(history) - protected_count)
 
+    def _protected_floor_tokens(self, history: list[Message]) -> int:
+        """Tokens of the turns compaction leaves in place (the protected window)."""
+        counter = getattr(self.engine, "_token_counter", None)
+        total = 0
+        for message in history[self._compaction_target_end(history):]:
+            text = message.content if isinstance(message.content, str) else str(message.content)
+            try:
+                total += int(counter(text)) if callable(counter) else len(text) // 4
+            except Exception:
+                total += len(text) // 4
+        return total
+
+    def _decide_compaction_wait(self, signal: object, history: list[Message]) -> CompactionWaitDecision:
+        """Whether the next request should block on the compaction *signal* starts.
+
+        Only a hard signal is ever waited on, and only when the protected
+        window leaves room under the hard threshold; otherwise the wait could
+        not change the payload and would only delay the request.
+        """
+        if signal is None or str(getattr(signal, "priority", "") or "") != "hard":
+            return decide_compaction_wait(signal, floor_tokens=0, hard_threshold=1.0)
+        try:
+            hard_threshold = float(self.engine.config.monitor.hard_threshold)
+        except (AttributeError, TypeError, ValueError):
+            hard_threshold = 1.0
+        decision = decide_compaction_wait(
+            signal, floor_tokens=self._protected_floor_tokens(history), hard_threshold=hard_threshold,
+        )
+        if not decision.should_wait():
+            logger.info(
+                "COMPACT_WAIT_UNRELIEVABLE conv=%s floor=%dt hard=%dt payload=%dt: the protected "
+                "window alone reaches the hard threshold, so requests will not wait for this compaction",
+                self.engine.config.conversation_id[:12], decision.floor_tokens, decision.hard_tokens,
+                int(getattr(signal, "current_tokens", 0) or 0),
+            )
+        return decision
+
     def _engine_state_int(self, field_name: str, default: int = 0) -> int:
         raw = getattr(getattr(self.engine, "_engine_state", None), field_name, default)
         try:
@@ -2611,6 +2650,7 @@ class ProxyState:
                 turn_number=turn,
             )
             self._last_compact_priority = signal.priority if signal else ""
+            self._compact_wait_decision = self._decide_compaction_wait(signal, history)
 
             tag_ms = round((time.monotonic() - t0) * 1000, 1)
             _tti = self.engine._turn_tag_index.entries
@@ -3602,6 +3642,7 @@ class ProxyState:
         self._pending_compact = None
         self._pending_split = None
         self._last_compact_priority = ""
+        self._compact_wait_decision = CompactionWaitDecision()
         self._initial_turns = None
         self._initial_tag_count = None
         self._initial_payload_kb = None

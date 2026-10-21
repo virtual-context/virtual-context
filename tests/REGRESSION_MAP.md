@@ -5,6 +5,14 @@ Use `pytest -m regression` to run all regression tests.
 
 ## By Bug ID
 
+### BUG-140 — Request waited on a compaction that could not relieve the overflow
+
+- **Symptom**: a request whose previous turn tripped the hard threshold blocked for the whole compaction (61 s measured) and then went upstream at nearly the same size, because the compaction removed 7.8k of 279k overflow tokens.
+- **Root cause**: the backpressure wait keyed on the signal priority alone. Compaction only removes the turns before the protected window, so when that window alone reaches the hard threshold the wait cannot change the payload.
+- **Fix**: the tag pass records a `CompactionWaitDecision` with the protected-window floor and the hard-threshold token count; the request waits only when the floor leaves room under the threshold and otherwise logs `COMPACT_WAIT_SKIPPED` and proceeds.
+- **Tests**:
+  - `test_compaction_backpressure.py`
+
 ### BUG-139 — Replay block split by an inline image was never expanded
 
 - **Symptom**: a host prompt whose replayed history carried an attachment arrived as text, image, text; the block opened in the first text part and closed in the last, so no single part held a complete block and the million-character prompt went upstream whole.
@@ -1470,6 +1478,7 @@ Use `pytest -m regression` to run all regression tests.
 | `test_responses_context_placement.py` | PROXY-027 |
 | `test_chat_context_placement.py` | PROXY-027 |
 | `test_host_replay_expansion.py` | PROXY-026, BUG-118, BUG-119, BUG-133, BUG-137, BUG-138, BUG-139 |
+| `test_compaction_backpressure.py` | BUG-140 |
 | `test_unreplied_turns_compaction.py` | BUG-079 |
 | `test_postgres_store.py` | BUG-078 |
 | `test_tui.py` | BUG-002 |
