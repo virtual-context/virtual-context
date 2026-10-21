@@ -45,7 +45,7 @@ def run_import(args: argparse.Namespace) -> int:
             files_skipped += 1
             continue
 
-        print(f"Importing {len(messages)} messages from conversation {conversation_id[:8]}...")
+        print(f"Importing {len(messages)} messages from conversation {conversation_id}...")
 
         # Override conversation_id on the loaded config so engine writes to the
         # correct conversation row without discarding the user's storage settings.

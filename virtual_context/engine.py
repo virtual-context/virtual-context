@@ -181,7 +181,7 @@ class VirtualContextEngine:
         self.judgment_runtime = _build_judgment_runtime(self.config.judgment)
         logger.info(
             "JUDGMENT_RUNTIME conv=%s mode=%s seams=%s",
-            self.config.conversation_id[:8], self.judgment_runtime.mode.value,
+            self.config.conversation_id, self.judgment_runtime.mode.value,
             ",".join(f"{k}:{v.value}" for k, v in sorted(self.judgment_runtime.seam_modes.items())) or "-",
         )
         _init_marks.append(("judgment", _init_time.monotonic()))
@@ -392,7 +392,7 @@ class VirtualContextEngine:
                 if not cache_generation_matches:
                     logger.info(
                         "Ignoring Redis snapshot for conversation %s because its generation does not match the active lifecycle",
-                        self.config.conversation_id[:12],
+                        self.config.conversation_id,
                     )
                 elif not _store_loaded:
                     self._apply_cached_state(_cached)
@@ -408,14 +408,14 @@ class VirtualContextEngine:
                         self._restored_checkpoint_source = "store+redis"
                         logger.info(
                             "Session cache history accepted for committed checkpoint %s (messages=%d, version=%s)",
-                            self.config.conversation_id[:12],
+                            self.config.conversation_id,
                             len(self._restored_conversation_history),
                             _cached.get("version", "?"),
                         )
                 else:
                     logger.info(
                         "Ignoring Redis snapshot for conversation %s because it does not match the committed store checkpoint",
-                        self.config.conversation_id[:12],
+                        self.config.conversation_id,
                     )
         else:
             # Provider mode: state will be injected by caller before each request.
@@ -573,7 +573,7 @@ class VirtualContextEngine:
                     "id %s; falling back to caller-driven hydration which "
                     "may load source-keyed state. Underlying error (transient "
                     "or persistent) will retry on next engine construction.",
-                    self.config.conversation_id[:12], exc_info=True,
+                    self.config.conversation_id, exc_info=True,
                 )
                 _session = None
             if _session is not None and not getattr(_session, "deleted", False):
@@ -582,7 +582,7 @@ class VirtualContextEngine:
                 logger.info(
                     "Engine self-hydrated from provider for resolver-rebound "
                     "id %s (compacted=%d, flushed=%d, last_completed_turn=%d)",
-                    self.config.conversation_id[:12],
+                    self.config.conversation_id,
                     self._engine_state.compacted_prefix_messages,
                     self._engine_state.flushed_prefix_messages,
                     self._engine_state.last_completed_turn,
@@ -592,7 +592,7 @@ class VirtualContextEngine:
         _init_marks.append(("vocabulary", _init_time.monotonic()))
         logger.info(
             "ENGINE_INIT_BREAKDOWN conv=%s total=%.1fms %s",
-            self.config.conversation_id[:12],
+            self.config.conversation_id,
             (_init_marks[-1][1] - _init_marks[0][1]) * 1000,
             " ".join(
                 f"{name}={(t - _init_marks[i][1]) * 1000:.1f}ms"
@@ -1398,7 +1398,7 @@ class VirtualContextEngine:
         except Exception:
             logger.warning(
                 "Failed to derive compaction watermark from canonical rows for %s",
-                conversation_id[:12],
+                conversation_id,
                 exc_info=True,
             )
             return None
@@ -1428,7 +1428,7 @@ class VirtualContextEngine:
         except Exception:
             logger.warning(
                 "Failed to load canonical turns for conversation %s",
-                conversation_id[:12],
+                conversation_id,
                 exc_info=True,
             )
             return False
@@ -1541,7 +1541,7 @@ class VirtualContextEngine:
             len(compacted_pairs),
             len(live_pairs),
             len(pending_pairs),
-            conversation_id[:12],
+            conversation_id,
         )
         return True
 
@@ -1558,7 +1558,7 @@ class VirtualContextEngine:
         try:
             rows = list(getter(conversation_id))
         except Exception:
-            logger.warning("Failed to load live canonical turns for %s", conversation_id[:12], exc_info=True)
+            logger.warning("Failed to load live canonical turns for %s", conversation_id, exc_info=True)
             return
         groups = [getattr(row, "turn_group_number", None) for row in rows]
         if any(group is None or int(group) < 0 for group in groups):
@@ -1592,7 +1592,7 @@ class VirtualContextEngine:
         try:
             rows = list(getter(conversation_id))
         except Exception:
-            logger.warning("Failed to load live canonical turns for %s", conversation_id[:12], exc_info=True)
+            logger.warning("Failed to load live canonical turns for %s", conversation_id, exc_info=True)
             return False
         if any(getattr(row, "turn_group_number", None) is None for row in rows):
             return False
@@ -1610,7 +1610,7 @@ class VirtualContextEngine:
         logger.info(
             "Canonical live restore loaded %d live and %d pending turns for conversation %s",
             len(self._restored_conversation_history), len(self._restored_pending_turns),
-            conversation_id[:12],
+            conversation_id,
         )
         return True
 
@@ -1672,7 +1672,7 @@ class VirtualContextEngine:
         logger.info(
             "Restored engine state: conversation=%s, compacted_prefix_messages=%d, indexed=%d, completed=%d, "
             "turns=%d, split_processed=%d, working_set=%d, history_messages=%d pending_turns=%d",
-            saved.conversation_id[:12], saved.compacted_prefix_messages,
+            saved.conversation_id, saved.compacted_prefix_messages,
             self._engine_state.last_indexed_turn,
             self._engine_state.last_completed_turn,
             len(saved.turn_tag_entries), len(saved.split_processed_tags),
@@ -2094,7 +2094,7 @@ class VirtualContextEngine:
                     logger.warning(
                         "Defensive recovery: turn_tag_entries reconstruction "
                         "failed for %s",
-                        self.config.conversation_id[:12], exc_info=True,
+                        self.config.conversation_id, exc_info=True,
                     )
 
     def note_session_state_saved(self, version: int | None) -> None:
@@ -2251,7 +2251,7 @@ class VirtualContextEngine:
         except StaleConversationWriteError as e:
             logger.info(
                 "Suppressed stale state save for conversation %s: %s",
-                self.config.conversation_id[:12],
+                self.config.conversation_id,
                 e,
             )
             return False
@@ -2694,7 +2694,7 @@ class VirtualContextEngine:
         except StaleConversationWriteError as exc:
             logger.info(
                 "Suppressed stale completed-turn persist for conversation %s: %s",
-                self.config.conversation_id[:12],
+                self.config.conversation_id,
                 exc,
             )
             return _completion_outcome(
@@ -2709,7 +2709,7 @@ class VirtualContextEngine:
             logger.info(
                 "Lifecycle-epoch mismatch during completed-turn persist for "
                 "conversation %s: %s",
-                self.config.conversation_id[:12],
+                self.config.conversation_id,
                 exc,
             )
             if _source_claim:
@@ -2752,7 +2752,7 @@ class VirtualContextEngine:
                 "Structural error persisting completed turn %d for "
                 "conversation %s: %s",
                 turn_number,
-                self.config.conversation_id[:12],
+                self.config.conversation_id,
                 exc,
                 exc_info=True,
             )
@@ -2775,7 +2775,7 @@ class VirtualContextEngine:
                 logger.exception(
                     "Failed canonical history reconstruction after exact "
                     "completion for conversation %s",
-                    self.config.conversation_id[:12],
+                    self.config.conversation_id,
                 )
                 state_history = []
         self._save_state(
@@ -3232,7 +3232,7 @@ class VirtualContextEngine:
                 "backfill_tag_summaries: no compactor configured; returning 0 "
                 "(no LLM provider in engine.config.providers + "
                 "config.summarization.provider)",
-                extra={"conversation_id": conv_id[:12]},
+                extra={"conversation_id": conv_id},
             )
             return 0
 
@@ -3243,13 +3243,13 @@ class VirtualContextEngine:
         logger.info(
             "backfill_tag_summaries: starting conv=%s segments=%d "
             "force_rebuild=%s",
-            conv_id[:12], len(all_segments), force_rebuild,
+            conv_id, len(all_segments), force_rebuild,
         )
         if not all_segments:
             logger.info(
                 "backfill_tag_summaries: no stored segments for conv=%s; "
                 "returning 0",
-                conv_id[:12],
+                conv_id,
             )
             return 0
 
@@ -3272,13 +3272,13 @@ class VirtualContextEngine:
         logger.info(
             "backfill_tag_summaries: derived %d cover tags from segments "
             "for conv=%s",
-            len(cover_tags), conv_id[:12],
+            len(cover_tags), conv_id,
         )
         if not cover_tags:
             logger.info(
                 "backfill_tag_summaries: no non-_general cover tags; returning 0 "
                 "for conv=%s",
-                conv_id[:12],
+                conv_id,
             )
             return 0
 
@@ -3297,13 +3297,13 @@ class VirtualContextEngine:
                 logger.info(
                     "backfill_tag_summaries: idempotency filter kept %d tags, "
                     "skipped %d that already had summaries for conv=%s",
-                    len(cover_tags), _skipped, conv_id[:12],
+                    len(cover_tags), _skipped, conv_id,
                 )
             if not cover_tags:
                 logger.info(
                     "backfill_tag_summaries: all cover tags already have "
                     "summaries; returning 0 for conv=%s",
-                    conv_id[:12],
+                    conv_id,
                 )
                 return 0
 
@@ -3327,13 +3327,13 @@ class VirtualContextEngine:
             logger.info(
                 "backfill_tag_summaries: pruned %d cover tag(s) with no "
                 "matching segments for conv=%s (pruned=%s)",
-                len(_pruned_tags), conv_id[:12], _pruned_tags[:10],
+                len(_pruned_tags), conv_id, _pruned_tags[:10],
             )
         if not cover_tags:
             logger.info(
                 "backfill_tag_summaries: no cover tags survive segment-matching "
                 "filter; returning 0 for conv=%s",
-                conv_id[:12],
+                conv_id,
             )
             return 0
 
@@ -3377,7 +3377,7 @@ class VirtualContextEngine:
         logger.info(
             "backfill_tag_summaries: invoking compactor for %d cover tags "
             "(max_turn=%d, conv=%s)",
-            len(cover_tags), max_turn, conv_id[:12],
+            len(cover_tags), max_turn, conv_id,
         )
         from .core.structured_summary import validate_tag_rollup_inputs
 
@@ -3420,7 +3420,7 @@ class VirtualContextEngine:
                 "backfill_tag_summaries: compactor returned no summary for "
                 "%d of %d requested tags for conv=%s (compactor_duration_s=%.2f); "
                 "missing=%s",
-                len(_missing_tags), len(cover_tags), conv_id[:12],
+                len(_missing_tags), len(cover_tags), conv_id,
                 _compactor_elapsed, _missing_tags[:20],
             )
 
@@ -3434,7 +3434,7 @@ class VirtualContextEngine:
                 ts.tag, segments_contrib,
                 getattr(ts, "summary_tokens", 0),
                 getattr(ts, "covers_through_turn", -1),
-                conv_id[:12],
+                conv_id,
             )
             try:
                 embed_fn = self._semantic.get_embed_fn() if self._semantic else None
@@ -3451,7 +3451,7 @@ class VirtualContextEngine:
                 logger.warning(
                     "backfill_tag_summaries: failed to embed tag '%s' during "
                     "backfill for conv=%s: %s",
-                    ts.tag, conv_id[:12], e,
+                    ts.tag, conv_id, e,
                 )
             count += 1
 
@@ -3460,7 +3460,7 @@ class VirtualContextEngine:
             "backfill_tag_summaries: done conv=%s tags_attempted=%d "
             "tags_persisted=%d tags_missing=%d compactor_duration_s=%.2f "
             "total_duration_s=%.2f force_rebuild=%s",
-            conv_id[:12], len(cover_tags), count, len(_missing_tags),
+            conv_id, len(cover_tags), count, len(_missing_tags),
             _compactor_elapsed, _total_elapsed, force_rebuild,
         )
         return count
@@ -3523,7 +3523,7 @@ class VirtualContextEngine:
             logger.warning(
                 "backfill_fact_embeddings: no embedding provider configured; "
                 "returning zero counts (conv=%s)",
-                conversation_id[:12],
+                conversation_id,
             )
             return report
 
@@ -3573,7 +3573,7 @@ class VirtualContextEngine:
                 logger.warning(
                     "backfill_fact_embeddings: failed to embed fact %s for "
                     "conv=%s: %s",
-                    fact.id, conversation_id[:12], e,
+                    fact.id, conversation_id, e,
                 )
                 continue
             self._store.store_fact_embeddings(
@@ -3585,7 +3585,7 @@ class VirtualContextEngine:
             "backfill_fact_embeddings: done conv=%s embedded=%d "
             "skipped_current=%d model_mismatch=%d malformed=%d "
             "windowed_out=%d force_rebuild=%s",
-            conversation_id[:12], report["embedded"],
+            conversation_id, report["embedded"],
             report["skipped_current"], report["model_mismatch"],
             report["malformed"], report["windowed_out"], force_rebuild,
         )
@@ -4598,7 +4598,7 @@ class VirtualContextEngine:
             "backfill_senders: done conv=%s eligible=%d updated=%d "
             "skipped_existing=%d skipped_no_raw=%d skipped_no_sender=%d "
             "failed=%d dry_run=%s",
-            conversation_id[:12], report["eligible"], report["updated"],
+            conversation_id, report["eligible"], report["updated"],
             report["skipped_existing"], report["skipped_no_raw"],
             report["skipped_no_sender"], report["failed"], dry_run,
         )
@@ -4780,7 +4780,7 @@ class VirtualContextEngine:
             "backfill_channels: done conv=%s eligible=%d updated=%d "
             "skipped_existing=%d skipped_receipted=%d skipped_no_derivation=%d derived_from_raw=%d "
             "derived_from_origin=%d failed=%d dry_run=%s",
-            conversation_id[:12], report["eligible"], report["updated"],
+            conversation_id, report["eligible"], report["updated"],
             report["skipped_existing"], report["skipped_receipted"],
             report["skipped_no_derivation"],
             report["derived_from_raw"], report["derived_from_origin"],
@@ -4934,7 +4934,7 @@ class VirtualContextEngine:
             "subject_replaced=%d orphan_chunks=%d orphan_rows=%d "
             "orphan_deleted=%d skipped_no_canonical_id=%d "
             "skipped_no_embedder=%d failed=%d dry_run=%s",
-            conversation_id[:12], report["subject_ok"],
+            conversation_id, report["subject_ok"],
             report["subject_missing"], report["subject_stale"],
             report["subject_created"], report["subject_replaced"],
             report["orphan_chunks"], report["orphan_rows"],
@@ -5030,7 +5030,7 @@ class VirtualContextEngine:
             except Exception:
                 logger.warning(
                     "CANONICAL_UPSERT_CONVERSATION_FAILED conv=%s",
-                    conv_id[:12],
+                    conv_id,
                     exc_info=True,
                 )
         # Epoch is taken from self._engine_state (loaded on __init__ via
@@ -5044,7 +5044,7 @@ class VirtualContextEngine:
         )
         logger.info(
             "SYNC_CANONICAL_ENTRIES: conv=%s mode=%s written=%d matched=%d appended=%d prepended=%d inserted=%d",
-            conv_id[:12],
+            conv_id,
             result.merge_mode,
             result.turns_written,
             result.turns_matched,

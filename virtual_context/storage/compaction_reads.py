@@ -69,7 +69,7 @@ def _backfill_all_legacy_groups(store, conversation_id):
     except Exception:
         # Matches the old loader's lazy-repair fallback. The read below still
         # derives exact legacy groups; the transaction rolled back any repair.
-        logger.warning("Lazy canonical group repair failed for %s", conversation_id[:12], exc_info=True)
+        logger.warning("Lazy canonical group repair failed for %s", conversation_id, exc_info=True)
 
 
 def _legacy_groups(rows):

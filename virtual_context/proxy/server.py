@@ -672,7 +672,7 @@ async def prepare_payload(
             stage_bits.append(f"unaccounted={breakdown['unaccounted']:.1f}ms")
         logger.info(
             "PREP_BREAKDOWN conv=%s turn=%s format=%s msgs=%d payload=%sKB in=%dt out=%dt total=%sms %s",
-            conversation_id[:12] if conversation_id else "none",
+            conversation_id if conversation_id else "none",
             turn,
             api_format,
             _initial_message_count,
@@ -944,7 +944,7 @@ async def prepare_payload(
         except Exception:
             logger.debug(
                 "Failed to record in-memory payload accounting for conv=%s",
-                state.engine.config.conversation_id[:12],
+                state.engine.config.conversation_id,
                 exc_info=True,
             )
 
@@ -1198,7 +1198,7 @@ async def prepare_payload(
         except Exception:
             logger.exception(
                 "handle_prepare_payload failed for conv=%s",
-                state.engine.config.conversation_id[:12],
+                state.engine.config.conversation_id,
             )
             # Fail closed: a DB hiccup MUST NOT silently disable the
             # multi-worker ingestion gate. ``started_tagger=False`` forces
@@ -1297,7 +1297,7 @@ async def prepare_payload(
                     "ACTIVE_PENDING_TAG conversation=%s "
                     "last_completed_turn=%d last_indexed_turn=%d "
                     "compacted_prefix_messages=%d pending_indexing=True",
-                    state.engine.config.conversation_id[:12],
+                    state.engine.config.conversation_id,
                     _dispatch_completed_turns - 1,
                     _dispatch_indexed_turns - 1,
                     _dispatch_compacted_prefix_messages,
@@ -1311,7 +1311,7 @@ async def prepare_payload(
                 "PASSTHROUGH_DECISION conversation=%s reason=%s existing_turns=%d needed_turns=%d "
                 "last_completed_turn=%d last_indexed_turn=%d compacted_prefix_messages=%d "
                 "pending_indexing=%s manual_passthrough=%s",
-                state.engine.config.conversation_id[:12],
+                state.engine.config.conversation_id,
                 _passthrough_reason,
                 _dispatch_existing_turns,
                 _dispatch_needed_turns,
@@ -1594,7 +1594,7 @@ async def prepare_payload(
                 logger.info(
                     "COMPACT_WAIT_SKIPPED conv=%s floor=%dt hard=%dt: pending compaction "
                     "cannot bring this request under the hard threshold",
-                    state.engine.config.conversation_id[:12],
+                    state.engine.config.conversation_id,
                     _compact_wait.floor_tokens, _compact_wait.hard_tokens,
                 )
 
@@ -1640,7 +1640,7 @@ async def prepare_payload(
                     except Exception:
                         logger.warning(
                             "Tier 2 stamping failed for conv=%s",
-                            state.engine.config.conversation_id[:12],
+                            state.engine.config.conversation_id,
                             exc_info=True,
                         )
 
@@ -1723,7 +1723,7 @@ async def prepare_payload(
         if _replay_items:
             logger.info(
                 "HOST_REPLAY_EXPANDED conv=%s items=%d",
-                state.engine.config.conversation_id[:12], _replay_items,
+                state.engine.config.conversation_id, _replay_items,
             )
         _note_prep("host_replay_expand", _replay_stage)
 
@@ -2942,8 +2942,8 @@ def create_app(
                                 extra={
                                     "event": "lossless_restart_rebind_refused",
                                     "reason": _ec.reason,
-                                    "source_id": _ec.source_id[:12],
-                                    "target_id": _ec.target_id[:12],
+                                    "source_id": _ec.source_id,
+                                    "target_id": _ec.target_id,
                                     "chain_prefix": [c[:12] for c in _ec.chain],
                                 },
                             )
@@ -3317,7 +3317,7 @@ def create_app(
         _payload_kb = round(len(body_bytes) / 1024, 1)
         _now = _dt.datetime.now().strftime("%H:%M:%S.%f")[:-3]
         _msg_count = len(fmt.get_messages(body))
-        _sid = state.engine.config.conversation_id[:12] if state else "none"
+        _sid = state.engine.config.conversation_id if state else "none"
         logger.info("%s POST /%s msgs=%d stream=%s conversation=%s payload=%sKB", _now, path, _msg_count, is_streaming, _sid, _payload_kb)
 
         if not user_message and _msg_count < 10:

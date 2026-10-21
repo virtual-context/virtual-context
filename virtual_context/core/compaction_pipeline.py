@@ -1011,14 +1011,14 @@ class CompactionPipeline:
         except Exception as exc:  # noqa: BLE001 - the rollup itself must still run
             logger.warning(
                 "TAG_ROLLUP_RECOVER lookup failed for conv=%s (%s)",
-                conv[:12], type(exc).__name__,
+                conv, type(exc).__name__,
             )
             return []
         missing = [tag for tag in missing if tag not in skip]
         if missing:
             logger.info(
                 "TAG_ROLLUP_RECOVER conv=%s tags=%d %s",
-                conv[:12], len(missing), missing[:10],
+                conv, len(missing), missing[:10],
             )
         return missing
 
@@ -1165,7 +1165,7 @@ class CompactionPipeline:
             logger.warning(
                 "Tag structured-input validation failed closed for conv=%s "
                 "(%s)",
-                self._config.conversation_id[:12],
+                self._config.conversation_id,
                 type(exc).__name__,
             )
             validated_tag_rollup_inputs = validate_tag_rollup_inputs(
@@ -1186,7 +1186,7 @@ class CompactionPipeline:
                 "source segments in conv=%s",
                 rejected_structured_count,
                 len(unique_source_refs),
-                self._config.conversation_id[:12],
+                self._config.conversation_id,
             )
 
         # Gather turn numbers + canonical_turn_ids per cover tag, plus
@@ -1393,7 +1393,7 @@ class CompactionPipeline:
         except Exception:
             logger.warning(
                 "Tag-stats snapshot refresh failed for %s",
-                self._config.conversation_id[:12],
+                self._config.conversation_id,
                 exc_info=True,
             )
         try:
@@ -1403,7 +1403,7 @@ class CompactionPipeline:
         except Exception:
             logger.warning(
                 "Tag-summary embedding snapshot refresh failed for %s",
-                self._config.conversation_id[:12],
+                self._config.conversation_id,
                 exc_info=True,
             )
 
@@ -1413,7 +1413,7 @@ class CompactionPipeline:
         if not saved:
             logger.warning(
                 "Compaction checkpoint save failed for conversation %s",
-                self._config.conversation_id[:12],
+                self._config.conversation_id,
             )
 
     def _compact_and_store(
@@ -1543,7 +1543,7 @@ class CompactionPipeline:
                 if entry is None:
                     logger.debug(
                         "Missing canonical turn tag entry during compaction for conv=%s turn=%d canonical=%s",
-                        self._config.conversation_id[:12],
+                        self._config.conversation_id,
                         row.turn_number,
                         row.canonical_turn_id[:12] if row.canonical_turn_id else "",
                     )

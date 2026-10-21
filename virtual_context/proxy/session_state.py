@@ -254,7 +254,7 @@ class SessionStateProvider:
                 ex=self._LAST_REQUEST_TTL_SECONDS,
             )
         except Exception:
-            logger.warning("Redis last-request save failed for %s", conversation_id[:12], exc_info=True)
+            logger.warning("Redis last-request save failed for %s", conversation_id, exc_info=True)
 
     def load_request_time(self, conversation_id: str) -> float:
         """The shared last upstream request time, 0.0 when unknown."""
@@ -267,10 +267,10 @@ class SessionStateProvider:
             try:
                 return float(raw)
             except (TypeError, ValueError):
-                logger.warning("Redis last-request marker for %s is not a timestamp; treating as unknown", conversation_id[:12])
+                logger.warning("Redis last-request marker for %s is not a timestamp; treating as unknown", conversation_id)
                 return 0.0
         except Exception:
-            logger.warning("Redis last-request load failed for %s", conversation_id[:12], exc_info=True)
+            logger.warning("Redis last-request load failed for %s", conversation_id, exc_info=True)
             return 0.0
 
     def _retrieval_memo_key(self, conversation_id: str, memo_key: str) -> str:
@@ -293,7 +293,7 @@ class SessionStateProvider:
             value = json.loads(raw)
             return value if isinstance(value, dict) else None
         except Exception:
-            logger.warning("Redis retrieval memo load failed for %s", conversation_id[:12], exc_info=True)
+            logger.warning("Redis retrieval memo load failed for %s", conversation_id, exc_info=True)
             return None
 
     def save_retrieval_memo(
@@ -306,7 +306,7 @@ class SessionStateProvider:
                 ex=ttl_seconds or self._RETRIEVAL_MEMO_TTL_SECONDS,
             )
         except Exception:
-            logger.warning("Redis retrieval memo save failed for %s", conversation_id[:12], exc_info=True)
+            logger.warning("Redis retrieval memo save failed for %s", conversation_id, exc_info=True)
 
     def _context_hint_cache_key(self, conversation_id: str, cache_key: str) -> str:
         return f"vc:context_hint:{conversation_id}:{cache_key}"
@@ -593,7 +593,7 @@ class SessionStateProvider:
         except Exception:
             logger.warning(
                 "Redis get_marker failed for %s",
-                conversation_id[:12],
+                conversation_id,
                 exc_info=True,
             )
             self._degraded = True
@@ -633,7 +633,7 @@ class SessionStateProvider:
                 return self._load_from_store(conversation_id)
             return SessionState.from_json(raw)
         except Exception:
-            logger.warning("Redis load failed for %s", conversation_id[:12], exc_info=True)
+            logger.warning("Redis load failed for %s", conversation_id, exc_info=True)
             self._degraded = True
             # Degraded — try Postgres fallback
             return self._load_from_store(conversation_id)
@@ -676,7 +676,7 @@ class SessionStateProvider:
             self._degraded = True
             logger.warning(
                 "Authoritative Redis tombstone read failed for %s",
-                conversation_id[:12],
+                conversation_id,
                 exc_info=True,
             )
             raise
@@ -713,7 +713,7 @@ class SessionStateProvider:
             self._degraded = True
             logger.warning(
                 "Authoritative Redis load failed for %s",
-                conversation_id[:12],
+                conversation_id,
                 exc_info=True,
             )
             raise
@@ -931,7 +931,7 @@ class SessionStateProvider:
             except Exception:
                 logger.warning(
                     "Failed to release marker-repair lease for %s",
-                    conversation_id[:12],
+                    conversation_id,
                     exc_info=True,
                 )
 
@@ -958,7 +958,7 @@ class SessionStateProvider:
                     current = json.loads(current_raw)
                     if current.get("deleted"):
                         state.version = original_version
-                        logger.info("Save rejected for %s — tombstoned", conversation_id[:12])
+                        logger.info("Save rejected for %s — tombstoned", conversation_id)
                         return None
                     current_generation = int(
                         current.get("conversation_generation", 0) or 0
@@ -970,7 +970,7 @@ class SessionStateProvider:
                         state.version = original_version
                         logger.info(
                             "Save rejected for %s — stale generation %d != %d",
-                            conversation_id[:12],
+                            conversation_id,
                             state_generation,
                             current_generation,
                         )
@@ -980,7 +980,7 @@ class SessionStateProvider:
                         state.version = original_version
                         logger.info(
                             "Save rejected for %s — stale version %d < %d",
-                            conversation_id[:12],
+                            conversation_id,
                             original_version,
                             current_version,
                         )
@@ -998,7 +998,7 @@ class SessionStateProvider:
         except Exception:
             state.version = original_version
             logger.warning("Redis save failed for %s — skipping Postgres backup",
-                           conversation_id[:12], exc_info=True)
+                           conversation_id, exc_info=True)
             self._degraded = True
             return None
 
@@ -1017,7 +1017,7 @@ class SessionStateProvider:
         except Exception:
             logger.warning(
                 "Redis payload-token cache load failed for %s",
-                conversation_id[:12],
+                conversation_id,
                 exc_info=True,
             )
             return None
@@ -1038,7 +1038,7 @@ class SessionStateProvider:
         except Exception:
             logger.warning(
                 "Redis tag-stats cache load failed for %s",
-                conversation_id[:12],
+                conversation_id,
                 exc_info=True,
             )
             return None
@@ -1062,7 +1062,7 @@ class SessionStateProvider:
         except Exception:
             logger.warning(
                 "Redis tag-stats cache save failed for %s",
-                conversation_id[:12],
+                conversation_id,
                 exc_info=True,
             )
 
@@ -1106,7 +1106,7 @@ class SessionStateProvider:
         except Exception:
             logger.warning(
                 "Redis payload-token cache save failed for %s",
-                conversation_id[:12],
+                conversation_id,
                 exc_info=True,
             )
 
@@ -1266,7 +1266,7 @@ class SessionStateProvider:
         except Exception:
             logger.warning(
                 "Redis tag-summary embedding snapshot load failed for %s",
-                conversation_id[:12],
+                conversation_id,
                 exc_info=True,
             )
             return None
@@ -1329,7 +1329,7 @@ class SessionStateProvider:
         try:
             self._redis.set(key, blob, ex=self._TAG_SUMMARY_EMBEDDING_SNAPSHOT_TTL_SECONDS)
         except Exception:
-            logger.warning("Segment chunk matrix save failed for %s", conversation_id[:12], exc_info=True)
+            logger.warning("Segment chunk matrix save failed for %s", conversation_id, exc_info=True)
         self._segment_chunk_matrix_runtime_cache[conversation_id] = (version or 0, refs, matrix)
         return refs, matrix
 
@@ -1357,7 +1357,7 @@ class SessionStateProvider:
                     break
                 after = tuple(cursor)
         except Exception:
-            logger.warning("Segment chunk embeddings unavailable for %s", conversation_id[:12], exc_info=True)
+            logger.warning("Segment chunk embeddings unavailable for %s", conversation_id, exc_info=True)
             return None
         if not blocks:
             return None
@@ -1419,7 +1419,7 @@ class SessionStateProvider:
         except Exception:
             logger.warning(
                 "Redis tag-summary embedding snapshot save failed for %s",
-                conversation_id[:12],
+                conversation_id,
                 exc_info=True,
             )
 
@@ -1458,7 +1458,7 @@ class SessionStateProvider:
         except Exception:
             logger.warning(
                 "Redis context-hint cache load failed for %s",
-                conversation_id[:12],
+                conversation_id,
                 exc_info=True,
             )
             return None
@@ -1481,7 +1481,7 @@ class SessionStateProvider:
         except Exception:
             logger.warning(
                 "Redis context-hint cache save failed for %s",
-                conversation_id[:12],
+                conversation_id,
                 exc_info=True,
             )
 
@@ -1504,7 +1504,7 @@ class SessionStateProvider:
                 ex=self._CONTEXT_HINT_CACHE_TTL_SECONDS,
             )
         except Exception:
-            logger.warning("Redis latest context-hint save failed for %s", conversation_id[:12], exc_info=True)
+            logger.warning("Redis latest context-hint save failed for %s", conversation_id, exc_info=True)
 
     def load_latest_context_hint(self, conversation_id: str, generation: int, paging_mode: str) -> str | None:
         """The most recent hint, only if this hint builder rendered it for this generation and mode."""
@@ -1522,7 +1522,7 @@ class SessionStateProvider:
             hint = data.get("hint")
             return hint if isinstance(hint, str) and hint else None
         except Exception:
-            logger.warning("Redis latest context-hint load failed for %s", conversation_id[:12], exc_info=True)
+            logger.warning("Redis latest context-hint load failed for %s", conversation_id, exc_info=True)
             return None
 
     def publish_tombstone(self, conversation_id: str) -> None:
@@ -1547,7 +1547,7 @@ class SessionStateProvider:
         except Exception as e:
             self._degraded = True
             raise RuntimeError(
-                f"Redis tombstone failed for {conversation_id[:12]}: {e}",
+                f"Redis tombstone failed for {conversation_id}: {e}",
             ) from e
 
     def delete(self, conversation_id: str) -> None:
@@ -1598,10 +1598,10 @@ class SessionStateProvider:
             # Then raise so the caller can retry or alert.
             logger.error(
                 "DELETE NOT STICKY for %s — %s",
-                conversation_id[:12], "; ".join(errors),
+                conversation_id, "; ".join(errors),
             )
             raise RuntimeError(
-                f"Delete incomplete for {conversation_id[:12]}: "
+                f"Delete incomplete for {conversation_id}: "
                 + "; ".join(errors)
             )
 
@@ -1636,7 +1636,7 @@ class SessionStateProvider:
                 )
             self._degraded = False
         except Exception:
-            logger.warning("Redis undelete failed for %s", conversation_id[:12], exc_info=True)
+            logger.warning("Redis undelete failed for %s", conversation_id, exc_info=True)
             self._degraded = True
 
     def exists(self, conversation_id: str) -> bool:
@@ -1679,13 +1679,13 @@ class SessionStateProvider:
                 if is_deleted(conversation_id) is True:
                     logger.info(
                         "Skipping durable fallback for deleted conversation %s",
-                        conversation_id[:12],
+                        conversation_id,
                     )
                     return SessionState(deleted=True, version=_MAX_VERSION)
             except Exception:
                 logger.warning(
                     "Skipping durable fallback for %s — lifecycle state unavailable",
-                    conversation_id[:12],
+                    conversation_id,
                     exc_info=True,
                 )
                 return None
@@ -1699,13 +1699,13 @@ class SessionStateProvider:
             if self._redis.get(f"vc:store_stale:{conversation_id}"):
                 logger.warning(
                     "Skipping Postgres fallback for %s — store is known-stale",
-                    conversation_id[:12],
+                    conversation_id,
                 )
                 return None
         except Exception:
             logger.warning(
                 "Skipping Postgres fallback for %s — cannot verify store freshness (Redis down)",
-                conversation_id[:12],
+                conversation_id,
             )
             return None
         try:
@@ -1717,7 +1717,7 @@ class SessionStateProvider:
                     self.seed_tool_counter(conversation_id, state.tool_tag_counter)
                 return state
         except Exception:
-            logger.warning("Postgres fallback load failed for %s", conversation_id[:12])
+            logger.warning("Postgres fallback load failed for %s", conversation_id)
         return None
 
     def _save_to_store(self, conversation_id: str, state: SessionState) -> None:
@@ -1738,7 +1738,7 @@ class SessionStateProvider:
                 pass
         except Exception:
             logger.warning("Postgres backup save failed for %s — marking store stale",
-                           conversation_id[:12])
+                           conversation_id)
             # Mark stale across all workers via Redis (5 min TTL — auto-heals
             # when the next successful backup clears it)
             try:

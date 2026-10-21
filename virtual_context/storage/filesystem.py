@@ -1152,7 +1152,7 @@ class FilesystemStore(ContextStore):
         if data.get("deleted") and not recreate_deleted:
             raise ConversationLifecycleConflict(
                 "deleted conversation requires explicit recreation: "
-                f"{conversation_id[:12]}"
+                f"{conversation_id}"
             )
         if data.get("deleted"):
             data["generation"] = int(data.get("generation", 0) or 0) + 1
@@ -1290,7 +1290,7 @@ class FilesystemStore(ContextStore):
                 or not bool(data.get("deleted", False))
             ):
                 raise ConversationLifecycleConflict(
-                    f"stale conversation delete refused for {conversation_id[:12]}"
+                    f"stale conversation delete refused for {conversation_id}"
                 )
         deleted = 0
         safe_id = conversation_id.replace("/", "_").replace("\\", "_").replace("..", "_")

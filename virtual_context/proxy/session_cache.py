@@ -136,5 +136,5 @@ class RedisSessionCache:
         def _flush():
             self.save_snapshot(conv_id, snapshot)
             logger.info("Redis recovery flush complete: conv=%s version=%s",
-                        conv_id[:12], snapshot.get("version", "?"))
+                        conv_id, snapshot.get("version", "?"))
         threading.Thread(target=_flush, daemon=True).start()

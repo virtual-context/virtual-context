@@ -597,7 +597,7 @@ class IngestReconciler:
                         except Exception:
                             logger.warning(
                                 "CANONICAL_TURN_GROUP_RECOMPUTE_FAILED: conv=%s",
-                                conversation_id[:12],
+                                conversation_id,
                                 exc_info=True,
                             )
                     batch = self._save_batch(
@@ -1272,19 +1272,19 @@ class IngestReconciler:
                 except Exception:
                     logger.warning(
                         "ACTOR_PROFILE_UPSERT_FAILED: conv=%s actor=%s",
-                        conversation_id[:12], actor_id[:24], exc_info=True,
+                        conversation_id, actor_id[:24], exc_info=True,
                     )
         _profiles_ms = (time.perf_counter() - _t_stage) * 1000.0
         if _profiles_ms >= _INGEST_BREAKDOWN_LOG_THRESHOLD_MS:
             logger.info(
                 "INGEST_ACTOR_PROFILES conv=%s upserts_ms=%.1f",
-                conversation_id[:12] if conversation_id else "none", _profiles_ms,
+                conversation_id if conversation_id else "none", _profiles_ms,
             )
         _wall_ms = (time.perf_counter() - _t_wall) * 1000.0
         if _wall_ms >= _INGEST_BREAKDOWN_LOG_THRESHOLD_MS:
             logger.info(
                 "INGEST_WALL conv=%s wall_ms=%.1f merge_ms=%.1f profiles_ms=%.1f pre_merge_ms=%.1f",
-                conversation_id[:12] if conversation_id else "none", _wall_ms, _merge_ms,
+                conversation_id if conversation_id else "none", _wall_ms, _merge_ms,
                 _profiles_ms, _wall_ms - _merge_ms - _profiles_ms,
             )
         return result
@@ -1592,7 +1592,7 @@ class IngestReconciler:
             )
         except Exception:
             logger.warning(
-                "REPLY_TARGET_LOOKUP_FAILED: conv=%s", conversation_id[:12],
+                "REPLY_TARGET_LOOKUP_FAILED: conv=%s", conversation_id,
                 exc_info=True,
             )
             return None
@@ -1617,7 +1617,7 @@ class IngestReconciler:
             ))
         except Exception:
             logger.warning(
-                "REPLY_LABEL_LOOKUP_FAILED: conv=%s", conversation_id[:12],
+                "REPLY_LABEL_LOOKUP_FAILED: conv=%s", conversation_id,
                 exc_info=True,
             )
             return []
@@ -1918,7 +1918,7 @@ class IngestReconciler:
         if not prepared_turns:
             logger.info(
                 "INGEST_EMPTY_PAYLOAD: conv=%s raw_turn_count=%d",
-                conversation_id[:12],
+                conversation_id,
                 raw_turn_count,
             )
             batch = self._save_batch(
@@ -1964,7 +1964,7 @@ class IngestReconciler:
         if alignment is None and existing and prepared_turns:
             logger.warning(
                 "CANONICAL_TURN_NO_ALIGNMENT: conv=%s existing=%d incoming=%d -> no_overlap_append",
-                conversation_id[:12],
+                conversation_id,
                 len(existing),
                 len(prepared_turns),
             )
@@ -2025,7 +2025,7 @@ class IngestReconciler:
                     "incoming=%d has_user=%s has_asst=%s — no complete "
                     "user+assistant pair, skipping persist to avoid "
                     "permanently-untag-able orphan rows.",
-                    conversation_id[:12],
+                    conversation_id,
                     len(existing),
                     len(prepared_turns),
                     has_user,
@@ -2279,7 +2279,7 @@ class IngestReconciler:
             except Exception:
                 logger.warning(
                     "CANONICAL_TURN_GROUP_RECOMPUTE_FAILED: conv=%s",
-                    conversation_id[:12],
+                    conversation_id,
                     exc_info=True,
                 )
         if phase_timings is not None:
@@ -2297,7 +2297,7 @@ class IngestReconciler:
             except Exception:
                 logger.warning(
                     "CANONICAL_TURN_ANCHOR_REFRESH_FAILED: conv=%s",
-                    conversation_id[:12],
+                    conversation_id,
                     exc_info=True,
                 )
         if phase_timings is not None:
@@ -2340,7 +2340,7 @@ class IngestReconciler:
         except Exception:
             logger.warning(
                 "CANONICAL_TURN_SENDER_UPGRADE_FAILED: conv=%s rows=%d",
-                conversation_id[:12],
+                conversation_id,
                 len(upgrades),
                 exc_info=True,
             )
@@ -2375,7 +2375,7 @@ class IngestReconciler:
         except Exception:
             logger.warning(
                 "CANONICAL_TURN_CHANNEL_UPGRADE_FAILED: conv=%s rows=%d",
-                conversation_id[:12],
+                conversation_id,
                 len(upgrades),
                 exc_info=True,
             )
@@ -2410,7 +2410,7 @@ class IngestReconciler:
         except Exception:
             logger.warning(
                 "CANONICAL_TURN_ACTOR_UPGRADE_FAILED: conv=%s rows=%d",
-                conversation_id[:12],
+                conversation_id,
                 len(upgrades),
                 exc_info=True,
             )
@@ -2446,7 +2446,7 @@ class IngestReconciler:
         except Exception:
             logger.warning(
                 "CANONICAL_TURN_REPLY_UPGRADE_FAILED: conv=%s rows=%d",
-                conversation_id[:12],
+                conversation_id,
                 len(upgrades),
                 exc_info=True,
             )
@@ -2832,7 +2832,7 @@ class IngestReconciler:
             except Exception:
                 logger.warning(
                     "CANONICAL_TURN_EMBED_FAILED side=both conv=%s turn=%d",
-                    row.conversation_id[:12],
+                    row.conversation_id,
                     resolved_turn_number,
                     exc_info=True,
                 )
@@ -2969,7 +2969,7 @@ class IngestReconciler:
         if keys is None:
             raise RuntimeError(
                 "sort-key allocation failed after rebalance: "
-                f"conv={conversation_id[:12]} left={left_key} "
+                f"conv={conversation_id} left={left_key} "
                 f"right={right_key} delta={delta} count={count}"
             )
         return keys
@@ -3073,7 +3073,7 @@ class IngestReconciler:
                     row.sort_key = float(row.sort_key) + delta
             logger.info(
                 "SORT_KEY_GAP_REBALANCE conv=%s right_key=%s delta=%s path=per-row",
-                conversation_id[:12], right_key, delta,
+                conversation_id, right_key, delta,
             )
             return delta
         for row in existing:
@@ -3084,7 +3084,7 @@ class IngestReconciler:
                 row.sort_key = float(row.sort_key) + delta
         logger.info(
             "SORT_KEY_GAP_REBALANCE conv=%s right_key=%s delta=%s rows=%d",
-            conversation_id[:12], right_key, delta, shifted,
+            conversation_id, right_key, delta, shifted,
         )
         return delta
 
@@ -3187,7 +3187,7 @@ class IngestReconciler:
         logger.info(
             "INGEST_BREAKDOWN conv=%s rows=%d total=%.1fms load_ms=%.1f "
             "align_ms=%.1f anchors_ms=%.1f anchor_rows_written=%d%s%s",
-            conversation_id[:12] if conversation_id else "none",
+            conversation_id if conversation_id else "none",
             existing_rows,
             total_ms,
             phase_timings.get("load_ms", -1.0),
@@ -3254,7 +3254,7 @@ class IngestReconciler:
             except Exception:
                 logger.warning(
                     "CANONICAL_TURN_ANCHOR_READ_FAILED: conv=%s",
-                    conversation_id[:12],
+                    conversation_id,
                     exc_info=True,
                 )
             # None means the backend cannot report its anchors, which is

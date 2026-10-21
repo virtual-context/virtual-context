@@ -3785,7 +3785,7 @@ class PostgresStore(PostgresVectorSearchMixin, RelationalStoreMixin, ContextStor
             except Exception:
                 logger.warning(
                     "Lazy turn_group_number backfill failed for %s; falling back to content heuristics",
-                    conversation_id[:12],
+                    conversation_id,
                     exc_info=True,
                 )
         return rows
@@ -4347,7 +4347,7 @@ class PostgresStore(PostgresVectorSearchMixin, RelationalStoreMixin, ContextStor
             if row is None:
                 raise ConversationLifecycleConflict(
                     "deleted conversation requires explicit recreation: "
-                    f"{conversation_id[:12]}"
+                    f"{conversation_id}"
                 )
             return int(row["generation"] if isinstance(row, dict) else row[0])
 
@@ -8210,7 +8210,7 @@ class PostgresStore(PostgresVectorSearchMixin, RelationalStoreMixin, ContextStor
                     ):
                         raise ConversationLifecycleConflict(
                             "stale conversation delete refused for "
-                            f"{conversation_id[:12]}: expected generation "
+                            f"{conversation_id}: expected generation "
                             f"{expected_generation}, current={current_generation}, "
                             f"deleted={current_deleted}"
                         )
@@ -9646,7 +9646,7 @@ class PostgresStore(PostgresVectorSearchMixin, RelationalStoreMixin, ContextStor
             if deleted or current_generation != expected_generation:
                 raise ConversationLifecycleConflict(
                     "stale engine checkpoint refused for "
-                    f"{state.conversation_id[:12]}: expected generation "
+                    f"{state.conversation_id}: expected generation "
                     f"{expected_generation}, current {current_generation}, "
                     f"deleted={deleted}"
                 )
@@ -12720,7 +12720,7 @@ class PostgresStore(PostgresVectorSearchMixin, RelationalStoreMixin, ContextStor
         except Exception:
             logger.warning(
                 "Lazy turn_group_number backfill failed for %s; falling back to content heuristics",
-                conversation_id[:12],
+                conversation_id,
                 exc_info=True,
             )
             return projected

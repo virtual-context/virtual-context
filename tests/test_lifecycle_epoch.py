@@ -13,14 +13,12 @@ def test_mismatch_exception_carries_details():
     assert "2" in str(err)
 
 
-def test_mismatch_message_truncates_conversation_id():
+def test_mismatch_message_carries_the_full_conversation_id():
     err = LifecycleEpochMismatch(
         conversation_id="aaaaaaaaaaaabbbbbbbbbbbb",
         expected=1, observed=2,
     )
-    assert "aaaaaaaaaaaa" in str(err)
-    # Full 24-char id should NOT appear — only first 12.
-    assert "aaaaaaaaaaaabbbbbbbbbbbb" not in str(err)
+    assert "aaaaaaaaaaaabbbbbbbbbbbb" in str(err)
 
 
 def test_verify_epoch_passes_when_match():

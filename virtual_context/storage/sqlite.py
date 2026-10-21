@@ -3555,7 +3555,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
             except Exception:
                 logger.warning(
                     "Lazy turn_group_number backfill failed for %s; falling back to content heuristics",
-                    conversation_id[:12],
+                    conversation_id,
                     exc_info=True,
                 )
         return rows
@@ -4866,7 +4866,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 if bool(row[1]) and not recreate_deleted:
                     raise ConversationLifecycleConflict(
                         "deleted conversation requires explicit recreation: "
-                        f"{conversation_id[:12]}"
+                        f"{conversation_id}"
                     )
                 generation = int(row[0]) + (1 if bool(row[1]) else 0)
                 conn.execute(
@@ -8030,7 +8030,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 ):
                     raise ConversationLifecycleConflict(
                         "stale conversation delete refused for "
-                        f"{conversation_id[:12]}: expected generation "
+                        f"{conversation_id}: expected generation "
                         f"{expected_generation}, current={current_generation}, "
                         f"deleted={current_deleted}"
                     )
@@ -8803,7 +8803,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
             if deleted or current_generation != expected_generation:
                 raise ConversationLifecycleConflict(
                     "stale engine checkpoint refused for "
-                    f"{state.conversation_id[:12]}: expected generation "
+                    f"{state.conversation_id}: expected generation "
                     f"{expected_generation}, current {current_generation}, "
                     f"deleted={deleted}"
                 )
@@ -11851,7 +11851,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
         except Exception:
             logger.warning(
                 "Lazy turn_group_number backfill failed for %s; falling back to content heuristics",
-                conversation_id[:12],
+                conversation_id,
                 exc_info=True,
             )
             return projected

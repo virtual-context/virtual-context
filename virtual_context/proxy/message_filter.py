@@ -2632,7 +2632,7 @@ def collapse_turn_chains(
         ]
         logger.info(
             "CHAIN_COLLAPSE_BREAKDOWN conv=%s total=%sms collapse=%d reused=%d new=%d recovered=%d %s",
-            conversation_id[:12] if conversation_id else "none",
+            conversation_id if conversation_id else "none",
             total_ms,
             collapse_count,
             _reused_existing,

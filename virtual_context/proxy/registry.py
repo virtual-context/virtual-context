@@ -207,7 +207,7 @@ class SessionRegistry:
         except Exception:
             logger.warning(
                 "VCATTACH existence lookup failed for %s",
-                conversation_id[:12],
+                conversation_id,
                 exc_info=True,
             )
             return False

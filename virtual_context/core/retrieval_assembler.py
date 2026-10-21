@@ -158,7 +158,7 @@ class RetrievalAssembler:
         except Exception:
             logger.warning(
                 "Recent stored turns unavailable for conv=%s; using request history",
-                self.config.conversation_id[:12], exc_info=True,
+                self.config.conversation_id, exc_info=True,
             )
             return None
         rows.sort(key=lambda row: (float(getattr(row, "sort_key", 0.0) or 0.0),
@@ -238,7 +238,7 @@ class RetrievalAssembler:
         ):
             logger.info(
                 "CURATION_MEMO hit conv=%s kept=%d/%d",
-                conversation_id[:12], len(kept), len(facts),
+                conversation_id, len(kept), len(facts),
             )
             return [facts[i] for i in kept]
         curated = self._fact_curator.curate(facts, question=question)
@@ -402,7 +402,7 @@ class RetrievalAssembler:
                     except Exception:
                         logger.warning(
                             "Tier 3 get_recent_canonical_turns failed for conv=%s",
-                            self.config.conversation_id[:12],
+                            self.config.conversation_id,
                             exc_info=True,
                         )
                         _db_recent_rows = []
@@ -720,7 +720,7 @@ class RetrievalAssembler:
                 stage_bits.extend(hint_bits)
             logger.info(
                 "INBOUND_BREAKDOWN conv=%s history_msgs=%d total=%sms %s",
-                self.config.conversation_id[:12] if self.config.conversation_id else "none",
+                self.config.conversation_id if self.config.conversation_id else "none",
                 len(conversation_history),
                 inbound_total_ms,
                 " ".join(stage_bits) if stage_bits else "no-stages",
@@ -753,7 +753,7 @@ class RetrievalAssembler:
                 "protected_window_db_read_ms=%.2f "
                 "protected_window_db_source_merged_rows=%d "
                 "protected_window_db_source_budget_evictions=%d",
-                self.config.conversation_id[:12] if self.config.conversation_id else "none",
+                self.config.conversation_id if self.config.conversation_id else "none",
                 _gate_outcome,
                 _gate_read_ms,
                 _gate_merged_rows,

@@ -174,8 +174,8 @@ class EngineConstructionError(RuntimeError):
     ) -> None:
         super().__init__(
             f"engine construction failed: {reason} "
-            f"(source={source_id[:12] or 'n/a'}, "
-            f"target={target_id[:12] or 'n/a'})"
+            f"(source={source_id or 'n/a'}, "
+            f"target={target_id or 'n/a'})"
         )
         self.reason = reason
         self.source_id = source_id
@@ -235,7 +235,7 @@ class SessionStateRepairFailedError(RuntimeError):
     ) -> None:
         super().__init__(
             "VCATTACH session-state repair incomplete "
-            f"(source={source_id[:12]}, target={target_id[:12]})"
+            f"(source={source_id}, target={target_id})"
         )
         self.source_id = source_id
         self.target_id = target_id

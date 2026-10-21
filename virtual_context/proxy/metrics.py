@@ -452,7 +452,7 @@ class ProxyMetrics:
             if removed:
                 logger.info(
                     "Cleared %d stale ingestion/compaction events for conv=%s",
-                    removed, conversation_id[:12],
+                    removed, conversation_id,
                 )
             return removed
 
@@ -492,14 +492,14 @@ class ProxyMetrics:
                 except Exception:
                     logger.debug(
                         "Failed to delete metrics artifacts for conv=%s",
-                        conv_id[:12],
+                        conv_id,
                         exc_info=True,
                     )
 
             if captures_removed or events_removed:
                 logger.info(
                     "Deleted metrics artifacts for conv=%s captures=%d events=%d",
-                    conv_id[:12],
+                    conv_id,
                     captures_removed,
                     events_removed,
                 )

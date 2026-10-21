@@ -1033,7 +1033,7 @@ class TaggingPipeline:
         logger.info(
             "%s conv=%s turn=%d total=%.1fms %s",
             label,
-            self.config.conversation_id[:12],
+            self.config.conversation_id,
             turn_number,
             total_ms,
             " ".join(parts) if parts else "no-stages",
@@ -1454,13 +1454,13 @@ class TaggingPipeline:
             if not repaired:
                 logger.warning(
                     "TAGGER_HASH_BACKFILL_REJECTED conv=%s turn_id=%s",
-                    self.config.conversation_id[:12],
+                    self.config.conversation_id,
                     row.canonical_turn_id[:12],
                 )
                 return False
             logger.warning(
                 "TAGGER_HASH_BACKFILLED conv=%s turn_id=%s",
-                self.config.conversation_id[:12],
+                self.config.conversation_id,
                 row.canonical_turn_id[:12],
             )
 
@@ -1482,7 +1482,7 @@ class TaggingPipeline:
             except Exception:
                 logger.exception(
                     "tag_canonical_row: generator failed conv=%s turn_id=%s",
-                    self.config.conversation_id[:12],
+                    self.config.conversation_id,
                     row.canonical_turn_id[:12] if row.canonical_turn_id else "?",
                 )
                 raise
@@ -1830,7 +1830,7 @@ class TaggingPipeline:
                 report["skipped_low_quality"] += 1
                 logger.info(
                     "RETAG_SKIPPED_LOW_QUALITY conv=%s turn=%d primary=%r",
-                    conversation_id[:12], batch_turn, tag_result.primary,
+                    conversation_id, batch_turn, tag_result.primary,
                 )
                 continue
 
@@ -1861,7 +1861,7 @@ class TaggingPipeline:
                 else:
                     logger.warning(
                         "RETAG_CAS_REJECTED conv=%s turn_id=%s",
-                        conversation_id[:12],
+                        conversation_id,
                         row.canonical_turn_id[:12],
                     )
             for tag in tag_result.tags:
@@ -1869,7 +1869,7 @@ class TaggingPipeline:
                     store_tags.append(tag)
             logger.info(
                 "RETAG conv=%s turn=%d rows=%d primary=%s tags=%s ctx_pairs=%d",
-                conversation_id[:12], batch_turn, len(pair_rows),
+                conversation_id, batch_turn, len(pair_rows),
                 tag_result.primary, sorted(tag_result.tags),
                 len(context) // 2 if context else 0,
             )

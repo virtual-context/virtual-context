@@ -49,7 +49,7 @@ def _has_canonical_turns(store, conversation_id: str) -> bool:
         except Exception:
             logger.warning(
                 "link_predecessor: get_recent_canonical_turns failed for %s",
-                conversation_id[:12], exc_info=True,
+                conversation_id, exc_info=True,
             )
     get_all = getattr(store, "get_all_canonical_turns", None)
     if callable(get_all):
@@ -58,7 +58,7 @@ def _has_canonical_turns(store, conversation_id: str) -> bool:
         except Exception:
             logger.warning(
                 "link_predecessor: get_all_canonical_turns failed for %s",
-                conversation_id[:12], exc_info=True,
+                conversation_id, exc_info=True,
             )
     return False
 
@@ -286,7 +286,7 @@ def _alias_deleted_event_for(store, target_id: str) -> dict:
             logger.warning(
                 "VCATTACH: _build_alias_deleted_event raised for %s; "
                 "falling back to minimal event",
-                target_id[:12], exc_info=True,
+                target_id, exc_info=True,
             )
     # Fallback shape matches the canonical store helpers' output keys
     # (``alias_id`` for the deleted-side, see
@@ -312,7 +312,7 @@ def _alias_created_event_for(store, old_id: str, target_id: str) -> dict:
             logger.warning(
                 "VCATTACH: _build_alias_created_event raised for %s->%s; "
                 "falling back to minimal event",
-                old_id[:12], target_id[:12], exc_info=True,
+                old_id[:12], target_id, exc_info=True,
             )
     return {"type": "alias_created", "source": old_id, "target": target_id}
 
@@ -412,13 +412,13 @@ def execute_attach(
         except Exception:
             logger.warning(
                 "VCATTACH: failed to clear existing alias for %s",
-                target_id[:12],
+                target_id,
             )
 
     # T0b. Register new alias old_id -> target_id. Same no-on_committed
     # rule as T0a — explicit cross-worker invocation at T1 below.
     store.save_conversation_alias(old_id, target_id)
-    logger.info("VCATTACH: alias %s -> %s", old_id[:12], target_id[:12])
+    logger.info("VCATTACH: alias %s -> %s", old_id[:12], target_id)
 
     # T2. Derive correct SessionState markers from canonical_turns and
     # write to Redis BEFORE publishing cross-worker invalidation. This
@@ -527,7 +527,7 @@ def execute_attach(
                     "target %s (generation=%d, version=%d, compacted=%d, "
                     "flushed=%d, last_completed_turn=%d, "
                     "last_indexed_turn=%d, turn_tag_entries=%d)",
-                    target_id[:12],
+                    target_id,
                     durable_generation,
                     saved_version,
                     derived.compacted_prefix_messages,
@@ -542,7 +542,7 @@ def execute_attach(
                 "VCATTACH: SessionState marker write failed for target %s; "
                 "alias is committed and cross-worker invalidation will "
                 "still fire; the caller must retry the incomplete repair",
-                target_id[:12], exc_info=True,
+                target_id, exc_info=True,
             )
 
     # T1. Cross-worker invalidation — fires whether T2 succeeded or
@@ -591,7 +591,7 @@ def execute_attach(
             try:
                 registry_invalidate(cid)
             except Exception:
-                logger.warning("VCATTACH: failed to invalidate session %s", cid[:12])
+                logger.warning("VCATTACH: failed to invalidate session %s", cid)
 
     if marker_repair_error is not None:
         from ..core.exceptions import SessionStateRepairFailedError

@@ -26,7 +26,7 @@ class ContextMonitor:
         self.config = config
         self.token_counter = token_counter or (lambda text: len(text) // 4)
         self._last_snapshot: ContextSnapshot | None = None
-        self._conv_short = conversation_id[:12] if conversation_id else ""
+        self._conv_short = conversation_id if conversation_id else ""
 
     def check(self, snapshot: ContextSnapshot) -> CompactionSignal | None:
         self._last_snapshot = snapshot

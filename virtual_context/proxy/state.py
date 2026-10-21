@@ -348,7 +348,7 @@ class ProxyState:
                 logger.debug(
                     "Ignoring unknown shared session state '%s' for conv=%s",
                     raw_state,
-                    self.engine.config.conversation_id[:12],
+                    self.engine.config.conversation_id,
                 )
 
         def _int_attr(name: str) -> int:
@@ -720,7 +720,7 @@ class ProxyState:
         except Exception:
             logger.warning(
                 "OPPORTUNISTIC_FINALIZE: claim_ingestion_lease raised for conv=%s",
-                conversation_id[:12], exc_info=True,
+                conversation_id, exc_info=True,
             )
             return False
         if not claimed:
@@ -734,7 +734,7 @@ class ProxyState:
         except Exception:
             logger.warning(
                 "OPPORTUNISTIC_FINALIZE: complete_ingestion_episode raised for conv=%s",
-                conversation_id[:12], exc_info=True,
+                conversation_id, exc_info=True,
             )
             return False
         if not completed:
@@ -748,7 +748,7 @@ class ProxyState:
         except Exception:
             logger.warning(
                 "OPPORTUNISTIC_FINALIZE: set_phase raised for conv=%s",
-                conversation_id[:12], exc_info=True,
+                conversation_id, exc_info=True,
             )
             return False
         if not ok:
@@ -758,7 +758,7 @@ class ProxyState:
         except Exception:
             logger.warning(
                 "OPPORTUNISTIC_FINALIZE: _publish_phase_transition raised for conv=%s",
-                conversation_id[:12], exc_info=True,
+                conversation_id, exc_info=True,
             )
         # Sync in-memory session state so the next Redis save_session_state
         # writes 'active' (dashboard badge source of truth) instead of the
@@ -771,12 +771,12 @@ class ProxyState:
         except Exception:
             logger.warning(
                 "OPPORTUNISTIC_FINALIZE: _transition_to(ACTIVE) raised for conv=%s",
-                conversation_id[:12], exc_info=True,
+                conversation_id, exc_info=True,
             )
         logger.info(
             "OPPORTUNISTIC_FINALIZE conv=%s: stuck 'ingesting' episode finalized; "
             "phase → 'active', session_state → ACTIVE",
-            conversation_id[:12],
+            conversation_id,
         )
         return True
 
@@ -826,7 +826,7 @@ class ProxyState:
         except Exception:
             logger.warning(
                 "INIT_ACTIVATE: set_phase raised for conv=%s",
-                conversation_id[:12], exc_info=True,
+                conversation_id, exc_info=True,
             )
             return False
         if not ok:
@@ -836,7 +836,7 @@ class ProxyState:
         except Exception:
             logger.warning(
                 "INIT_ACTIVATE: _publish_phase_transition raised for conv=%s",
-                conversation_id[:12], exc_info=True,
+                conversation_id, exc_info=True,
             )
         # Same session-state sync as the episode finalizer: without it the
         # durable phase reads 'active' while the session blob keeps serving
@@ -847,12 +847,12 @@ class ProxyState:
         except Exception:
             logger.warning(
                 "INIT_ACTIVATE: _transition_to(ACTIVE) raised for conv=%s",
-                conversation_id[:12], exc_info=True,
+                conversation_id, exc_info=True,
             )
         logger.info(
             "INIT_ACTIVATE conv=%s: tagged content present; "
             "phase 'init' → 'active'",
-            conversation_id[:12],
+            conversation_id,
         )
         return True
 
@@ -895,7 +895,7 @@ class ProxyState:
             except LifecycleEpochMismatch:
                 logger.info(
                     "Tagger %s exiting: lifecycle epoch changed for conv=%s",
-                    self._worker_id, conversation_id[:12],
+                    self._worker_id, conversation_id,
                 )
                 return False
 
@@ -1033,7 +1033,7 @@ class ProxyState:
             except Exception:
                 logger.warning(
                     "CANONICAL_GROUP_EMBED_FAILED conv=%s group=%s",
-                    row.conversation_id[:12],
+                    row.conversation_id,
                     row.turn_group_number,
                     exc_info=True,
                 )
@@ -1042,7 +1042,7 @@ class ProxyState:
                 logger.warning(
                     "CANONICAL_GROUP_EMBED_INCOMPLETE conv=%s group=%s; "
                     "leaving untagged for retry",
-                    row.conversation_id[:12],
+                    row.conversation_id,
                     row.turn_group_number,
                 )
                 return False
@@ -1133,7 +1133,7 @@ class ProxyState:
             logger.info(
                 "enter_compaction aborted: begin_compaction_with_lock "
                 "rejected for conv=%s worker=%s",
-                conv[:12], self._worker_id,
+                conv, self._worker_id,
             )
             return False
         self._publish_compaction_progress()
@@ -1162,7 +1162,7 @@ class ProxyState:
             logger.info(
                 "Compactor %s yielding phase advance: epoch changed"
                 " for conv=%s",
-                self._worker_id, conv[:12],
+                self._worker_id, conv,
             )
             return
         self.engine._store.advance_compaction_phase(
@@ -1338,7 +1338,7 @@ class ProxyState:
                 )
                 logger.info(
                     "HPP_BREAKDOWN conv=%s phase=%s total=%.1fms %s unaccounted=%.1fms",
-                    conversation_id[:12], phase, total_ms, bits, total_ms - accounted,
+                    conversation_id, phase, total_ms, bits, total_ms - accounted,
                 )
             return _decision_result
 
@@ -1398,7 +1398,7 @@ class ProxyState:
                 logger.debug(
                     "handle_prepare_payload: engine._ingest_reconciler missing; "
                     "skipping canonical row persistence for conv=%s",
-                    conversation_id[:12],
+                    conversation_id,
                 )
             else:
                 _rows = getattr(_ingest_result, "rows", None)
@@ -1474,7 +1474,7 @@ class ProxyState:
                     logger.info(
                         "ORPHAN_COMPACTING_REPAIR conv=%s: phase='compacting' "
                         "with no active compaction_operation row — flipped to 'active'",
-                        conversation_id[:12],
+                        conversation_id,
                     )
                     phase = "active"
 
@@ -1557,7 +1557,7 @@ class ProxyState:
                 logger.info(
                     "COMPACTION_TAKEOVER_SKIP_NO_FRESH conv=%s dead_op=%s "
                     "worker=%s reason=dead_op_already_handled",
-                    conversation_id[:12], dead_op, self._worker_id,
+                    conversation_id, dead_op, self._worker_id,
                 )
                 widened = self.engine._store.widen_pending_raw_payload_entries(
                     conversation_id=conversation_id,
@@ -1570,7 +1570,7 @@ class ProxyState:
 
             logger.info(
                 "COMPACTION_TAKEOVER conv=%s dead_op=%s new_op=%s worker=%s",
-                conversation_id[:12], dead_op, new_op, self._worker_id,
+                conversation_id, dead_op, new_op, self._worker_id,
             )
 
             # Spawn fresh compaction with preexisting_operation_id.
@@ -1603,7 +1603,7 @@ class ProxyState:
                 # self._active_compaction_op; re-raise for observability.
                 logger.exception(
                     "COMPACTION_TAKEOVER_SUBMIT_FAILED conv=%s new_op=%s",
-                    conversation_id[:12], new_op,
+                    conversation_id, new_op,
                 )
                 # Do NOT re-raise — we still want to widen + return so the
                 # current POST can passthrough. Next POST will reclaim the
@@ -1689,7 +1689,7 @@ class ProxyState:
             logger.error(
                 "INGEST_COMPLETE_GROUP_ATOMIC_UNAVAILABLE conv=%s; "
                 "failing closed",
-                conversation_id[:12],
+                conversation_id,
             )
             return _decision(phase=phase, started_tagger=False)
         if claim_result == "stale":
@@ -1703,7 +1703,7 @@ class ProxyState:
         if claim_result == "no-work":
             logger.info(
                 "INGEST_DEFER_INCOMPLETE_PHYSICAL_GROUP conv=%s phase=%s",
-                conversation_id[:12], phase,
+                conversation_id, phase,
             )
             return _decision(phase=phase, started_tagger=False)
         if claim_result.endswith("-transitioned"):
@@ -1813,7 +1813,7 @@ class ProxyState:
         except Exception:
             logger.warning(
                 "Failed durable untagged-row probe for resume (conv=%s)",
-                conversation_id[:12],
+                conversation_id,
                 exc_info=True,
             )
             return False
@@ -1850,7 +1850,7 @@ class ProxyState:
             logger.warning(
                 "Failed to load physical canonical rows for durable resume "
                 "(conv=%s)",
-                conversation_id[:12],
+                conversation_id,
                 exc_info=True,
             )
             return False
@@ -1905,7 +1905,7 @@ class ProxyState:
                         "Durable resume gap at turn %d for conversation %s; "
                         "deferring before lease claim",
                         expected_turn,
-                        conversation_id[:12],
+                        conversation_id,
                     )
                     break
                 if not _complete_group(group_rows):
@@ -1914,7 +1914,7 @@ class ProxyState:
                         "turn %d for conversation %s; deferring before lease "
                         "claim",
                         expected_turn,
-                        conversation_id[:12],
+                        conversation_id,
                     )
                     break
                 selected_rows.extend(group_rows)
@@ -1940,7 +1940,7 @@ class ProxyState:
                     logger.warning(
                         "Failed to load merged canonical rows for durable "
                         "resume fallback (conv=%s)",
-                        conversation_id[:12],
+                        conversation_id,
                         exc_info=True,
                     )
                     merged = {}
@@ -1994,7 +1994,7 @@ class ProxyState:
             except Exception:
                 logger.warning(
                     "Failed atomic durable resume claim (conv=%s)",
-                    conversation_id[:12],
+                    conversation_id,
                     exc_info=True,
                 )
                 return False
@@ -2020,7 +2020,7 @@ class ProxyState:
             logger.info(
                 "resume_pending_ingestion_if_needed: skipping spawn — "
                 "could not claim ingestion lease (conv=%s, this=%s)",
-                conversation_id[:12], self._worker_id,
+                conversation_id, self._worker_id,
             )
             return False
 
@@ -2046,7 +2046,7 @@ class ProxyState:
             )
         logger.info(
             "Resuming durable ingestion for conversation %s from turn %d to %d",
-            conversation_id[:12], baseline, total - 1,
+            conversation_id, baseline, total - 1,
         )
         return True
 
@@ -2062,7 +2062,7 @@ class ProxyState:
             })
         logger.info(
             "Conversation %s: %s → %s",
-            self.engine.config.conversation_id[:12], old.value, new_state.value,
+            self.engine.config.conversation_id, old.value, new_state.value,
         )
 
     def extract_session_state(self):
@@ -2082,7 +2082,7 @@ class ProxyState:
         except Exception as exc:
             logger.warning(
                 "extract_session_state: read_progress_snapshot failed for conv=%s: %s",
-                conversation_id[:12], exc,
+                conversation_id, exc,
             )
             live_turn_count = 0
         else:
@@ -2396,7 +2396,7 @@ class ProxyState:
             logger.info(
                 "COMPACT_WAIT_UNRELIEVABLE conv=%s floor=%dt hard=%dt payload=%dt: the protected "
                 "window alone reaches the hard threshold, so requests will not wait for this compaction",
-                self.engine.config.conversation_id[:12], decision.floor_tokens, decision.hard_tokens,
+                self.engine.config.conversation_id, decision.floor_tokens, decision.hard_tokens,
                 int(getattr(signal, "current_tokens", 0) or 0),
             )
         return decision
@@ -2541,7 +2541,7 @@ class ProxyState:
         if self.is_conversation_deleted():
             logger.info(
                 "fire_turn_complete skipped for deleted session %s",
-                self.engine.config.conversation_id[:12],
+                self.engine.config.conversation_id,
             )
             return
         signature = self._completed_turn_signature(history_snapshot)
@@ -2560,12 +2560,12 @@ class ProxyState:
             if newest is not None and newest.message_hash == message_hash:
                 logger.info(
                     "fire_turn_complete deduped for %s turn=%d (newest already indexed)",
-                    self.engine.config.conversation_id[:12], next_turn - 1,
+                    self.engine.config.conversation_id, next_turn - 1,
                 )
                 return
             logger.info(
                 "fire_turn_complete reserving turn=%d for %s (payload carried %d turns, index has %d)",
-                next_turn, self.engine.config.conversation_id[:12], reserved_turn + 1, next_turn,
+                next_turn, self.engine.config.conversation_id, reserved_turn + 1, next_turn,
             )
             reserved_turn = next_turn
         existing = index.get_tags_for_logical_turn(reserved_turn)
@@ -2573,7 +2573,7 @@ class ProxyState:
             if existing.message_hash != message_hash:
                 logger.warning(
                     "fire_turn_complete skipped divergent duplicate for %s turn=%d indexed=%s new=%s",
-                    self.engine.config.conversation_id[:12],
+                    self.engine.config.conversation_id,
                     reserved_turn,
                     existing.message_hash,
                     message_hash,
@@ -2581,7 +2581,7 @@ class ProxyState:
             else:
                 logger.info(
                     "fire_turn_complete deduped for %s turn=%d (already indexed)",
-                    self.engine.config.conversation_id[:12],
+                    self.engine.config.conversation_id,
                     reserved_turn,
                 )
             return
@@ -2590,7 +2590,7 @@ class ProxyState:
             if queued_hash == message_hash:
                 logger.info(
                     "fire_turn_complete deduped for %s turn=%d (already queued)",
-                    self.engine.config.conversation_id[:12],
+                    self.engine.config.conversation_id,
                     reserved_turn,
                 )
                 return
@@ -2605,7 +2605,7 @@ class ProxyState:
                     self._queued_tag_turns.pop(reserved_turn, None)
             logger.info(
                 "fire_turn_complete suppressed for shut down session %s",
-                self.engine.config.conversation_id[:12],
+                self.engine.config.conversation_id,
             )
 
     @measured("tag", lambda self, *a, **k: self.engine.config.conversation_id)
@@ -2632,7 +2632,7 @@ class ProxyState:
                     logger.warning(
                         "T%d TAG skipped divergent duplicate conversation=%s indexed=%s new=%s",
                         turn,
-                        conversation_id[:12],
+                        conversation_id,
                         existing.message_hash,
                         turn_hash,
                     )
@@ -2640,7 +2640,7 @@ class ProxyState:
                     logger.info(
                         "T%d TAG skipped (already indexed) conversation=%s",
                         turn,
-                        conversation_id[:12],
+                        conversation_id,
                     )
                 return
             signal = self.engine.tag_turn(
@@ -2665,7 +2665,7 @@ class ProxyState:
             )
             logger.info(
                 "T%d tagged (%dms) conversation=%s compacted_prefix_messages=%d history=%d%s",
-                turn, int(tag_ms), conversation_id[:12],
+                turn, int(tag_ms), conversation_id,
                 self.engine._engine_state.compacted_prefix_messages,
                 len(history),
                 " compact_queued" if _needs_compact else "",
@@ -2719,7 +2719,7 @@ class ProxyState:
                     except RuntimeError:
                         logger.info(
                             "T%d compaction suppressed for shut down session %s",
-                            turn, conversation_id[:12],
+                            turn, conversation_id,
                         )
 
             self._queue_deferred_tag_split(history, turn)
@@ -2735,7 +2735,7 @@ class ProxyState:
             except Exception:
                 logger.warning(
                     "T%d opportunistic finalize raised for conv=%s",
-                    turn, conversation_id[:12], exc_info=True,
+                    turn, conversation_id, exc_info=True,
                 )
             # Init-lane sibling of the self-heal above: the single-turn
             # completion flow never claims an episode, so the finalizer's
@@ -2748,7 +2748,7 @@ class ProxyState:
             except Exception:
                 logger.warning(
                     "T%d init activation raised for conv=%s",
-                    turn, conversation_id[:12], exc_info=True,
+                    turn, conversation_id, exc_info=True,
                 )
 
         except Exception as e:
@@ -2800,7 +2800,7 @@ class ProxyState:
         if self._pending_split is not None and not self._pending_split.done():
             logger.info(
                 "T%d TAG_SPLIT already queued for %s — skipping requeue",
-                turn, conversation_id[:12],
+                turn, conversation_id,
             )
             return
         try:
@@ -2812,7 +2812,7 @@ class ProxyState:
         except RuntimeError:
             logger.info(
                 "T%d tag split suppressed for shut down session %s",
-                turn, conversation_id[:12],
+                turn, conversation_id,
             )
 
     def _run_deferred_tag_split(
@@ -2888,7 +2888,7 @@ class ProxyState:
                     ))
                 except Exception:
                     logger.warning("RECORD_EDIT enter_compaction failed for %s",
-                                   conversation_id[:12], exc_info=True)
+                                   conversation_id, exc_info=True)
                     entered = False
                 if entered:
                     stop = threading.Event()
@@ -2909,7 +2909,7 @@ class ProxyState:
                         try:
                             self.exit_compaction(success=False, error_message=str(exc))
                         except Exception:
-                            logger.warning("exit_compaction failed for %s", conversation_id[:12], exc_info=True)
+                            logger.warning("exit_compaction failed for %s", conversation_id, exc_info=True)
                         return True
                     finally:
                         stop.set()
@@ -3116,7 +3116,7 @@ class ProxyState:
                 except Exception:
                     logger.warning(
                         "enter_compaction failed for %s; skipping compaction",
-                        conversation_id[:12],
+                        conversation_id,
                         exc_info=True,
                     )
                     entered_lifecycle = False
@@ -3131,7 +3131,7 @@ class ProxyState:
                     logger.info(
                         "Compaction lifecycle not entered for %s; "
                         "yielding to active owner",
-                        conversation_id[:12],
+                        conversation_id,
                     )
                     self._update_compaction_state(
                         operation_id=operation_id,
@@ -3291,7 +3291,7 @@ class ProxyState:
                         except Exception:
                             logger.warning(
                                 "exit_compaction(success=True) failed for %s",
-                                conversation_id[:12],
+                                conversation_id,
                                 exc_info=True,
                             )
 
@@ -3317,7 +3317,7 @@ class ProxyState:
                         except Exception:
                             logger.warning(
                                 "exit_compaction(success=False) failed after lease-lost for conv=%s",
-                                conversation_id[:12], exc_info=True,
+                                conversation_id, exc_info=True,
                             )
                     return
 
@@ -3351,7 +3351,7 @@ class ProxyState:
                         except Exception:
                             logger.warning(
                                 "exit_compaction(success=False) failed for %s",
-                                conversation_id[:12],
+                                conversation_id,
                                 exc_info=True,
                             )
             finally:
@@ -3547,7 +3547,7 @@ class ProxyState:
                 "HISTORY_WIDENING_SUPPRESSED conversation=%s payload_entries=%d "
                 "durable_entries=%d old_turns=%d new_turns=%d: the payload "
                 "cannot rebuild the durable history; skipping reset",
-                conversation_id[:12], payload_entries, durable_entries,
+                conversation_id, payload_entries, durable_entries,
                 old_turns, new_turns,
             )
             return False
@@ -3555,12 +3555,12 @@ class ProxyState:
         logger.info(
             "HISTORY_WIDENED conversation=%s old_hash=%s new_hash=%s old_turns=%d new_turns=%d "
             "threshold=%.0f%% — clearing state and re-ingesting",
-            conversation_id[:12], old_first_hash, new_first_hash,
+            conversation_id, old_first_hash, new_first_hash,
             old_turns, new_turns, threshold * 100,
         )
         logger.info(
             "INGEST History widened: %d->%d turns, prefix changed -- full re-ingest (conversation=%s)",
-            old_turns, new_turns, conversation_id[:12],
+            old_turns, new_turns, conversation_id,
         )
 
         # Clear all conversation state
@@ -3693,7 +3693,7 @@ class ProxyState:
                     logger.warning(
                         "Background task failed while draining %s for conv=%s",
                         attr,
-                        self.engine.config.conversation_id[:12],
+                        self.engine.config.conversation_id,
                         exc_info=True,
                     )
                 finally:
@@ -3717,7 +3717,7 @@ class ProxyState:
                 logger.debug(
                     "Failed to request cancellation for %s on conv=%s",
                     attr,
-                    self.engine.config.conversation_id[:12],
+                    self.engine.config.conversation_id,
                     exc_info=True,
                 )
 
@@ -3738,7 +3738,7 @@ class ProxyState:
                 logger.debug(
                     "Failed to cancel %s for conv=%s",
                     attr,
-                    self.engine.config.conversation_id[:12],
+                    self.engine.config.conversation_id,
                     exc_info=True,
                 )
             finally:
@@ -3773,7 +3773,7 @@ class ProxyState:
         if thread.is_alive():
             msg = (
                 "Ingestion thread did not stop within "
-                f"{timeout_s:.1f}s for conv={self.engine.config.conversation_id[:12]}"
+                f"{timeout_s:.1f}s for conv={self.engine.config.conversation_id}"
             )
             if raise_on_timeout:
                 raise RuntimeError(msg)
@@ -3790,7 +3790,7 @@ class ProxyState:
                 logger.warning(
                     "Heartbeat sidecar did not stop within %.1fs for conv=%s",
                     timeout_s,
-                    self.engine.config.conversation_id[:12],
+                    self.engine.config.conversation_id,
                 )
         self._heartbeat_thread = None
         self._ingestion_cancel.clear()
@@ -3819,7 +3819,7 @@ class ProxyState:
         if not acquired_compaction_lock:
             msg = (
                 "Compaction lock did not quiesce within 5.0s for "
-                f"conv={self.engine.config.conversation_id[:12]}"
+                f"conv={self.engine.config.conversation_id}"
             )
             if authoritative:
                 raise RuntimeError(msg)
@@ -4010,7 +4010,7 @@ class ProxyState:
 
             logger.info(
                 "INGEST %d turns in %dms (conversation=%s)",
-                turns, int(elapsed_ms), conversation_id[:12],
+                turns, int(elapsed_ms), conversation_id,
             )
 
             if self.metrics:
@@ -4077,7 +4077,7 @@ class ProxyState:
                 "start_ingestion_if_needed: skipping spawn — "
                 "active ingestion episode is owned by another worker "
                 "(conv=%s, this=%s)",
-                conversation_id[:12], self._worker_id,
+                conversation_id, self._worker_id,
             )
             return
         with self._ingestion_lock:
@@ -4087,7 +4087,7 @@ class ProxyState:
             needed_turns = self._history_turn_count(history_messages)
             logger.info(
                 "INGEST_ENTRY conversation=%s turns=%d index_size=%d thread_alive=%s",
-                conversation_id[:12], needed_turns,
+                conversation_id, needed_turns,
                 self._indexed_turn_count(),
                 self._ingestion_thread is not None and self._ingestion_thread.is_alive(),
             )
@@ -4180,7 +4180,7 @@ class ProxyState:
 
                 logger.info(
                     "INGEST Cancel at T%d/%d, resuming from T%d (conversation=%s)",
-                    done, total, existing_turns, conversation_id[:12],
+                    done, total, existing_turns, conversation_id,
                 )
 
                 # Verify hash at handoff point
@@ -4336,7 +4336,7 @@ class ProxyState:
             logger.warning(
                 "legacy ingestion: complete_ingestion_episode raised for "
                 "conv=%s — leaving episode 'running' for next worker",
-                conversation_id[:12],
+                conversation_id,
                 exc_info=True,
             )
             return False
@@ -4344,7 +4344,7 @@ class ProxyState:
             logger.info(
                 "legacy ingestion: episode not completable for conv=%s — "
                 "deferring to next worker",
-                conversation_id[:12],
+                conversation_id,
             )
             return False
         try:
@@ -4357,7 +4357,7 @@ class ProxyState:
             logger.warning(
                 "legacy ingestion: set_phase raised after successful "
                 "episode completion for conv=%s — not publishing event",
-                conversation_id[:12],
+                conversation_id,
                 exc_info=True,
             )
             return False
@@ -4365,7 +4365,7 @@ class ProxyState:
             logger.info(
                 "legacy ingestion: set_phase('active') returned False for "
                 "conv=%s — epoch stale; deferring",
-                conversation_id[:12],
+                conversation_id,
             )
             return False
         # Both DB ops succeeded — advance local state.
@@ -4376,7 +4376,7 @@ class ProxyState:
         except Exception:
             logger.warning(
                 "_publish_phase_transition raised for conv=%s",
-                conversation_id[:12],
+                conversation_id,
                 exc_info=True,
             )
         return True
@@ -4420,7 +4420,7 @@ class ProxyState:
                 logger.warning(
                     "heartbeat sidecar: refresh exception for conv=%s — "
                     "retrying next tick",
-                    conversation_id[:12],
+                    conversation_id,
                     exc_info=True,
                 )
                 continue
@@ -4428,7 +4428,7 @@ class ProxyState:
                 logger.info(
                     "heartbeat sidecar: refresh rejected for conv=%s "
                     "(worker=%s) — lease lost; cancelling ingestion",
-                    conversation_id[:12], self._worker_id,
+                    conversation_id, self._worker_id,
                 )
                 self._ingestion_cancel.set()
                 return
@@ -4468,7 +4468,7 @@ class ProxyState:
                 logger.warning(
                     "compaction heartbeat sidecar: refresh raised for conv=%s "
                     "op=%s; retrying next tick",
-                    conversation_id[:12], operation_id[:8],
+                    conversation_id, operation_id[:8],
                     exc_info=True,
                 )
                 continue
@@ -4476,7 +4476,7 @@ class ProxyState:
                 logger.info(
                     "compaction heartbeat sidecar: refresh rejected for conv=%s "
                     "op=%s (lease lost or epoch bumped) — signalling cancel",
-                    conversation_id[:12], operation_id[:8],
+                    conversation_id, operation_id[:8],
                 )
                 self._compaction_cancelled.set()
                 return
@@ -4542,7 +4542,7 @@ class ProxyState:
                         "Ingestion catch-up: %d gap turns (have=%d, need=%d) "
                         "conv=%s",
                         self._history_turn_count(gap_messages), have, needed,
-                        conversation_id[:12],
+                        conversation_id,
                     )
                     self._ingestion_progress = (have, needed)
                     self._ingest_messages_with_progress(gap_messages, baseline=have, cumulative_total=needed)
@@ -4554,20 +4554,20 @@ class ProxyState:
                 cancelled = True
                 logger.info(
                     "Ingestion cancelled at %d/%d conv=%s",
-                    e.done, e.total, conversation_id[:12],
+                    e.done, e.total, conversation_id,
                 )
             except StaleConversationWriteError as e:
                 cancelled = True
                 logger.info(
                     "Ingestion abandoned for deleted/stale conversation %s: %s",
-                    conversation_id[:12],
+                    conversation_id,
                     e,
                 )
             except Exception as e:
                 logger.error(
                     "Legacy pair-based ingestion errored (falling through "
                     "to row-based DB sweep) conv=%s: %s",
-                    conversation_id[:12],
+                    conversation_id,
                     e,
                     exc_info=True,
                 )
@@ -4582,7 +4582,7 @@ class ProxyState:
                     logger.info(
                         "Row-based DB sweep exited on lifecycle epoch "
                         "mismatch for conv=%s",
-                        conversation_id[:12],
+                        conversation_id,
                     )
                     cancelled = True
                     completed_cleanly = False
@@ -4591,13 +4591,13 @@ class ProxyState:
                     logger.info(
                         "Row-based DB sweep abandoned for deleted/stale "
                         "conversation %s: %s",
-                        conversation_id[:12], e,
+                        conversation_id, e,
                     )
                 except Exception:
                     logger.exception(
                         "Row-based DB sweep errored for conv=%s; "
                         "leaving episode INGESTING for next worker",
-                        conversation_id[:12],
+                        conversation_id,
                     )
         finally:
             if not cancelled:
@@ -4629,7 +4629,7 @@ class ProxyState:
                         logger.warning(
                             "_advance_compaction_watermark raised after "
                             "row-based sweep for conv=%s",
-                            conversation_id[:12],
+                            conversation_id,
                             exc_info=True,
                         )
                 if should_run_post_ingestion:
@@ -4643,7 +4643,7 @@ class ProxyState:
                     logger.info(
                         "legacy ingestion finalisation deferred for conv=%s "
                         "— staying in INGESTING so the next worker can resume",
-                        conversation_id[:12],
+                        conversation_id,
                     )
 
     def _ingest_messages_with_progress(
@@ -4688,7 +4688,7 @@ class ProxyState:
             baseline, _total, len(grouped),
             len(self.engine._turn_tag_index.entries),
             _snapshot_done_floor,
-            conversation_id[:12],
+            conversation_id,
         )
         # Bug 2 fix (P2): heartbeat cadence is handled by the dedicated
         # ``_run_heartbeat_sidecar`` thread (started alongside the
@@ -4751,7 +4751,7 @@ class ProxyState:
 
         logger.info(
             "INGEST %d turns in %dms (conversation=%s)",
-            turns, int(elapsed_ms), conversation_id[:12],
+            turns, int(elapsed_ms), conversation_id,
         )
 
         if self.metrics:

@@ -207,7 +207,7 @@ def derive_session_state_markers(
         logger.warning(
             "derive_session_state_markers: failed to load canonical_turns "
             "for %s",
-            conversation_id[:12],
+            conversation_id,
             exc_info=True,
         )
         raise

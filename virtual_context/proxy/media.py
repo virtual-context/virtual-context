@@ -82,7 +82,7 @@ def compress_media_in_payload(
                     with open(cached["file_path"], "rb") as f:
                         compressed_b64 = base64.b64encode(f.read()).decode("ascii")
                     setter(block, compressed_b64, "image/jpeg")
-                    logger.info("MEDIA-CACHE: ref=%s conv=%s", ref, conversation_id[:12])
+                    logger.info("MEDIA-CACHE: ref=%s conv=%s", ref, conversation_id)
                     count += 1
                     continue
 

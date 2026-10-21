@@ -133,5 +133,5 @@ def attach_replay_images(replay_messages: list, store, body: dict, conversation_
                 out[index] = replace(message, metadata={**message.metadata, REPLAY_IMAGES_KEY: images})
         return out
     except Exception:
-        logger.warning("Replay images unavailable for conv=%s", conversation_id[:12], exc_info=True)
+        logger.warning("Replay images unavailable for conv=%s", conversation_id, exc_info=True)
         return replay_messages

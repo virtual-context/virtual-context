@@ -903,7 +903,7 @@ async def _handle_streaming(
                     _stream_first_chunk = False
                     logger.info(
                         "STREAM_FIRST_BYTE conv=%s turn=%d after=%.1fs",
-                        conversation_id[:12], turn,
+                        conversation_id, turn,
                         _now - _stream_t0,
                     )
 
@@ -911,7 +911,7 @@ async def _handle_streaming(
                 if _gap > 30.0:
                     logger.warning(
                         "STREAM_STALL conv=%s turn=%d gap=%.1fs chunks=%d bytes=%d elapsed=%.1fs",
-                        conversation_id[:12], turn, _gap,
+                        conversation_id, turn, _gap,
                         _stream_chunk_count, _stream_total_bytes,
                         _now - _stream_t0,
                     )
@@ -989,13 +989,13 @@ async def _handle_streaming(
             _stream_elapsed = time.monotonic() - _stream_t0
             logger.info(
                 "STREAM_END conv=%s turn=%d elapsed=%.1fs chunks=%d bytes=%d max_gap=%.1fs",
-                conversation_id[:12], turn, _stream_elapsed,
+                conversation_id, turn, _stream_elapsed,
                 _stream_chunk_count, _stream_total_bytes, _stream_max_gap,
             )
             if _stream_elapsed > 60.0:
                 logger.warning(
                     "STREAM_SLOW conv=%s turn=%d elapsed=%.1fs max_gap=%.1fs chunks=%d — investigate",
-                    conversation_id[:12], turn, _stream_elapsed, _stream_max_gap, _stream_chunk_count,
+                    conversation_id, turn, _stream_elapsed, _stream_max_gap, _stream_chunk_count,
                 )
             await upstream.aclose()
             if received_all:
@@ -1013,7 +1013,7 @@ async def _handle_streaming(
                         # A deletion/epoch change suppresses this side effect
                         # and marker; it must not corrupt the delivered stream.
                         completion_live = False
-                        logger.info("STREAM_COMPLETION_SKIPPED conv=%s: request authority expired", conversation_id[:12])
+                        logger.info("STREAM_COMPLETION_SKIPPED conv=%s: request authority expired", conversation_id)
                 if completion_live and state and assistant_text and not skip_marker_injection and not state.is_conversation_deleted():
                     yield get_format(api_format).emit_conversation_marker_sse(context.conversation_id)
 
@@ -1326,7 +1326,7 @@ async def _handle_vcattach(
                 popped.shutdown(wait=True, cancel_futures=True)
             except Exception:
                 logger.warning(
-                    "VCATTACH: shutdown of evicted state failed for %s", cid[:12],
+                    "VCATTACH: shutdown of evicted state failed for %s", cid,
                 )
 
     lease_factory = getattr(

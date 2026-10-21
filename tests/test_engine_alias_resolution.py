@@ -679,7 +679,7 @@ def test_refresh_conversation_binding_after_rebind_rebuilds_monitor(
         or getattr(mon, "_conversation_id", None)
         or getattr(mon, "_conv_short", None)
     )
-    assert captured == "rebind-target-004"[:12]
+    assert captured == "rebind-target-004"
 
 
 def test_refresh_conversation_binding_after_rebind_rebuilds_assembler(

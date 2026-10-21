@@ -9,7 +9,7 @@ class LifecycleEpochMismatch(Exception):
         self.expected = expected
         self.observed = observed
         super().__init__(
-            f"Lifecycle epoch mismatch for {conversation_id[:12]}: "
+            f"Lifecycle epoch mismatch for {conversation_id}: "
             f"expected={expected}, observed={observed}. "
             "In-memory handle is stale; rehydrate before retrying."
         )
