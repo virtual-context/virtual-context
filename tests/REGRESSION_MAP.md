@@ -5,6 +5,22 @@ Use `pytest -m regression` to run all regression tests.
 
 ## By Bug ID
 
+### BUG-139 — Replay block split by an inline image was never expanded
+
+- **Symptom**: a host prompt whose replayed history carried an attachment arrived as text, image, text; the block opened in the first text part and closed in the last, so no single part held a complete block and the million-character prompt went upstream whole.
+- **Root cause**: history detection and parsing looked at one text part of the newest user message.
+- **Fix**: the text parts from the opening tag to the closing tag are joined for detection and parsing, then merged into one residual text part; non-text parts between them keep their order after it.
+- **Tests**:
+  - `test_host_replay_expansion.py` — `test_block_split_across_text_parts_by_an_inline_image_is_expanded`
+
+### BUG-138 — Attributed `[user sender=…]` headers were not turn boundaries
+
+- **Symptom**: a replayed history whose user sections carry a `sender={…}` attribute parsed as one assistant entry, so the whole block was inserted as a single item and the speakers were lost.
+- **Root cause**: the section-header pattern accepted only a bare role between the brackets.
+- **Fix**: headers may carry attributes after the role; a user header's `sender` JSON supplies the speaker prefix (name, then username, then id), and plain headers parse as before.
+- **Tests**:
+  - `test_host_replay_expansion.py` — `test_attributed_user_headers_are_turn_boundaries`, `test_attributed_block_in_the_current_message_expands_into_turns`
+
 ### BUG-137 — Retried turn sent the host's replayed history unexpanded
 
 - **Symptom**: after a failed attempt, each retry of a fresh host thread reached upstream at 365k–607k tokens, though the first attempt was trimmed to 76k.
@@ -1453,7 +1469,7 @@ Use `pytest -m regression` to run all regression tests.
 | `test_context_cache_prefix.py` | PROXY-027 |
 | `test_responses_context_placement.py` | PROXY-027 |
 | `test_chat_context_placement.py` | PROXY-027 |
-| `test_host_replay_expansion.py` | PROXY-026, BUG-118, BUG-119, BUG-133, BUG-137 |
+| `test_host_replay_expansion.py` | PROXY-026, BUG-118, BUG-119, BUG-133, BUG-137, BUG-138, BUG-139 |
 | `test_unreplied_turns_compaction.py` | BUG-079 |
 | `test_postgres_store.py` | BUG-078 |
 | `test_tui.py` | BUG-002 |

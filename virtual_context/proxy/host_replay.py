@@ -28,8 +28,11 @@ from ._envelope import (
 )
 
 _BLOCK_RE = re.compile(r"<conversation_context>([\s\S]*?)</conversation_context>")
+# A section header is the role alone, or the role followed by attributes the
+# host attaches to it, e.g. ``[user sender={"id":"1","name":"optics"}]``.
 _SECTION_RE = re.compile(
-    r"(?m)^[ \t]*\[(user|assistant|toolResult|toolCall|tool|system|compactionSummary)\][ \t]*$"
+    r"(?m)^[ \t]*\[(user|assistant|toolResult|toolCall|tool|system|compactionSummary)"
+    r"(?:[ \t]+([^\n]*?))?\][ \t]*$"
 )
 _PREAMBLE_RE = re.compile(
     r"(?m)^[ \t]*" + re.escape(_HOST_ASSEMBLED_LABEL) + r"[ \t]*\n"
@@ -47,8 +50,26 @@ _SELECTED_LINE_RE = re.compile(r"^#(session:\S+|\d+) \d{4}-\d\d-\d\d \d\d:\d\d:\
 _HOST_SPEAKERS = {"OpenClaw"}
 
 
+def _attributed_speaker(attrs: str | None) -> str:
+    """Display name from a header's ``sender={json}`` attribute, or ``""``."""
+    if not attrs or "sender=" not in attrs:
+        return ""
+    raw = attrs[attrs.index("sender=") + len("sender="):]
+    try:
+        sender, _end = json.JSONDecoder().raw_decode(raw)
+    except ValueError:
+        return ""
+    if not isinstance(sender, dict):
+        return ""
+    return str(sender.get("name") or sender.get("username") or sender.get("id") or "")
+
+
 def parse_replay_block(block: str) -> list[tuple[str, str]]:
-    """Ordered ``(role, text)`` entries; non-user sections between users fold into one assistant entry."""
+    """Ordered ``(role, text)`` entries; non-user sections between users fold into one assistant entry.
+
+    A user header may carry the speaker (``[user sender={...}]``); the entry
+    then starts with that speaker's name, as selected room history does.
+    """
     heads = list(_SECTION_RE.finditer(block))
     entries: list[tuple[str, str]] = []
     for i, head in enumerate(heads):
@@ -60,6 +81,10 @@ def parse_replay_block(block: str) -> list[tuple[str, str]]:
         if label in _USER_ROLES:
             if label != "user":
                 text = f"[{label}]\n{text}"
+            else:
+                speaker = _attributed_speaker(head.group(2))
+                if speaker:
+                    text = f"{speaker}: {text}"
             entries.append(("user", text))
         elif entries and entries[-1][0] == "assistant":
             entries[-1] = ("assistant", entries[-1][1] + "\n\n" + text)
@@ -187,12 +212,35 @@ def _newest_user_with(items: list, carries) -> int | None:
     return None
 
 
-def _history_part(item: dict, carries) -> tuple[list, int | None]:
+def _is_text_part(part) -> bool:
+    return isinstance(part, dict) and isinstance(part.get("text"), str)
+
+
+def _history_span(item: dict) -> tuple[list, tuple[int, int, str] | None]:
+    """Content parts and the ``(first, last, joined_text)`` span holding the newest history.
+
+    The history is normally one text part. A host that places an attachment
+    from the replayed history inside the message splits the block across the
+    text parts around it; the span then runs to the part that closes the block
+    and the joined text is what gets parsed.
+    """
     content = item.get("content")
     parts = content if isinstance(content, list) else [{"type": "input_text", "text": content}]
-    at = next((i for i, part in enumerate(parts)
-               if isinstance(part, dict) and carries(str(part.get("text", "")))), None)
-    return parts, at
+    start = next((i for i, part in enumerate(parts)
+                  if _is_text_part(part) and _carries_history(part["text"])), None)
+    if start is None:
+        return parts, None
+    end = start
+    text = parts[start]["text"]
+    if "<conversation_context>" in text and "</conversation_context>" not in text:
+        for j in range(start + 1, len(parts)):
+            if not _is_text_part(parts[j]):
+                continue
+            text += parts[j]["text"]
+            end = j
+            if "</conversation_context>" in parts[j]["text"]:
+                break
+    return parts, (start, end, text)
 
 
 def _has_block(text: str) -> bool:
@@ -224,19 +272,20 @@ def expand_host_replay(body: dict) -> tuple[dict, int]:
     selected_at = _newest_user_with(items, _has_selected)
     if block_at is None and selected_at is None:
         return body, 0
-    texts: dict[int, tuple[list, int, str]] = {}
+    texts: dict[int, tuple[list, tuple[int, int, str], str]] = {}
     inserted: dict[int, list[tuple[str, str]]] = {}
-    # Only the text part holding the history is rewritten; every other part of
-    # the message (images, files, audio, further text) is kept as-is.
+    # Only the text holding the history is rewritten; every other part of the
+    # message (images, files, audio, further text) is kept as-is. Text parts an
+    # inline attachment split the block across are merged back into one.
     for index, item in enumerate(items):
         if index > (selected_at if selected_at is not None else -1) and index != block_at:
             continue
         if not (isinstance(item, dict) and item.get("type", "message") == "message" and item.get("role") == "user"):
             continue
-        parts, at = _history_part(item, _carries_history)
-        if at is None:
+        parts, span = _history_span(item)
+        if span is None:
             continue
-        text, entries = _take_selected_history(parts[at]["text"])
+        text, entries = _take_selected_history(span[2])
         if index != selected_at:
             entries = []
         replayed = []
@@ -247,9 +296,9 @@ def expand_host_replay(body: dict) -> tuple[dict, int]:
                 before = _PREAMBLE_RE.sub("", text[:match.start()]).rstrip()
                 after = text[match.end():].lstrip()
                 text = (before + "\n\n" + after) if before else after
-        if text == parts[at]["text"] and not entries and not replayed:
+        if text == span[2] and not entries and not replayed:
             continue
-        texts[index] = (parts, at, text.strip())
+        texts[index] = (parts, span, text.strip())
         inserted[index] = entries + replayed
     if not inserted:
         return body, 0
@@ -257,14 +306,15 @@ def expand_host_replay(body: dict) -> tuple[dict, int]:
     count = 0
     for index, item in enumerate(items):
         if index in texts:
-            parts, at, text = texts[index]
+            parts, (start, end, _joined), text = texts[index]
             expanded = [_message(role, entry) for role, entry in inserted[index]]
             out_items.extend(expanded)
             count += len(expanded)
             current = copy.deepcopy(item)
             new_parts = copy.deepcopy(parts)
-            new_parts[at] = {**new_parts[at], "text": text}
-            current["content"] = new_parts
+            merged = {**new_parts[start], "text": text}
+            kept_between = [part for part in new_parts[start + 1:end + 1] if not _is_text_part(part)]
+            current["content"] = new_parts[:start] + [merged] + kept_between + new_parts[end + 1:]
             out_items.append(current)
         else:
             out_items.append(item)

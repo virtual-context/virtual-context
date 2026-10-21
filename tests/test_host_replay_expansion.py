@@ -180,6 +180,56 @@ def test_attachments_in_the_current_message_survive_the_split():
     assert parts[0]["text"].endswith("What did you find about the camera?")
 
 
+ATTRIBUTED_BLOCK = (
+    "\n[user sender={\"id\":\"387316537012518913\",\"name\":\"optics\",\"username\":\"kidw.ai\"}]\n"
+    "Queue 1 and 3.\n\n"
+    "[assistant]\ntool call: exec [input omitted]\n\n"
+    "[toolResult]\ntool result: call_1 [content omitted]\n\n"
+    "[assistant]\nQueued 1, then 3.\n\n"
+    "[user sender={\"id\":\"99\",\"username\":\"guest99\"}]\nAnd the second batch?\n\n"
+    "[assistant]\nNot yet reviewed.\n"
+)
+
+
+@pytest.mark.regression("BUG-138")
+def test_attributed_user_headers_are_turn_boundaries():
+    entries = parse_replay_block(ATTRIBUTED_BLOCK)
+    assert [role for role, _ in entries] == ["user", "assistant", "user", "assistant"]
+    assert entries[0][1] == "optics: Queue 1 and 3."
+    assert entries[2][1] == "guest99: And the second batch?"
+    assert "sender=" not in entries[0][1] and "tool result: call_1" in entries[1][1]
+
+
+@pytest.mark.regression("BUG-138")
+def test_attributed_block_in_the_current_message_expands_into_turns():
+    prompt = PROMPT.replace(BLOCK, ATTRIBUTED_BLOCK)
+    out, n = expand_host_replay({"model": "m", "input": [_user(prompt)]})
+    assert n == 4
+    assert [item["role"] for item in out["input"][:-1]] == ["user", "assistant", "user", "assistant"]
+    assert _text(out["input"][-1]).endswith("What did you find about the camera?")
+    assert "<conversation_context>" not in _text(out["input"][-1])
+
+
+@pytest.mark.regression("BUG-139")
+def test_block_split_across_text_parts_by_an_inline_image_is_expanded():
+    cut = PROMPT.index("[user]\nCan you access the bridge?")
+    image = {"type": "input_image", "image_url": "data:image/jpeg;base64,/9j/AAAA"}
+    current = {"type": "message", "role": "user", "content": [
+        {"type": "input_text", "text": PROMPT[:cut]},
+        image,
+        {"type": "input_text", "text": PROMPT[cut:]},
+    ]}
+    out, n = expand_host_replay({"model": "m", "input": [current]})
+    assert n == 5
+    assert [item["role"] for item in out["input"][:-1]] == ["user", "user", "assistant", "user", "assistant"]
+    parts = out["input"][-1]["content"]
+    assert [p["type"] for p in parts] == ["input_text", "input_image"]
+    assert parts[1] == image
+    assert "<conversation_context>" not in parts[0]["text"]
+    assert parts[0]["text"].endswith("What did you find about the camera?")
+    assert parts[0]["text"].startswith("OpenClaw runtime context for this turn:")
+
+
 @pytest.mark.regression("BUG-118")
 def test_a_reused_thread_expands_the_block_in_its_first_message():
     """A host that projects history once into a thread's first message and then
