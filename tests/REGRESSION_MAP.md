@@ -5,6 +5,14 @@ Use `pytest -m regression` to run all regression tests.
 
 ## By Bug ID
 
+### BUG-141 — Provider-reported stream failures were answered as client errors
+
+- **Symptom**: when the provider sent an `error` event (`response protection is unavailable`, type `internal_error`) during a collected internal-tool turn, the proxy answered 422 "The provider interrupted the response with an error." without the provider's text; the client read it as a rejected request and did not move to a fallback model.
+- **Root cause**: `collect_response` reused the 422 chosen for replies the proxy cannot read for failures the provider reported itself, and dropped the provider's message.
+- **Fix**: `error` events and `response.failed` raise a 502 whose message carries the provider's text; `response.incomplete` stays 422 because it ends on a request-side limit.
+- **Tests**:
+  - `test_proxy_collect_provider_errors.py`
+
 ### BUG-140 — Request waited on a compaction that could not relieve the overflow
 
 - **Symptom**: a request whose previous turn tripped the hard threshold blocked for the whole compaction (61 s measured) and then went upstream at nearly the same size, because the compaction removed 7.8k of 279k overflow tokens.

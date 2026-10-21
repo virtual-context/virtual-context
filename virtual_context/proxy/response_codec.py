@@ -19,6 +19,11 @@ logger = logging.getLogger(__name__)
 # An upstream reply this proxy cannot read is answered with a client error rather
 # than a gateway error: clients retry 5xx and stream errors, and each retry is a
 # full model call, so the failure has to be terminal for the caller.
+#
+# A failure the provider reports itself (an ``error`` event, a failed response)
+# is different: the request was accepted and the provider gave up, so it is
+# answered as a gateway error carrying the provider's message. Clients treat a
+# 4xx as a rejected request and will not move to a fallback model for it.
 
 
 def _describe(response, size, head):
@@ -31,11 +36,17 @@ def _describe(response, size, head):
 _SSE_FIELD_PREFIXES = (b"event:", b"data:", b"id:", b"retry:", b":")
 
 
-def _log_provider_failure(kind, event):
-    """Log what the provider said when it ended a stream without an answer."""
+def _provider_failure(kind, event, summary, status_code=502):
+    """Log what the provider said when it ended a stream without an answer and
+    return the error to raise, with the provider's own words in the message."""
     nested = event.get("response") if isinstance(event.get("response"), dict) else {}
     detail = event.get("error") or nested.get("error") or nested.get("incomplete_details") or event
     logger.warning("PROVIDER_STREAM_ERROR type=%s detail=%s", kind or "?", json.dumps(detail, ensure_ascii=False)[:500])
+    said = detail
+    if isinstance(detail, dict):
+        said = detail.get("message") or detail.get("reason") or detail.get("code") or detail.get("type")
+    said = " ".join(str(said).split())[:300] if said else ""
+    return ContinuationError(f"{summary}: {said}." if said else f"{summary}.", status_code)
 
 
 async def _peek(chunks, minimum=8, limit=65536):
@@ -128,8 +139,7 @@ async def collect_response(response, api_format):
                 raise ContinuationError("The provider returned malformed SSE data.", 422) from exc
             kind = event.get("type", "")
             if kind == "error" or event.get("error"):
-                _log_provider_failure(kind, event)
-                raise ContinuationError("The provider interrupted the response with an error.", 422)
+                raise _provider_failure(kind, event, "The provider interrupted the response with an error")
             if api_format == "anthropic":
                 if kind == "message_start":
                     result = event.get("message", {})
@@ -174,9 +184,12 @@ async def collect_response(response, api_format):
                     if not result.get("output") and blocks:
                         result["output"] = [blocks[index] for index in sorted(blocks)]
                     terminal = True
-                elif kind in ("response.failed", "response.incomplete"):
-                    _log_provider_failure(kind, event)
-                    raise ContinuationError("The provider did not complete the response.", 422)
+                elif kind == "response.failed":
+                    raise _provider_failure(kind, event, "The provider failed to complete the response")
+                elif kind == "response.incomplete":
+                    # The provider stopped on a request-side limit (for example
+                    # max_output_tokens); retrying unchanged cannot help.
+                    raise _provider_failure(kind, event, "The provider did not complete the response", 422)
             elif api_format == "openai":
                 result.update({key: value for key, value in event.items() if key != "choices"})
                 for choice in event.get("choices", []):
