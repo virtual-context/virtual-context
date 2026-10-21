@@ -577,6 +577,47 @@ class _ProxyToolRuntime:
                         break
 
 
+_COMPACTION_PROMPT = "You are performing a CONTEXT CHECKPOINT COMPACTION"
+
+
+def _item_text(item) -> str:
+    if not isinstance(item, dict):
+        return ""
+    content = item.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        for part in content:
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                return part["text"]
+    return ""
+
+
+def upstream_request_kind(body) -> str:
+    """Name the kind of upstream call: a client context compaction or a normal turn."""
+    if not isinstance(body, dict):
+        return "turn"
+    items = body.get("input") if isinstance(body.get("input"), list) else body.get("messages")
+    if not isinstance(items, list):
+        return "turn"
+    for item in reversed(items[-3:]):
+        if _item_text(item).lstrip().startswith(_COMPACTION_PROMPT):
+            return "compaction"
+    return "turn"
+
+
+def _log_stream_provider_error(event, conversation_id, turn, passthrough, request_kind, body) -> None:
+    """Record a provider-reported failure seen while forwarding a stream unchanged."""
+    nested = event.get("response") if isinstance(event.get("response"), dict) else {}
+    detail = event.get("error") or nested.get("error") or nested.get("incomplete_details") or event
+    logger.warning(
+        "PROVIDER_STREAM_ERROR path=forwarded type=%s conv=%s turn=%d kind=%s model=%s passthrough=%s detail=%s",
+        event.get("type", "?"), conversation_id, turn, request_kind,
+        body.get("model", "?") if isinstance(body, dict) else "?", passthrough,
+        json.dumps(detail, ensure_ascii=False)[:500],
+    )
+
+
 async def _passthrough(
     client: httpx.AsyncClient,
     request: Request,
@@ -669,6 +710,13 @@ async def _handle_streaming(
 
     headers = dict(headers)
     headers.pop("accept-encoding", None)
+    request_kind = upstream_request_kind(body)
+    if request_kind != "turn":
+        logger.info(
+            "UPSTREAM_REQUEST kind=%s conv=%s turn=%d model=%s passthrough=%s payload_tokens=%s",
+            request_kind, conversation_id, turn, body.get("model", "?"), passthrough,
+            getattr(context, "payload_tokens", "?"),
+        )
 
     # Open upstream connection — resolves after response headers arrive,
     # body streams lazily via aiter_bytes().
@@ -888,6 +936,8 @@ async def _handle_streaming(
                                 text_chunks.append(delta)
                             # Extract usage from message_start / message_delta
                             _dtype = data.get("type", "")
+                            if _dtype in ("error", "response.failed", "response.incomplete") or (isinstance(data, dict) and data.get("error")):
+                                _log_stream_provider_error(data, conversation_id, turn, passthrough, request_kind, body)
                             if _dtype == "message_start":
                                 _mu = data.get("message", {}).get("usage", {})
                                 _extract_usage(_mu, _raw_usage)

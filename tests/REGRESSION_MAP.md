@@ -5,6 +5,14 @@ Use `pytest -m regression` to run all regression tests.
 
 ## By Bug ID
 
+### BUG-142 — Conversation deletions and forwarded provider failures left no trace
+
+- **Symptom**: a conversation's lifecycle row was found deleted with nothing identifying the caller, and a client compaction that the provider refused on a forwarded stream logged only its byte count.
+- **Root cause**: the lifecycle tombstone writers logged nothing, the forwarded-stream path parsed provider events without recording errors, and nothing marked a client compaction request.
+- **Fix**: `begin_conversation_deletion` logs `CONVERSATION_DELETE_BEGIN` with the full id, generation and caller chain; streams log `UPSTREAM_REQUEST kind=compaction` and `PROVIDER_STREAM_ERROR path=forwarded` with the provider's error text.
+- **Tests**:
+  - `test_operational_audit_logging.py`
+
 ### BUG-141 — Provider-reported stream failures were answered as client errors
 
 - **Symptom**: when the provider sent an `error` event (`response protection is unavailable`, type `internal_error`) during a collected internal-tool turn, the proxy answered 422 "The provider interrupted the response with an error." without the provider's text; the client read it as a rejected request and did not move to a fallback model.

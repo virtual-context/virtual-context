@@ -95,6 +95,8 @@ from ..types import (
 from .helpers import dt_to_str as _dt_to_str, str_to_dt as _str_to_dt, extract_excerpt as _extract_excerpt
 
 
+from ..core.deletion_audit import log_deletion
+
 logger = logging.getLogger(__name__)
 
 
@@ -4897,6 +4899,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
             (conversation_id, generation, _dt_to_str(datetime.now(timezone.utc))),
         )
         conn.commit()
+        log_deletion(conversation_id, generation, "sqlite")
         return generation
 
     def get_conversation_generation(self, conversation_id: str) -> int:

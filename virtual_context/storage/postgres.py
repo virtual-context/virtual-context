@@ -126,6 +126,8 @@ from .helpers import dt_to_str as _dt_to_str, str_to_dt as _str_to_dt, extract_e
 from .postgres_vectors import PostgresVectorSearchMixin
 from .relational import RelationalStoreMixin
 
+from ..core.deletion_audit import log_deletion
+
 logger = logging.getLogger(__name__)
 
 
@@ -4361,7 +4363,9 @@ class PostgresStore(PostgresVectorSearchMixin, RelationalStoreMixin, ContextStor
                 RETURNING generation""",
                 (conversation_id, _dt_to_str(datetime.now(timezone.utc))),
             ).fetchone()
-            return int(row["generation"] if isinstance(row, dict) else row[0])
+            generation = int(row["generation"] if isinstance(row, dict) else row[0])
+        log_deletion(conversation_id, generation, "postgres")
+        return generation
 
     def get_conversation_generation(self, conversation_id: str) -> int:
         with self.pool.connection() as conn:
