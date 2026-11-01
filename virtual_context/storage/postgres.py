@@ -29,7 +29,7 @@ if TYPE_CHECKING:
     from ..core.compaction_fence import CompactionFenceMode
     from ..types import BacklogCandidate, CompactionLeaseClaim
 
-from ..core.canonical_turns import STRIP_WHITESPACE
+from ..core.canonical_turns import STRIP_WHITESPACE, canonical_turn_index_row
 from ..core.discord_snowflake import (
     datetime_to_snowflake_ceil,
     datetime_to_snowflake_floor,
@@ -86,6 +86,7 @@ from ..types import (
     FactLink,
     FactSignal,
     CanonicalTurnChunkEmbedding,
+    CanonicalTurnIndexRow,
     CanonicalTurnReconcileRow,
     CanonicalTurnRow,
     LinkedFact,
@@ -12571,12 +12572,14 @@ class PostgresStore(PostgresVectorSearchMixin, RelationalStoreMixin, ContextStor
         *,
         min_turn_group: int,
         max_turn_group: int | None = None,
+        with_raw: bool = True,
     ) -> list[CanonicalTurnRow]:
         """Full canonical rows of the turn groups in ``[min_turn_group, max_turn_group]``.
 
         Same rows and order as ``get_all_canonical_turns`` restricted to those
         groups, so a caller that needs only recent turns reads only them. A
         conversation still on legacy (ungrouped) rows is read whole and filtered.
+        ``with_raw=False`` leaves the raw bodies in storage, as the text loader does.
         """
         with self.pool.connection() as conn:
             legacy = conn.execute(
@@ -12589,7 +12592,7 @@ class PostgresStore(PostgresVectorSearchMixin, RelationalStoreMixin, ContextStor
                 if max_turn_group is not None:
                     params.append(int(max_turn_group))
                 rows = conn.execute(
-                    f"""SELECT {_CANONICAL_TURN_ROW_COLUMNS}
+                    f"""SELECT {_CANONICAL_TURN_ROW_COLUMNS if with_raw else _CANONICAL_TURN_TEXT_COLUMNS}
                        FROM canonical_turns_ordinal
                        WHERE conversation_id = %s AND turn_group_number >= %s{upper}
                        ORDER BY sort_key, canonical_turn_id""",
@@ -12597,7 +12600,10 @@ class PostgresStore(PostgresVectorSearchMixin, RelationalStoreMixin, ContextStor
                 ).fetchall()
                 return [_row_to_canonical_turn(row) for row in rows]
         return [
-            row for row in self._load_canonical_turn_rows(conversation_id)
+            row for row in self._load_canonical_turn_rows(
+                conversation_id,
+                _CANONICAL_TURN_ROW_COLUMNS if with_raw else _CANONICAL_TURN_TEXT_COLUMNS,
+            )
             if int(row.turn_group_number) >= int(min_turn_group)
             and (max_turn_group is None or int(row.turn_group_number) <= int(max_turn_group))
         ]
@@ -12632,6 +12638,48 @@ class PostgresStore(PostgresVectorSearchMixin, RelationalStoreMixin, ContextStor
                 (conversation_id, int(turn_number), STRIP_WHITESPACE),
             ).fetchone()
         return (row["session_date"] or "").strip() if row is not None else ""
+
+    def get_canonical_turn_index_rows(
+        self, conversation_id: str,
+    ) -> list[CanonicalTurnIndexRow] | None:
+        """Every canonical turn without its text, with its group's text hash.
+
+        The hash is computed here from each group's first non-empty user and
+        assistant text, so the text itself never leaves the database.
+        """
+        with self.pool.connection() as conn:
+            legacy = conn.execute(
+                "SELECT 1 FROM canonical_turns WHERE conversation_id = %s AND turn_group_number < 0 LIMIT 1",
+                (conversation_id,),
+            ).fetchone()
+            if legacy is not None:
+                return None
+            rows = conn.execute(
+                f"""WITH firsts AS (
+                       SELECT turn_group_number,
+                              (array_agg(user_content ORDER BY sort_key, canonical_turn_id)
+                                  FILTER (WHERE coalesce(user_content, '') <> ''))[1] AS u,
+                              (array_agg(assistant_content ORDER BY sort_key, canonical_turn_id)
+                                  FILTER (WHERE coalesce(assistant_content, '') <> ''))[1] AS a
+                       FROM canonical_turns
+                       WHERE conversation_id = %s
+                       GROUP BY turn_group_number
+                   )
+                   SELECT o.canonical_turn_id, o.turn_number, o.turn_group_number, o.sort_key,
+                          o.primary_tag, o.tags_json, o.session_date, o.sender,
+                          o.fact_signals_json, o.code_refs_json, o.tagged_at, o.compacted_at,
+                          o.first_seen_at, o.last_seen_at, o.created_at, o.updated_at,
+                          (btrim(coalesce(o.user_content, ''), %s) <> '') AS has_user_content,
+                          (btrim(coalesce(o.assistant_content, ''), %s) <> '') AS has_assistant_content,
+                          left(encode(sha256(convert_to(
+                              coalesce(f.u, '') || ' ' || coalesce(f.a, ''), 'UTF8')), 'hex'), 16) AS pair_hash
+                   FROM canonical_turns_ordinal o
+                   JOIN firsts f ON f.turn_group_number = o.turn_group_number
+                   WHERE o.conversation_id = %s
+                   ORDER BY o.sort_key, o.canonical_turn_id""",
+                (conversation_id, STRIP_WHITESPACE, STRIP_WHITESPACE, conversation_id),
+            ).fetchall()
+        return [canonical_turn_index_row(row) for row in rows]
 
     def get_canonical_turn_tags(
         self, conversation_id: str,

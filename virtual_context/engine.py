@@ -30,6 +30,8 @@ from .core.telemetry import TelemetryLedger
 from .core.monitor import ContextMonitor
 from .core.retriever import ContextRetriever
 from .core.segmenter import TopicSegmenter, pair_messages_into_turns
+from .core.canonical_turns import pair_text_hash
+from .core.store import canonical_rows_in_groups, canonical_turn_index_rows
 from .core.store_capabilities import capabilities_of
 from .core.tag_canonicalizer import TagCanonicalizer
 from .core.tag_generator import build_tag_generator, TagGenerator
@@ -38,6 +40,7 @@ from .storage.sqlite import SQLiteStore
 from .token_counter import create_token_counter
 from .types import (
     AssembledContext,
+    CanonicalTurnIndexRow,
     CompactionReport,
     CompactionSignal,
     DEFAULT_CHAT_MODEL,
@@ -84,6 +87,13 @@ _STUB_PATTERNS = [
     re.compile(r"\[attachment:[^\]]*\]"),
     re.compile(r"To send an image back to the user.*", re.IGNORECASE),
 ]
+
+
+def _row_has_text(row: object, side: str) -> bool:
+    """Whether a canonical row carries non-blank text on ``side`` ("user" or "assistant")."""
+    if isinstance(row, CanonicalTurnIndexRow):
+        return bool(getattr(row, f"has_{side}_content"))
+    return bool(str(getattr(row, f"{side}_content", "") or "").strip())
 
 
 def _is_stub_content(text: str) -> bool:
@@ -1364,14 +1374,8 @@ class VirtualContextEngine:
         compacted_messages = 0
         last_prefix_turn = -1
         for turn_number, rows in paired_rows:
-            user_halves = sum(
-                1 for row in rows
-                if str(getattr(row, "user_content", "") or "").strip()
-            )
-            assistant_halves = sum(
-                1 for row in rows
-                if str(getattr(row, "assistant_content", "") or "").strip()
-            )
+            user_halves = sum(1 for row in rows if _row_has_text(row, "user"))
+            assistant_halves = sum(1 for row in rows if _row_has_text(row, "assistant"))
             halves = user_halves + assistant_halves
             if halves and all(getattr(row, "compacted_at", None) for row in rows):
                 compacted_messages += halves
@@ -1421,17 +1425,32 @@ class VirtualContextEngine:
         return user_content, assistant_content, user_raw_content, assistant_raw_content
 
     def _restore_from_canonical_rows(self, conversation_id: str) -> bool:
-        # The turn index needs every turn's text and tags; raw bodies are
-        # read afterwards for the live and pending turns only.
+        # The turn index needs every turn's tags and a hash of its text. The
+        # store computes the hash, so text is read only for the live and
+        # pending turns past the compaction watermark; raw bodies are read
+        # afterwards for the pending turns only. A store that cannot project
+        # the hash (or a conversation with ungrouped rows) falls back to
+        # reading every turn's text.
         try:
-            rows = list(self._store.get_all_canonical_turn_texts(conversation_id))
+            rows = canonical_turn_index_rows(self._store, conversation_id)
         except Exception:
             logger.warning(
-                "Failed to load canonical turns for conversation %s",
+                "Failed to project canonical turns for conversation %s; reading full rows",
                 conversation_id,
                 exc_info=True,
             )
-            return False
+            rows = None
+        projected = rows is not None
+        if not projected:
+            try:
+                rows = list(self._store.get_all_canonical_turn_texts(conversation_id))
+            except Exception:
+                logger.warning(
+                    "Failed to load canonical turns for conversation %s",
+                    conversation_id,
+                    exc_info=True,
+                )
+                return False
         if not rows:
             return False
 
@@ -1443,7 +1462,11 @@ class VirtualContextEngine:
         ]
         self._turn_tag_index = TurnTagIndex()
         for turn_number, pair_rows in tagged_pairs:
-            user_content, assistant_content, *_ = self._pair_payload_from_rows(pair_rows)
+            if projected:
+                message_hash = pair_rows[0].pair_hash
+            else:
+                user_content, assistant_content, *_ = self._pair_payload_from_rows(pair_rows)
+                message_hash = pair_text_hash(user_content, assistant_content)
             primary_tag = "_general"
             sender = ""
             session_date = ""
@@ -1477,7 +1500,7 @@ class VirtualContextEngine:
             self._turn_tag_index.append(TurnTagEntry(
                 turn_number=turn_number,
                 canonical_turn_id=canonical_turn_id,
-                message_hash=hashlib.sha256(f"{user_content} {assistant_content}".encode()).hexdigest()[:16],
+                message_hash=message_hash,
                 tags=list(dict.fromkeys(tags)) or [primary_tag],
                 primary_tag=primary_tag,
                 timestamp=self._parse_turn_timestamp(*timestamp_values),
@@ -1522,6 +1545,12 @@ class VirtualContextEngine:
         self._engine_state.last_completed_turn = max(self._engine_state.last_completed_turn, last_completed_turn)
         self._engine_state.last_indexed_turn = max(self._engine_state.last_indexed_turn, last_indexed_turn)
         self._engine_state.checkpoint_version = max(self._engine_state.checkpoint_version, 4)
+        if projected:
+            text_rows = self._texts_for_groups(
+                conversation_id, [turn for turn, _ in live_pairs + pending_pairs],
+            )
+            live_pairs = [(turn, text_rows.get(turn, [])) for turn, _ in live_pairs]
+            pending_pairs = [(turn, text_rows.get(turn, [])) for turn, _ in pending_pairs]
         self._restored_conversation_history = [
             (turn_number, *self._pair_payload_from_rows(pair_rows)[:2])
             for turn_number, pair_rows in live_pairs
@@ -1544,6 +1573,21 @@ class VirtualContextEngine:
             conversation_id,
         )
         return True
+
+    def _texts_for_groups(self, conversation_id: str, groups: list[int]) -> dict[int, list[object]]:
+        """Text rows of the given turn groups, keyed by group, without raw bodies."""
+        if not groups:
+            return {}
+        wanted = set(groups)
+        out: dict[int, list[object]] = {}
+        for row in canonical_rows_in_groups(
+            self._store, conversation_id, min_turn_group=min(wanted), max_turn_group=max(wanted),
+            with_raw=False,
+        ):
+            group = int(row.turn_group_number)
+            if group in wanted:
+                out.setdefault(group, []).append(row)
+        return out
 
     def _fill_restored_raw_bodies(self, conversation_id: str) -> None:
         """Give restored pending turns their raw bodies.

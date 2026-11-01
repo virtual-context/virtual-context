@@ -12,6 +12,7 @@ from ..types import (
     CANONICAL_TAGGING_IDENTITY_KEY,
     CanonicalTurnChunkEmbedding,
     CanonicalTurnRow,
+    CanonicalTurnIndexRow,
     CanonicalTurnReconcileRow,
     ChunkEmbedding,
     CompactionLeaseClaim,
@@ -177,15 +178,30 @@ def canonical_turn_tags(store, conversation_id: str) -> list[tuple[str, int, str
     return ContextStore.get_canonical_turn_tags(store, conversation_id)
 
 
+def canonical_turn_index_rows(store, conversation_id: str) -> list | None:
+    """Text-free index rows for a conversation, or None when the store cannot project them."""
+    loader = getattr(store, "get_canonical_turn_index_rows", None)
+    if callable(loader):
+        return loader(conversation_id)
+    return None
+
+
 def canonical_rows_in_groups(
     store, conversation_id: str, *, min_turn_group: int, max_turn_group: int | None = None,
+    with_raw: bool = True,
 ) -> list:
-    """Full canonical rows of a turn-group range, from any store."""
+    """Canonical rows of a turn-group range, from any store; raw bodies only when ``with_raw``."""
     loader = getattr(store, "get_canonical_turn_rows_in_groups", None)
     if callable(loader):
-        return loader(conversation_id, min_turn_group=min_turn_group, max_turn_group=max_turn_group)
+        if with_raw:
+            return loader(conversation_id, min_turn_group=min_turn_group, max_turn_group=max_turn_group)
+        return loader(
+            conversation_id, min_turn_group=min_turn_group, max_turn_group=max_turn_group,
+            with_raw=False,
+        )
     return ContextStore.get_canonical_turn_rows_in_groups(
         store, conversation_id, min_turn_group=min_turn_group, max_turn_group=max_turn_group,
+        with_raw=with_raw,
     )
 
 
@@ -1437,14 +1453,19 @@ class ContextStore(ABC):
         *,
         min_turn_group: int,
         max_turn_group: int | None = None,
+        with_raw: bool = True,
     ) -> list[CanonicalTurnRow]:
         """Full canonical rows of the turn groups in ``[min_turn_group, max_turn_group]``,
         in ``get_all_canonical_turns`` order."""
-        return [
+        rows = [
             row for row in self.get_all_canonical_turns(conversation_id)
             if int(row.turn_group_number) >= int(min_turn_group)
             and (max_turn_group is None or int(row.turn_group_number) <= int(max_turn_group))
         ]
+        if not with_raw:
+            for row in rows:
+                row.user_raw_content = row.assistant_raw_content = None
+        return rows
 
     def first_untagged_complete_group(self, conversation_id: str) -> int | None:
         """Lowest turn group with both halves present and a row not yet tagged."""
@@ -1485,6 +1506,17 @@ class ContextStore(ABC):
                 list(getattr(row, "tags", None) or []),
             ))
         return out
+
+    def get_canonical_turn_index_rows(
+        self,
+        conversation_id: str,
+    ) -> list["CanonicalTurnIndexRow"] | None:
+        """Every canonical turn without its text, carrying its group's text hash.
+
+        None when the backend cannot compute the hash or the conversation
+        still has ungrouped rows; the caller then reads full rows instead.
+        """
+        return None
 
     def get_canonical_turn_reconcile_rows(
         self,

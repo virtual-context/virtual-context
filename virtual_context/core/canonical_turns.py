@@ -8,9 +8,60 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-from ..types import CanonicalTurnRow, IngestBatchRecord
+import json
+
+from ..types import CanonicalTurnIndexRow, CanonicalTurnRow, FactSignal, IngestBatchRecord
 
 HASH_VERSION = 1
+
+
+def pair_text_hash(user_text: str, assistant_text: str) -> str:
+    """The turn index's key for a turn: sha256 over ``"<user> <assistant>"``, 16 hex digits."""
+    return hashlib.sha256(f"{user_text} {assistant_text}".encode()).hexdigest()[:16]
+
+
+def canonical_turn_index_row(row) -> CanonicalTurnIndexRow:
+    """Build an index row from a mapping of the projected columns."""
+    def _json_list(key: str) -> list:
+        try:
+            value = json.loads(row[key] or "[]")
+        except Exception:
+            return []
+        return value if isinstance(value, list) else []
+
+    fact_signals = [
+        FactSignal(
+            subject=item.get("subject", ""),
+            verb=item.get("verb", ""),
+            object=item.get("object", ""),
+            status=item.get("status", ""),
+            fact_type=item.get("fact_type", ""),
+            what=item.get("what", ""),
+        )
+        for item in _json_list("fact_signals_json")
+        if isinstance(item, dict)
+    ]
+    return CanonicalTurnIndexRow(
+        canonical_turn_id=str(row["canonical_turn_id"] or ""),
+        turn_number=int(row["turn_number"]) if row["turn_number"] is not None else -1,
+        turn_group_number=int(row["turn_group_number"]) if row["turn_group_number"] is not None else -1,
+        sort_key=float(row["sort_key"] or 0.0),
+        primary_tag=row["primary_tag"] or "_general",
+        tags=list(_json_list("tags_json")),
+        session_date=row["session_date"] or "",
+        sender=row["sender"] or "",
+        fact_signals=fact_signals,
+        code_refs=list(_json_list("code_refs_json")),
+        tagged_at=row["tagged_at"] or None,
+        compacted_at=row["compacted_at"] or None,
+        first_seen_at=row["first_seen_at"] or None,
+        last_seen_at=row["last_seen_at"] or None,
+        created_at=row["created_at"] or None,
+        updated_at=row["updated_at"] or None,
+        has_user_content=bool(row["has_user_content"]),
+        has_assistant_content=bool(row["has_assistant_content"]),
+        pair_hash=row["pair_hash"] or "",
+    )
 
 # Every character ``str.strip()`` removes, as one string.
 #

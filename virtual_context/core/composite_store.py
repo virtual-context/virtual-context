@@ -528,11 +528,20 @@ class CompositeStore:
     ) -> list[CanonicalTurnRow]:
         return self._segments.get_all_canonical_turn_texts(conversation_id)
 
+    def get_canonical_turn_index_rows(self, conversation_id: str):
+        from .store import canonical_turn_index_rows
+
+        return canonical_turn_index_rows(self._segments, conversation_id)
+
     def get_canonical_turn_rows_in_groups(
         self, conversation_id: str, *, min_turn_group: int, max_turn_group: int | None = None,
+        with_raw: bool = True,
     ) -> list[CanonicalTurnRow]:
-        return self._segments.get_canonical_turn_rows_in_groups(
-            conversation_id, min_turn_group=min_turn_group, max_turn_group=max_turn_group,
+        from .store import canonical_rows_in_groups
+
+        return canonical_rows_in_groups(
+            self._segments, conversation_id, min_turn_group=min_turn_group,
+            max_turn_group=max_turn_group, with_raw=with_raw,
         )
 
     def first_untagged_complete_group(self, conversation_id: str) -> int | None:

@@ -40,7 +40,7 @@ from ..core.progress_snapshot import (
     ActiveEpisodeSnapshot,
     ProgressSnapshot,
 )
-from ..core.canonical_turns import STRIP_WHITESPACE
+from ..core.canonical_turns import STRIP_WHITESPACE, canonical_turn_index_row, pair_text_hash
 from ..core.store import ContextStore, float32_vectors
 from .audience_proof import effective_attested_audience, verify_source_replay_audience
 from .assistant_channel_enrichment import (
@@ -68,7 +68,7 @@ from .audience_reassignment import (
 )
 from .relational import RelationalStoreMixin
 from ..core.exceptions import CanonicalSourceConflict, ConversationLifecycleConflict
-from ..types import AUDIENCE_ATTRIBUTION_VERSION, ChunkEmbedding, ConversationStats, DepthLevel, EngineStateSnapshot, Fact, FactLink, FactSignal, CanonicalTurnChunkEmbedding, CanonicalTurnReconcileRow, CanonicalTurnRow, LinkedFact, QuoteResult, SegmentMetadata, SourceProvenance, SpeakerRetrievalContext, StoredSegment, StoredSummary, TagStats, TagSummary, TagTopic, TurnTagEntry, WorkingSetEntry, channel_excerpt_prefix, strip_channel_hash
+from ..types import AUDIENCE_ATTRIBUTION_VERSION, ChunkEmbedding, ConversationStats, DepthLevel, EngineStateSnapshot, Fact, FactLink, FactSignal, CanonicalTurnChunkEmbedding, CanonicalTurnIndexRow, CanonicalTurnReconcileRow, CanonicalTurnRow, LinkedFact, QuoteResult, SegmentMetadata, SourceProvenance, SpeakerRetrievalContext, StoredSegment, StoredSummary, TagStats, TagSummary, TagTopic, TurnTagEntry, WorkingSetEntry, channel_excerpt_prefix, strip_channel_hash
 from ..types import (
     strict_segment_identity_metadata,
     strict_structured_summary,
@@ -11706,12 +11706,14 @@ CREATE TABLE IF NOT EXISTS request_captures (
         *,
         min_turn_group: int,
         max_turn_group: int | None = None,
+        with_raw: bool = True,
     ) -> list[CanonicalTurnRow]:
         """Full canonical rows of the turn groups in ``[min_turn_group, max_turn_group]``.
 
         Same rows and order as ``get_all_canonical_turns`` restricted to those
         groups, so a caller that needs only recent turns reads only them. A
         conversation still on legacy (ungrouped) rows is read whole and filtered.
+        ``with_raw=False`` leaves the raw bodies in storage, as the text loader does.
         """
         conn = self._get_conn()
         legacy = conn.execute(
@@ -11724,7 +11726,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
             if max_turn_group is not None:
                 params.append(int(max_turn_group))
             rows = conn.execute(
-                f"""SELECT {_CANONICAL_TURN_ROW_COLUMNS}
+                f"""SELECT {_CANONICAL_TURN_ROW_COLUMNS if with_raw else _CANONICAL_TURN_TEXT_COLUMNS}
                    FROM canonical_turns_ordinal
                    WHERE conversation_id = ? AND turn_group_number >= ?{upper}
                    ORDER BY sort_key, canonical_turn_id""",
@@ -11732,7 +11734,10 @@ CREATE TABLE IF NOT EXISTS request_captures (
             ).fetchall()
             return [_row_to_canonical_turn(row) for row in rows]
         return [
-            row for row in self._load_canonical_turn_rows(conversation_id)
+            row for row in self._load_canonical_turn_rows(
+                conversation_id,
+                _CANONICAL_TURN_ROW_COLUMNS if with_raw else _CANONICAL_TURN_TEXT_COLUMNS,
+            )
             if int(row.turn_group_number) >= int(min_turn_group)
             and (max_turn_group is None or int(row.turn_group_number) <= int(max_turn_group))
         ]
@@ -11765,6 +11770,50 @@ CREATE TABLE IF NOT EXISTS request_captures (
             (conversation_id, int(turn_number), STRIP_WHITESPACE),
         ).fetchone()
         return (row["session_date"] or "").strip() if row is not None else ""
+
+    def get_canonical_turn_index_rows(
+        self, conversation_id: str,
+    ) -> list[CanonicalTurnIndexRow] | None:
+        """Every canonical turn without its text, with its group's text hash.
+
+        The hash is computed in SQL from each group's first non-empty user and
+        assistant text, so the text itself is never returned.
+        """
+        conn = self._get_conn()
+        if conn.execute(
+            "SELECT 1 FROM canonical_turns WHERE conversation_id = ? AND turn_group_number < 0 LIMIT 1",
+            (conversation_id,),
+        ).fetchone() is not None:
+            return None
+        conn.create_function(
+            "vc_pair_text_hash", 2,
+            lambda u, a: pair_text_hash(u or "", a or ""),
+            deterministic=True,
+        )
+        first = """(SELECT c.{side}_content FROM canonical_turns c
+                    WHERE c.conversation_id = ? AND c.turn_group_number = g.turn_group_number
+                      AND coalesce(c.{side}_content, '') <> ''
+                    ORDER BY c.sort_key, c.canonical_turn_id LIMIT 1)"""
+        rows = conn.execute(
+            f"""SELECT o.canonical_turn_id, o.turn_number, o.turn_group_number, o.sort_key,
+                          o.primary_tag, o.tags_json, o.session_date, o.sender,
+                          o.fact_signals_json, o.code_refs_json, o.tagged_at, o.compacted_at,
+                          o.first_seen_at, o.last_seen_at, o.created_at, o.updated_at,
+                      (trim(coalesce(o.user_content, ''), ?) <> '') AS has_user_content,
+                      (trim(coalesce(o.assistant_content, ''), ?) <> '') AS has_assistant_content,
+                      g.pair_hash
+               FROM canonical_turns_ordinal o
+               JOIN (
+                   SELECT g.turn_group_number,
+                          vc_pair_text_hash({first.format(side="user")}, {first.format(side="assistant")}) AS pair_hash
+                   FROM (SELECT DISTINCT turn_group_number FROM canonical_turns WHERE conversation_id = ?) g
+               ) g ON g.turn_group_number = o.turn_group_number
+               WHERE o.conversation_id = ?
+               ORDER BY o.sort_key, o.canonical_turn_id""",
+            (STRIP_WHITESPACE, STRIP_WHITESPACE, conversation_id, conversation_id,
+             conversation_id, conversation_id),
+        ).fetchall()
+        return [canonical_turn_index_row(row) for row in rows]
 
     def get_canonical_turn_tags(
         self, conversation_id: str,

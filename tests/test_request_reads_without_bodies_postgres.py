@@ -52,3 +52,43 @@ def test_postgres_projections_match_full_rows():
         assert all(row.user_raw_content is None for row in texts)
     finally:
         store.delete_conversation(conv)
+
+
+@pytest.mark.regression("BUG-143")
+def test_postgres_index_projection_hashes_match_python():
+    import hashlib
+
+    from virtual_context.engine import VirtualContextEngine
+    from virtual_context.storage.postgres import PostgresStore
+
+    suffix = uuid.uuid4().hex
+    conv = f"sk:agent:test:discord:guild:{suffix}"
+    store = PostgresStore(PG_URL)
+    store.activate_conversation(conv)
+    try:
+        turns = [
+            (0, "naïve café — 東京 ✓", "réponse ü"),
+            (1, "", ""),
+            (1, "second user", ""),
+            (1, "", "second answer"),
+            (2, "  ", "only blank user"),
+        ]
+        for i, (group, user, assistant) in enumerate(turns):
+            store.save_canonical_turn(
+                conv, -1, user, assistant,
+                canonical_turn_id=str(uuid.uuid4()), sort_key=1000.0 * (i + 1),
+                turn_hash=f"hash-{suffix}-{i}", turn_group_number=group,
+            )
+        rows = store.get_canonical_turn_index_rows(conv)
+        full = store.get_all_canonical_turns(conv)
+        assert [r.canonical_turn_id for r in rows] == [r.canonical_turn_id for r in full]
+        expected = {}
+        for group, pair_rows in VirtualContextEngine._group_canonical_rows_into_pairs(full):
+            user, assistant, *_ = VirtualContextEngine._pair_payload_from_rows(pair_rows)
+            expected[group] = hashlib.sha256(f"{user} {assistant}".encode()).hexdigest()[:16]
+        assert {r.turn_group_number: r.pair_hash for r in rows} == expected
+        assert [(r.has_user_content, r.has_assistant_content) for r in rows] == [
+            (bool(r.user_content.strip()), bool(r.assistant_content.strip())) for r in full
+        ]
+    finally:
+        store.delete_conversation(conv)

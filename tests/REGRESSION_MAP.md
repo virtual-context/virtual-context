@@ -5,6 +5,15 @@ Use `pytest -m regression` to run all regression tests.
 
 ## By Bug ID
 
+### BUG-143 — Restoring an engine read every canonical turn's text
+
+- **Symptom**: a worker's resident memory jumped by roughly 100 MB the first time it served a long conversation, and stayed there after the load finished.
+- **Root cause**: `_restore_from_canonical_rows` loaded the full text of every canonical turn to compute the turn index's per-turn text hash, although only the live and pending turns past the compaction watermark need their text.
+- **Fix**: stores project every turn without its text through `get_canonical_turn_index_rows`, computing each turn group's hash in SQL; the restore reads text only for the live and pending groups, through a raw-body-free group-range read. Stores that cannot project fall back to the full read.
+- **Tests**:
+  - `test_restore_reads_live_window.py`
+  - `test_request_reads_without_bodies_postgres.py::test_postgres_index_projection_hashes_match_python`
+
 ### BUG-142 — Conversation deletions and forwarded provider failures left no trace
 
 - **Symptom**: a conversation's lifecycle row was found deleted with nothing identifying the caller, and a client compaction that the provider refused on a forwarded stream logged only its byte count.

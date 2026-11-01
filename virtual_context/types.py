@@ -2551,6 +2551,42 @@ class CanonicalTurnReconcileRow:
 
 
 @dataclass
+class CanonicalTurnIndexRow:
+    """A canonical turn projected down to what rebuilding the turn index reads.
+
+    The index keys each turn on a hash of its text, so building it used to
+    load every turn's full text. Here the store computes that hash instead:
+    ``pair_hash`` is the first 16 hex digits of sha256 over the turn group's
+    first non-empty user text, a space, and its first non-empty assistant
+    text, the same value the engine derives from full rows. Every row of a
+    group carries its group's hash.
+
+    A separate type for the same reason as ``CanonicalTurnReconcileRow``:
+    it has no text, so it must never be mistaken for a full row.
+    """
+
+    canonical_turn_id: str = ""
+    turn_number: int = -1
+    turn_group_number: int = -1
+    sort_key: float = 0.0
+    primary_tag: str = "_general"
+    tags: list[str] = field(default_factory=list)
+    session_date: str = ""
+    sender: str = ""
+    fact_signals: list[FactSignal] = field(default_factory=list)
+    code_refs: list[dict] = field(default_factory=list)
+    tagged_at: str | None = None
+    compacted_at: str | None = None
+    first_seen_at: str | None = None
+    last_seen_at: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
+    has_user_content: bool = False
+    has_assistant_content: bool = False
+    pair_hash: str = ""
+
+
+@dataclass
 class CanonicalTurnChunkEmbedding:
     """One embedded chunk from a canonical turn side."""
     conversation_id: str
