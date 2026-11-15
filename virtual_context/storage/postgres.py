@@ -12655,7 +12655,7 @@ class PostgresStore(PostgresVectorSearchMixin, RelationalStoreMixin, ContextStor
             if legacy is not None:
                 return None
             rows = conn.execute(
-                f"""WITH firsts AS (
+                """WITH firsts AS (
                        SELECT turn_group_number,
                               (array_agg(user_content ORDER BY sort_key, canonical_turn_id)
                                   FILTER (WHERE coalesce(user_content, '') <> ''))[1] AS u,
